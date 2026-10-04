@@ -8,9 +8,6 @@ const docs = defineDocs({
   dir: 'content/docs',
   docs: {
     schema: pageSchema,
-    postprocess: {
-      includeProcessedMarkdown: true,
-    },
   },
   meta: {
     schema: metaSchema,
@@ -43,9 +40,9 @@ export function getPageMarkdownUrl(page: (typeof source)['$inferPage']) {
 }
 
 export async function getLLMText(page: (typeof source)['$inferPage']) {
-  const processed = await page.data.getText('processed');
+  const raw = await page.data.getText('raw');
 
   return `# ${page.data.title} (${page.url})
 
-${processed}`;
+${raw}`;
 }
