@@ -1,0 +1,114 @@
+---
+title: 'Cost, scaling & architecture patterns'
+description: 'Think about a whole system the way an experienced engineer does — where cost actually comes from, scaling decisions, and SLI/SLO discipline.'
+---
+
+<Callout type="info" title="Goal">
+  Think about a whole system the way an experienced engineer does — where cost actually comes from
+  and how to control it, how scaling decisions get made, and how to define "good enough" precisely
+  instead of vaguely, using the SLI/SLO vocabulary introduced in the observability modules.
+</Callout>
+
+## 1. From individual services to one whole system
+
+Earlier modules covered services one at a time. This guide is about how they fit together into judgment calls — the kind you'd actually be asked to make on a real team.
+
+---
+
+## 2. Concrete cost optimization techniques
+
+- **Right-sizing** — Don't allocate a VM's or Cloud Run task's memory/CPU "just in case." Look at actual usage in Cloud Monitoring/CloudWatch and size to what's really being used, with a sensible margin.
+- **Scale-to-zero vs. reserved capacity** — For spiky or unpredictable traffic, Cloud Run/Lambda's scale-to-zero wins on cost. For steady, predictable, always-on load, **Committed Use Discounts** (GCP) or **Savings Plans / Reserved Instances** (AWS) trade a commitment for a meaningfully lower rate than on-demand pricing.
+- **Storage lifecycle policies** — Automatically transition old objects in Cloud Storage/S3 to cheaper cold tiers (Nearline/Coldline on GCP, Glacier on AWS) or delete them outright after N days, instead of paying standard rates for data nobody's read in months.
+- **Data egress costs** — The sneaky one. Moving data _out_ of a cloud (to the public internet, or across regions) usually costs meaningfully more than storing or computing on it. Keeping traffic within one region, and one provider, is a real and often-overlooked lever.
+- **Spot / Preemptible instances** — Deeply discounted compute the provider can reclaim with little notice. Excellent for fault-tolerant batch work (Spot VMs on GCP, Spot Instances on AWS) — bad for anything that can't tolerate an abrupt interruption.
+
+---
+
+## 3. Scaling patterns, in theory
+
+- **Vertical scaling** (a bigger machine) vs. **horizontal scaling** (more machines) — Vertical has a hard ceiling and remains a single point of failure; horizontal scales further but requires your app to be stateless, the exact same requirement introduced for serverless compute.
+- **Reactive autoscaling** (add capacity once a metric like CPU crosses a threshold) vs. **predictive/scheduled scaling** (scale up ahead of a known traffic pattern — a marketing email going out at 9am, say) — Reactive is simpler and the default; predictive avoids the lag of reacting only after load has already arrived.
+
+---
+
+## 4. The Well-Architected Framework — a mental checklist, not a memorization exercise
+
+Both clouds publish a framework for reviewing a system design against the same handful of concerns — AWS's **Well-Architected Framework** is the more widely referenced original; GCP publishes its own **Architecture Framework** covering equivalent ground.
+
+The pillars, worth recognizing by name rather than memorizing in depth:
+
+1. **Operational excellence**
+2. **Security**
+3. **Reliability**
+4. **Performance efficiency**
+5. **Cost optimization**
+
+When reviewing any real design, running through these five as a checklist catches blind spots a narrower "does it work" review misses.
+
+---
+
+## 5. SLI, SLO, and error budget — properly this time
+
+Observability modules mentioned these in passing; here's the actual discipline behind them, which originated at Google as part of Site Reliability Engineering:
+
+- **SLI (Service Level Indicator)** — The actual measured metric — e.g., "the percentage of requests that complete in under 200ms."
+- **SLO (Service Level Objective)** — Your target for that SLI over a time window — e.g., "99.9% of requests under 200ms, measured over a rolling 30 days."
+- **Error budget** — The failure room your SLO implicitly allows — 0.1% in the example above. While you're within budget, ship features at normal speed. Once you've burned through it, the discipline says: stop shipping new features and fix reliability first.
+
+<Callout type="info" title="Worked example: growing past a hobby project">
+  Say your containerized app has actually picked up real users. The mature sequence isn't "add more
+  regions" first — it's: right-size based on real metrics → add horizontal autoscaling within your
+  current region → ensure redundancy across availability zones within that region → only then
+  consider true multi-region, and only if the SLO you've defined genuinely requires it. Reaching for
+  multi-region before single-region redundancy is solid is one of the most common real
+  over-engineering mistakes — most projects never actually need it.
+</Callout>
+
+---
+
+## Hands-on exercise
+
+<Steps>
+  <Step>
+    ### Inspect real usage
+
+    Open Cloud Monitoring (or CloudWatch) for your actual deployed services and look at real accumulated request count, latency, and CPU/memory usage.
+
+  </Step>
+  <Step>
+    ### Right-size allocations
+
+    Based on what you see, make one concrete right-sizing change — e.g., lower your Cloud Run service's memory allocation if usage has consistently sat well below the current limit — and redeploy.
+
+  </Step>
+  <Step>
+    ### Configure storage lifecycle
+
+    Add a lifecycle rule to your Cloud Storage or S3 bucket: transition objects older than 30 days to Nearline/Glacier, or auto-delete them — a real, free-to-configure setting, not a simulation.
+
+  </Step>
+  <Step>
+    ### Define a precise SLO
+
+    Write down one precise SLO for your deployed app — e.g., "95% of requests succeed with under 500ms latency, measured over a rolling 7 days." It doesn't need to be enforced by tooling yet; the exercise is stating one precisely instead of vaguely.
+
+  </Step>
+</Steps>
+
+---
+
+## Self-check before the capstone
+
+- Name three concrete ways to lower cloud spend without reducing reliability.
+- Why does horizontal scaling require statelessness while vertical scaling doesn't?
+- What's the practical consequence of burning through an error budget?
+- Why is reaching for multi-region before solid single-region redundancy usually a mistake?
+
+---
+
+## References
+
+- [aws.amazon.com/architecture/well-architected](https://aws.amazon.com/architecture/well-architected/) — AWS's Well-Architected Framework, all five pillars in depth.
+- [cloud.google.com/architecture/framework](https://cloud.google.com/architecture/framework) — GCP's equivalent Architecture Framework.
+- [sre.google](https://sre.google) — Google's own free Site Reliability Engineering book — the original source for SLI/SLO/error budget discipline.

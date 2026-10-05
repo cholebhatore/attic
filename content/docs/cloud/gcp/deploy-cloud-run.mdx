@@ -1,0 +1,136 @@
+---
+title: 'Deploy your first Cloud Run service'
+description: 'Take your containerized app and deploy to Google Cloud Run, comparing its developer velocity against AWS ECS Fargate and App Runner.'
+---
+
+<Callout type="info" title="Goal">
+  Take your containerized application and deploy it to Google Cloud Run — source code to public
+  HTTPS URL — and understand how Cloud Run's single-command serverless abstraction compares directly
+  against AWS App Runner and ECS Fargate.
+</Callout>
+
+## 1. The anatomy of a deploy
+
+Every Cloud Run deploy, no matter how you trigger it, goes through the same pipeline: **your source code → a container image → a container registry → Cloud Run pulls and runs it → you get a URL**. The Foundations modules explained each piece separately (containers, storage, IAM); this module wires them into one working path.
+
+---
+
+## 2. Writing a Dockerfile — the blueprint for your image
+
+A `Dockerfile` is a short recipe telling Docker how to build your container image, line by line. For a small Node app it's genuinely short:
+
+```dockerfile
+FROM node:20-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm install --production
+COPY . .
+ENV PORT=8080
+EXPOSE 8080
+CMD ["node", "server.js"]
+```
+
+Read it top to bottom exactly as it executes: start from a base image with Node already installed, set a working directory, copy just the dependency manifest first and install (so Docker can cache this expensive step separately from your actual code), copy the rest of your code in, and declare the command that runs when a container starts. **Cloud Run expects your app to listen on the port in the `PORT` environment variable** (it defaults to `8080`) — this one convention trips up almost every beginner's first deploy, so bake it in from the start: `app.listen(process.env.PORT || 8080)`.
+
+---
+
+## 3. Two ways to get to a deployed service
+
+| Method                                                        | What happens                                                                                                                         | When to use it                                                                                                      |
+| :------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------ |
+| **Source deploy** — `gcloud run deploy --source .`            | Cloud Build automatically detects your language and builds a container for you using **Buildpacks** — no Dockerfile required at all. | Fastest path for a straightforward app; great for this hands-on.                                                    |
+| **Image deploy** — build → push → `gcloud run deploy --image` | You explicitly build the image from your own Dockerfile, push it to **Artifact Registry**, then point Cloud Run at that exact image. | Whenever you need control the Dockerfile gives you — custom base images, specific build steps, reproducible builds. |
+
+Buildpacks (used by source deploy) are a genuinely useful beginner on-ramp, but understanding the Dockerfile path matters because it's what CI/CD pipelines almost always use in practice.
+
+---
+
+## 4. The config knobs that actually matter
+
+**Concurrency** — How many simultaneous requests one container instance will handle before Cloud Run spins up another. Higher concurrency = fewer instances = cheaper, but only works if your app doesn't choke under parallel load.
+
+**Min / max instances** — Min instances above 0 keeps at least that many warm, eliminating cold starts for those — at the cost of paying for idle capacity, which quietly breaks the "scale to zero" benefit. Max instances caps runaway scaling (and runaway cost) during a traffic spike or bug.
+
+**Memory / CPU allocation** — Set per revision, same idea as picking a VM's machine type, just scoped to one container instance instead of a whole machine.
+
+**Request timeout** — How long Cloud Run waits for your app to respond before giving up — matters for anything slow like a big file upload or a long-running computation.
+
+---
+
+## 5. Secrets and custom domains, briefly
+
+Never bake a real secret (API key, DB password) directly into your image or a plain environment variable — reference it from **Secret Manager** instead, so it's fetched at runtime and access is controlled by IAM. For a custom domain instead of the auto-generated `*.run.app` URL, Cloud Run supports direct **domain mapping** — just point a CNAME/A record at what Cloud Run provides.
+
+---
+
+## 6. The same deploy on AWS
+
+This is where the multi-cloud asymmetry becomes very concrete. Deploying the identical containerized app looks meaningfully different depending which AWS service you pick:
+
+| Step           | Cloud Run                                 | App Runner                                  | Fargate (via ECS)                                                                         |
+| :------------- | :---------------------------------------- | :------------------------------------------ | :---------------------------------------------------------------------------------------- |
+| Image source   | Buildpacks from source, or your own image | Connect a repo, or point at an image in ECR | Must push your own image to ECR first                                                     |
+| Compute config | One command / console form                | One console form                            | Write a **Task Definition** (image, CPU/mem, port) by hand                                |
+| Running it     | Automatic                                 | Automatic                                   | Create a **Cluster** and a **Service** (desired count, load balancer attachment) yourself |
+| Public URL     | Given automatically                       | Given automatically                         | You wire up an Application Load Balancer yourself                                         |
+
+App Runner is genuinely the closer match in day-to-day experience — a handful of clicks or one CLI command, no cluster to think about. Fargate gives you real orchestration primitives (useful once you need multiple interdependent services), but you're assembling infrastructure Cloud Run and App Runner both hide from you by design.
+
+---
+
+## Hands-on
+
+<Steps>
+  <Step>
+    ### Prepare your app
+
+    Take your Node app, add a minimal `package.json`, and write the Dockerfile from section 2 above (or skip the Dockerfile entirely and let Buildpacks handle it — your choice).
+
+  </Step>
+  <Step>
+    ### Deploy to Cloud Run
+
+    From Cloud Shell or your local terminal with `gcloud` authenticated, run:
+
+    ```bash
+    gcloud run deploy my-first-service --source . --region us-central1 --allow-unauthenticated
+    ```
+
+  </Step>
+  <Step>
+    ### Verify the deploy
+
+    Watch the output — it builds, pushes to Artifact Registry automatically, and prints a live `https://...run.app` URL. Open it, or `curl` it.
+
+  </Step>
+  <Step>
+    ### Experiment with config
+
+    In the console, open your service's *Revisions* tab and try changing **min instances** from 0 to 1, redeploy, and compare how fast the very first request feels afterward versus before (cold start vs. always-warm).
+
+  </Step>
+  <Step>
+    ### (Optional) Deploy on AWS App Runner
+
+    Push the same image to ECR (`aws ecr` commands) and deploy it via App Runner, pointing it at that image — compare how many steps it took versus the single `gcloud run deploy` command.
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What's the difference between a source deploy and an image deploy, and when would you deliberately choose the Dockerfile path?
+- Why must your app listen on `process.env.PORT` rather than a hardcoded port?
+- What does setting min-instances to 1 actually trade away, compared to 0?
+- Why is App Runner usually the more useful comparison point for Cloud Run than Fargate, even though Fargate is architecturally closer in some ways?
+
+---
+
+## References
+
+- [cloud.google.com/run/docs](https://cloud.google.com/run/docs) — Full Cloud Run documentation — the deploy quickstart matches this flow closely.
+- [docs.docker.com — Dockerfile reference](https://docs.docker.com/reference/dockerfile/) — The authoritative reference for every Dockerfile instruction.
+- [aws.amazon.com/apprunner](https://aws.amazon.com/apprunner/) — App Runner overview.
+- [Google Cloud Tech](https://www.youtube.com/@googlecloudtech) — Search "Cloud Run deploy" on this channel for a walkthrough matching this exact flow.

@@ -1,0 +1,178 @@
+---
+title: Amazon VPC Architecture & Subnets
+description: Virtual Private Cloud topology, CIDR planning, public vs. private subnets, NAT Gateways, Security Groups, and NACLs.
+---
+
+<Callout type="info" title="Core Concept">
+  An Amazon Virtual Private Cloud (VPC) is a logically isolated virtual network dedicated to your
+  AWS account. It gives you complete control over your virtual networking environment, including IP
+  address selection, subnet creation, and route table configuration.
+</Callout>
+
+## 1. Production VPC Architecture
+
+Every secure production deployment on AWS follows a multi-tier, multi-Availability Zone VPC topology:
+
+<Mermaid
+  chart={`
+flowchart TD
+    Internet["Public Internet"] <--> IGW["Internet Gateway (IGW)"]
+    subgraph VPC["Virtual Private Cloud (10.0.0.0/16)"]
+        subgraph AZ1["Availability Zone 1a"]
+            Pub1["Public Subnet 1a (10.0.1.0/24)"]
+            Priv1["Private Subnet 1a (10.0.10.0/24)"]
+            NAT1["NAT Gateway 1a (Elastic IP)"]
+            Pub1 --- NAT1
+        end
+        subgraph AZ2["Availability Zone 1b"]
+            Pub2["Public Subnet 1b (10.0.2.0/24)"]
+            Priv2["Private Subnet 1b (10.0.20.0/24)"]
+            NAT2["NAT Gateway 1b (Elastic IP)"]
+            Pub2 --- NAT2
+        end
+        IGW <--> Pub1
+        IGW <--> Pub2
+        NAT1 -.->|Outbound Only Internet| Priv1
+        NAT2 -.->|Outbound Only Internet| Priv2
+    end
+    ALB["Application Load Balancer (Public Subnets)"]
+    Workloads["ECS Tasks / RDS DB (Private Subnets)"]
+    Pub1 --- ALB
+    Pub2 --- ALB
+    Priv1 --- Workloads
+    Priv2 --- Workloads
+`}
+/>
+
+---
+
+## 2. Core VPC Networking Components
+
+### CIDR Blocks (Classless Inter-Domain Routing)
+
+When creating a VPC, you assign an IPv4 CIDR block (e.g., `10.0.0.0/16`, providing 65,536 private IP addresses). Subnets subdivide this range:
+
+- `10.0.1.0/24` = Public Subnet AZ 1a (256 IP addresses; 251 usable by workloads, as AWS reserves 5 IPs per subnet for network routing, DNS, and broadcast).
+
+### Public Subnet vs. Private Subnet
+
+- **Public Subnet:** Its route table has a direct route to an **Internet Gateway** (`0.0.0.0/0 -> igw-xxx`). Workloads in this subnet can receive direct public traffic if assigned a public IPv4 address. Used exclusively for ingress resources: Application Load Balancers, NAT Gateways, and bastion hosts.
+- **Private Subnet:** Its route table does **not** route directly to an Internet Gateway. Workloads have only private IP addresses (`10.0.x.x`), making them completely unreachable from the public internet. Used for backend API tasks, microservices, and databases.
+
+### Internet Gateway (IGW)
+
+A horizontally scaled, redundant, highly available VPC component that enables communication between instances in your VPC and the internet.
+
+### NAT Gateway (Network Address Translation)
+
+Backend tasks in private subnets often need to initiate outbound requests (e.g., downloading npm packages, calling third-party payment APIs like Stripe), but must not accept inbound connections.
+
+- A **NAT Gateway** translates private IPs to an Elastic IP (public IP) for outbound traffic.
+- **Placement Rule:** A NAT Gateway _must_ be provisioned in a **public subnet** with an attached Elastic IP so it can talk to the Internet Gateway.
+
+---
+
+## 3. Defense in Depth: Security Groups vs. Network ACLs
+
+AWS uses two complementary firewall layers:
+
+| Feature            | Security Groups (SG)                                                                                                    | Network ACLs (NACL)                                                                                  |
+| :----------------- | :---------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------- |
+| **Operates At**    | Instance / Network Interface (ENI) level                                                                                | Subnet boundary level                                                                                |
+| **State Tracking** | **Stateful:** If an inbound request is permitted, return traffic is automatically allowed regardless of outbound rules. | **Stateless:** Return traffic must be explicitly allowed by an outbound rule.                        |
+| **Rule Types**     | **Allow rules only.** Everything not explicitly allowed is denied.                                                      | **Allow and Deny rules.** Rules are evaluated in numerical order (e.g., 100, 200). First match wins. |
+| **Common Use**     | Daily application security: "Allow port 8080 only from the ALB security group."                                         | Coarse subnet-level defense: "Block a malicious IP range (e.g., `198.51.100.0/24`) completely."      |
+
+---
+
+## 4. VPC Endpoints (AWS PrivateLink)
+
+By default, services like Amazon S3 and Amazon DynamoDB live outside your VPC on public AWS endpoints. If a private EC2/ECS instance accesses S3 without an endpoint, traffic flows out through the NAT Gateway across the public internet, incurring NAT Gateway data processing charges ($0.045/GB).
+
+- **Gateway Endpoints (Free):** Directly routes traffic from your VPC route tables to **Amazon S3** and **Amazon DynamoDB** over the AWS private backbone with zero data transfer fees.
+- **Interface Endpoints (PrivateLink):** Provisions an Elastic Network Interface with a private IP inside your subnet for other AWS services (e.g., Secrets Manager, ECR, CloudWatch Logs).
+
+---
+
+## Practical Implementation: Building a Multi-AZ VPC via CLI
+
+<Steps>
+  <Step>
+    ### Create the VPC
+
+    ```bash
+    VPC_ID=$(aws ec2 create-vpc \
+      --cidr-block 10.0.0.0/16 \
+      --query 'Vpc.VpcId' --output text)
+
+    # Enable DNS hostnames
+    aws ec2 modify-vpc-attribute --vpc-id $VPC_ID --enable-dns-hostnames "{\"Value\":true}"
+    ```
+
+  </Step>
+  <Step>
+    ### Create Internet Gateway and attach to VPC
+
+    ```bash
+    IGW_ID=$(aws ec2 create-internet-gateway --query 'InternetGateway.InternetGatewayId' --output text)
+    aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW_ID
+    ```
+
+  </Step>
+  <Step>
+    ### Create Public and Private Subnets across 2 AZs
+
+    ```bash
+    # Public Subnet in us-east-1a
+    PUB_SUB_1=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.1.0/24 --availability-zone us-east-1a --query 'Subnet.SubnetId' --output text)
+
+    # Private Subnet in us-east-1a
+    PRIV_SUB_1=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block 10.0.10.0/24 --availability-zone us-east-1a --query 'Subnet.SubnetId' --output text)
+    ```
+
+  </Step>
+  <Step>
+    ### Configure Public Route Table
+
+    ```bash
+    PUB_RT=$(aws ec2 create-route-table --vpc-id $VPC_ID --query 'RouteTable.RouteTableId' --output text)
+
+    # Route 0.0.0.0/0 to Internet Gateway
+    aws ec2 create-route --route-table-id $PUB_RT --destination-cidr-block 0.0.0.0/0 --gateway-id $IGW_ID
+
+    # Associate with public subnet
+    aws ec2 associate-route-table --subnet-id $PUB_SUB_1 --route-table-id $PUB_RT
+    ```
+
+  </Step>
+  <Step>
+    ### Create an S3 Gateway Endpoint
+
+    Eliminate NAT data transfer fees for S3:
+
+    ```bash
+    aws ec2 create-vpc-endpoint \
+      --vpc-id $VPC_ID \
+      --service-name com.amazonaws.us-east-1.s3 \
+      --route-table-ids $PUB_RT
+    ```
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- Why are 5 IP addresses reserved by AWS in every subnet?
+- Why must a NAT Gateway be deployed into a public subnet rather than a private subnet?
+- What is the difference between stateful Security Groups and stateless Network ACLs?
+- How does an Amazon S3 Gateway Endpoint reduce AWS network transfer costs?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html](https://docs.aws.amazon.com/vpc/latest/userguide/what-is-amazon-vpc.html) — Amazon VPC User Guide.
+- [docs.aws.amazon.com/vpc/latest/userguide/VPC_SecurityGroups.html](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_SecurityGroups.html) — Security Groups for your VPC.
+- [docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html](https://docs.aws.amazon.com/vpc/latest/privatelink/gateway-endpoints.html) — Gateway Endpoints for Amazon S3.

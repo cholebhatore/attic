@@ -1,0 +1,127 @@
+---
+title: 'Observability: logging & monitoring'
+description: 'Google Cloud Operations suite: Cloud Logging, Monitoring, and Error Reporting.'
+---
+
+<Callout type="info" title="Goal">
+  Be able to answer "is my app actually healthy right now, and if not, why" without guessing — using
+  logs, metrics, and alerts on your service, and know the AWS equivalents by name.
+</Callout>
+
+## 1. Why this comes after CI/CD, not before
+
+Now that deploys happen automatically via pipelines, the risk shifts: a bad change can ship without you watching. Observability is how you notice immediately.
+
+---
+
+## 2. The pillars, cloud-agnostic
+
+- **Logs** — Discrete, timestamped text or structured events — "what happened." Good for understanding one specific incident in detail.
+- **Metrics** — Numeric time-series measurements — request count, latency, error rate, CPU% — sampled continuously. Good for spotting trends and setting alerts.
+- **Traces** — The path a single request takes across multiple services, with timing for each hop. Most valuable once you have more than one service talking to another.
+
+---
+
+## 3. GCP's stack vs. AWS's stack — a branding difference worth knowing
+
+| Pillar                      | GCP                                | AWS                                           |
+| :-------------------------- | :--------------------------------- | :-------------------------------------------- |
+| **Logs**                    | Cloud Logging                      | CloudWatch Logs                               |
+| **Metrics & dashboards**    | Cloud Monitoring                   | CloudWatch Metrics                            |
+| **Alerting**                | Cloud Monitoring alerting policies | CloudWatch Alarms                             |
+| **Tracing**                 | Cloud Trace                        | X-Ray                                         |
+| **Auto-grouped exceptions** | Error Reporting                    | — (closest: CloudWatch Logs Insights queries) |
+
+GCP gives each pillar its own product name even though they're one integrated suite under the hood (historically branded "Stackdriver," now just "Cloud Operations"). AWS bundles logs, metrics, and alarms all under one umbrella brand, **CloudWatch**, with tracing split out separately as X-Ray. Functionally the two clouds cover the same ground — this is naming, not a capability gap.
+
+---
+
+## 4. Structured logging — worth doing from day one
+
+Compare these two log lines:
+
+```javascript
+// unstructured — hard to filter later
+console.log('user logged in: ' + userId);
+
+// structured — every field is independently queryable
+console.log(
+  JSON.stringify({
+    severity: 'INFO',
+    message: 'user logged in',
+    userId: userId,
+  }),
+);
+```
+
+Both Cloud Logging and CloudWatch Logs Insights automatically parse JSON-formatted log lines into filterable fields — so "show me every failed login for this specific user" becomes a real query instead of manually scrolling through text.
+
+---
+
+## 5. Alerting and uptime checks
+
+An **alerting policy** (GCP) or **CloudWatch Alarm** (AWS) watches a metric and fires a notification when a condition holds — e.g. "error rate above 5% for 5 minutes." Notifications go out through a **notification channel** (email, Slack, PagerDuty) on GCP, or an **SNS topic** subscribers listen to on AWS. Separately, an **uptime check** (GCP) or a health check via Route 53 / **CloudWatch Synthetics** (AWS) periodically hits your public URL from outside your infrastructure entirely, catching the case where your whole app — not just one metric — is unreachable.
+
+<Callout type="info" title="Where this is heading">
+  Once you're tracking metrics like error rate and latency, the natural next question is "how good
+  does this actually need to be?" — that's an **SLI** (Service Level Indicator, the raw
+  measurement), an **SLO** (Service Level Objective, your target for it), and an **error budget**
+  (how much you're allowed to miss that target before you stop shipping new features and fix
+  reliability instead). You don't need to operationalize this yet — just recognize the vocabulary;
+  it resurfaces in the architecture patterns module.
+</Callout>
+
+---
+
+## Hands-on
+
+<Steps>
+  <Step>
+    ### Filter logs in Cloud Logging
+
+    Open *Cloud Logging* and find the request logs from your Cloud Run service. Try a filter query like `resource.type="cloud_run_revision" AND severity>=ERROR` — even with no errors yet, get comfortable with the query bar.
+
+  </Step>
+  <Step>
+    ### Add structured logging to your app
+
+    Add one structured log line to your app (log the incoming request's path as a JSON object, per section 4), push it through your pipeline, and confirm the new field shows up as independently filterable in Cloud Logging.
+
+  </Step>
+  <Step>
+    ### Create an alerting policy
+
+    Go to *Cloud Monitoring → Alerting → Create Policy*. Set a condition on your Cloud Run service (e.g. request latency above some threshold, or 5xx error count above 0), and add your email as the notification channel. You don't need to actually trigger it — the goal is understanding the configuration shape.
+
+  </Step>
+  <Step>
+    ### Set up an Uptime Check
+
+    Create an **Uptime Check** pointed at your live Cloud Run URL and watch it report healthy from multiple global locations.
+
+  </Step>
+  <Step>
+    ### (Optional) CloudWatch parallel step
+
+    If you built the App Runner/Fargate version earlier, open its CloudWatch Logs and create one CloudWatch Alarm on a basic metric, to feel the naming differences directly.
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What's the practical difference between a log, a metric, and a trace — and which one would you reach for to answer "why was this one specific request slow"?
+- Why are GCP's Logging/Monitoring/Trace really one integrated suite despite the separate names, while AWS bundles differently under CloudWatch?
+- Why log in structured JSON instead of plain text strings, concretely?
+- What's the difference between an alerting policy watching a metric and an uptime check?
+
+---
+
+## References
+
+- [cloud.google.com/logging/docs](https://cloud.google.com/logging/docs) — Cloud Logging, including the query language used above.
+- [cloud.google.com/monitoring/docs](https://cloud.google.com/monitoring/docs) — Cloud Monitoring — dashboards, alerting policies, uptime checks.
+- [aws.amazon.com/cloudwatch](https://aws.amazon.com/cloudwatch/) — CloudWatch overview — logs, metrics, and alarms all under one product.
+- [aws.amazon.com/xray](https://aws.amazon.com/xray/) — X-Ray — AWS's distributed tracing product.

@@ -1,0 +1,165 @@
+---
+title: 'Kubernetes: GKE vs EKS'
+description: "Understand precisely what Kubernetes solves that Cloud Run and Fargate don't, core objects, and get real kubectl practice without cloud cost."
+---
+
+<Callout type="info" title="Goal">
+  Understand precisely what Kubernetes solves that Cloud Run and Fargate don't, the core objects
+  you'd actually read in a real cluster's config, and get real kubectl practice — without needing to
+  pay for an always-on cluster to do it.
+</Callout>
+
+## 1. Why this exists when Cloud Run/Fargate already work
+
+Cloud Run, App Runner, and Fargate are excellent for a single containerized service. Kubernetes exists for what happens past that: many interdependent services that need to discover each other, fine-grained control over scheduling and resource sharing across a fleet of machines, and portability across clouds or even on-prem hardware. It is genuinely more powerful and genuinely more complex — not a default choice, but something worth understanding precisely since it underpins a huge share of real production infrastructure.
+
+---
+
+## 2. Core objects, explained plainly
+
+- **Cluster** — A set of machines managed together as one unit.
+- **Node** — One machine (a VM, usually) inside the cluster, running the agent that lets Kubernetes schedule work onto it.
+- **Pod** — The smallest deployable unit — one or more tightly coupled containers sharing network and storage. Most simple apps use one container per Pod.
+- **Deployment** — Manages a set of identical Pod replicas and handles rolling updates between versions — the K8s-native equivalent of the Auto Scaling Group concept.
+- **Service (Kubernetes)** — A stable network endpoint in front of a constantly-changing set of Pods. Pods get destroyed and recreated with new internal IPs all the time; a Service gives callers one address that doesn't change. _Note: this is a different concept from an "ECS Service" in AWS — same word, different layer, worth not confusing._
+- **Ingress** — HTTP(S) routing rules for traffic entering the cluster from outside — the K8s-native equivalent of a load balancer's routing config.
+- **Namespace** — A way to logically partition one cluster — separate dev/staging/prod, or per-team, without needing separate clusters.
+- **ConfigMap / Secret** — Kubernetes' own way to inject configuration and secret values into Pods — conceptually parallel to cloud-managed Secret Managers, but scoped to the cluster rather than the whole cloud account.
+
+---
+
+## 3. GKE vs. EKS: what "managed" actually means here
+
+Both **GKE** and **EKS** run the Kubernetes _control plane_ for you (the API server, scheduler, and cluster state store) — the hardest part to operate yourself — leaving you to manage just the worker nodes, or not even that:
+
+- **GKE Autopilot** — GCP manages node provisioning and scaling entirely too, the closest thing to "serverless Kubernetes" that still exposes the full Kubernetes API.
+- **EKS with Fargate** — The same idea on AWS: Pods run on Fargate instead of self-managed EC2 worker nodes, so there's no node fleet for you to patch or size.
+
+Worth knowing as genuine history, not just marketing: Kubernetes itself was born out of Google's internal system (Borg), which is part of why GKE has long been considered the most polished managed offering — though EKS has closed that gap substantially in recent years.
+
+---
+
+## 4. A minimal Deployment + Service, read line by line
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: my-app }
+  template:
+    metadata:
+      labels: { app: my-app }
+    spec:
+      containers:
+        - name: my-app
+          image: my-app:latest
+          ports: [{ containerPort: 8080 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-app-service
+spec:
+  selector: { app: my-app }
+  ports: [{ port: 80, targetPort: 8080 }]
+  type: LoadBalancer
+```
+
+The Deployment says "keep 2 identical copies of this container running." The Service says "give callers one stable address, port 80, that load-balances across whichever Pods currently match `app: my-app`" — regardless of how many times those Pods get replaced underneath.
+
+---
+
+## 5. kubectl — the one genuinely portable tool in this whole path
+
+`kubectl` is the command-line tool for talking to any Kubernetes cluster, and unlike almost every other tool in this course, the exact same commands work against GKE, EKS, or a cluster running entirely on your own laptop — a rare moment of real, not just marketed, portability.
+
+<Callout type="warn" title="Cost honesty before you spin anything up">
+  A real GKE or EKS cluster is not free even at idle — worker nodes bill continuously regardless of
+  traffic, a real regression from Cloud Run/Lambda's scale-to-zero. For learning the YAML and
+  kubectl workflow itself, use a free local cluster tool — **kind** (Kubernetes-in-Docker) or
+  **minikube** — with zero cloud cost. Only spin up a real GKE Autopilot or EKS cluster if you
+  specifically want that experience, and delete it immediately after.
+</Callout>
+
+---
+
+## Hands-on exercise
+
+<Steps>
+  <Step>
+    ### Install local cluster tools
+
+    Install `kubectl` and `kind` (or minikube) locally — no cloud account needed for this part.
+
+  </Step>
+  <Step>
+    ### Create a local cluster
+
+    ```bash
+    kind create cluster
+    ```
+
+  </Step>
+  <Step>
+    ### Apply deployment and service
+
+    Save section 4's YAML as `app.yaml` (swap in your own small test image), then:
+
+    ```bash
+    kubectl apply -f app.yaml
+    ```
+
+  </Step>
+  <Step>
+    ### Inspect and port-forward
+
+    Run `kubectl get pods` — you should see 2 Pods running. Port-forward:
+
+    ```bash
+    kubectl port-forward service/my-app-service 8080:80
+    ```
+
+    Hit `localhost:8080` in a browser or curl.
+
+  </Step>
+  <Step>
+    ### Scale replicas dynamically
+
+    Try scaling up:
+
+    ```bash
+    kubectl scale deployment my-app --replicas=3
+    ```
+
+    Run `kubectl get pods` again to watch a third Pod appear live.
+
+  </Step>
+  <Step>
+    ### (Optional, cost-aware) GKE Autopilot
+
+    Create a real GKE Autopilot cluster, apply the same YAML there instead of locally, confirm it works identically, then delete the cluster immediately afterward so it doesn't keep billing.
+
+  </Step>
+</Steps>
+
+---
+
+## Self-check before moving forward
+
+- What does Kubernetes solve that Cloud Run/Fargate genuinely don't?
+- What's the actual difference between a Deployment and a Service in Kubernetes?
+- Why is `kubectl` described as "genuinely portable" when most other tooling in this path isn't?
+- Why does a local kind/minikube cluster cost nothing while a real GKE/EKS cluster bills continuously?
+
+---
+
+## References
+
+- [kubernetes.io/docs](https://kubernetes.io/docs/home/) — The official, vendor-neutral Kubernetes documentation — concepts apply to GKE and EKS equally.
+- [cloud.google.com/kubernetes-engine](https://cloud.google.com/kubernetes-engine) — GKE overview, including Autopilot.
+- [aws.amazon.com/eks](https://aws.amazon.com/eks/) — EKS overview, including Fargate-backed pods.
+- [kind.sigs.k8s.io](https://kind.sigs.k8s.io) — The free local cluster tool used in this hands-on exercise.

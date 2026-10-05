@@ -1,0 +1,189 @@
+---
+title: Amazon EC2 & Auto Scaling
+description: Virtual machine architecture, instance families, AMIs, User Data bootstrapping, Auto Scaling Groups, and Load Balancing.
+---
+
+<Callout type="info" title="Core Concept">
+  Amazon Elastic Compute Cloud (Amazon EC2) provides resizable, on-demand virtual compute capacity
+  in the cloud. It represents the foundational Infrastructure as a Service (IaaS) layer on AWS.
+</Callout>
+
+## 1. Amazon EC2 Architecture
+
+An EC2 instance is a virtual machine running on physical hardware partitioned by the AWS Nitro System hypervisor. When provisioning an EC2 instance, you configure:
+
+1. **Amazon Machine Image (AMI):** A pre-configured template containing the operating system (e.g., Ubuntu 24.04, Amazon Linux 2023, Red Hat), application server, and software packages.
+2. **Instance Type:** Determines CPU architecture, core count, memory allocation, storage throughput, and network bandwidth.
+3. **Storage (EBS or Instance Store):** Persistent virtual block storage attached over network (EBS) or ephemeral physical SSD disks attached directly to the host server.
+4. **Security Group:** A virtual stateful firewall controlling inbound and outbound network traffic at the instance level.
+5. **IAM Instance Profile:** An IAM Role attached directly to the virtual machine, allowing software running on the VM to securely query AWS APIs without static credentials.
+
+---
+
+## 2. EC2 Instance Families
+
+AWS names instance types using a standardized formula: `family` + `generation` + `capabilities` + `size` (e.g., `c6g.xlarge` = Compute-optimized, 6th generation, Graviton ARM processor, extra-large size).
+
+| Family                    | Prefix               | Target Workloads                                                    | vCPU : RAM Ratio  |
+| :------------------------ | :------------------- | :------------------------------------------------------------------ | :---------------- |
+| **General Purpose**       | `t4g`, `m6i`, `m7g`  | Web servers, small databases, development environments              | 1 : 4 (Balanced)  |
+| **Compute Optimized**     | `c6i`, `c7g`         | High-traffic web servers, batch processing, video encoding          | 1 : 2 (CPU-heavy) |
+| **Memory Optimized**      | `r6i`, `r7g`, `x2gd` | In-memory caches (Redis), relational databases, real-time analytics | 1 : 8 (RAM-heavy) |
+| **Accelerated Computing** | `g5`, `p4d`          | Machine learning training/inference, graphics rendering             | GPU-attached      |
+
+### Burstable Instances (`t4g`, `t3`)
+
+Burstable instances provide baseline CPU performance with the ability to burst above baseline when needed using CPU credits. Ideal for workloads with intermittent traffic spikes.
+
+---
+
+## 3. Purchasing Options: Optimizing Compute Spend
+
+- **On-Demand:** Pay by the second with zero long-term commitment. Best for unpredictable workloads or initial testing.
+- **Spot Instances:** Spare AWS compute capacity available at up to 90% discount. AWS can reclaim instances with a 2-minute warning. Ideal for fault-tolerant batch processing, CI/CD runners, and stateless web tiers.
+- **Compute Savings Plans / Reserved Instances (RI):** Commit to a consistent compute spend ($/hour) for a 1- or 3-year term in exchange for up to 72% discounts.
+
+---
+
+## 4. Bootstrapping with User Data & IMDSv2
+
+When an instance boots for the first time, the cloud-init daemon executes bash commands passed in the **User Data** field:
+
+```bash
+#!/bin/bash
+yum update -y
+yum install -y httpd
+systemctl start httpd
+systemctl enable httpd
+echo "<h1>Hello from EC2 instance $(hostname -f)</h1>" > /var/www/html/index.html
+```
+
+<Callout type="warn" title="Enforce IMDSv2 for Instance Security">
+  The **Instance Metadata Service (IMDS)** provides temporary credentials and instance metadata at
+  `http://169.254.169.254`. IMDSv1 was vulnerable to Server-Side Request Forgery (SSRF) attacks.
+  Modern AWS infrastructure enforces **IMDSv2**, requiring a session token header
+  (`X-aws-ec2-metadata-token`) to prevent credential theft.
+</Callout>
+
+---
+
+## 5. Auto Scaling Groups (ASG) & Application Load Balancers (ALB)
+
+Production web workloads never run on a single standalone EC2 instance. They run inside an **Auto Scaling Group** distributed across multiple Availability Zones behind an **Application Load Balancer**:
+
+<Mermaid
+  chart={`
+flowchart TD
+    Client["Client Traffic"] --> ALB["Application Load Balancer (ALB)"]
+    ALB --> TG["Target Group (Health Checks: /health)"]
+    subgraph ASG["Auto Scaling Group (Multi-AZ)"]
+        TG --> EC2_A["EC2 Instance (AZ 1a)"]
+        TG --> EC2_B["EC2 Instance (AZ 1b)"]
+        TG -.->|Scale-out event| EC2_C["EC2 Instance (AZ 1c)"]
+    end
+`}
+/>
+
+### Auto Scaling Mechanics
+
+- **Launch Template:** Declares the AMI, instance type, security groups, IAM role, and user data used whenever a new instance is spawned.
+- **Capacity Limits:** `min_size` (minimum instances running), `max_size` (ceiling to prevent runaway costs), and `desired_capacity`.
+- **Target Tracking Scaling Policy:** Dynamically adds or removes instances to keep a target metric stable (e.g., maintain average CPU utilization at 60%).
+
+---
+
+## Practical Implementation: Deploying a Multi-AZ EC2 Web Tier
+
+<Steps>
+  <Step>
+    ### Create an IAM Role for EC2
+
+    Create an IAM role with the `AmazonSSMManagedInstanceCore` policy attached. This enables AWS Systems Manager Session Manager, allowing secure browser-based terminal access without opening SSH port 22 to the public internet:
+
+    ```bash
+    aws iam create-role \
+      --role-name EC2WebServerRole \
+      --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+    aws iam attach-role-policy \
+      --role-name EC2WebServerRole \
+      --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+    aws iam create-instance-profile --instance-profile-name EC2WebServerProfile
+    aws iam add-role-to-instance-profile --instance-profile-name EC2WebServerProfile --role-name EC2WebServerRole
+    ```
+
+  </Step>
+  <Step>
+    ### Configure Security Group
+
+    Create a security group allowing inbound HTTP traffic on port 80:
+
+    ```bash
+    SG_ID=$(aws ec2 create-security-group \
+      --group-name web-tier-sg \
+      --description "Security group for web server instances" \
+      --query 'GroupId' --output text)
+
+    aws ec2 authorize-security-group-ingress \
+      --group-id $SG_ID \
+      --protocol tcp \
+      --port 80 \
+      --cidr 0.0.0.0/0
+    ```
+
+  </Step>
+  <Step>
+    ### Create Launch Template
+
+    Save the user data script to `userdata.sh`, base64 encode it, and create the Launch Template:
+
+    ```bash
+    USER_DATA_B64=$(base64 -w 0 userdata.sh)
+
+    aws ec2 create-launch-template \
+      --launch-template-name web-server-template \
+      --version-description "v1" \
+      --launch-template-data "{
+        \"ImageId\": \"ami-0c7217cdde317cfec\",
+        \"InstanceType\": \"t4g.small\",
+        \"SecurityGroupIds\": [\"$SG_ID\"],
+        \"IamInstanceProfile\": {\"Name\": \"EC2WebServerProfile\"},
+        \"UserData\": \"$USER_DATA_B64\",
+        \"MetadataOptions\": {\"HttpTokens\": \"required\"}
+      }"
+    ```
+
+  </Step>
+  <Step>
+    ### Create Auto Scaling Group
+
+    ```bash
+    aws autoscaling create-auto-scaling-group \
+      --auto-scaling-group-name web-tier-asg \
+      --launch-template "LaunchTemplateName=web-server-template,Version=1" \
+      --min-size 2 \
+      --max-size 5 \
+      --desired-capacity 2 \
+      --vpc-zone-identifier "subnet-12345678,subnet-87654321"
+    ```
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What is the difference between On-Demand, Spot, and Savings Plan pricing?
+- Why should instance metadata service (IMDSv2) always be required on EC2 instances?
+- What problem do Auto Scaling Groups and Elastic Load Balancers solve together?
+- How does attaching an IAM Instance Profile eliminate hardcoded API keys on EC2 instances?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/AWSEC2/latest/UserGuide/concepts.html](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/concepts.html) — Amazon EC2 User Guide.
+- [docs.aws.amazon.com/autoscaling/ec2/userguide/what-is-amazon-ec2-auto-scaling.html](https://docs.aws.amazon.com/autoscaling/ec2/userguide/what-is-amazon-ec2-auto-scaling.html) — EC2 Auto Scaling documentation.
+- [docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html) — Securing EC2 with IMDSv2.

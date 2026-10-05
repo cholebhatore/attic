@@ -1,0 +1,197 @@
+---
+title: 'Infrastructure as Code (Terraform)'
+description: 'Describe your infrastructure in code, version it in git, and apply it the same way every time across clouds.'
+---
+
+<Callout type="info" title="Goal">
+  Stop clicking through consoles for anything real — describe your infrastructure in code, version
+  it in git, and apply it the same way every time, on either cloud, with the same declarative tool.
+</Callout>
+
+## 1. The problem with manual operations
+
+Every resource configured manually through a console or one-off CLI command leaves no audit trace of _why_ something exists, cannot be peer-reviewed via pull requests, and cannot be reliably recreated for a second identical environment (staging, production, disaster recovery).
+
+**Infrastructure as Code (IaC)** fixes all three: you write the desired end state as code, commit it to version control, and an automation engine calculates and executes the steps needed to make reality match code.
+
+---
+
+## 2. Declarative vs. Imperative
+
+An imperative script is a sequence of commands: _"create this VPC, then create this subnet, then provision this database."_ You are responsible for dependency ordering, checking whether resources already exist, and handling idempotency during re-runs.
+
+A **declarative** tool like Terraform flips this: you describe _what should exist_ in `.tf` configuration files. Terraform inspects the real-world state of your cloud account, computes a **diff** between the live infrastructure and your declared configuration, and executes only the required changes.
+
+---
+
+## 3. Terraform's Core Vocabulary
+
+- **Provider:** A plugin that knows how to communicate with a specific cloud platform's API — the `aws` provider (`hashicorp/aws`) for AWS, the `google` provider (`hashicorp/google`) for GCP.
+- **Resource:** One declared piece of infrastructure — an `aws_ecs_cluster`, an `aws_s3_bucket`, an `aws_iam_role`.
+- **State File (`terraform.tfstate`):** Terraform's internal record of what currently exists, used to calculate subsequent plans and diffs.
+- **Plan / Apply / Destroy:** The core workflow:
+  - `terraform init`: Downloads provider plugins and configures state backends.
+  - `terraform plan`: Generates a dry-run execution plan showing what will be added, modified, or destroyed.
+  - `terraform apply`: Applies the changes to live cloud infrastructure.
+  - `terraform destroy`: Tears down every resource managed by the configuration file.
+- **Variables & Outputs:** Variables parameterize configurations (e.g., `var.environment`); outputs export generated values (e.g., load balancer DNS names, bucket ARNs).
+- **Modules:** Reusable, packaged collections of Terraform files that encapsulate architectural patterns.
+
+<Callout type="warn" title="Critical Production Practice: Remote State Storage">
+  By default, Terraform stores the state file on local disk. For production teams, the state file
+  must be stored in a **Remote Backend** — such as an Amazon S3 bucket with an Amazon DynamoDB table
+  for state locking, or Google Cloud Storage. This ensures a single shared source of truth and
+  prevents simultaneous concurrent modifications.
+</Callout>
+
+---
+
+## 4. Declaring Resources: AWS & GCP Side-by-Side
+
+### AWS App Runner Declared in Terraform:
+
+```hcl
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "us-east-1"
+}
+
+resource "aws_apprunner_service" "app" {
+  service_name = "production-web-service"
+
+  source_configuration {
+    image_repository {
+      image_identifier      = "123456789012.dkr.ecr.us-east-1.amazonaws.com/production-api:latest"
+      image_repository_type = "ECR"
+      image_configuration {
+        port = "8080"
+      }
+    }
+    auto_deployments_enabled = true
+  }
+
+  instance_configuration {
+    cpu    = "1024"
+    memory = "2048"
+  }
+}
+
+output "service_url" {
+  value = aws_apprunner_service.app.service_url
+}
+```
+
+### GCP Cloud Run Declared in Terraform:
+
+```hcl
+provider "google" {
+  project = "your-project-id"
+  region  = "us-central1"
+}
+
+resource "google_cloud_run_v2_service" "app" {
+  name     = "production-web-service"
+  location = "us-central1"
+
+  template {
+    containers {
+      image = "us-central1-docker.pkg.dev/your-project-id/repo/production-api:latest"
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "1Gi"
+        }
+      }
+    }
+  }
+}
+```
+
+<Callout type="info" title="Terraform Unifies the Workflow, Not the Cloud Primitives">
+  While Terraform works across multiple clouds, a resource block for AWS (`aws_apprunner_service`)
+  cannot be applied to Google Cloud. You still write cloud-specific resource definitions. Terraform
+  unifies the syntax, tooling, state tracking, and deployment workflow across providers.
+</Callout>
+
+---
+
+## 5. IaC Tool Landscape
+
+- **Terraform (HashiCorp / OpenTofu):** The multi-cloud industry standard using HashiCorp Configuration Language (HCL).
+- **AWS CloudFormation:** AWS's native YAML/JSON IaC engine. Deeply integrated with AWS services and Service Catalog.
+- **AWS CDK (Cloud Development Kit):** Allows developers to define AWS CloudFormation infrastructure using familiar programming languages (TypeScript, Python, Go).
+- **Pulumi:** Multi-cloud IaC engine using real programming languages.
+
+---
+
+## Hands-on
+
+<Steps>
+  <Step>
+    ### Write main.tf
+
+    Install the Terraform CLI, create a directory `infra/`, and write a `main.tf` file matching the AWS App Runner or S3 example.
+
+  </Step>
+  <Step>
+    ### Initialize the working directory
+
+    ```bash
+    terraform init
+    ```
+    This downloads the AWS provider plugin into `.terraform/`.
+
+  </Step>
+  <Step>
+    ### Generate and inspect the execution plan
+
+    ```bash
+    terraform plan
+    ```
+    Carefully inspect the `+ create` entries in the output.
+
+  </Step>
+  <Step>
+    ### Apply the configuration
+
+    ```bash
+    terraform apply
+    ```
+    Type `yes` when prompted to create the resources.
+
+  </Step>
+  <Step>
+    ### Cleanly destroy resources
+
+    ```bash
+    terraform destroy
+    ```
+    Watch Terraform remove all declared resources in reverse dependency order with zero orphaned components.
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What is the difference between declarative and imperative infrastructure management?
+- Why is local state file storage problematic for team development, and how does S3 + DynamoDB resolve it?
+- What are the distinct roles of `terraform plan` and `terraform apply`?
+- How does AWS CDK differ from native Terraform HCL?
+
+---
+
+## References
+
+- [developer.hashicorp.com/terraform](https://developer.hashicorp.com/terraform) — Official Terraform Documentation.
+- [registry.terraform.io/providers/hashicorp/aws/latest/docs](https://registry.terraform.io/providers/hashicorp/aws/latest/docs) — Terraform AWS Provider documentation.
+- [aws.amazon.com/cdk](https://aws.amazon.com/cdk/) — AWS Cloud Development Kit (CDK).

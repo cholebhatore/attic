@@ -1,0 +1,208 @@
+---
+title: Amazon S3, EBS & EFS Storage
+description: Object, block, and file storage on AWS, S3 storage tiers, lifecycle management, encryption, and bucket policies.
+---
+
+<Callout type="info" title="Core Concept">
+  AWS provides three primary storage archetypes: **Object Storage (Amazon S3)** for unstructured web
+  data and backups, **Block Storage (Amazon EBS)** for virtual machine system disks, and **File
+  Storage (Amazon EFS)** for shared network filesystems.
+</Callout>
+
+## 1. Storage Comparison Matrix
+
+| Storage Service | Type                 | Protocol / Access        | Max Size                         | Typical Use Case                                                      |
+| :-------------- | :------------------- | :----------------------- | :------------------------------- | :-------------------------------------------------------------------- |
+| **Amazon S3**   | Object Storage       | HTTP / REST API          | 5 TB per object; unlimited total | Images, videos, static websites, log archives, AI dataset storage     |
+| **Amazon EBS**  | Block Storage        | Block device (POSIX)     | 64 TB per volume                 | Operating system boot drives, high-IOPS databases running on EC2      |
+| **Amazon EFS**  | Network File Storage | NFSv4 (POSIX filesystem) | Petabytes (elastic)              | Shared directories mounted across multiple EC2 instances or ECS tasks |
+
+---
+
+## 2. Amazon S3: Architecture & Durability
+
+Amazon Simple Storage Service (Amazon S3) stores data as objects within buckets:
+
+- **Bucket Namespace:** Bucket names are globally unique across all AWS accounts worldwide.
+- **11 9s Durability (99.999999999%):** Designed to withstand the simultaneous loss of data in two separate facilities within a region.
+- **Strong Read-After-Write Consistency:** Once an object is created (`PUT`) or deleted (`DELETE`), immediate subsequent `GET` requests reflect the change immediately.
+
+---
+
+## 3. S3 Storage Classes & Cost Optimization
+
+Storage costs accumulate rapidly. Transitioning objects along storage tiers matches spend to data value over time:
+
+<Mermaid
+  chart={`
+flowchart LR
+    Standard["S3 Standard (Hot Data: active access)"] -->|After 30 Days| IA["S3 Standard-IA (Infrequent: lower storage cost, retrieval fee)"]
+    IA -->|After 90 Days| Glacier["S3 Glacier Instant (Archive: millisecond retrieval)"]
+    Glacier -->|After 365 Days| Deep["S3 Glacier Deep Archive (Lowest cost: 12-hour retrieval)"]
+`}
+/>
+
+| Storage Class               | Retrieval Latency | Storage Cost / GB | Retrieval Fee               | Best For                                                    |
+| :-------------------------- | :---------------- | :---------------- | :-------------------------- | :---------------------------------------------------------- |
+| **S3 Standard**             | Milliseconds      | ~$0.023           | None                        | Active data, web assets, frequently read files              |
+| **S3 Intelligent-Tiering**  | Milliseconds      | ~$0.023           | None (small monitoring fee) | Unknown or changing access patterns (auto-moves tiers)      |
+| **S3 Standard-IA**          | Milliseconds      | ~$0.0125          | Per GB retrieved            | Backups, disaster recovery data needed rapidly if invoked   |
+| **S3 Glacier Instant**      | Milliseconds      | ~$0.004           | Per GB retrieved            | Medical records, compliance archives needing instant lookup |
+| **S3 Glacier Deep Archive** | 12 to 48 Hours    | ~$0.00099         | Per GB retrieved            | Long-term compliance retention (7–10 years)                 |
+
+---
+
+## 4. S3 Security: Block Public Access, KMS & Policies
+
+<Callout type="warn" title="S3 Block Public Access is Enabled by Default">
+  S3 buckets are private by default. Unless explicitly configured, all public read/write access is
+  blocked at the account and bucket level. Never disable Block Public Access unless you are hosting
+  a public static website or public downloads.
+</Callout>
+
+### Server-Side Encryption (SSE)
+
+- **SSE-S3 (`AES256`):** Managed completely by S3. Enabled automatically at zero additional cost.
+- **SSE-KMS (`aws:kms`):** Encrypts data using keys managed in **AWS Key Management Service (KMS)**. Provides audit trails of who decrypted the data and enforces granular key policies.
+
+### S3 Bucket Policy
+
+A resource-based IAM policy attached directly to the bucket. Commonly used to enforce HTTPS-only access:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EnforceTLSRequestsOnly",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": ["arn:aws:s3:::my-secure-bucket", "arn:aws:s3:::my-secure-bucket/*"],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "false"
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 5. Amazon EBS & Amazon EFS
+
+### Amazon Elastic Block Store (EBS)
+
+- Virtual hard drives attached to an individual EC2 instance.
+- **`gp3` (General Purpose SSD):** Default choice for boot and application volumes. Lets you scale IOPS and throughput independently of storage capacity.
+- **`io2` (Provisioned IOPS SSD):** Designed for extreme, mission-critical database workloads requiring sustained high IOPS.
+- **EBS Snapshots:** Point-in-time incremental backups stored durably in Amazon S3 behind the scenes.
+
+### Amazon Elastic File System (EFS)
+
+- Managed Network File System (NFS) that scales automatically as files are added or deleted.
+- Can be concurrently mounted on hundreds of EC2 instances and ECS Fargate containers across multiple Availability Zones.
+
+---
+
+## Practical Implementation: Configuring S3 Lifecycle & Encryption
+
+<Steps>
+  <Step>
+    ### Create an encrypted S3 bucket
+
+    ```bash
+    BUCKET_NAME="production-artifacts-$(date +%s)"
+
+    aws s3api create-bucket \
+      --bucket $BUCKET_NAME \
+      --region us-east-1
+
+    # Enforce default encryption
+    aws s3api put-bucket-encryption \
+      --bucket $BUCKET_NAME \
+      --server-side-encryption-configuration '{
+        "Rules": [
+          {
+            "ApplyServerSideEncryptionByDefault": {
+              "SSEAlgorithm": "AES256"
+            }
+          }
+        ]
+      }'
+    ```
+
+  </Step>
+  <Step>
+    ### Configure automated Lifecycle Policy
+
+    Create a lifecycle configuration `lifecycle.json` that transitions files to Standard-IA after 30 days and deletes them after 365 days:
+
+    ```json
+    {
+      "Rules": [
+        {
+          "ID": "MoveOldLogsToIA",
+          "Status": "Enabled",
+          "Filter": {
+            "Prefix": "logs/"
+          },
+          "Transitions": [
+            {
+              "Days": 30,
+              "StorageClass": "STANDARD_IA"
+            },
+            {
+              "Days": 90,
+              "StorageClass": "GLACIER"
+            }
+          ],
+          "Expiration": {
+            "Days": 365
+          }
+        }
+      ]
+    }
+    ```
+
+    Apply the configuration:
+    ```bash
+    aws s3api put-bucket-lifecycle-configuration \
+      --bucket $BUCKET_NAME \
+      --lifecycle-configuration file://lifecycle.json
+    ```
+
+  </Step>
+  <Step>
+    ### Upload and verify object metadata
+
+    ```bash
+    echo "Sample log payload" > app.log
+    aws s3 cp app.log s3://$BUCKET_NAME/logs/app.log
+
+    aws s3api head-object \
+      --bucket $BUCKET_NAME \
+      --key logs/app.log
+    ```
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What is the difference between Block Storage (EBS) and Object Storage (S3)?
+- When should you use S3 Intelligent-Tiering instead of configuring fixed lifecycle days?
+- What durability guarantee does Amazon S3 provide, and what does it mean practically?
+- Why is an S3 bucket policy denying `aws:SecureTransport = false` a standard security recommendation?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html) — Amazon S3 User Guide.
+- [docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-class-intro.html) — S3 Storage Classes overview.
+- [docs.aws.amazon.com/AWSEC2/latest/UserGuide/AmazonEBS.html](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/AmazonEBS.html) — Amazon EBS Features.

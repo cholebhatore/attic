@@ -1,0 +1,149 @@
+---
+title: AWS CodePipeline, CodeBuild & CodeDeploy
+description: The AWS native continuous delivery toolchain, buildspec specifications, and automated blue/green deployment rollouts.
+---
+
+<Callout type="info" title="Core Concept">
+  AWS provides an integrated, fully managed suite for continuous delivery: **AWS CodePipeline**
+  orchestrates workflow stages, **AWS CodeBuild** compiles code and builds container images, and
+  **AWS CodeDeploy** automates rollouts to EC2, ECS, or Lambda using blue/green deployment
+  strategies.
+</Callout>
+
+## 1. The AWS Native DevOps Trio
+
+While GitHub Actions is popular for single-repository developer workflows, large enterprises frequently adopt AWS's native CI/CD suite for strict multi-account compliance, IAM-native audit logging with CloudTrail, and native blue/green traffic shifting:
+
+<Mermaid
+  chart={`
+flowchart LR
+    Source["1. Source Stage (GitHub / AWS CodeCommit / S3)"] --> Build["2. Build Stage (AWS CodeBuild)"]
+    Build --> Deploy["3. Deploy Stage (AWS CodeDeploy / ECS)"]
+    subgraph CodePipeline["AWS CodePipeline (Orchestrator)"]
+        Source
+        Build
+        Deploy
+    end
+    Build -.->|Push Image| ECR["Amazon ECR"]
+    Deploy -.->|Traffic Shift| ALB["Application Load Balancer"]
+`}
+/>
+
+1. **AWS CodePipeline:** The workflow orchestrator. Visualizes and automates the progression of code through distinct phases (Source → Build → Test → Approval → Deploy).
+2. **AWS CodeBuild:** An ephemeral compute service that pulls a Docker image, provisions build environments on demand, runs test suites, builds container images, and exports build artifacts.
+3. **AWS CodeDeploy:** The deployment engine that coordinates instance-by-instance or container-by-container rollouts with automated rollback upon metric failure.
+
+---
+
+## 2. Anatomy of a `buildspec.yml`
+
+AWS CodeBuild is controlled by a declarative YAML specification placed at the root of your repository:
+
+```yaml
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo "Logging in to Amazon ECR..."
+      - aws --version
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+  build:
+    commands:
+      - echo "Build started on `date`"
+      - echo "Building Docker image..."
+      - docker build -t $REPOSITORY_URI:latest .
+      - docker tag $REPOSITORY_URI:latest $REPOSITORY_URI:$IMAGE_TAG
+  post_build:
+    commands:
+      - echo "Build completed on `date`"
+      - echo "Pushing Docker images..."
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - echo "Writing image definitions file for CodeDeploy/ECS..."
+      - printf '[{"name":"%s","imageUri":"%s"}]' "$CONTAINER_NAME" "$REPOSITORY_URI:$IMAGE_TAG" > imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json
+```
+
+---
+
+## 3. CodeDeploy Strategies: Blue/Green vs. Rolling
+
+When shipping changes to Amazon ECS or EC2, CodeDeploy supports zero-downtime deployment patterns:
+
+| Strategy             | How It Works                                                                                                                                                 | Rollback Speed                                          | Cost Impact                                    |
+| :------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------ | :--------------------------------------------- |
+| **Rolling Update**   | Gradually terminates old container tasks and launches new tasks in batches.                                                                                  | Moderate (must roll back batch by batch)                | Zero extra cost (runs within current capacity) |
+| **Blue/Green (ALB)** | Deploys a completely new set of tasks ("Green") alongside old tasks ("Blue"), runs integration tests on a test listener, then flips production traffic over. | **Instantaneous** (re-routes ALB listener back to Blue) | Temporarily runs 2x capacity during deployment |
+| **Canary Shifting**  | Shifts a small percentage of traffic (e.g., 10%) to the new version for 5–15 minutes. If CloudWatch Alarms stay green, shifts the remaining 90%.             | Fast (rolls back upon alarm breach)                     | Minimal extra capacity                         |
+
+---
+
+## Practical Implementation: Configuring a Build Project via CLI
+
+<Steps>
+  <Step>
+    ### Create IAM Role for CodeBuild
+
+    ```bash
+    aws iam create-role \
+      --role-name CodeBuildServiceRole \
+      --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"codebuild.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+    aws iam attach-role-policy \
+      --role-name CodeBuildServiceRole \
+      --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+
+    aws iam attach-role-policy \
+      --role-name CodeBuildServiceRole \
+      --policy-arn arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+    ```
+
+  </Step>
+  <Step>
+    ### Create CodeBuild Project
+
+    ```bash
+    aws codebuild create-project \
+      --name api-build-project \
+      --source type=GITHUB,location=https://github.com/your-org/your-repo.git \
+      --artifacts type=NO_ARTIFACTS \
+      --environment type=LINUX_CONTAINER,image=aws/codebuild/amazonlinux2-x86_64-standard:5.0,computeType=BUILD_GENERAL1_SMALL,privilegedMode=true \
+      --service-role arn:aws:iam::123456789012:role/CodeBuildServiceRole \
+      --region us-east-1
+    ```
+    *Note: `privilegedMode=true` is required so CodeBuild can execute the Docker daemon inside the build container.*
+
+  </Step>
+  <Step>
+    ### Trigger manual build run
+
+    ```bash
+    aws codebuild start-build --project-name api-build-project
+    ```
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What is the difference between AWS CodePipeline and AWS CodeBuild?
+- Why is `privilegedMode: true` required in an AWS CodeBuild environment when building Docker containers?
+- How does an ECS Blue/Green deployment using CodeDeploy achieve near-instantaneous rollbacks?
+- What is the purpose of the `imagedefinitions.json` artifact generated during the build?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/codepipeline/latest/userguide/welcome.html](https://docs.aws.amazon.com/codepipeline/latest/userguide/welcome.html) — AWS CodePipeline User Guide.
+- [docs.aws.amazon.com/codebuild/latest/userguide/build-spec-ref.html](https://docs.aws.amazon.com/codebuild/latest/userguide/build-spec-ref.html) — Buildspec reference for CodeBuild.
+- [docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-type-bluegreen.html](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/deployment-type-bluegreen.html) — ECS Blue/Green deployments with CodeDeploy.

@@ -1,0 +1,194 @@
+---
+title: Amazon ECS & AWS Fargate
+description: Container orchestration on AWS, Task Definitions, ECR registries, Fargate serverless launch type, and IAM roles.
+---
+
+<Callout type="info" title="Core Concept">
+  Amazon Elastic Container Service (Amazon ECS) is a fully managed container orchestration service.
+  With the **AWS Fargate** launch type, ECS runs containers without requiring you to provision,
+  configure, or scale virtual machine clusters.
+</Callout>
+
+## 1. Container Orchestration Primitives
+
+When running Docker containers at production scale, you need an orchestrator to maintain container health, scale instances, distribute incoming traffic, and inject configuration. ECS structures container workloads using three primary concepts:
+
+1. **Task Definition:** The blueprint. A declarative JSON file specifying which Docker images to pull, how much CPU and memory to allocate, port mappings, environment variables, log configuration, and IAM permissions.
+2. **Task:** A running instantiation of a Task Definition (analogous to a single Pod in Kubernetes).
+3. **Service:** A controller that keeps a specified number of Tasks running continuously across multiple Availability Zones, automatically restarting failed tasks and registering new tasks with an Application Load Balancer.
+4. **Cluster:** A logical boundary grouping Tasks, Services, and capacity providers.
+
+---
+
+## 2. Launch Types: AWS Fargate vs. EC2
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph Fargate["AWS Fargate (Serverless)"]
+        direction TB
+        F_Task1["Container Task"]
+        F_Task2["Container Task"]
+        F_AWS["AWS manages underlying OS, patching, scaling, and hardware isolation"]
+    end
+    subgraph EC2Launch["EC2 Launch Type (Customer-Managed)"]
+        direction TB
+        EC2_VM1["EC2 Instance (Customer patches OS / Docker daemon)"]
+        EC2_VM2["EC2 Instance (Customer manages cluster scaling)"]
+        EC2_VM1 --> E_Task1["Container Task"]
+        EC2_VM2 --> E_Task2["Container Task"]
+    end
+`}
+/>
+
+| Dimension               | AWS Fargate                                                                           | EC2 Launch Type                                                                      |
+| :---------------------- | :------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------- |
+| **Server Management**   | Zero. No EC2 instances visible in your account.                                       | Full. You provision, patch, and monitor EC2 VMs.                                     |
+| **Billing Model**       | Pay per vCPU-second and GB-second of running tasks.                                   | Pay for the running EC2 instances whether containers utilize them fully or sit idle. |
+| **Isolation**           | Kernel-level isolation per task in a dedicated microVM.                               | Multiple containers share the same EC2 host OS kernel.                               |
+| **Network Performance** | Each task receives its own dedicated Elastic Network Interface (ENI) with private IP. | ENIs are shared across containers on the host.                                       |
+
+---
+
+## 3. The Crucial Distinction: Execution Role vs. Task Role
+
+A Task Definition requests two distinct IAM roles. Conflating them is the most common ECS security pitfall:
+
+<Callout type="warn" title="Execution Role vs. Task Role">
+  - **Task Execution Role (`executionRoleArn`):** Assumed by the **AWS ECS infrastructure agent**
+  before your container starts. It needs permissions to pull images from private Amazon ECR
+  (`ecr:GetDownloadUrlForLayer`, `ecr:BatchGetImage`), fetch secrets from AWS Secrets Manager to
+  inject as environment variables, and create CloudWatch Log streams. - **Task Role
+  (`taskRoleArn`):** Assumed by **your application code** while running. If your Node.js, Go, or
+  Python application calls `s3:GetObject` or writes to DynamoDB, those permissions must be attached
+  to the Task Role.
+</Callout>
+
+---
+
+## 4. Container Registry: Amazon ECR
+
+Amazon Elastic Container Registry (ECR) stores Docker and OCI-compliant container images securely within your AWS account:
+
+- **Private Repositories:** Enforce IAM access control so only your ECS tasks can pull images.
+- **Vulnerability Scanning:** Automated Common Vulnerabilities and Exposures (CVE) scanning on image push.
+- **Lifecycle Policies:** Automatically expire untagged or older image revisions to prevent storage bloat.
+
+---
+
+## Practical Implementation: Deploying a Multi-Container Fargate Service
+
+<Steps>
+  <Step>
+    ### Create an ECR repository and push image
+
+    ```bash
+    aws ecr create-repository \
+      --repository-name production-api \
+      --image-scanning-configuration scanOnPush=true \
+      --region us-east-1
+
+    # Authenticate Docker client
+    aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 123456789012.dkr.ecr.us-east-1.amazonaws.com
+
+    # Build and push image
+    docker build -t production-api .
+    docker tag production-api:latest 123456789012.dkr.ecr.us-east-1.amazonaws.com/production-api:latest
+    docker push 123456789012.dkr.ecr.us-east-1.amazonaws.com/production-api:latest
+    ```
+
+  </Step>
+  <Step>
+    ### Configure the IAM Roles
+
+    Create the Task Execution Role using the managed policy:
+
+    ```bash
+    aws iam create-role \
+      --role-name ecsTaskExecutionRole \
+      --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+    aws iam attach-role-policy \
+      --role-name ecsTaskExecutionRole \
+      --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+    ```
+
+  </Step>
+  <Step>
+    ### Register Task Definition (`task-definition.json`)
+
+    ```json
+    {
+      "family": "production-api-task",
+      "networkMode": "awsvpc",
+      "requiresCompatibilities": ["FARGATE"],
+      "cpu": "256",
+      "memory": "512",
+      "executionRoleArn": "arn:aws:iam::123456789012:role/ecsTaskExecutionRole",
+      "taskRoleArn": "arn:aws:iam::123456789012:role/myApplicationTaskRole",
+      "containerDefinitions": [
+        {
+          "name": "api",
+          "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/production-api:latest",
+          "portMappings": [
+            {
+              "containerPort": 8080,
+              "protocol": "tcp"
+            }
+          ],
+          "essential": true,
+          "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+              "awslogs-group": "/ecs/production-api",
+              "awslogs-region": "us-east-1",
+              "awslogs-stream-prefix": "ecs",
+              "awslogs-create-group": "true"
+            }
+          }
+        }
+      ]
+    }
+    ```
+
+    Register the definition:
+    ```bash
+    aws ecs register-task-definition --cli-input-json file://task-definition.json
+    ```
+
+  </Step>
+  <Step>
+    ### Create Cluster and Deploy Service behind ALB
+
+    ```bash
+    aws ecs create-cluster --cluster-name production-cluster
+
+    aws ecs create-service \
+      --cluster production-cluster \
+      --service-name api-service \
+      --task-definition production-api-task \
+      --desired-count 2 \
+      --launch-type FARGATE \
+      --network-configuration "awsvpcConfiguration={subnets=[subnet-private-1a,subnet-private-1b],securityGroups=[sg-api-tasks],assignPublicIp=DISABLED}" \
+      --load-balancers "targetGroupArn=arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/api-tg/abc123,containerName=api,containerPort=8080"
+    ```
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What is the architectural role of an ECS Task Definition versus an ECS Service?
+- Why should container tasks run in private subnets with `assignPublicIp=DISABLED` in production?
+- What happens if an ECS container process crashes inside a Fargate task managed by a Service?
+- Why does the Task Execution Role need access to Secrets Manager while the Task Role needs access to application databases?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/Welcome.html) — Amazon ECS Developer Guide.
+- [docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html](https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html) — AWS Fargate serverless containers.
+- [docs.aws.amazon.com/AmazonECR/latest/userguide/what-is-ecr.html](https://docs.aws.amazon.com/AmazonECR/latest/userguide/what-is-ecr.html) — Amazon ECR User Guide.

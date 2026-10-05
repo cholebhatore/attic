@@ -1,0 +1,196 @@
+---
+title: Amazon Route 53 & Application Load Balancers
+description: Highly available DNS routing policies, Application Load Balancers (ALB), Target Groups, health checking, and TLS termination.
+---
+
+<Callout type="info" title="Core Concept">
+  **Amazon Route 53** provides authoritative global Domain Name System (DNS) resolution with latency
+  and health-based routing. **Application Load Balancers (ALB)** distribute incoming Layer 7
+  HTTP/HTTPS traffic across targets like ECS containers and EC2 instances.
+</Callout>
+
+## 1. Amazon Route 53 DNS Fundamentals
+
+Route 53 connects user requests to infrastructure running in AWS or on-premises:
+
+- **Public Hosted Zone:** A container for DNS records accessible globally across the internet for your domain (e.g., `example.com`).
+- **Private Hosted Zone:** A DNS container resolvable only within your VPCs, providing private service discovery (e.g., `internal.service.local`).
+- **Alias Records vs. CNAME Records:**
+  - Standard DNS specifications forbid CNAME records on the **zone apex** (`example.com` without `www`).
+  - **AWS Alias Records** solve this: they act like virtual pointers directly to AWS resources (ALBs, CloudFront distributions, S3 website buckets) on the zone apex, and Route 53 queries to AWS Alias targets are **free of charge**.
+
+---
+
+## 2. Route 53 Advanced Routing Policies
+
+<Mermaid
+  chart={`
+flowchart TD
+    User["Client DNS Lookup"] --> R53["Route 53 Routing Engine"]
+    R53 --> P1["Simple: 1-to-1 IP resolution"]
+    R53 --> P2["Weighted: Split traffic 80/20 for blue-green canaries"]
+    R53 --> P3["Latency-Based: Direct to lowest network latency AWS region"]
+    R53 --> P4["Failover: Health-check primary; redirect to backup if primary fails"]
+    R53 --> P5["Geolocation: Route based on visitor country/continent"]
+`}
+/>
+
+- **Simple Routing:** Standard single-record lookup with optional round-robin return of multiple IPs.
+- **Weighted Routing:** Distribute percentages of traffic across multiple endpoints (e.g., 90% to version 1, 10% to version 2 canary).
+- **Latency-Based Routing:** Routes traffic to the AWS region that provides the lowest network latency for that specific visitor.
+- **Failover Routing:** Configures an active-passive disaster recovery failover based on Route 53 health check probes.
+- **Geolocation / Geoproximity Routing:** Directs users to endpoints based on their physical geographical origin.
+
+---
+
+## 3. Application Load Balancers (ALB) vs. Network Load Balancers (NLB)
+
+| Feature                  | Application Load Balancer (ALB)                                  | Network Load Balancer (NLB)                                          |
+| :----------------------- | :--------------------------------------------------------------- | :------------------------------------------------------------------- |
+| **OSI Layer**            | **Layer 7** (HTTP, HTTPS, gRPC, WebSockets)                      | **Layer 4** (TCP, UDP, TLS)                                          |
+| **Routing Intelligence** | Content-based: Path, Host header, Query parameters, HTTP headers | Port and IP-based only                                               |
+| **Throughput / Latency** | High throughput (~10ms latency)                                  | Ultra-high throughput (millions of req/sec, sub-millisecond latency) |
+| **Static IP Support**    | Dynamic IPs; accessed via DNS name                               | Provides static Elastic IPs per Availability Zone                    |
+| **Typical Workload**     | Microservices, REST APIs, containerized web apps                 | Gaming protocols, VoIP, extreme scale TCP services                   |
+
+---
+
+## 4. ALB Architecture: Listeners, Rules & Target Groups
+
+An ALB evaluates incoming traffic using modular building blocks:
+
+<Mermaid
+  chart={`
+flowchart LR
+    Client["Client HTTPS Request"] --> Listener["ALB Listener (Port 443 with ACM TLS Cert)"]
+    Listener --> Rule1{"Rule: Path /api/*"}
+    Listener --> Rule2{"Rule: Host payments.com"}
+    Listener --> Default{"Default Rule"}
+    Rule1 --> TG_API["Target Group: ECS Backend API (Port 8080)"]
+    Rule2 --> TG_Pay["Target Group: Payments Service (Port 3000)"]
+    Default --> TG_Web["Target Group: Web Frontend (Port 80)"]
+`}
+/>
+
+### 1. Listeners
+
+Checks for connection requests on a configured port and protocol (e.g., HTTPS on Port 443).
+
+- **SSL/TLS Termination:** Offloads the computational burden of encrypting/decrypting SSL certificates from your backend containers using free certificates from **AWS Certificate Manager (ACM)**.
+
+### 2. Listener Rules
+
+Determines how requests are routed to specific target groups:
+
+- **Path-Based Routing:** Route `/api/*` to your backend containers and `/static/*` to static storage.
+- **Host-Based Routing:** Route `api.example.com` and `app.example.com` through the same ALB to different services.
+
+### 3. Target Groups & Health Checks
+
+A logical group of endpoints (EC2 instances, ECS Fargate tasks, Lambda functions).
+
+- The ALB continuously polls configured health check endpoints (e.g., `GET /health` expecting HTTP 200). If a target fails multiple consecutive health checks, the ALB immediately stops routing traffic to it until it recovers.
+
+---
+
+## Practical Implementation: Creating an ALB & Target Group via CLI
+
+<Steps>
+  <Step>
+    ### Create Target Group
+
+    ```bash
+    TG_ARN=$(aws elbv2 create-target-group \
+      --name api-target-group \
+      --protocol HTTP \
+      --port 8080 \
+      --vpc-id vpc-0123456789abcdef0 \
+      --target-type ip \
+      --health-check-protocol HTTP \
+      --health-check-path /health \
+      --health-check-interval-seconds 15 \
+      --healthy-threshold-count 2 \
+      --unhealthy-threshold-count 3 \
+      --query 'TargetGroups[0].TargetGroupArn' --output text)
+    ```
+
+  </Step>
+  <Step>
+    ### Create Application Load Balancer
+
+    Provision an internet-facing ALB across two public subnets:
+
+    ```bash
+    ALB_ARN=$(aws elbv2 create-load-balancer \
+      --name production-alb \
+      --subnets subnet-pub-1a subnet-pub-1b \
+      --security-groups sg-alb-public \
+      --scheme internet-facing \
+      --type application \
+      --query 'LoadBalancers[0].LoadBalancerArn' --output text)
+    ```
+
+  </Step>
+  <Step>
+    ### Create HTTP Listener with Redirect to HTTPS
+
+    ```bash
+    aws elbv2 create-listener \
+      --load-balancer-arn $ALB_ARN \
+      --protocol HTTP \
+      --port 80 \
+      --default-actions Type=redirect,RedirectConfig="{Protocol=HTTPS,Port=443,StatusCode=HTTP_301}"
+    ```
+
+  </Step>
+  <Step>
+    ### Create Route 53 Alias Record pointing to the ALB
+
+    Create a JSON file `dns-record.json` pointing `api.example.com` to the ALB's hosted zone ID and DNS name:
+
+    ```json
+    {
+      "Comment": "Point api.example.com to ALB",
+      "Changes": [
+        {
+          "Action": "UPSERT",
+          "ResourceRecordSet": {
+            "Name": "api.example.com.",
+            "Type": "A",
+            "AliasTarget": {
+              "HostedZoneId": "Z35SXDOTRQ7X7K",
+              "DNSName": "production-alb-123456.us-east-1.elb.amazonaws.com.",
+              "EvaluateTargetHealth": true
+            }
+          }
+        }
+      ]
+    }
+    ```
+
+    Apply the DNS update:
+    ```bash
+    aws route53 change-resource-record-sets \
+      --hosted-zone-id Z123456789EXAMPLE \
+      --change-batch file://dns-record.json
+    ```
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- Why are AWS Alias records preferred over standard CNAME records for Route 53?
+- What is the difference between Layer 7 routing on an ALB and Layer 4 routing on an NLB?
+- How does an ALB health check prevent users from experiencing 502/504 errors during a deployment?
+- What are the benefits of terminating SSL/TLS certificates at the Application Load Balancer level?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/Route53/latest/DeveloperGuide/Welcome.html](https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/Welcome.html) — Amazon Route 53 Developer Guide.
+- [docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/introduction.html) — Application Load Balancers overview.
+- [docs.aws.amazon.com/acm/latest/userguide/acm-overview.html](https://docs.aws.amazon.com/acm/latest/userguide/acm-overview.html) — AWS Certificate Manager.

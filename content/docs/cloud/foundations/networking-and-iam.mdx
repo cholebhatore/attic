@@ -1,0 +1,128 @@
+---
+title: 'Networking & IAM basics'
+description: 'VPCs, subnets, firewalls, load balancing, DNS, and the basics of who can do what to which resource.'
+---
+
+<Callout type="info" title="Goal">
+  Understand how your resources talk to each other privately, how traffic gets routed in from the
+  internet, and who's allowed to do what to what — enough to reason about a real architecture
+  diagram. This covers the fundamentals; full IAM policy-writing depth is explored in the IAM &
+  Security modules.
+</Callout>
+
+## 1. The private network you don't see yet
+
+Every VM, container, and managed service you've created so far has actually been sitting inside a private virtual network the whole time, provisioned automatically with sensible defaults. This module makes that network visible and explains the vocabulary.
+
+---
+
+## 2. VPC and subnets
+
+A **VPC** (Virtual Private Cloud) is your own isolated slice of network — private IP ranges, routing, and rules — that only your resources live inside. Both clouds literally use the same term, "VPC," which is rare and convenient. The genuinely different part is **subnets**:
+
+- **GCP subnets are regional** — one subnet automatically spans every zone in a region, so a VM in any zone of that region can use it.
+- **AWS subnets are zonal** — one subnet lives in exactly one Availability Zone, so a multi-zone AWS setup needs a separate subnet per zone by design.
+
+This trips people up constantly when translating AWS diagrams to GCP or vice versa — it's a real architectural difference, not just naming.
+
+---
+
+## 3. Controlling traffic: firewalls, security groups, and NACLs
+
+| Concept                              | GCP                                                            | AWS                                                          |
+| :----------------------------------- | :------------------------------------------------------------- | :----------------------------------------------------------- |
+| Instance/service-level traffic rules | Firewall rules (VPC-level, apply via tags or service accounts) | Security Groups (stateful, attached to instances/interfaces) |
+| Subnet-level traffic rules           | — (no separate layer; firewall rules cover it)                 | Network ACLs (stateless, attached to the subnet itself)      |
+
+AWS genuinely has two layers here — Security Groups _and_ Network ACLs — while GCP handles it with one: firewall rules attached at the VPC level. Neither approach is more "correct"; AWS's extra layer gives you a coarser subnet-wide backstop, GCP's single layer is simpler to reason about.
+
+---
+
+## 4. Load balancing
+
+A load balancer sits in front of multiple instances of your app and spreads traffic across them. Here's a real, easy-to-miss difference: **GCP's load balancer is global by default** — one anycast IP address automatically routes users to your nearest healthy region. **AWS load balancers are regional** — an Application Load Balancer (L7, understands HTTP) or Network Load Balancer (L4, raw TCP/UDP) lives in one region, and going truly global needs an extra product layered on top (CloudFront or Global Accelerator).
+
+---
+
+## 5. DNS — you already know most of this
+
+Given the DNS resolution chain, record types, and Route 53 routing policies you've already worked through, this needs less explaining than the rest: **GCP Cloud DNS** is the direct equivalent of **AWS Route 53** — a managed, authoritative DNS host you point your domain's nameservers at, which then resolves your friendly domain to whatever's in front of your Cloud Run service, load balancer, or VM.
+
+---
+
+## 6. IAM basics: principals, roles, and a real difference in mental model
+
+Both clouds answer the same question — _who can do what to which resource_ — but structure the answer differently:
+
+**Principal** — Anything that can be granted permissions: a human user, a group, or a non-human identity acting on behalf of a running service.
+
+**Service account (GCP) vs. IAM Role (AWS)** — This is the real mental-model difference. On GCP, a **service account** is a first-class identity with its own email-like address — you create it once and attach it to whatever resource needs it (a VM, a Cloud Run service). On AWS, an **IAM Role** isn't really a standing identity — it's more like a costume: a resource "assumes" the role temporarily to borrow its permissions, and there's no persistent account behind it the way there is with a GCP service account.
+
+**Role / Policy** — A named bundle of permissions. GCP: predefined roles (e.g. _Storage Object Viewer_) or custom roles you build yourself. AWS: managed policies (AWS-authored or your own customer-managed ones) or inline policies attached directly to a role.
+
+**Principle of least privilege** — Grant the smallest set of permissions that lets something do its job, nothing more — the single most important habit in cloud security, and the one beginners skip most often by reaching for broad "Editor"/"Admin" roles out of convenience.
+
+<Callout type="info" title="Worked example">
+  Say your Cloud Run service needs to read files from the bucket you made in the storage module. On
+  GCP: create a service account, grant it the `Storage Object Viewer` role scoped to that bucket,
+  then attach that service account to the Cloud Run service — it can now read the bucket and nothing
+  else. On AWS: create an IAM Role with a policy granting `s3:GetObject` on that bucket's ARN, then
+  attach the role to your Lambda function or Fargate task — same outcome, same underlying principle,
+  different plumbing.
+</Callout>
+
+---
+
+## Hands-on exercise
+
+<Steps>
+  <Step>
+    ### Inspect existing firewall rules
+
+    In the GCP console, go to *VPC network → Firewall* and look at the rules that already exist on your default network (usually `default-allow-internal`, `default-allow-ssh`). You didn't create these — GCP did, when your project was born. Read what each one actually allows.
+
+  </Step>
+  <Step>
+    ### Create a service account
+
+    Go to *IAM & Admin → Service Accounts → Create Service Account*. Create one called something like `bucket-reader`.
+
+  </Step>
+  <Step>
+    ### Grant scoped permissions
+
+    Go back to your earlier Cloud Storage bucket → *Permissions* → grant that new service account the **Storage Object Viewer** role, scoped to just this bucket.
+
+  </Step>
+  <Step>
+    ### Attach to a VM and test
+
+    If you still have your Compute VM running: attach that service account to it (Compute Engine lets you change this from the instance's settings while it's stopped), restart it, SSH back in, and run `gsutil cat gs://your-bucket-name/your-file` — no keys, no passwords, just an identity the VM was handed. This is the exact mechanism Cloud Run will use in the container deployment module.
+
+  </Step>
+  <Step>
+    ### (Optional) Do the same on AWS
+
+    Create an IAM Role with an S3 read policy scoped to your bucket, and attach it as an "instance profile" to your EC2 instance to do the same thing with the AWS CLI's `aws s3 cp`.
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What's the actual difference between how GCP and AWS scope subnets to zones?
+- Why does AWS have both Security Groups and Network ACLs when GCP gets by with just firewall rules?
+- Is a GCP load balancer global or regional by default — and what does AWS need extra to match that?
+- What's the real mental-model difference between a GCP service account and an AWS IAM Role?
+
+---
+
+## References
+
+- [cloud.google.com/vpc](https://cloud.google.com/vpc) — GCP VPC overview.
+- [aws.amazon.com/vpc](https://aws.amazon.com/vpc/) — AWS VPC overview — same term, different subnet model, worth comparing directly.
+- [cloud.google.com/iam](https://cloud.google.com/iam) — GCP IAM overview.
+- [aws.amazon.com/iam](https://aws.amazon.com/iam/) — AWS IAM overview.
+- [cloud.google.com/load-balancing](https://cloud.google.com/load-balancing) — GCP's global load balancing model.

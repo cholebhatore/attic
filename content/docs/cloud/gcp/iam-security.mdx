@@ -1,0 +1,123 @@
+---
+title: 'IAM & security deep dive'
+description: 'GCP IAM bindings, custom roles, service accounts, and Secret Manager.'
+---
+
+<Callout type="info" title="Goal">
+  Understand how GCP IAM policies are structured and evaluated, how to avoid classic mistakes
+  (long-lived keys, overly broad roles), and the equivalent hardening patterns on AWS — precise
+  enough that you could review an IAM setup and spot a real problem.
+</Callout>
+
+## 1. What a policy actually is
+
+On GCP, an IAM policy is a set of **bindings** — each one pairs a **role** with the **members** who hold it — attached to a resource. Policies are inherited down the resource hierarchy: a binding on an Organization applies to every Folder, Project, and resource underneath it, unless something more specific overrides it. GCP is, by default, **allow-only** — if no binding grants an action, it's denied by default; explicit Deny policies exist but are a newer, less commonly reached-for feature.
+
+On AWS, a policy is a JSON document with an `Effect` (`Allow` or `Deny`), one or more `Action`s, a `Resource`, and optional `Condition`s — attached either to an identity (user/group/role) or, for some services, directly to the resource itself (an S3 bucket policy, for instance). AWS evaluates every applicable policy together, and **an explicit Deny always wins**, no matter how many Allows exist elsewhere. That's a real structural difference from GCP's model, and it matters: on AWS you can safely bolt on a hard Deny as a backstop; on GCP the more common pattern is simply not granting the broader role in the first place.
+
+---
+
+## 2. Custom roles vs. predefined convenience
+
+Predefined roles (GCP) and AWS-managed policies (AWS) are convenient but almost always broader than one specific app actually needs — `Storage Object Viewer` lets something read _every_ object in a bucket, even if your app only ever touches one folder's worth of files. A **custom role** (GCP) or **customer-managed policy** (AWS) lets you bundle only the exact permissions the job requires. This is more setup upfront and is exactly what real least-privilege design looks like in practice.
+
+---
+
+## 3. The single most common real-world mistake: static keys
+
+<Callout type="warn" title="Why downloaded keys are a liability">
+  A downloaded GCP service account JSON key, or an AWS IAM user's access key pair, is a long-lived
+  secret that works from anywhere, forever, until someone manually revokes it — and they leak
+  constantly (committed to Git by accident, pasted into a support ticket, left in a CI log). The fix
+  on both clouds is the same principle: **never create one if you can avoid it.** For anything
+  running inside the cloud (a VM, Cloud Run, Lambda, Fargate task), attach the identity directly so
+  credentials are short-lived and automatically rotated behind the scenes. For anything running
+  *outside* the cloud that still needs access (most commonly, a CI/CD pipeline like GitHub Actions),
+  use **Workload Identity Federation** (GCP) or an **OIDC-based IAM Role** (AWS) — both let an
+  external system prove its identity and receive short-lived temporary credentials, with zero
+  long-lived keys ever created or stored.
+</Callout>
+
+---
+
+## 4. Secrets management
+
+Passwords, API keys, and tokens your app needs at runtime belong in a dedicated secrets service, not in code or plain environment variables: **Secret Manager** (GCP) or **AWS Secrets Manager** / **Systems Manager Parameter Store** (AWS, which genuinely has two overlapping options — Secrets Manager adds automatic rotation and costs more per secret, Parameter Store is cheaper/simpler and fine for values that don't need rotation). Access to a given secret is itself controlled by IAM, so you grant only the specific service account/role that needs it — the same least-privilege habit, applied to data instead of infrastructure.
+
+---
+
+## 5. Guardrails above the project level
+
+| Concept                                        | GCP                                                                         | AWS                                                                                                                        |
+| :--------------------------------------------- | :-------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------- |
+| **Fine-grained conditional access**            | IAM Conditions (e.g. time-bound, resource-tag-based grants)                 | Policy `Condition` blocks (e.g. restrict by source IP, require MFA)                                                        |
+| **Ceiling on what a role can ever be granted** | — (closest analog: scoping custom roles tightly from the start)             | Permission Boundaries — caps what an IAM entity's own policies can grant, even if someone attaches something broader later |
+| **Org-wide guardrails**                        | Organization Policy Service (e.g. "no public buckets anywhere in this org") | Service Control Policies (SCPs) — same idea, enforced at the AWS Organizations level                                       |
+| **Who-did-what audit trail**                   | Cloud Audit Logs                                                            | CloudTrail                                                                                                                 |
+
+Permission Boundaries are a genuinely AWS-specific concept worth remembering by name — they're how larger AWS orgs safely let a team create their own IAM roles without risking someone accidentally grants themselves admin.
+
+---
+
+## Hands-on
+
+<Steps>
+  <Step>
+    ### Create a custom role in GCP
+
+    Go to *IAM & Admin → Roles → Create Role*. Build a custom role containing only `storage.objects.get` and `storage.objects.list` — nothing else — and name it something like `bucket-reader-minimal`.
+
+  </Step>
+  <Step>
+    ### Scope the service account to the custom role
+
+    Revoke any predefined `Storage Object Viewer` role from that service account, and grant this new custom role instead, scoped to a single bucket. Re-run the `gsutil cat` command to confirm it still works with a strictly narrower grant.
+
+  </Step>
+  <Step>
+    ### Store a secret in Secret Manager
+
+    Go to *Secret Manager → Create Secret*, store a test value (e.g. `demo-api-key-12345`). Grant your Cloud Run service's service account the **Secret Manager Secret Accessor** role, scoped to just this one secret.
+
+  </Step>
+  <Step>
+    ### Redeploy with secret reference
+
+    Redeploy your Cloud Run service, this time referencing the secret as an environment variable sourced from Secret Manager (the `--set-secrets` flag on `gcloud run deploy`) instead of a plain `--set-env-vars` value — confirm your app can still read it.
+
+  </Step>
+  <Step>
+    ### (Optional) Parallel step on AWS
+
+    On AWS, write a customer-managed policy scoped to only `s3:GetObject` on your specific bucket ARN, and store a secret in Secrets Manager, granting your Fargate task role access to retrieve it.
+
+  </Step>
+</Steps>
+
+---
+
+## Glossary
+
+- **Binding** — A GCP IAM pairing of one role with the members who hold it, attached to a specific resource.
+- **Explicit Deny** — An AWS policy statement with `"Effect": "Deny"` that overrides any Allow, no matter where else it's granted.
+- **Workload Identity Federation** — A way for an external system (like a CI pipeline) to exchange its own identity for short-lived GCP credentials, with no long-lived key ever created.
+- **Permission Boundary** — An AWS-specific ceiling on the maximum permissions an identity's policies can ever grant, regardless of what's attached later.
+- **Org Policy / Service Control Policy (SCP)** — An organization-wide guardrail restricting what's possible at all, beneath any individual IAM grant — GCP: Org Policy, AWS: SCP.
+
+---
+
+## Self-Check Questions
+
+- Why is a custom role/customer-managed policy a stronger least-privilege choice than a predefined one, concretely?
+- Why are downloaded service account keys or IAM user access keys considered a liability, and what replaces them for (a) resources running inside the cloud and (b) external CI/CD pipelines?
+- What's the actual difference between a Permission Boundary and a regular IAM policy?
+- Where would you look to answer "who deleted this resource, and when" — on GCP, and on AWS?
+
+---
+
+## References
+
+- [cloud.google.com/iam/docs](https://cloud.google.com/iam/docs/overview) — GCP IAM concepts in depth.
+- [cloud.google.com — Workload Identity Federation](https://cloud.google.com/iam/docs/workload-identity-federation) — The keyless-auth pattern referenced above.
+- [docs.aws.amazon.com/IAM](https://docs.aws.amazon.com/IAM/) — Full AWS IAM user guide, including Permission Boundaries.
+- [cloud.google.com/secret-manager](https://cloud.google.com/secret-manager) — Secret Manager overview.

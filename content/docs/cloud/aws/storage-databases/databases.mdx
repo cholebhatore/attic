@@ -1,0 +1,155 @@
+---
+title: 'Databases on AWS: RDS, Aurora & DynamoDB'
+description: Relational vs. NoSQL architectures, Amazon RDS Multi-AZ deployments, Amazon Aurora distributed storage, and Amazon DynamoDB.
+---
+
+<Callout type="info" title="Core Concept">
+  AWS provides specialized managed databases tailored to specific data access patterns. The primary
+  offerings are **Amazon RDS & Aurora** for relational SQL workloads, and **Amazon DynamoDB** for
+  hyperscale, single-digit millisecond NoSQL key-value workloads.
+</Callout>
+
+## 1. Database Decision Matrix
+
+| Dimension                | Amazon RDS                                             | Amazon Aurora                                                | Amazon DynamoDB                                              |
+| :----------------------- | :----------------------------------------------------- | :----------------------------------------------------------- | :----------------------------------------------------------- |
+| **Data Model**           | Relational SQL (Postgres, MySQL)                       | Relational SQL (Postgres, MySQL compatible)                  | NoSQL Key-Value & Document                                   |
+| **Scaling Model**        | Vertical scaling (larger instance) + Read Replicas     | Vertical scaling or Aurora Serverless v2 + Read Replicas     | Horizontal autoscaling of partitions (near-infinite)         |
+| **Storage Architecture** | Standard EBS volume attached to primary VM             | Distributed storage layer (replicated 6 ways across 3 AZs)   | Distributed SSD partitions managed internally                |
+| **High Availability**    | Multi-AZ synchronous standby replica                   | Native Multi-AZ fault tolerance (tolerates loss of 2 copies) | Multi-AZ native replication (built-in)                       |
+| **Access Latency**       | Single-digit to low-double-digit milliseconds          | Single-digit milliseconds                                    | Single-digit milliseconds at any scale                       |
+| **Best Used For**        | Standard monolithic apps, CMS, established SQL schemas | High-throughput enterprise SQL, transactional applications   | Shopping carts, user sessions, gaming state, serverless APIs |
+
+---
+
+## 2. Amazon RDS: Managed Relational Database Service
+
+Managing raw PostgreSQL or MySQL on a raw EC2 instance requires handling operating system patching, database software updates, manual backup scripts, and custom high-availability failover scripts. **Amazon RDS** automates all of this:
+
+<Mermaid
+  chart={`
+flowchart LR
+    App["Application Fleet (ECS / EC2)"] -->|Writes & Reads| Primary["Primary RDS DB Instance (AZ 1a)"]
+    Primary -->|Synchronous Block-Level Replication| Standby["Standby DB Instance (AZ 1b)"]
+    Primary -.->|Asynchronous Replication| ReadReplica["Read Replica (AZ 1c)"]
+    App -.->|Offload Heavy SELECT Queries| ReadReplica
+`}
+/>
+
+### High Availability via Multi-AZ Deployments
+
+- When enabled, RDS provisions an identical standby instance in a different Availability Zone.
+- Data is synchronously replicated from the primary instance to the standby instance.
+- If the primary crashes or experiences a hardware failure, RDS initiates an **automatic DNS failover** to the standby within 60–120 seconds with zero data loss.
+
+### Scaling Reads via Read Replicas
+
+- Read Replicas asynchronously replicate data from the primary instance.
+- Applications can route heavy `SELECT` queries (e.g., analytics, reports) to Read Replicas, preserving primary instance capacity for `INSERT`, `UPDATE`, and `DELETE` operations.
+
+### Amazon RDS Proxy
+
+Serverless architectures (like AWS Lambda) can spawn thousands of concurrent container executions within seconds. If each container opens a direct connection to a relational database, the database quickly runs out of memory and exhausts its connection pool. **RDS Proxy** sits between Lambda and RDS, pooling and sharing database connections to maintain database stability.
+
+---
+
+## 3. Amazon Aurora: Cloud-Native Relational Engine
+
+Amazon Aurora re-architects the database engine specifically for the cloud:
+
+- Compatible with PostgreSQL and MySQL.
+- **Storage Virtualization:** Aurora separates the compute layer (query processing) from the storage layer. Storage automatically scales up to 128 TB in 10 GB increments without provisioning disk ahead of time.
+- **6-Way Replication Across 3 AZs:** Every write is replicated across three Availability Zones. Aurora can lose an entire Availability Zone and an additional disk without losing data or write availability.
+- **Aurora Serverless v2:** Dynamically adjusts compute capacity in fractions of a second based on application demand, scaling down to half an ACU (Aurora Capacity Unit) when idle.
+
+---
+
+## 4. Amazon DynamoDB: Hyperscale Serverless NoSQL
+
+Amazon DynamoDB is a fully managed, serverless, key-value and document database designed for high-scale applications requiring consistent single-digit millisecond response times.
+
+### Core Architecture Primitives
+
+- **Tables, Items, and Attributes:** A Table holds Items (analogous to rows), and each Item contains Attributes (analogous to columns). Schema is flexible except for the Primary Key.
+- **Primary Key Types:**
+  1. **Partition Key (Hash):** An attribute whose value is hashed to determine which internal physical partition stores the item.
+  2. **Composite Primary Key (Partition Key + Sort Key):** The Partition Key determines partition placement; the Sort Key organizes items within that partition in ascending order.
+- **Read/Write Capacity Modes:**
+  - **On-Demand:** Scales capacity up or down automatically based on traffic; pay only for actual read and write requests performed.
+  - **Provisioned:** Specify Read Capacity Units (RCU) and Write Capacity Units (WCU) in advance with optional auto-scaling.
+
+### Global Secondary Indexes (GSI)
+
+To query data using attributes other than the Primary Key, define a Global Secondary Index (GSI). GSIs contain a partition key and sort key that can be different from those on the base table.
+
+---
+
+## Practical Implementation: Working with Amazon DynamoDB
+
+<Steps>
+  <Step>
+    ### Create a DynamoDB Table via AWS CLI
+
+    Create an `Orders` table with a composite primary key (`CustomerId` as Partition Key and `OrderId` as Sort Key):
+
+    ```bash
+    aws dynamodb create-table \
+      --table-name Orders \
+      --attribute-definitions \
+        AttributeName=CustomerId,AttributeType=S \
+        AttributeName=OrderId,AttributeType=S \
+      --key-schema \
+        AttributeName=CustomerId,KeyType=HASH \
+        AttributeName=OrderId,KeyType=RANGE \
+      --billing-mode PAY_PER_REQUEST \
+      --region us-east-1
+    ```
+
+  </Step>
+  <Step>
+    ### Insert an item (Item Creation)
+
+    ```bash
+    aws dynamodb put-item \
+      --table-name Orders \
+      --item '{
+        "CustomerId": {"S": "cust_1001"},
+        "OrderId": {"S": "ord_99812"},
+        "Amount": {"N": "149.50"},
+        "Status": {"S": "CONFIRMED"},
+        "CreatedAt": {"S": "2026-10-05T12:00:00Z"}
+      }'
+    ```
+
+  </Step>
+  <Step>
+    ### Query items by Partition Key
+
+    Retrieve all orders placed by customer `cust_1001`:
+
+    ```bash
+    aws dynamodb query \
+      --table-name Orders \
+      --key-condition-expression "CustomerId = :c" \
+      --expression-attribute-values '{":c": {"S": "cust_1001"}}'
+    ```
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What is the difference between an RDS Multi-AZ standby instance and an RDS Read Replica?
+- Why is Amazon RDS Proxy recommended when connecting AWS Lambda functions to Amazon RDS?
+- How does Amazon Aurora's storage architecture differ from standard Amazon RDS on EBS?
+- What is the role of a Partition Key in Amazon DynamoDB?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Welcome.html](https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/Welcome.html) — Amazon RDS User Guide.
+- [docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/CHAP_AuroraOverview.html](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/CHAP_AuroraOverview.html) — Amazon Aurora Architecture.
+- [docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Introduction.html) — Amazon DynamoDB Developer Guide.

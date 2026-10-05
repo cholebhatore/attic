@@ -1,0 +1,175 @@
+---
+title: 'Compute: VMs → containers → serverless'
+description: 'Understand VMs, containers, and serverless compute, then manually run an app on a raw VM so every abstraction after this feels earned.'
+---
+
+<Callout type="info" title="Goal">
+  Explain what a VM actually is under the hood, why a container isn't just "a smaller VM," which AWS
+  service is the real equivalent of GCP Cloud Run (it's not what most tutorials tell you), and
+  manually run a Node app on a raw VM at least once — so every abstraction after this feels earned,
+  not magic.
+</Callout>
+
+## 1. Zooming into one slice of the stack
+
+The previous module covered the whole spectrum at a high level — IaaS, PaaS, FaaS, SaaS. This module zooms into just **compute**: the layer that actually executes your code. Everything below is still that same spectrum, just examined up close, with your hands actually on a keyboard by the end of it.
+
+---
+
+## 2. Virtual machines: renting a full computer
+
+A VM is a slice of a real physical machine, carved out by software called a **hypervisor**, that behaves like its own independent computer — own OS, own kernel, own disk, own IP. Underneath, dozens of VMs share one physical box, but from inside your VM you can't tell, and you're not supposed to be able to.
+
+When you create one, you pick two things: a **machine type** (how much CPU/RAM) and a **boot image** (which OS, pre-installed). GCP calls the OS template an _image_; AWS calls it an **AMI** (Amazon Machine Image) — same concept, different name, and worth memorizing because "AMI" shows up constantly in AWS docs.
+
+| Concept                          | GCP (Compute Engine) | AWS (EC2)                  |
+| :------------------------------- | :------------------- | :------------------------- |
+| Smallest free-tier-friendly size | `e2-micro`           | `t2.micro` / `t3.micro`    |
+| General machine families         | e2, n2, c2, m1...    | t, m, c, r...              |
+| OS template                      | Image                | AMI (Amazon Machine Image) |
+| Attached storage                 | Persistent Disk      | EBS (Elastic Block Store)  |
+
+<Callout type="info" title="Anchor analogy">
+  A hypervisor is like a landlord who's converted one big house into several fully separate flats —
+  each tenant (VM) has their own locked front door, own kitchen, own everything, and genuinely can't
+  tell there's another flat on the other side of the wall. The building (physical server) is shared;
+  the living experience is not.
+</Callout>
+
+---
+
+## 3. Containers: a lighter unit than a VM
+
+A container is **not** a smaller VM, even though tutorials often gloss over this. A VM virtualizes hardware and runs a whole separate kernel. A container shares the _host machine's_ kernel and just gets an isolated view of processes, filesystem, and network (using Linux features called namespaces and cgroups) — it only packages your app plus its exact dependencies, not an entire OS.
+
+- **Startup:** a VM boots in tens of seconds to minutes (it's booting a whole OS); a container starts in milliseconds to a couple seconds.
+- **Density:** you can pack far more containers than VMs onto the same hardware, since there's no duplicated OS overhead per unit.
+- **Portability:** a container image runs identically on your laptop, a teammate's laptop, and production — "works on my machine" stops being a meaningful complaint.
+
+A **container image** is the packaged, frozen blueprint (your code + runtime + dependencies); a **container** is that image actually running. You build an image once (usually from a `Dockerfile`) and push it to a **container registry** so any platform can pull and run it: GCP's is **Artifact Registry**, AWS's is **ECR** (Elastic Container Registry).
+
+<Callout type="warn" title="Common beginner confusion">
+  A "VM image/AMI" and a "container image" are two completely different things that just happen to
+  share the word "image." A VM image contains an entire operating system. A container image contains
+  only your app and its dependencies, and relies on whatever machine runs it to already have a
+  compatible kernel. Don't mix them up in your head — they solve the same-sounding problem ("package
+  something to run elsewhere") at completely different layers.
+</Callout>
+
+---
+
+## 4. Serverless compute: two different flavors, not one
+
+This is the part almost every "GCP vs AWS" comparison article gets slightly wrong, so let's be precise. Serverless compute actually splits into two distinct families, and each cloud has an answer for both:
+
+- **Serverless functions** — a single function, triggered by an event (HTTP request, file upload, message on a queue), that runs briefly and exits. **GCP Cloud Functions** and **AWS Lambda** are the direct equivalents of each other here.
+- **Serverless containers** — you bring a whole Docker container (any language, any framework, long-lived HTTP server), and the platform runs it, scales it, and can scale it to zero. **GCP Cloud Run** is squarely in this bucket. AWS actually has _two_ answers: **AWS App Runner**, which is the closest experience to Cloud Run (push a container or connect a repo, get a URL, done), and **AWS Fargate**, the serverless compute engine underneath ECS or EKS — more powerful and more knobs, but you're also setting up a cluster/service/task definition around it rather than just deploying a container directly.
+
+So: if someone says "what's the AWS version of Cloud Run," the honest answer is "App Runner is the closest UX match, Fargate is the closest architectural match" — not a single clean 1:1, which is exactly the kind of nuance that's easy to miss from surface-level comparisons.
+
+| Layer                               | GCP                          | AWS                                                         |
+| :---------------------------------- | :--------------------------- | :---------------------------------------------------------- |
+| IaaS — full VM                      | Compute Engine               | EC2                                                         |
+| Serverless containers (Render-like) | Cloud Run                    | App Runner (simple) / Fargate via ECS or EKS (more control) |
+| Serverless functions                | Cloud Functions              | Lambda                                                      |
+| Container registry                  | Artifact Registry            | ECR                                                         |
+| VM autoscaling group                | Managed Instance Group (MIG) | Auto Scaling Group (ASG)                                    |
+
+---
+
+## 5. Choosing the right compute for the job
+
+- **Need full OS-level control, or software that must run continuously and stateful in a specific way (e.g. a game server, a custom daemon):** VM — Compute Engine / EC2.
+- **Have a containerized HTTP app, want it to autoscale (including to zero) without managing servers:** Cloud Run / App Runner.
+- **Small, event-triggered piece of logic — resize an uploaded image, respond to a queue message, glue two services together:** Cloud Functions / Lambda.
+- **Multiple interdependent containers at real scale, needing fine-grained orchestration:** this is Kubernetes territory (GKE / EKS) — covered in the advanced section, just noting it exists so the map stays complete.
+
+---
+
+## Hands-on exercise
+
+<Callout type="info" title="Goal">
+  Manually run a tiny Node.js server on a raw VM, so you feel exactly what Cloud Run/App Runner will
+  later do for you automatically.
+</Callout>
+
+<Steps>
+  <Step>
+    ### Create a VM instance
+
+    In the GCP console, go to *Compute Engine → VM instances → Create Instance*. Choose `e2-micro`, keep the default Debian/Ubuntu image, and pick a free-tier-eligible region (currently `us-west1`, `us-central1`, or `us-east1` — check [cloud.google.com/free](https://cloud.google.com/free/docs/free-cloud-features) for the current list, it does shift over time).
+
+  </Step>
+  <Step>
+    ### SSH into the VM
+
+    Once it's running, click **SSH** next to the instance — this opens a terminal straight in your browser, no key pair setup needed.
+
+  </Step>
+  <Step>
+    ### Install Node
+
+    ```bash
+    sudo apt update && sudo apt install -y nodejs npm
+    ```
+
+  </Step>
+  <Step>
+    ### Write and run a one-file server
+
+    `nano server.js`, paste a minimal `http.createServer` that responds "hello from a real VM," save, then run `node server.js`.
+
+  </Step>
+  <Step>
+    ### Test it
+
+    In a second SSH tab, run `curl localhost:3000` (or whatever port you used) and watch your own request hit code you're running on a machine you provisioned yourself.
+
+  </Step>
+  <Step>
+    ### Clean up
+
+    Stop the VM when you're done (or delete it) so it doesn't sit there burning free-tier hours.
+
+  </Step>
+  <Step>
+    ### (Optional) Do the same on AWS
+
+    Launch a `t2.micro` EC2 instance, notice you now have to explicitly create/download a key pair and open port 22 (and 3000) in a **Security Group** before you can even SSH in. GCP quietly handles both of those for you by default; AWS makes you do it explicitly. Neither is "wrong" — it's a real difference in how much is decided for you, straight out of the cloud foundations spectrum.
+
+  </Step>
+</Steps>
+
+---
+
+## Glossary
+
+**Hypervisor** — The software layer that splits one physical machine into multiple isolated virtual machines.
+
+**Instance** — The generic cloud term for "one running VM." GCP and AWS both use this word.
+
+**Image / AMI** — A frozen template of an OS (plus optionally pre-installed software) used to boot a new VM. GCP: Image. AWS: AMI.
+
+**Container image** — A frozen package of your app + its dependencies (not a full OS) built from a Dockerfile, stored in a registry, and run by any compatible container platform.
+
+**Managed instance group / Auto Scaling group** — A pool of identical VMs that automatically grows or shrinks based on load or health — the "old-school" IaaS way to autoscale, before serverless containers existed.
+
+---
+
+## Self-Check Questions
+
+- What's actually different between a VM and a container — not just "containers are lighter," but _why_?
+- Why is "AWS App Runner" a better one-line answer than "AWS Fargate" if someone asks for Cloud Run's direct AWS equivalent — and when would Fargate actually be the better answer instead?
+- What's the difference between a VM image/AMI and a container image?
+- If you needed something to run once a day for two minutes and then stop completely, would you reach for a VM, Cloud Run, or Cloud Functions/Lambda — and why?
+
+---
+
+## References
+
+- [cloud.google.com/compute](https://cloud.google.com/compute) — GCP Compute Engine overview.
+- [aws.amazon.com/ec2](https://aws.amazon.com/ec2/) — AWS EC2 overview — read this right after the GCP one to spot the vocabulary differences yourself.
+- [cloud.google.com/run](https://cloud.google.com/run) — Cloud Run overview.
+- [aws.amazon.com/apprunner](https://aws.amazon.com/apprunner/) — AWS App Runner — the closer Cloud Run match than most articles tell you.
+- [docker.com — What is a Container](https://www.docker.com/resources/what-container/) — Short, vendor-neutral explanation of containers vs. VMs, worth reading once properly.
+- [Fireship](https://www.youtube.com/@Fireship) — Search "Docker in 100 seconds" and "Containers vs VMs" on this channel — fast, accurate, no fluff.

@@ -1,0 +1,181 @@
+---
+title: AWS IAM Policies, Roles & Least Privilege
+description: IAM policy grammar, ARNs, explicit Deny evaluation, IAM Roles vs. Users, Permission Boundaries, and SCPs.
+---
+
+<Callout type="info" title="Core Concept">
+  AWS Identity and Access Management (IAM) is the central security and authorization engine of AWS.
+  Every API call made by human users, CLI scripts, ECS containers, or Lambda functions is evaluated
+  against IAM policy documents.
+</Callout>
+
+## 1. The IAM Policy Grammar
+
+An IAM policy is a declarative JSON document defining permissions:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowReadSpecificDataBucket",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::my-company-data-prod", "arn:aws:s3:::my-company-data-prod/*"],
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "true"
+        }
+      }
+    }
+  ]
+}
+```
+
+### Key Policy Attributes
+
+- **`Version`:** Always specify `"2012-10-17"` (the current policy language version).
+- **`Effect`:** Either `"Allow"` or `"Deny"`.
+- **`Action`:** Specific API operations (`service:action`). Use wildcard patterns judiciously (`s3:Get*`), avoiding blanket wildcards (`s3:*` or `*`).
+- **`Resource`:** Identified by an **ARN** (Amazon Resource Name). Scopes permissions to exact buckets, tables, or task definitions.
+- **`Condition`:** Fine-grained contextual requirements (e.g., enforce HTTPS with `aws:SecureTransport`, restrict by source IP with `aws:SourceIp`, or enforce multi-factor authentication with `aws:MultiFactorAuthPresent`).
+
+---
+
+## 2. Policy Evaluation Logic: Explicit Deny Always Wins
+
+When AWS evaluates whether an API request is authorized, it follows a strict sequence:
+
+<Mermaid
+  chart={`
+flowchart TD
+    Request["Incoming API Call"] --> DenyCheck{"Does ANY policy contain an Explicit Deny?"}
+    DenyCheck -- "Yes" --> Denied["DENIED (Explicit Deny overrides all)"]
+    DenyCheck -- "No" --> AllowCheck{"Does ANY policy contain an Explicit Allow?"}
+    AllowCheck -- "Yes" --> Allowed["ALLOWED"]
+    AllowCheck -- "No" --> DefaultDeny["DENIED (Default Deny)"]
+`}
+/>
+
+1. **Default Deny:** By default, all requests are implicitly denied.
+2. **Explicit Allow:** A permission must be explicitly granted by an identity-based policy, resource-based policy, or permission boundary.
+3. **Explicit Deny Overrides All:** An explicit `"Effect": "Deny"` in any policy overrides every `"Effect": "Allow"`, regardless of where it is attached.
+
+---
+
+## 3. IAM Identities: Users, Roles & Temporary Credentials
+
+- **IAM User:** A permanent identity with long-term credentials (password, access key). Should be limited to initial administrative setup.
+- **IAM Group:** A collection of IAM users used to apply policies to teams (e.g., `developers`, `security-auditors`).
+- **IAM Role:** An identity created in your account that has specific permissions, but is **not** associated with a specific person. Instead, it is assumed dynamically by:
+  - **AWS Services:** EC2 instances, ECS tasks, and Lambda functions assume roles via the **AWS Security Token Service (STS)** to obtain short-lived, automatically rotated credentials.
+  - **External Identities:** CI/CD runners (like GitHub Actions) assume roles via OpenID Connect (OIDC) without permanent access keys.
+
+---
+
+## 4. Permission Boundaries & Service Control Policies (SCPs)
+
+As organizations scale, security teams need guardrails to prevent developers from accidentally or maliciously granting themselves administrator privileges:
+
+| Security Layer                   | Scope                                    | Purpose                                                                                                                                                                                      |
+| :------------------------------- | :--------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Permission Policy**            | Attached to Role / User                  | Grants permissions to perform actions.                                                                                                                                                       |
+| **Permission Boundary**          | Attached to Role / User                  | Sets the **maximum ceiling** of permissions that an identity's policies can ever grant. Even if an admin attaches `AdministratorAccess`, the effective permission is capped by the boundary. |
+| **Service Control Policy (SCP)** | AWS Organizations (Root, OU, or Account) | Centralized guardrail applied across an entire AWS account. SCPs act as account-wide filters; they cannot grant permissions, only restrict them.                                             |
+
+---
+
+## Practical Implementation: Writing & Testing a Least-Privilege Policy
+
+<Steps>
+  <Step>
+    ### Create customer-managed policy via CLI
+
+    ```bash
+    aws iam create-policy \
+      --policy-name MicroserviceS3ReaderPolicy \
+      --description "Allows reading objects strictly from the production assets bucket" \
+      --policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Sid": "AllowListBucket",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::production-assets-bucket"
+          },
+          {
+            "Sid": "AllowGetObjectOnly",
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::production-assets-bucket/*"
+          }
+        ]
+      }'
+    ```
+
+  </Step>
+  <Step>
+    ### Create an Application Task Role with Trust Policy
+
+    ```bash
+    aws iam create-role \
+      --role-name ProductionApplicationTaskRole \
+      --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {
+              "Service": "ecs-tasks.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+          }
+        ]
+      }'
+    ```
+
+  </Step>
+  <Step>
+    ### Attach Policy to Role
+
+    ```bash
+    aws iam attach-role-policy \
+      --role-name ProductionApplicationTaskRole \
+      --policy-arn arn:aws:iam::123456789012:policy/MicroserviceS3ReaderPolicy
+    ```
+
+  </Step>
+  <Step>
+    ### Validate with IAM Policy Simulator
+
+    Verify that your role is permitted to read from `production-assets-bucket`, but denied access to any other bucket in the account:
+
+    ```bash
+    aws iam simulate-principal-policy \
+      --policy-source-arn arn:aws:iam::123456789012:role/ProductionApplicationTaskRole \
+      --action-names s3:GetObject \
+      --resource-arns arn:aws:s3:::production-assets-bucket/test.png
+    ```
+
+    Check output: `evalDecision: "allowed"`.
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What is the difference between an IAM User and an IAM Role?
+- Why does an explicit `Deny` take precedence over an explicit `Allow`?
+- How does an IAM Permission Boundary prevent privilege escalation?
+- Why should you avoid using `"Resource": "*"` in application policies?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/IAM/latest/UserGuide/introduction.html](https://docs.aws.amazon.com/IAM/latest/UserGuide/introduction.html) — AWS IAM User Guide.
+- [docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies.html) — Policies and permissions in IAM.
+- [docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_boundaries.html](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_boundaries.html) — Permissions boundaries for IAM entities.

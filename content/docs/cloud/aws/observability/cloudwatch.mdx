@@ -1,0 +1,204 @@
+---
+title: 'Amazon CloudWatch: Logs, Metrics & Alarms'
+description: Centralized logging with CloudWatch Logs Insights, custom metrics, dashboard monitoring, and SNS-backed automated alerts.
+---
+
+<Callout type="info" title="Core Concept">
+  **Amazon CloudWatch** is AWS's centralized observability and telemetry service. It collects
+  monitoring and operational data in the form of logs, metrics, and events, providing a unified view
+  of AWS resources and applications.
+</Callout>
+
+## 1. CloudWatch Architecture Overview
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph Sources["Telemetry Sources"]
+        EC2["EC2 Instances (CloudWatch Agent)"]
+        ECS["ECS Containers (awslogs Driver)"]
+        Lambda["Lambda Functions (stdout / stderr)"]
+        ALB["Application Load Balancer (Access Logs)"]
+    end
+    subgraph CloudWatch["Amazon CloudWatch Engine"]
+        Logs["CloudWatch Logs (Log Groups & Streams)"]
+        Metrics["CloudWatch Metrics (Time-Series Database)"]
+        Alarms["CloudWatch Alarms (State: OK / ALARM)"]
+    end
+    Sources --> Logs
+    Sources --> Metrics
+    Metrics --> Alarms
+    Alarms --> SNS["Amazon SNS (PagerDuty / Slack / Email)"]
+    Alarms --> AutoScale["Auto Scaling Action (Add/Remove EC2 or ECS Tasks)"]
+`}
+/>
+
+---
+
+## 2. Centralized Logging & Logs Insights
+
+### Log Groups and Log Streams
+
+- **Log Group:** A logical container representing a specific application or service (e.g., `/ecs/production-api` or `/aws/lambda/process-order`). Retention policies are set at the Log Group level (e.g., auto-expire after 30 or 90 days to eliminate storage bloat).
+- **Log Stream:** Represents an individual container instance, virtual machine, or Lambda execution environment writing lines sequentially.
+
+### Structured JSON Logging Pattern
+
+Emit log messages formatted as single-line JSON objects to standard output:
+
+```javascript
+console.log(
+  JSON.stringify({
+    timestamp: new Date().toISOString(),
+    level: 'ERROR',
+    service: 'order-service',
+    requestId: req.headers['x-request-id'],
+    userId: req.user?.id,
+    errorMessage: 'Payment gateway timeout',
+    latencyMs: 5120,
+  }),
+);
+```
+
+### Purpose-Built CloudWatch Logs Insights Queries
+
+Instead of grepping or downloading gigabytes of logs, Logs Insights executes parallel queries across terabytes of data in seconds:
+
+```text
+fields @timestamp, level, service, userId, errorMessage, latencyMs
+| filter level = "ERROR"
+| sort @timestamp desc
+| limit 50
+```
+
+To calculate p90 and p99 latency per minute:
+
+```text
+filter ispresent(latencyMs)
+| stats pct(latencyMs, 90) as p90, pct(latencyMs, 99) as p99 by bin(1m)
+```
+
+---
+
+## 3. Metrics, Dashboards & Embedded Metric Format (EMF)
+
+- **Standard Metrics:** Generated automatically by AWS resources at 1-minute or 5-minute intervals (e.g., EC2 `CPUUtilization`, ALB `TargetResponseTime`, S3 `BucketSizeBytes`).
+- **Embedded Metric Format (EMF):** Allows application code to emit custom business and performance metrics directly in JSON log lines. CloudWatch extracts metrics automatically without incurring custom API call charges (`PutMetricData`):
+
+```javascript
+console.log(
+  JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [
+        {
+          Namespace: 'ECommerceApp',
+          Dimensions: [['Environment']],
+          Metrics: [{ Name: 'CheckoutSuccess', Unit: 'Count' }],
+        },
+      ],
+    },
+    Environment: 'Production',
+    CheckoutSuccess: 1,
+    orderId: 'ord_12345',
+  }),
+);
+```
+
+---
+
+## 4. High-Priority Alarms & Amazon SNS
+
+A **CloudWatch Alarm** evaluates a metric over specified evaluation periods against a numerical threshold:
+
+- **`OK`:** The metric is within allowable thresholds.
+- **`ALARM`:** The threshold has been breached for consecutive periods.
+- **`INSUFFICIENT_DATA`:** The metric has not received enough data points to determine status.
+
+When transitioning to `ALARM`, the alarm triggers an **Amazon Simple Notification Service (SNS)** topic, broadcasting immediate notifications to on-call engineers via SMS, email, PagerDuty, or Slack webhooks.
+
+---
+
+## Practical Implementation: Configuring Log Retention & Alarms
+
+<Steps>
+  <Step>
+    ### Create a Log Group with explicit retention
+
+    Prevent runaway storage costs by setting a 30-day retention window:
+
+    ```bash
+    aws logs create-log-group --log-group-name /ecs/production-api
+
+    aws logs put-retention-policy \
+      --log-group-name /ecs/production-api \
+      --retention-in-days 30
+    ```
+
+  </Step>
+  <Step>
+    ### Create an SNS topic for operations alerts
+
+    ```bash
+    TOPIC_ARN=$(aws sns create-topic --name ops-critical-alerts --query 'TopicArn' --output text)
+
+    # Subscribe on-call email
+    aws sns subscribe \
+      --topic-arn $TOPIC_ARN \
+      --protocol email \
+      --notification-endpoint oncall-devops@example.com
+    ```
+    *Confirm the verification email received in your inbox.*
+
+  </Step>
+  <Step>
+    ### Create a CloudWatch Alarm on ALB 5xx Errors
+
+    ```bash
+    aws cloudwatch put-metric-alarm \
+      --alarm-name "ALB-High-5xx-Errors" \
+      --alarm-description "Alerts if 5xx error count exceeds 10 over 1 minute" \
+      --metric-name HTTPCode_Target_5XX_Count \
+      --namespace AWS/ApplicationELB \
+      --statistic Sum \
+      --period 60 \
+      --threshold 10 \
+      --comparison-operator GreaterThanThreshold \
+      --evaluation-periods 1 \
+      --alarm-actions $TOPIC_ARN
+    ```
+
+  </Step>
+  <Step>
+    ### Query logs via CLI
+
+    ```bash
+    QUERY_ID=$(aws logs start-query \
+      --log-group-name /ecs/production-api \
+      --start-time $(date -d '1 hour ago' +%s) \
+      --end-time $(date +%s) \
+      --query-string 'fields @timestamp, @message | filter @message like /error/ | limit 20' \
+      --query 'queryId' --output text)
+
+    aws logs get-query-results --query-id $QUERY_ID
+    ```
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- Why is setting explicit retention on CloudWatch Log Groups an essential cost practice?
+- How does structured JSON logging improve incident investigation compared to raw text?
+- What are the three states of a CloudWatch Alarm?
+- How does the Embedded Metric Format (EMF) allow custom metrics to be recorded without direct API fees?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/WhatIsCloudWatch.html) — Amazon CloudWatch Documentation.
+- [docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html](https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CWL_QuerySyntax.html) — CloudWatch Logs Insights Query Syntax.
+- [docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format.html](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch_Embedded_Metric_Format.html) — Embedded Metric Format.

@@ -1,0 +1,138 @@
+---
+title: Distributed Tracing with AWS X-Ray & Container Insights
+description: End-to-end request tracing, trace propagation, service latency maps, and ECS Container Insights.
+---
+
+<Callout type="info" title="Core Concept">
+  **AWS X-Ray** collects data about requests that your application serves, providing a visual map of
+  downstream service calls, databases, and microservices to identify performance bottlenecks and
+  root-cause errors.
+</Callout>
+
+## 1. Why Logs Are Not Enough: Distributed Tracing
+
+In a distributed microservice or serverless architecture, a single user click might travel through an Application Load Balancer, hit an authentication service, query DynamoDB, publish an event to Amazon SQS, and invoke an asynchronous background worker.
+
+<Mermaid
+  chart={`
+flowchart LR
+    Client["Client Request"] --> ALB["Application Load Balancer (Injects Trace ID)"]
+    ALB --> Auth["Auth Service (ECS Container)"]
+    Auth --> DB[("Amazon DynamoDB")]
+    Auth --> Queue["Amazon SQS Queue"]
+    Queue --> Worker["Worker Function (AWS Lambda)"]
+    Worker --> S3[("Amazon S3 Bucket")]
+`}
+/>
+
+When a request takes 4,500ms instead of the expected 200ms, examining isolated log lines across four separate services makes diagnosing the latency bottleneck extremely tedious. **AWS X-Ray connects every hop into a unified trace timeline.**
+
+---
+
+## 2. Segments, Subsegments & Trace IDs
+
+- **Trace ID (`X-Amzn-Trace-Id`):** A unique identifier injected into HTTP request headers at the edge (by the ALB or API Gateway). Format: `1-[unix-timestamp]-[96-bit-random-hex]`.
+- **Segment:** Records compute resources serving the request (hostname, request method, status code, start and end timestamp).
+- **Subsegment:** Measures granular operations inside the application code (e.g., the exact duration of a SQL query, a Redis lookup, or an HTTP call to a payment gateway).
+
+---
+
+## 3. The Visual Service Map
+
+AWS X-Ray compiles all traces into an interactive **Service Map**:
+
+- Nodes represent services, databases, queues, and external APIs.
+- Edge connections display real-time latency distributions and error rates.
+- Color coding highlights latency anomalies and 4xx/5xx error clusters visually.
+
+---
+
+## 4. Amazon ECS Container Insights
+
+While X-Ray monitors application request paths, **Amazon ECS Container Insights** monitors the underlying container runtime health:
+
+- Collects task-level CPU and memory utilization.
+- Automatically tracks container restarts, task count fluctuations, and network bytes in/out.
+- Integrates directly with CloudWatch automatic alarms to trigger alerts when an ECS task is terminated by an Out-of-Memory (OOM) event.
+
+---
+
+## Practical Implementation: Instrumenting Application with AWS X-Ray
+
+<Steps>
+  <Step>
+    ### Install AWS X-Ray SDK in your application
+
+    ```bash
+    npm install aws-xray-sdk
+    ```
+
+  </Step>
+  <Step>
+    ### Wrap HTTP server and AWS SDK calls
+
+    ```javascript
+    import AWSXRay from "aws-xray-sdk";
+    import http from "http";
+
+    // Automatically wrap all standard HTTP/HTTPS outgoing calls
+    AWSXRay.captureHTTPsGlobal(require("http"));
+    AWSXRay.captureHTTPsGlobal(require("https"));
+
+    const server = http.createServer((req, res) => {
+      // Create subsegment for database operation
+      const segment = AWSXRay.getSegment();
+      const subsegment = segment?.addNewSubsegment("query_database");
+
+      setTimeout(() => {
+        subsegment?.close();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
+      }, 150);
+    });
+
+    server.listen(8080);
+    ```
+
+  </Step>
+  <Step>
+    ### Enable ECS Container Insights via CLI
+
+    ```bash
+    aws ecs update-cluster-settings \
+      --cluster production-cluster \
+      --settings name=containerInsights,value=enabled
+    ```
+
+  </Step>
+  <Step>
+    ### Query trace summaries
+
+    Retrieve recent traces that took longer than 2 seconds:
+
+    ```bash
+    aws xray get-trace-summaries \
+      --start-time $(date -d '1 hour ago' +%s) \
+      --end-time $(date +%s) \
+      --filter-expression 'responsetime > 2'
+    ```
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What problem does distributed tracing solve that centralized log aggregation cannot?
+- What is the difference between an X-Ray segment and a subsegment?
+- How is the `X-Amzn-Trace-Id` header propagated across downstream microservice calls?
+- What metrics are automatically collected when ECS Container Insights is enabled?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/xray/latest/devguide/aws-xray.html](https://docs.aws.amazon.com/xray/latest/devguide/aws-xray.html) — AWS X-Ray Developer Guide.
+- [docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/ContainerInsights.html) — Using Container Insights on Amazon ECS.
+- [github.com/aws/aws-xray-sdk-node](https://github.com/aws/aws-xray-sdk-node) — AWS X-Ray SDK for Node.js.

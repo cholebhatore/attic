@@ -1,0 +1,191 @@
+---
+title: AWS Lambda & Serverless Compute
+description: Event-driven serverless architecture, execution lifecycles, Function URLs, concurrency controls, and the Lambda Web Adapter.
+---
+
+<Callout type="info" title="Core Concept">
+  AWS Lambda is a serverless compute service that runs your code in response to events and
+  automatically manages underlying compute resources. You pay only for the compute time consumed
+  down to the millisecond.
+</Callout>
+
+## 1. The Event-Driven Execution Model
+
+Unlike traditional web servers that run continuously waiting for requests, AWS Lambda functions exist in a dormant state until invoked by an event:
+
+<Mermaid
+  chart={`
+flowchart LR
+    Event["Event Trigger (API Request, S3 Upload, SQS Queue)"] --> Runtime["MicroVM Environment (Firecracker)"]
+    subgraph Execution["Lambda Invocation Lifecycle"]
+        Runtime --> Init["INIT Phase (Cold Start: download code, run global imports)"]
+        Init --> Invoke["INVOKE Phase (Handler execution: event in, response out)"]
+        Invoke --> Idle["Freeze / Idle (Held warm for subsequent requests)"]
+    end
+    Invoke --> Result["Return Response / Process Data"]
+`}
+/>
+
+### Key Operating Constraints:
+
+- **Maximum Execution Duration:** 15 minutes (900 seconds). For tasks longer than 15 minutes, reach for ECS Fargate or AWS Batch.
+- **Memory Allocation:** 128 MB to 10,240 MB (10 GB). **vCPU is allocated proportionally to memory** — allocating 1,769 MB provides the equivalent of 1 full vCPU.
+- **Statelessness:** Local disk space (`/tmp`, up to 10 GB) is ephemeral. Any data that must persist across invocations must be stored in Amazon S3, Amazon DynamoDB, or Amazon EFS.
+
+---
+
+## 2. Cold Starts vs. Warm Invocations
+
+- **Cold Start:** Occurs when a request arrives and no initialized container environment exists. Lambda must provision a Firecracker microVM, download the deployment package/container image, initialize the runtime, and execute top-level code outside the handler.
+- **Warm Invocation:** If another request arrives shortly after, Lambda reuses the existing initialized environment, executing only the handler function.
+
+### Optimizing Cold Starts:
+
+1. **Minimize Deployment Size:** Strip unnecessary dependencies and bundle with esbuild/webpack.
+2. **Move Initialization Logic Outside Handler:** Database connections and AWS SDK client instantiations should happen outside the handler function so they are reused across warm requests.
+3. **Provisioned Concurrency:** Pre-initializes a requested number of execution environments, completely eliminating cold starts at the cost of continuous hourly billing.
+
+---
+
+## 3. Concurrency Controls: Reserved vs. Provisioned
+
+Every AWS account has a default regional concurrency limit (typically 1,000 concurrent executions).
+
+- **Reserved Concurrency:** Guarantees a maximum number of concurrent instances for a function. This prevents a high-traffic function from starving other functions in the account, and protects downstream databases (like RDS) from being overwhelmed by thousands of simultaneous connections.
+- **Provisioned Concurrency:** Keeps execution environments initialized and hyper-ready to respond in double-digit milliseconds.
+
+---
+
+## 4. Lambda Function URLs
+
+In the past, exposing a Lambda function to public HTTP traffic required configuring Amazon API Gateway or an Application Load Balancer. **Lambda Function URLs** provide a direct HTTPS endpoint (`https://<url-id>.lambda-url.<region>.on.aws`) directly attached to your function:
+
+- Built-in Cross-Origin Resource Sharing (CORS) configuration.
+- Supports `AWS_IAM` authentication or `NONE` (publicly accessible).
+- Ideal for webhooks, microservices, and single-purpose APIs.
+
+---
+
+## 5. Running Existing Web Frameworks via Lambda Web Adapter
+
+You do not need to rewrite your Express.js, FastAPI, or Next.js application into the traditional event handler syntax. Using the open-source **AWS Lambda Web Adapter**, an ordinary Dockerfile runs inside Lambda:
+
+```dockerfile
+FROM node:20-alpine
+# Include the Lambda Web Adapter binary
+COPY --from=public.ecr.aws/awslabs/aws-lambda-web-adapter:0.8.4 /lambda-adapter /opt/extensions/lambda-adapter
+WORKDIR /app
+COPY package*.json ./
+RUN npm install --production
+COPY . .
+ENV PORT=8080
+EXPOSE 8080
+CMD ["node", "server.js"]
+```
+
+The adapter starts your Node/Python HTTP server and converts incoming Lambda event payloads into standard HTTP requests on `localhost:8080`, returning standard HTTP responses back to the client.
+
+---
+
+## Practical Implementation: Deploying a Public Lambda API
+
+<Steps>
+  <Step>
+    ### Write the handler code (`index.mjs`)
+
+    ```javascript
+    export const handler = async (event) => {
+      const httpMethod = event.requestContext?.http?.method || "GET";
+      const rawPath = event.rawPath || "/";
+
+      console.log(JSON.stringify({
+        event: "request_received",
+        method: httpMethod,
+        path: rawPath
+      }));
+
+      return {
+        statusCode: 200,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: "Hello from AWS Lambda!",
+          path: rawPath,
+          timestamp: new Date().toISOString()
+        })
+      };
+    };
+    ```
+
+  </Step>
+  <Step>
+    ### Package and Deploy via AWS CLI
+
+    ```bash
+    zip function.zip index.mjs
+
+    # Create basic execution role
+    aws iam create-role \
+      --role-name LambdaBasicRole \
+      --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+
+    aws iam attach-role-policy \
+      --role-name LambdaBasicRole \
+      --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+    # Deploy function
+    aws lambda create-function \
+      --function-name api-gateway-alternative \
+      --runtime nodejs20.x \
+      --role arn:aws:iam::123456789012:role/LambdaBasicRole \
+      --handler index.handler \
+      --zip-file fileb://function.zip \
+      --timeout 10 \
+      --memory-size 256
+    ```
+
+  </Step>
+  <Step>
+    ### Create Function URL
+
+    ```bash
+    aws lambda create-function-url-config \
+      --function-name api-gateway-alternative \
+      --auth-type NONE
+
+    aws lambda add-permission \
+      --function-name api-gateway-alternative \
+      --action lambda:InvokeFunctionUrl \
+      --principal "*" \
+      --function-url-auth-type NONE \
+      --statement-id AllowPublicAccess
+    ```
+
+  </Step>
+  <Step>
+    ### Test the endpoint
+
+    Query the generated URL using `curl`:
+
+    ```bash
+    curl -i https://xyz123.lambda-url.us-east-1.on.aws/test
+    ```
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- How is CPU allocated to an AWS Lambda function relative to memory configuration?
+- What causes a cold start in Lambda, and how does Provisioned Concurrency eliminate it?
+- Why is Reserved Concurrency essential when connecting Lambda functions to relational databases?
+- What architectural purpose does the AWS Lambda Web Adapter serve?
+
+---
+
+## References
+
+- [docs.aws.amazon.com/lambda/latest/dg/welcome.html](https://docs.aws.amazon.com/lambda/latest/dg/welcome.html) — AWS Lambda Developer Guide.
+- [docs.aws.amazon.com/lambda/latest/dg/lambda-concurrency.html](https://docs.aws.amazon.com/lambda/latest/dg/lambda-concurrency.html) — Managing Lambda Concurrency.
+- [github.com/awslabs/aws-lambda-web-adapter](https://github.com/awslabs/aws-lambda-web-adapter) — AWS Lambda Web Adapter GitHub repository.

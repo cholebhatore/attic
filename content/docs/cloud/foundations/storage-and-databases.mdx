@@ -1,0 +1,137 @@
+---
+title: 'Storage & databases'
+description: 'Know exactly which storage type to reach for and which database family fits a given data shape, and spot the classic beginner trap with managed SQL billing.'
+---
+
+<Callout type="info" title="Goal">
+  Know exactly which storage type to reach for (object, block, or file) and which database family
+  fits a given data shape — and spot the one classic beginner trap: spinning up a managed SQL
+  database and getting a surprise bill, because unlike Compute Engine or Cloud Storage, it has no
+  always-free tier.
+</Callout>
+
+## 1. Why this matters right after "serverless"
+
+You just learned Cloud Run/Lambda instances are stateless and disposable — anything they write to local disk can vanish the moment that instance recycles. So where does data actually live? That's this entire module. Storage and compute are deliberately separate concerns in cloud architecture, and understanding that separation is what makes the rest of this path click.
+
+---
+
+## 2. Three shapes of storage
+
+"Storage" isn't one thing — it's three genuinely different products, each shaped for a different access pattern:
+
+**Object storage** — A flat store of files ("objects"), each addressed by a key/URL, with no real folder structure underneath (folders in the console UI are cosmetic). Built for huge scale, cheap storage of things like images, videos, backups, and datasets — not for a database or a filesystem your app edits in place. GCP: **Cloud Storage**. AWS: **S3**.
+
+**Block storage** — A raw virtual disk attached to exactly one VM at a time, formatted with a normal filesystem (ext4, NTFS...). This is what your VM's boot disk and any extra attached drives actually are. GCP: **Persistent Disk**. AWS: **EBS** (Elastic Block Store).
+
+**File storage** — A shared network filesystem multiple VMs can mount and read/write at once (via NFS), useful when several machines need to see the same files live. GCP: **Filestore**. AWS: **EFS** (Elastic File System).
+
+<Callout type="info" title="Anchor analogy">
+  Object storage is a warehouse with a single barcode per box — you don't browse shelves, you scan a
+  code and it's retrieved. Block storage is a filing cabinet bolted to one specific desk (VM) — only
+  that desk's owner uses it. File storage is a shared office cabinet with one key copied for the
+  whole team — several desks can open it at once.
+</Callout>
+
+---
+
+## 3. Databases: matching the shape of your data
+
+Beyond raw storage, you'll almost always need a proper database. The first real fork in the road is relational vs. NoSQL, and it's about the _shape_ of your data and how you'll query it, not which one is "more modern."
+
+| Type                            | Best for                                                                           | GCP                                   | AWS                                  |
+| :------------------------------ | :--------------------------------------------------------------------------------- | :------------------------------------ | :----------------------------------- |
+| Managed relational (SQL)        | Structured data with relationships, joins, transactions — orders, users, invoices  | Cloud SQL (Postgres/MySQL/SQL Server) | RDS (Postgres/MySQL/SQL Server/etc.) |
+| Globally-distributed relational | Relational data at massive, multi-region scale                                     | Cloud Spanner                         | Aurora (with Global Database)        |
+| NoSQL document/key-value        | Simple, high-throughput lookups by key — sessions, user profiles, flexible schemas | Firestore                             | DynamoDB                             |
+| In-memory cache                 | Sub-millisecond reads for hot data — rate limits, leaderboards, session caching    | Memorystore (Redis)                   | ElastiCache (Redis/Memcached)        |
+
+The practical rule of thumb: if you're picturing tables with foreign keys and you'll want to ask questions like "all orders for this user, joined with product names" — relational. If you're picturing "give me this one document by its ID, fast, at huge scale, and I don't care about joins" — NoSQL.
+
+<Callout type="warn" title="The trap almost every beginner falls into">
+  Compute Engine's `e2-micro` and Cloud Storage both have genuine **always-free** quotas — you can
+  leave them running and pay nothing. **Cloud SQL and RDS do not.** Even the smallest managed SQL
+  instance bills by the hour from the moment it exists, free trial credit aside. It's easy to spin
+  one up "just to try it" and forget about it. For this hands-on exercise, we're deliberately using
+  Firestore/DynamoDB instead — both have real always-free tiers — and we'll come back to Cloud
+  SQL/RDS later with explicit cost guardrails once you're ready to budget for it.
+</Callout>
+
+---
+
+## 4. Consistency and durability, briefly
+
+Two words you'll see constantly in docs, worth knowing precisely rather than glossing over:
+
+- **Durability** — the odds your data survives hardware failure. Object storage like GCS/S3 is designed for extreme durability (often quoted as "eleven nines") by silently keeping multiple copies across different hardware.
+- **Consistency** — whether a read immediately after a write is guaranteed to see that write. **Strong consistency** means yes, always. **Eventual consistency** means usually, but there can be a brief window where different readers see slightly stale data. Object storage historically leaned eventual (both GCS and S3 now offer strong read-after-write consistency for most operations, a relatively recent improvement worth knowing since a lot of older articles still describe the old eventual-consistency behavior).
+
+---
+
+## Hands-on exercise
+
+<Steps>
+  <Step>
+    ### Create a Cloud Storage bucket
+
+    In the GCP console, go to *Cloud Storage → Buckets → Create*. Make a bucket with a globally-unique name, default settings are fine. Upload any small file from your computer.
+
+  </Step>
+  <Step>
+    ### Test the uploaded file
+
+    Click the uploaded file and note its public URL structure — try making it public (or generate a signed URL) and open that link in a private browser tab to confirm it actually serves the file.
+
+  </Step>
+  <Step>
+    ### Create a Firestore database
+
+    Go to *Firestore → Create Database* (choose Native mode, any region). Manually add a collection (e.g. `notes`) and one document with a couple of fields (e.g. `title: "hello"`, `done: false`) straight from the console UI.
+
+  </Step>
+  <Step>
+    ### Confirm the document
+
+    Refresh and confirm the document is really there — that's the entire mental model of a document database: no schema to define up front, no migration, just a document with fields.
+
+  </Step>
+  <Step>
+    ### (Optional) Do the S3 + DynamoDB equivalents on AWS
+
+    Create an S3 bucket and upload the same file, then create a DynamoDB table and manually add one item via the console. Compare how much more setup DynamoDB's console asks for upfront (a table needs a defined partition key, even though the document body itself stays schemaless) versus Firestore's more improvisational feel.
+
+  </Step>
+</Steps>
+
+---
+
+## Glossary
+
+**Object / Blob** — A single file stored in object storage, addressed by a unique key.
+
+**Partition key** — The field DynamoDB (and similar systems) uses to decide which physical partition stores a given item — chosen up front when you create the table.
+
+**Durability** — The probability your stored data survives underlying hardware failure over time.
+
+**Consistency (strong vs. eventual)** — Whether a read immediately after a write is guaranteed to reflect that write (strong), or might briefly return stale data (eventual).
+
+**Schema-on-write vs. schema-on-read** — Relational databases enforce a schema when data is written (schema-on-write). Many NoSQL stores let you write whatever shape you want and only care about structure when you read it back (schema-on-read).
+
+---
+
+## Self-Check Questions
+
+- Given a use case, could you say confidently: object, block, or file storage?
+- Why would you pick Firestore/DynamoDB over Cloud SQL/RDS for a given app, and vice versa?
+- Why does Cloud SQL/RDS need real cost caution that Compute Engine's free-tier VM and Cloud Storage don't?
+- What's the practical difference between strong and eventual consistency, in terms of something a user could actually notice?
+
+---
+
+## References
+
+- [cloud.google.com/storage](https://cloud.google.com/storage) — Cloud Storage overview.
+- [aws.amazon.com/s3](https://aws.amazon.com/s3/) — S3 overview — read alongside the GCS page above.
+- [cloud.google.com/firestore](https://cloud.google.com/firestore) — Firestore overview.
+- [aws.amazon.com/dynamodb](https://aws.amazon.com/dynamodb/) — DynamoDB overview.
+- [Fireship](https://www.youtube.com/@Fireship) — Search "SQL vs NoSQL" on this channel for a fast, accurate 100-second refresher.

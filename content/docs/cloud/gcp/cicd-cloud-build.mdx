@@ -1,0 +1,133 @@
+---
+title: 'CI/CD with Cloud Build'
+description: 'GCP Cloud Build pipelines compared with AWS CodePipeline and GitHub Actions.'
+---
+
+<Callout type="info" title="Goal">
+  Stop manually typing `gcloud run deploy` — set up a real pipeline that builds, tests, and
+  redeploys automatically on every push, and understand why AWS splits this into three products
+  where GCP mostly uses one.
+</Callout>
+
+## 1. Why automate the deploy step
+
+Every manual deploy means personally typing commands. That's fragile for production — someone forgets a step, deploys the wrong branch, or forgets to deploy a critical patch. CI/CD replaces "a human runs a command" with "a pipeline runs the same steps identically, every single time, triggered automatically."
+
+---
+
+## 2. Core concepts, before any specific tool
+
+- **Continuous Integration (CI)** — Automatically build and test code on every push or pull request, catching breakage immediately instead of at deploy time.
+- **Continuous Delivery / Deployment (CD)** — Automatically ship the resulting build to an environment — delivery means it's ready to release with a manual approval step; deployment means it goes live with no human in the loop.
+- **Pipeline** — The ordered sequence of stages a change moves through: source → build → test → push artifact → deploy.
+- **Trigger** — What starts a pipeline run — a push to a branch, a pull request, a new tag, a schedule, or a manual click.
+
+---
+
+## 3. Cloud Build: GCP's answer
+
+Cloud Build runs a pipeline defined in a `cloudbuild.yaml` file sitting in your repo — each step is literally a container image running one command. A minimal pipeline for your containerized app looks like this:
+
+```yaml
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'us-central1-docker.pkg.dev/PROJECT/repo/my-app', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'us-central1-docker.pkg.dev/PROJECT/repo/my-app']
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      [
+        'run',
+        'deploy',
+        'my-first-service',
+        '--image',
+        'us-central1-docker.pkg.dev/PROJECT/repo/my-app',
+        '--region',
+        'us-central1',
+      ]
+```
+
+A **Build Trigger** connects this file to your GitHub repo, so a push to `main` runs exactly these three steps with no one typing anything.
+
+---
+
+## 4. AWS's answer: three products, not one
+
+This is a genuine, worth-remembering asymmetry — what Cloud Build does in a single product, AWS deliberately splits across three:
+
+| AWS product      | Role                                                                                               | Roughly maps to                                    |
+| :--------------- | :------------------------------------------------------------------------------------------------- | :------------------------------------------------- |
+| **CodeBuild**    | Runs the actual build/test commands, similar to one Cloud Build step                               | Cloud Build's execution engine                     |
+| **CodePipeline** | Orchestrates the multi-stage flow (source → build → deploy) and wires the other two together       | Cloud Build's trigger + step sequencing, combined  |
+| **CodeDeploy**   | Handles the actual rollout to EC2, ECS/Fargate, or Lambda, including rolling/blue-green strategies | The `gcloud run deploy` step in the pipeline above |
+
+None of this is "AWS is more complicated for no reason" — CodePipeline genuinely supports more exotic multi-account, multi-region release flows than Cloud Build does out of the box. For a small project it's more moving parts than you need; at real organizational scale, that separation becomes a feature.
+
+---
+
+## 5. The pattern that's increasingly replacing both: GitHub Actions
+
+Many engineering teams skip Cloud Build and CodePipeline entirely and run the pipeline in **GitHub Actions**, authenticating to whichever cloud via the keyless Workload Identity Federation / OIDC pattern — one CI tool, either cloud, no long-lived keys stored as GitHub secrets.
+
+---
+
+## 6. Deployment strategies, briefly
+
+- **Rolling deploy** — Replace old instances with new ones gradually, a few at a time.
+- **Blue/green deploy** — Stand up the entire new version alongside the old one, then flip traffic over all at once (fast rollback: just flip back).
+- **Canary deploy** — Send a small percentage of real traffic to the new version first, watch for problems, then ramp up. Cloud Run supports this natively via **traffic splitting** between revisions — genuinely one of its nicer built-in features.
+
+---
+
+## Hands-on
+
+<Steps>
+  <Step>
+    ### Add cloudbuild.yaml
+
+    Add the `cloudbuild.yaml` from section 3 to your app's repo (adjust the project/repo names to your own).
+
+  </Step>
+  <Step>
+    ### Create a Build Trigger
+
+    In the console, go to *Cloud Build → Triggers → Create Trigger*, connect your GitHub repo, and point it at this file, triggering on push to `main`.
+
+  </Step>
+  <Step>
+    ### Trigger automated deploy
+
+    Make a tiny visible change to your app (edit the response text), commit, and push. Watch the trigger fire in the Cloud Build console — build logs, push, deploy — with you doing nothing but `git push`.
+
+  </Step>
+  <Step>
+    ### Verify live changes
+
+    Curl your live URL again and confirm the text actually changed, deployed entirely by the pipeline.
+
+  </Step>
+  <Step>
+    ### (Optional) Test traffic splitting
+
+    Deploy a second small change, then in the Cloud Run console try splitting traffic 90/10 between the old and new revision, and watch requests actually land on both if you refresh a few times.
+
+  </Step>
+</Steps>
+
+---
+
+## Self-Check Questions
+
+- What's the difference between Continuous Delivery and Continuous Deployment?
+- Why does AWS split this into three products (CodeBuild/CodePipeline/CodeDeploy) where GCP mostly uses one?
+- What's the practical benefit of a canary deploy over just deploying straight to 100% of traffic?
+- Why does using GitHub Actions with OIDC avoid the static key problem?
+
+---
+
+## References
+
+- [cloud.google.com/build/docs](https://cloud.google.com/build/docs) — Cloud Build documentation, including the full `cloudbuild.yaml` reference.
+- [aws.amazon.com/codepipeline](https://aws.amazon.com/codepipeline/) — CodePipeline overview, with links out to CodeBuild and CodeDeploy.
+- [docs.github.com/actions](https://docs.github.com/actions) — GitHub Actions documentation.
