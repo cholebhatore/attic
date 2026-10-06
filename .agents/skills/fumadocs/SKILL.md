@@ -211,49 +211,50 @@ To ensure diagrams are crisp, solid, uncolored (neutral monochrome), and comfort
 1. **Mermaid Initialization (Monochrome & Crisp)**: In `mermaid.initialize()`, set `look: 'classic'`, `theme: 'base'`, `fontSize: 13`, and configure neutral grayscale `themeVariables` with `useGradient: false` and `dropShadow: 'none'`:
 
    ```ts
-   const neutralBorder = isDark ? "#52525b" : "#71717a";
-   const neutralLine = isDark ? "#71717a" : "#71717a";
+   const neutralBorder = isDark ? '#52525b' : '#71717a';
+   const neutralLine = isDark ? '#71717a' : '#71717a';
 
    mermaid.initialize({
      startOnLoad: false,
-     securityLevel: "loose",
-     fontFamily: "inherit",
+     securityLevel: 'loose',
+     fontFamily: 'inherit',
      fontSize: 13,
-     themeCSS: "margin: 0 !important;",
-     theme: "base",
-     look: "classic",
+     themeCSS: 'margin: 0 !important;',
+     theme: 'base',
+     look: 'classic',
      flowchart: {
        padding: 8,
      },
      themeVariables: {
        useGradient: false,
-       dropShadow: "none",
+       dropShadow: 'none',
        darkMode: isDark,
-       background: "transparent",
-       fontSize: "13px",
+       background: 'transparent',
+       fontSize: '13px',
        // Strictly neutral shades of black / zinc / gray (zero blue or colored tints)
-       primaryColor: isDark ? "#18181b" : "#ffffff",
-       primaryTextColor: isDark ? "#f4f4f5" : "#18181b",
+       primaryColor: isDark ? '#18181b' : '#ffffff',
+       primaryTextColor: isDark ? '#f4f4f5' : '#18181b',
        primaryBorderColor: neutralBorder,
-       secondaryColor: isDark ? "#27272a" : "#f4f4f5",
-       secondaryTextColor: isDark ? "#f4f4f5" : "#18181b",
+       secondaryColor: isDark ? '#27272a' : '#f4f4f5',
+       secondaryTextColor: isDark ? '#f4f4f5' : '#18181b',
        secondaryBorderColor: neutralBorder,
-       tertiaryColor: isDark ? "#18181b" : "#ffffff",
+       tertiaryColor: isDark ? '#18181b' : '#ffffff',
        tertiaryBorderColor: neutralBorder,
        lineColor: neutralLine,
        arrowheadColor: neutralLine,
        nodeBorder: neutralBorder,
-       textColor: isDark ? "#f4f4f5" : "#18181b",
-       clusterBkg: isDark ? "#121214" : "#fafafa",
-       clusterBorder: isDark ? "#27272a" : "#e4e4e7",
+       textColor: isDark ? '#f4f4f5' : '#18181b',
+       clusterBkg: isDark ? '#121214' : '#fafafa',
+       clusterBorder: isDark ? '#27272a' : '#e4e4e7',
      },
    });
    ```
 
 2. **SVG Wrapper Scale & Zero Left Margin**: Align diagrams flush with the document content, prevent oversized scaling, and strip SVG filters:
+
    ```tsx
    className =
-     "mermaid-wrapper my-4 flex w-full justify-start overflow-x-auto rounded-lg border border-fd-border bg-fd-card/30 p-4 shadow-xs [&>svg]:m-0! [&>svg]:max-w-135 [&>svg]:w-auto [&>svg]:h-auto [&_rect]:filter-none! [&_polygon]:filter-none! [&_circle]:filter-none! [&_.node_rect]:stroke-[1.25px]!";
+     'mermaid-wrapper my-4 flex w-full justify-start overflow-x-auto rounded-lg border border-fd-border bg-fd-card/30 p-4 shadow-xs [&>svg]:m-0! [&>svg]:max-w-135 [&>svg]:w-auto [&>svg]:h-auto [&_rect]:filter-none! [&_polygon]:filter-none! [&_circle]:filter-none! [&_.node_rect]:stroke-[1.25px]!';
    ```
 
    - `[&>svg]:m-0!` and `themeCSS: 'margin: 0 !important;'`: Eliminates weird left margins caused by Mermaid's default `margin: auto` injection inside flex containers.
@@ -261,6 +262,7 @@ To ensure diagrams are crisp, solid, uncolored (neutral monochrome), and comfort
    - `[&>svg]:max-w-[540px] [&>svg]:w-auto`: Prevents diagrams from blowing up to oversized billboard dimensions.
    - `[&_rect]:filter-none! [&_polygon]:filter-none! [&_circle]:filter-none!`: Strips SVG drop-shadow filters from all diagram shapes.
    - `[&_.node_rect]:stroke-[1.25px]!`: Forces solid, crisp 1.25px borders across all node bounding boxes.
+
 3. **Sanitize React `useId()`**: React's `useId()` produces colons (`:r1:`) which trigger `DOMException: '#:r1:' is not a valid selector` in Mermaid. Always sanitize: `id = 'mermaid-' + useId().replace(/[^a-zA-Z0-9_-]/g, '')`.
 
 - Use `flowchart`, `sequenceDiagram`, `timeline`, `graph`, or `classDiagram` as needed.
@@ -355,13 +357,13 @@ registered via the MDX component map, typically in `src/components/mdx.tsx`).
 If you need to use a component in a `.tsx` file (not MDX), import from:
 
 ```typescript
-import { Step, Steps } from "fumadocs-ui/components/steps";
-import { Tab, Tabs } from "fumadocs-ui/components/tabs";
-import { Callout } from "fumadocs-ui/components/callout";
-import { Card, Cards } from "fumadocs-ui/components/card";
-import { Accordion, Accordions } from "fumadocs-ui/components/accordion";
-import { File, Files, Folder } from "fumadocs-ui/components/files";
-import { InlineTOC } from "fumadocs-ui/components/inline-toc";
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Card, Cards } from 'fumadocs-ui/components/card';
+import { Accordion, Accordions } from 'fumadocs-ui/components/accordion';
+import { File, Files, Folder } from 'fumadocs-ui/components/files';
+import { InlineTOC } from 'fumadocs-ui/components/inline-toc';
 ```
 
 ### Fumapress Component Registration (`press.config.tsx`)
@@ -369,12 +371,12 @@ import { InlineTOC } from "fumadocs-ui/components/inline-toc";
 In Fumapress, `defaultMdxComponents` only provides basic HTML tags, `Card`, `Cards`, and `Callout`. To make `<Tabs>`, `<Steps>`, `<Accordions>`, `<Files>`, Lucide icons, and custom components like `<Mermaid>` globally available without manual imports in every `.mdx` file, configure `getMdxComponents`:
 
 ```typescript
-import defaultMdxComponents, { createRelativeLink } from "fumadocs-ui/mdx";
-import { Tab, Tabs } from "fumadocs-ui/components/tabs";
-import { Step, Steps } from "fumadocs-ui/components/steps";
-import { Accordion, Accordions } from "fumadocs-ui/components/accordion";
-import { File, Files, Folder } from "fumadocs-ui/components/files";
-import { Mermaid } from "./src/components/mermaid";
+import defaultMdxComponents, { createRelativeLink } from 'fumadocs-ui/mdx';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+import { Accordion, Accordions } from 'fumadocs-ui/components/accordion';
+import { File, Files, Folder } from 'fumadocs-ui/components/files';
+import { Mermaid } from './src/components/mermaid';
 
 export default defineConfig({
   // ...
