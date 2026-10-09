@@ -5,6 +5,7 @@ import { Tabs, Tab } from 'fumadocs-ui/components/tabs';
 import { Steps, Step } from 'fumadocs-ui/components/steps';
 import { Accordions, Accordion } from 'fumadocs-ui/components/accordion';
 import { Files, Folder, File } from 'fumadocs-ui/components/files';
+import { ImageZoom } from 'fumadocs-ui/components/image-zoom';
 import {
   Zap,
   ShieldCheck,
@@ -32,6 +33,18 @@ function getNodeText(node: React.ReactNode): string {
   return '';
 }
 
+function MdxImageZoom({ children, ...props }: React.ComponentProps<typeof ImageZoom>) {
+  if (children || (props.width && props.height)) {
+    return <ImageZoom {...props}>{children}</ImageZoom>;
+  }
+
+  return (
+    <ImageZoom {...props}>
+      <img {...(props as React.ImgHTMLAttributes<HTMLImageElement>)} />
+    </ImageZoom>
+  );
+}
+
 export function getMDXComponents(components?: MDXComponents) {
   return {
     ...defaultMdxComponents,
@@ -55,6 +68,8 @@ export function getMDXComponents(components?: MDXComponents) {
 
       return defaultMdxComponents.pre(props);
     },
+    img: (props) => <MdxImageZoom {...(props as any)} />,
+    ImageZoom: (props) => <MdxImageZoom {...(props as any)} />,
     Mermaid,
     Tabs,
     Tab,
