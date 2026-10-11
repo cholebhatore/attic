@@ -1,0 +1,111 @@
+---
+title: Integrity, Consistency, and Validation
+description: Enforcing domain invariants, entity identity, referential relationships, and why application-layer validation alone fails.
+---
+
+Data corruption rarely occurs from malicious tampering; it occurs when software bugs, edge cases, and unexpected network timeouts write malformed or contradictory state. A database acts as the final enforcement boundary protecting data invariants.
+
+---
+
+## The Three Pillars of Data Integrity
+
+Relational engines categorize integrity constraints into three distinct levels:
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph EntityIntegrity["1. Entity Integrity"]
+        PK["PRIMARY KEY & UNIQUE"]
+        PKDesc["Ensures every row represents an identifiable, non-duplicate real-world entity"]
+    end
+
+    subgraph DomainIntegrity["2. Domain Integrity"]
+        Types["Data Types, NOT NULL, CHECK"]
+        TypesDesc["Restricts column values to valid ranges, formats, and categories"]
+    end
+
+    subgraph ReferentialIntegrity["3. Referential Integrity"]
+        FK["FOREIGN KEY Constraints"]
+        FKDesc["Ensures relationships across tables never point to missing or deleted entities"]
+    end
+
+`}
+/>
+
+---
+
+## 1. Domain Integrity
+
+Domain integrity ensures that values stored inside a specific column conform to the defined data type and allowable business domain ranges.
+
+- **Data Types**: An `INTEGER` column rejects string inputs like `"twelve"`. A `TIMESTAMPTZ` column guarantees valid calendar dates and leap years.
+- **Nullability**: `NOT NULL` prevents required fields (such as user email addresses or invoice amounts) from being omitted.
+- **CHECK Constraints**: Define explicit logical assertions evaluated on every write:
+
+```sql
+CREATE TABLE account_balances (
+    account_id UUID PRIMARY KEY,
+    currency VARCHAR(3) NOT NULL,
+    balance_cents BIGINT NOT NULL,
+    -- Engine rejects any write attempting to set negative balance
+    CONSTRAINT positive_balance CHECK (balance_cents >= 0)
+);
+```
+
+---
+
+## 2. Entity Integrity
+
+Entity integrity guarantees that every row in a table has an unambiguous identity and cannot be duplicated.
+
+- **Primary Keys**: Every row must have a unique identifier that cannot be null (`PRIMARY KEY`). This uniquely identifies a tuple.
+- **Unique Constraints**: Secondary unique keys enforce unicity across other business fields (such as `UNIQUE (email)` or composite constraints like `UNIQUE (workspace_id, slug)`).
+- **Surrogate vs Natural Keys**:
+  - Natural keys derive from existing business attributes (such as National Tax IDs or VIN numbers). They carry operational risk if real-world standards change or identity formats evolve.
+  - Surrogate keys are synthetic identifiers generated purely for system use (such as auto-incrementing `BIGSERIAL` integers, `UUIDv4`, or `UUIDv7`).
+
+---
+
+## 3. Referential Integrity
+
+Referential integrity preserves valid relationships between connected tables. If table `orders` references table `users`, referential integrity prevents an order from pointing to a non-existent `user_id`.
+
+```sql
+CREATE TABLE orders (
+    order_id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    amount_cents INT NOT NULL,
+    CONSTRAINT fk_orders_user
+        FOREIGN KEY (user_id)
+        REFERENCES users(id)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE
+);
+```
+
+### Referential Actions on Delete
+
+When a referenced parent row is deleted, the database can execute predefined behaviors:
+
+| Action                   | Behavior                                                    | Common Use Case                                            |
+| :----------------------- | :---------------------------------------------------------- | :--------------------------------------------------------- |
+| `RESTRICT` / `NO ACTION` | Aborts the delete statement if child rows exist             | Prevents deleting customers who have order history         |
+| `CASCADE`                | Automatically deletes all child rows pointing to parent     | Deletes child `order_items` when parent `order` is deleted |
+| `SET NULL`               | Sets child foreign key to `NULL` (requires nullable column) | Keeps task records when assigning user is removed          |
+| `SET DEFAULT`            | Sets child foreign key to defined default value             | Reassigns records to a default system account              |
+
+---
+
+## Why Application-Only Validation Fails
+
+Many developers assume that validating data inside application code (using libraries like Zod, Pydantic, or class validators) eliminates the need for database constraints. In production, application-only validation consistently allows invalid data to accumulate:
+
+1. **Multiple Entry Points**: Modern systems interact with the database via web APIs, asynchronous background queue workers, cron jobs, and direct engineer terminal scripts (`psql`). If validation lives only in the web API layer, background workers or scripts bypass it entirely.
+2. **Race Conditions During Uniqueness Checks**: Checking `SELECT COUNT(*) FROM users WHERE email = 'alice@example.com'` in application code before running an insert contains a concurrency gap. Two simultaneous signup requests will both find zero rows, and both proceed to insert identical emails. Only a database `UNIQUE` constraint serializes this check safely.
+3. **Partial Failures and Direct Migrations**: Data migration scripts that backfill columns or transform schemas can introduce nulls or invalid formats unless the database rejects them.
+
+<Callout type="warn">
+  Application validation provides immediate, friendly error messages to end users. Database
+  constraints guarantee absolute consistency of data on disk. Both layers are necessary; neither
+  replaces the other.
+</Callout>

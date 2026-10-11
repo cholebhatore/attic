@@ -1,0 +1,85 @@
+---
+title: Durability, Backup, and Recovery
+description: How write-ahead logging, crash recovery algorithms, and point-in-time recovery protect data against crashes and hardware disasters.
+---
+
+Hardware failure is an inevitable operational reality: storage controllers crash, power supplies fail, and operating system kernels panic. A production database guarantees that once a transaction reports a successful commit, the data will survive any immediate crash.
+
+---
+
+## Write-Ahead Logging (WAL)
+
+Writing modified data pages directly to random locations on disk for every transaction would cripple database performance because random I/O on disk drives incurs heavy seek times and storage write amplification.
+
+Instead, database engines use a **Write-Ahead Log (WAL)** (referred to as the Redo Log in MySQL and Oracle).
+
+<Mermaid
+  chart={`
+flowchart LR
+    Tx["Transaction Commit"] --> WALBuf["WAL Buffer (RAM)"]
+    WALBuf -->|"Sequential Append + fsync"| WALFile["WAL Disk File (Sequential I/O)"]
+    WALFile -->|"Acknowledge Success to App"| Client["Client Application"]
+    Tx -.->|"Dirty Page modified in memory"| BufferPool["Buffer Pool (RAM)"]
+    BufferPool -.->|"Background Checkpoint Flush"| DataFile["Data Files (Random I/O)"]
+`}
+/>
+
+### The WAL Invariant
+
+> **The WAL Rule**: Before any modified data page in RAM is allowed to overwrite a data file on disk, the corresponding log record describing the change must already be flushed and synchronized (`fsync`) to the write-ahead log on non-volatile media.
+
+Writing to the WAL is fast because:
+
+1. It is strictly **sequential append-only I/O** (no random disk seeks).
+2. It writes compact binary deltas rather than entire 8 KB pages.
+3. Once the WAL entry is flushed, the transaction is durable. The database can flush the actual table data pages asynchronously in the background.
+
+---
+
+## Crash Recovery Mechanics
+
+If the server loses power unexpectedly while modified data pages still reside in RAM, the DBMS executes automatic recovery upon the next boot:
+
+1. **Analysis Phase**: The engine scans the WAL from the last known checkpoint to identify all active transactions and dirty pages at the time of the crash.
+2. **Redo Phase (Roll-Forward)**: The engine replays every committed transaction from the WAL log forward, reapplying changes to table pages on disk up to the crash point.
+3. **Undo Phase (Roll-Back)**: The engine identifies transactions that were active (in-flight) but never committed before power was lost, and reverses their partial modifications.
+
+Once recovery completes, the database returns to a completely consistent state with zero corrupted or partial transactions.
+
+---
+
+## Backups: Logical vs Physical
+
+A comprehensive data safety strategy combines two different backup models:
+
+| Backup Type                               | Mechanism                                                                              | Speed & Size                             | Restores What?                                                          |
+| :---------------------------------------- | :------------------------------------------------------------------------------------- | :--------------------------------------- | :---------------------------------------------------------------------- |
+| **Logical Dump** (`pg_dump`, `mysqldump`) | Connects as a client, reads rows, generates SQL `CREATE TABLE` and `INSERT` statements | Slower; creates text/archive files       | Portable across OS platforms, minor database versions, and schemas      |
+| **Physical Backup** (`pg_basebackup`)     | Copies the underlying raw 8 KB binary page blocks and WAL segments directly            | Extremely fast; matches raw storage size | Exact binary replica of the database cluster on the same engine version |
+
+---
+
+## Point-in-Time Recovery (PITR)
+
+A standard nightly backup leaves an operational gap: if a database drops at 3:00 PM, restoring a backup taken at 1:00 AM results in 14 hours of lost transactions.
+
+**Point-in-Time Recovery (PITR)** eliminates this gap by combining a baseline physical backup with continuous WAL segment archiving:
+
+```
+[ Base Physical Backup (Sunday 00:00) ]
+                  +
+[ Archived WAL Segments (Sun 00:00 -> Tue 14:28:10) ]
+                  =
+[ Database state at exact second Tuesday 14:28:10 ]
+```
+
+If an engineer accidentally runs an unconstrained `DROP TABLE` or `DELETE` at 2:30 PM, the administrator restores the base backup and instructs the engine to replay the WAL stream up to `14:29:59`—one second before the catastrophic command occurred.
+
+---
+
+## Core Disaster Recovery Metrics
+
+Engineering organizations measure backup infrastructure against two service-level agreements:
+
+- **Recovery Point Objective (RPO)**: The maximum acceptable age of data lost during a disaster. If WAL archives stream to cloud object storage every 60 seconds, your maximum data loss (RPO) is 60 seconds.
+- **Recovery Time Objective (RTO)**: The maximum acceptable duration to restore service availability. If streaming 500 GB from storage to spin up a replacement node takes 45 minutes, your RTO is 45 minutes.

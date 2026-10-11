@@ -1,0 +1,103 @@
+---
+title: Security and Access Control
+description: Managing authentication, role-based authorization, row-level security, encryption layers, and database audit logs.
+---
+
+Databases store high-value business assets, customer personal identifiable information (PII), and financial ledgers. Securing a database requires defense in depth across network boundaries, identity verification, authorization policies, and cryptographic controls.
+
+---
+
+## The Security Layers
+
+<Mermaid
+  chart={`
+flowchart TD
+    Client["Client Application"] -->|"1. TLS 1.3 Encryption"| Net["Network Transport"]
+    Net -->|"2. SCRAM-SHA-256 / IAM Auth"| Auth["Authentication Layer"]
+    Auth -->|"3. GRANT / REVOKE / RBAC"| RBAC["Role-Based Access Control"]
+    RBAC -->|"4. Row-Level Security (RLS)"| RLS["Row & Column Filters"]
+    RLS -->|"5. Storage Engine (TDE / KMS)"| Disk["Encrypted Disk Files"]
+`}
+/>
+
+---
+
+## 1. Authentication: Proving Identity
+
+Authentication verifies the identity of the client attempting to establish a connection socket.
+
+- **Password Hashing (SCRAM-SHA-256)**: Modern database connections use Salted Challenge Response Authentication Mechanism (SCRAM). The password is never transmitted in cleartext, and the server verifies identity without storing cleartext credentials.
+- **Mutual TLS (mTLS)**: Both client and server validate cryptographic X.509 certificates, eliminating passwords entirely for automated service-to-service communication.
+- **Cloud IAM Token Authentication**: In managed environments like AWS RDS or GCP Cloud SQL, clients fetch short-lived ephemeral OAuth/IAM tokens with 15-minute lifespans, eliminating static credentials from application configuration.
+
+---
+
+## 2. Authorization: Role-Based Access Control (RBAC)
+
+Once authenticated, authorization determines which database operations a role is permitted to execute.
+
+### The Principle of Least Privilege
+
+An application connection pool must never connect as the database superuser (`postgres` or `root`). Instead, dedicated roles are provisioned with the minimum permissions required for their tasks:
+
+```sql
+-- Create an application-specific role
+CREATE ROLE web_app_user WITH LOGIN PASSWORD 'strong_random_secret';
+
+-- Grant connection to the target database
+GRANT CONNECT ON DATABASE production_store TO web_app_user;
+
+-- Grant usage on the specific schema
+GRANT USAGE ON SCHEMA public TO web_app_user;
+
+-- Grant specific DML privileges (no DROP, ALTER, or TRUNCATE)
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO web_app_user;
+```
+
+---
+
+## 3. Row-Level Security (RLS)
+
+Standard SQL table permissions are all-or-nothing: granting `SELECT` on `orders` permits a user to read every row in the table.
+
+**Row-Level Security (RLS)** allows the database engine to attach a security predicate that filters returned rows dynamically based on the current session user or application context:
+
+```sql
+-- Enable RLS on the multi-tenant documents table
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+
+-- Define policy ensuring tenants only see their own records
+CREATE POLICY tenant_isolation_policy ON documents
+    FOR ALL
+    TO web_app_user
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+```
+
+When the application runs `SELECT * FROM documents`, the database automatically appends `AND tenant_id = ...` into the query execution tree. Even if application code contains a bug that omits tenant filtering, the database engine enforces tenant boundaries.
+
+---
+
+## 4. Encryption
+
+Production databases implement cryptographic protection at two stages:
+
+### In-Transit Encryption
+
+All network traffic between application servers and the database socket passes through TLS 1.3 tunnels. This prevents man-in-the-middle eavesdropping and packet sniffing on internal network switches.
+
+### At-Rest Encryption
+
+At-rest encryption ensures that physical storage media stolen from a datacenter or unattached disk snapshots cannot be mounted and inspected:
+
+- **Transparent Data Encryption (TDE)**: The database engine encrypts individual data files and WAL blocks using AES-256 before writing to the filesystem.
+- **Block Storage Encryption**: Cloud providers encrypt the underlying volume using keys managed by Key Management Services (AWS KMS, GCP KMS).
+
+---
+
+## 5. Audit Logging and Compliance
+
+Compliance frameworks (SOC 2, HIPAA, PCI-DSS) require tracking access to sensitive records:
+
+- Logging failed authentication attempts to detect brute-force attacks.
+- Recording Data Definition Language (DDL) events (`CREATE`, `ALTER`, `DROP`) to audit schema adjustments.
+- Capturing modifications to sensitive columns (such as credit card tokens or medical history) via database triggers or dedicated audit plugins (`pgaudit`).

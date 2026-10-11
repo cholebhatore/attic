@@ -1,0 +1,90 @@
+---
+title: Schema-on-Write vs Schema-on-Read
+description: Analyzing structural trade-offs between rigid database-enforced schemas and flexible runtime document interpretation.
+---
+
+One of the central architectural divides in modern database systems is **when** data structure is verified: when data enters the database (**Schema-on-Write**), or when data is queried by an application (**Schema-on-Read**).
+
+---
+
+## High-Level Comparison
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph SchemaOnWrite["Schema-on-Write (e.g. PostgreSQL, MySQL)"]
+        direction TB
+        Input1["Raw Write Request"] --> Validate1["DBMS Validates Types & Constraints"]
+        Validate1 --> Store1["Stores Compact Binary Tuple on Disk"]
+        Store1 --> Read1["Fast Predictable Query Execution"]
+    end
+
+    subgraph SchemaOnRead["Schema-on-Read (e.g. MongoDB, S3 Data Lake)"]
+        direction TB
+        Input2["Raw Write Request"] --> Store2["Stores Raw JSON / Document to Disk"]
+        Store2 --> Read2["App Parses & Validates Fields at Query Time"]
+    end
+
+`}
+/>
+
+---
+
+## 1. Schema-on-Write
+
+In a schema-on-write system (such as PostgreSQL, MySQL, or SQLite), the database administrator or migration script defines explicit tables, column types, nullability rules, and foreign keys before any rows can be inserted.
+
+### Advantages
+
+- **Guaranteed Consistency**: Every row conforming to a table is guaranteed to have valid types. An application reading a table never encounters an unexpected data type or missing mandatory attribute.
+- **Optimized Storage**: Because the engine knows that column 1 is a 4-byte integer and column 2 is an 8-byte timestamp, it stores values in compact, aligned binary representations without repeating column keys for every single row.
+- **Predictable Query Optimization**: The query planner relies on strict schema information and column statistics to select optimal indexes and join algorithms.
+
+### Trade-offs
+
+- **Migration Overhead**: Altering existing structures requires executing Data Definition Language (DDL) migrations (`ALTER TABLE`). In large tables, DDL operations must be carefully managed to avoid table locks.
+
+---
+
+## 2. Schema-on-Read
+
+In a schema-on-read system (such as document stores like MongoDB, or object-storage data lakes like S3 paired with DuckDB or Athena), the engine accepts arbitrary JSON objects or records without pre-validating their internal fields.
+
+### Advantages
+
+- **Ingestion Velocity**: Applications can immediately store events or payloads from external third-party webhooks without pre-configuring columns.
+- **Rapid Prototyping**: Adding new fields to application code requires zero database migration scripts during early exploratory development.
+
+### Trade-offs: The Schema Drift Penalty
+
+When schemas are not enforced at write time, structural enforcement shifts to application code:
+
+```typescript
+// Schema-on-read defensive handling in application code:
+// Over time, different records in the same collection have different formats:
+const price = order.price ?? order.amount ?? order.total_cents / 100 ?? 0;
+```
+
+If version 1 of your API wrote `{ "zip": 90210 }` (number) and version 2 wrote `{ "zip": "90210" }` (string) and version 3 wrote `{ "postal_code": "90210" }`, the database holds corrupt, heterogeneous documents. Queries that filter or sort by this field yield inconsistent results.
+
+---
+
+## The Modern Hybrid Pattern: Relational JSONB
+
+Modern relational engines resolve this trade-off by combining structured relational columns with indexed binary JSON (`JSONB` in PostgreSQL):
+
+```sql
+CREATE TABLE audit_events (
+    id BIGSERIAL PRIMARY KEY,
+    event_type VARCHAR(50) NOT NULL,
+    actor_id UUID NOT NULL REFERENCES users(id),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Semi-structured metadata payload
+    payload JSONB NOT NULL DEFAULT '{}'::JSONB
+);
+
+-- Creating a partial index on a specific JSON attribute
+CREATE INDEX idx_audit_ip ON audit_events ((payload->>'ip_address'));
+```
+
+This pattern provides strict entity identity, referential integrity, and timestamp indexing on core columns, while allowing extensible JSON payloads for evolving domain attributes.

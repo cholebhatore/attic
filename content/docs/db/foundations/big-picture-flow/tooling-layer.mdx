@@ -1,0 +1,119 @@
+---
+title: ORMs, ODMs, and Migrations in the Stack
+description: Mapping where object mappers, query builders, and schema migration utilities sit within application data architectures.
+---
+
+Few production applications interact with database servers by writing raw SQL strings directly inside network socket drivers. Developers rely on a rich tooling ecosystem to balance productivity, type safety, and operational control.
+
+---
+
+## The Data Access Spectrum
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph AppLayer["Application Layer"]
+        App["Application Code"]
+    end
+
+    subgraph ToolingLayer["Data Access Abstractions"]
+        direction TB
+        ORM["Object-Relational Mapper (Prisma, SQLAlchemy, TypeORM)"]
+        QB["Query Builder (Kysely, Knex)"]
+        Raw["Raw SQL Driver (pg, psycopg, asyncpg)"]
+    end
+
+    subgraph EngineLayer["Database Server"]
+        Migrate["Migration Tool (Alembic, Prisma Migrate)"] -.->|"Applies DDL Schema State"| Schema["Tables & Schemas"]
+        DB["Query Engine & Storage"]
+    end
+
+    App --> ORM
+    App --> QB
+    App --> Raw
+
+    ORM -->|"Generates SQL"| QB
+    QB -->|"Passes SQL + Parameters"| Raw
+    Raw -->|"TCP / TLS Socket"| DB
+
+`}
+/>
+
+---
+
+## 1. The Abstraction Hierarchy
+
+### Raw SQL Drivers (`pg`, `asyncpg`, `mysql2`)
+
+- **Position**: Sits directly on top of the operating system TCP socket.
+- **Responsibility**: Manages connection handshakes, binary wire protocol serialization, and query parameter substitution.
+- **Trade-off**: Complete control and maximum execution speed, but requires writing raw SQL strings without automatic compile-time TypeScript or Python type checking.
+
+### Query Builders (Kysely, Knex)
+
+- **Position**: Sits between application code and the raw driver.
+- **Responsibility**: Provides a fluent, type-safe API to construct SQL Abstract Syntax Trees without hiding SQL's underlying relational mechanics.
+- **Trade-off**: Eliminates syntax typos and provides autocompletion while allowing full visibility into the generated SQL statement.
+
+### Object-Relational Mappers (ORMs: Prisma, SQLAlchemy, Drizzle)
+
+- **Position**: Sits at the highest level of the application data access layer.
+- **Responsibility**: Maps relational tables to programming language classes or types. Automatically constructs joins, executes nested inserts, and manages identity maps and sessions.
+- **Trade-off**: Significant developer velocity and type safety, but introduces risks of inefficient generated queries (such as the N+1 select problem) and hidden database round-trips.
+
+### Object-Document Mappers (ODMs: Mongoose, Beanie)
+
+- **Position**: Sits on top of NoSQL document drivers (such as MongoDB driver, Motor).
+- **Responsibility**: Implements schema-on-read validation at the application level, converting unstructured BSON/JSON documents into typed models with schema hooks and middleware.
+
+---
+
+## 2. Where Schema Migration Tools Fit
+
+A schema migration tool manages the lifecycle of database structures over time. Rather than letting engineers run manual `ALTER TABLE` commands in production, migrations treat database schemas as version-controlled code.
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant CI as Deployment Pipeline
+    participant Tool as Migration Tool (e.g. Prisma Migrate, Alembic)
+    participant DB as Production Database
+
+    CI->>Tool: Execute 'migrate deploy'
+    Tool->>DB: Query migration history table (_prisma_migrations)
+    DB->>Tool: Returns applied migrations: [001, 002]
+    Note over Tool: Identifies pending migration: 003_add_orders.sql
+    Tool->>DB: Execute DDL inside transaction (ALTER TABLE...)
+    Tool->>DB: Record '003' in _prisma_migrations table
+    DB->>Tool: Migration successful
+    CI->>CI: Start new application containers
+
+`}
+/>
+
+### The Migration History Table
+
+Migration tools maintain a dedicated tracking table inside the database itself:
+
+- `_prisma_migrations` (Prisma)
+- `alembic_version` (SQLAlchemy / Alembic)
+- `schema_migrations` (Rails / Go-Migrate)
+
+Before an updated application binary boots up, the migration tool compares committed migration files against this tracking table and applies any missing DDL scripts inside isolated database transactions.
+
+---
+
+## Tooling Selection Framework
+
+| Requirement                                                | Recommended Tooling Pattern                                 | Primary Benefits                                                             |
+| :--------------------------------------------------------- | :---------------------------------------------------------- | :--------------------------------------------------------------------------- |
+| **High developer velocity, strong end-to-end type safety** | Full ORM (Prisma, Drizzle, SQLAlchemy)                      | Autocomplete, generated TypeScript types, built-in migration generation      |
+| **Complex analytical queries, sub-millisecond control**    | Query Builder (Kysely, Knex)                                | Predictable SQL generation, zero hidden object hydration overhead            |
+| **Document-oriented storage with application invariants**  | ODM (Mongoose, Beanie)                                      | Schema validation hooks, nested document typing, change tracking             |
+| **Database-first workflows, team database administrators** | Pure Migration Tool (Flyway, Liquibase, Atlas) + Raw Driver | Database engines write raw SQL migrations; application is decoupled from DDL |
+
+<Callout type="info">
+  In mature engineering teams, ORMs and raw queries frequently coexist: developers use ORMs for
+  standard CRUD endpoints and drop down to query builders or raw SQL for latency-critical reports
+  and complex joins.
+</Callout>

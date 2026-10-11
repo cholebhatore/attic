@@ -1,0 +1,113 @@
+---
+title: The Query Lifecycle
+description: 'Inside the database engine: parsing, semantic validation, view rewriting, cost-based optimization, execution pipelines, and result streaming.'
+---
+
+A relational database does not execute raw SQL strings directly. Between the receipt of an SQL string and the transmission of data packets back to the client, the query passes through six distinct engine stages.
+
+---
+
+## The Six Lifecycle Stages
+
+<Mermaid
+  chart={`
+flowchart TD
+    SQL["Raw SQL String: 'SELECT * FROM users...'"] --> Parser["1. Lexer & Parser (AST Generation)"]
+    Parser --> Analyzer["2. Semantic Analyzer & Catalog Lookup"]
+    Analyzer --> Rewriter["3. Query Rewriter (View Expansion)"]
+    Rewriter --> Optimizer["4. Cost-Based Optimizer & Planner"]
+    Optimizer --> Executor["5. Query Executor (Volcano Iterator Engine)"]
+    Executor --> Streamer["6. Result Serialization & Wire Streaming"]
+`}
+/>
+
+---
+
+## 1. Lexical Analysis and Parsing
+
+The database parser breaks the incoming text string into discrete tokens (keywords, identifiers, literals, operators) and validates grammar rules.
+
+- **Tokens**: `SELECT`, `*`, `FROM`, `users`, `WHERE`, `id`, `=`, `42`.
+- **Abstract Syntax Tree (AST)**: The parser builds a tree representing the structural intent of the query.
+- If the statement contains a syntax error (such as a missing comma or misspelled keyword), execution halts here and returns an error immediately without touching any tables.
+
+---
+
+## 2. Semantic Analysis and Catalog Lookup
+
+The parser checks only grammar; it does not know if table `users` actually exists. The semantic analyzer validates the AST against the system catalog (metadata tables):
+
+- Verifies that table `users` and column `id` exist in the target schema.
+- Verifies that the constant value `42` matches or can be cast to column `id`'s declared type.
+- Checks user privileges to confirm the session role has `SELECT` permission on the requested columns.
+
+---
+
+## 3. Query Rewriter
+
+The query rewriter expands database abstractions into concrete query trees:
+
+- **View Expansion**: If the query references a view (such as `active_customers`), the rewriter replaces the view name with its underlying SQL definition.
+- **Rule Engine**: Evaluates security policies (such as Row-Level Security rules) and injects required filtering conditions directly into the AST.
+- **Constant Folding**: Evaluates deterministic expressions ahead of execution (e.g. `WHERE created_at > NOW() - INTERVAL '7 days'` is computed once).
+
+---
+
+## 4. Cost-Based Optimizer and Planner
+
+The optimizer is the computational heart of the database engine. A single declarative query can be executed in dozens of different physical ways. The optimizer models potential execution plans and estimates their cost:
+
+```
+Physical Scan Options:
+Option A: Sequential scan across all 10,000 pages (Cost: 10,500)
+Option B: Index scan using idx_users_id, reading 3 pages (Cost: 4.2)  <-- Selected!
+```
+
+To calculate plan costs, the optimizer consults table statistics gathered by background workers (`ANALYZE` in PostgreSQL):
+
+- Total page count and row count.
+- Column null fractions and distinct value ratios (n-distinct).
+- Most Common Values (MCV) lists and frequency histograms.
+
+For complex multi-table joins, the optimizer selects the physical join algorithm:
+
+- **Nested Loop Join**: For small outer tables joined to indexed inner tables.
+- **Hash Join**: For joining large, unsorted datasets.
+- **Merge Join**: For joining datasets that are already sorted on the join key.
+
+---
+
+## 5. Query Executor (The Volcano Iterator Model)
+
+The query plan consists of a tree of physical operator nodes. Modern database engines execute this plan using the **Volcano Iterator Model**:
+
+<Mermaid
+  chart={`
+flowchart TD
+    LimitNode["Limit Operator (50 rows)"]
+    IndexScan["Index Scan: idx_users_created_at"]
+    HeapFetch["Heap Page Fetch (table: users)"]
+
+    LimitNode -->|"Next()"| IndexScan
+    IndexScan -->|"Next()"| HeapFetch
+
+`}
+/>
+
+Each operator in the tree implements three primary methods:
+
+- `Open()`: Initializes operator state and allocates buffers.
+- `Next()`: Pulls a single tuple (or vector of tuples) from child operators, processes it, and yields it upward.
+- `Close()`: Tears down buffers and releases locks.
+
+This pipelined iterator architecture allows queries to begin streaming matching rows to the network before the entire query finishes executing, keeping engine memory usage bounded.
+
+---
+
+## 6. Result Serialization and Wire Streaming
+
+As the executor yields tuples:
+
+- The worker process serializes columns into wire protocol binary packets.
+- Packets are written to the server's TCP socket buffer.
+- When all rows are delivered, the server emits a `CommandComplete` packet followed by a `ReadyForQuery` status message.

@@ -1,0 +1,77 @@
+---
+title: OLTP vs OLAP Systems
+description: Architectural distinctions between transactional processing and analytical query engines, storage formats, and workloads.
+---
+
+Database workloads divide into two distinct operational paradigms: **Online Transaction Processing (OLTP)** for running day-to-day user-facing applications, and **Online Analytical Processing (OLAP)** for running aggregate business intelligence queries across historical datasets.
+
+---
+
+## The Workload Divide
+
+<Mermaid
+  chart={`
+flowchart LR
+    subgraph Web["Web App (OLTP)"]
+        User["End Users"] -->|"Small writes & indexed reads"| Postgres[("PostgreSQL / MySQL (Row-Oriented)")]
+    end
+
+    Postgres -.->|"CDC / ETL Pipeline"| Warehouse[("ClickHouse / Snowflake (Column-Oriented)")]
+
+    subgraph Analytics["Analytics (OLAP)"]
+        Warehouse -->|"Aggregate scans across millions of rows"| Dashboard["BI Dashboards / Data Scientists"]
+    end
+
+`}
+/>
+
+---
+
+## Row-Oriented vs Column-Oriented Storage
+
+The fundamental difference between OLTP and OLAP systems lies in how data blocks are organized on physical disk:
+
+```
+Table: users (id, name, age, country)
+
+Row-Oriented Layout (OLTP - PostgreSQL, MySQL):
+[ Block 1: (1, 'Alice', 28, 'US'), (2, 'Bob', 34, 'CA') ]
+[ Block 2: (3, 'Charlie', 22, 'UK'), (4, 'Diana', 29, 'FR') ]
+
+Column-Oriented Layout (OLAP - ClickHouse, DuckDB, Parquet):
+[ Block 1 (id):      1, 2, 3, 4 ... ]
+[ Block 2 (name):    'Alice', 'Bob', 'Charlie', 'Diana' ... ]
+[ Block 3 (age):     28, 34, 22, 29 ... ]
+[ Block 4 (country): 'US', 'CA', 'UK', 'FR' ... ]
+```
+
+### Why Row-Oriented Storage Fits OLTP
+
+When an application executes `SELECT * FROM users WHERE id = 42;` or updates a single user's address, the entire record sits contiguously in a single 8 KB disk page. The engine reads or writes that exact block in one I/O operation.
+
+### Why Columnar Storage Fits OLAP
+
+When an analyst calculates the average user age across 50,000,000 records:
+
+- **Row-Oriented System**: Must read all 50,000,000 complete rows from disk into memory—wasting 95% of disk I/O loading unused columns like `name`, `bio`, and `address`.
+- **Column-Oriented System**: Reads _only_ the contiguous column block containing `age`. In addition, because similar integers sit adjacent to each other, columnar storage achieves 10x higher compression using Run-Length Encoding and SIMD vector instructions.
+
+---
+
+## Technical Comparison Matrix
+
+| Dimension              | OLTP (Transactional)                                  | OLAP (Analytical)                                |
+| :--------------------- | :---------------------------------------------------- | :----------------------------------------------- |
+| **Typical Queries**    | `SELECT`, `INSERT`, `UPDATE` by primary key           | Aggregations (`COUNT`, `SUM`, `AVG`, `GROUP BY`) |
+| **Rows per Operation** | 1 to a few hundred rows                               | Millions to billions of rows                     |
+| **Latency Targets**    | Sub-millisecond to `< 20 ms`                          | Seconds to minutes                               |
+| **Concurrency**        | Thousands of simultaneous clients                     | Tens of simultaneous analysts                    |
+| **Schema Design**      | Highly normalized (3NF) to eliminate update anomalies | Denormalized (Star schema, Snowflake schema)     |
+| **Data Mutability**    | High (frequent live updates and deletes)              | Append-mostly or immutable batch partitions      |
+| **Primary Engines**    | PostgreSQL, MySQL, SQLite, Oracle                     | ClickHouse, DuckDB, Snowflake, BigQuery          |
+
+<Callout type="warn">
+  Never run unconstrained analytical queries (`SELECT count(*), avg(amount) FROM orders WHERE ...`)
+  directly against your live production OLTP database during peak traffic. Full-table scans consume
+  buffer pool RAM and exhaust disk I/O, spiking latency for real users.
+</Callout>

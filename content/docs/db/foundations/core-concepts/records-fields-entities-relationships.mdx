@@ -1,0 +1,117 @@
+---
+title: Records, Fields, Entities, and Relationships
+description: Understanding the relational building blocks — domain entities, attributes, tuples, cardinality, and junction tables.
+---
+
+Relational database theory, pioneered by Edgar F. Codd in 1970, models real-world business domains as mathematical relations. In modern database engineering, this theory manifests as tables, rows, columns, and foreign keys.
+
+---
+
+## The Relational Vocabulary
+
+<Mermaid
+  chart={`
+flowchart LR
+    Entity["Entity (e.g. User)"] --> Table["Table (Relation)"]
+    Attribute["Attribute (e.g. Email)"] --> Column["Field / Column"]
+    Instance["Instance (e.g. Alice's Account)"] --> Row["Record / Row (Tuple)"]
+`}
+/>
+
+| Domain Term   | Relational Theory Term | SQL Implementation      | Description                                                                               |
+| :------------ | :--------------------- | :---------------------- | :---------------------------------------------------------------------------------------- |
+| **Entity**    | Relation               | Table                   | A distinct business concept (e.g., `customers`, `products`, `invoices`)                   |
+| **Attribute** | Attribute              | Column / Field          | A single named property belonging to an entity with a fixed type (e.g., `price_cents`)    |
+| **Instance**  | Tuple                  | Row / Record            | A single concrete record containing values for each attribute                             |
+| **Domain**    | Domain                 | Data Type & Constraints | The set of allowable values for a given column (e.g., positive integer, ISO country code) |
+
+---
+
+## Relationship Cardinality
+
+Real-world entities rarely exist in isolation; they interact with and reference each other. Relational databases model these connections through foreign keys according to three cardinality patterns:
+
+### 1. One-to-One (1:1)
+
+A single row in Table A corresponds to at most one row in Table B.
+
+- **Example**: A `users` row and a `user_profiles` or `user_security_settings` row.
+- **Implementation**: Table B holds a foreign key referencing Table A's primary key, and marks that foreign key column as `UNIQUE`.
+
+```sql
+CREATE TABLE user_profiles (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    bio TEXT,
+    timezone VARCHAR(50) NOT NULL DEFAULT 'UTC'
+);
+```
+
+### 2. One-to-Many (1:N)
+
+A single row in Table A corresponds to multiple rows in Table B, but each row in Table B references exactly one row in Table A.
+
+- **Example**: One `author` writes many `articles`. One `customer` places many `orders`.
+- **Implementation**: The child table ("many" side) contains a foreign key column pointing to the parent table ("one" side).
+
+```sql
+CREATE TABLE orders (
+    id BIGSERIAL PRIMARY KEY,
+    customer_id BIGINT NOT NULL REFERENCES customers(id),
+    total_cents INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+### 3. Many-to-Many (M:N)
+
+A row in Table A corresponds to multiple rows in Table B, and a row in Table B corresponds to multiple rows in Table A.
+
+- **Example**: `students` enroll in many `courses`; each `course` contains many `students`.
+- **Implementation**: Requires a third table called an **association table** (or **junction table** / **bridge table**).
+
+---
+
+## Association Tables in Practice
+
+Directly placing an array of foreign keys inside a column violates first normal form and destroys indexing efficiency. An association table decomposes the M:N relationship into two separate 1:N relationships:
+
+<Mermaid
+  chart={`
+erDiagram
+    STUDENTS ||--o{ ENROLLMENTS : "has"
+    COURSES ||--o{ ENROLLMENTS : "contains"
+
+    STUDENTS {
+        uuid id PK
+        string full_name
+    }
+    ENROLLMENTS {
+        uuid student_id PK, FK
+        uuid course_id PK, FK
+        timestamptz enrolled_at
+        string grade
+    }
+    COURSES {
+        uuid id PK
+        string course_code
+    }
+
+`}
+/>
+
+```sql
+CREATE TABLE enrollments (
+    student_id UUID NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+    enrolled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    grade VARCHAR(2),
+    -- Composite primary key prevents a student from enrolling twice in the same course
+    PRIMARY KEY (student_id, course_id)
+);
+```
+
+<Callout type="info">
+  A composite primary key on `(student_id, course_id)` enforces uniqueness and automatically builds
+  a B-Tree index covering queries filtered by `student_id`. To quickly query courses by student, add
+  a secondary index on `(course_id)`.
+</Callout>

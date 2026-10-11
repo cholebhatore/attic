@@ -1,0 +1,101 @@
+---
+title: Concurrency and Multi-User Access
+description: Coordinating simultaneous readers and writers, eliminating race conditions, and preventing lost updates in production systems.
+---
+
+Production web applications serve thousands of concurrent requests. When multiple users or background tasks attempt to read and mutate shared state at the same instant, naive storage mechanisms suffer from race conditions, dirty writes, and state clobbering.
+
+---
+
+## The Lost Update Hazard
+
+Consider an inventory counter for a product with 10 units in stock. Two customers click "Purchase" at the exact same millisecond.
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant Alice as Customer A (Thread 1)
+    participant Storage as Shared Storage
+    participant Bob as Customer B (Thread 2)
+
+    Alice->>Storage: Read quantity (returns 10)
+    Bob->>Storage: Read quantity (returns 10)
+    Note over Alice: Calculates 10 - 1 = 9
+    Note over Bob: Calculates 10 - 1 = 9
+    Alice->>Storage: Write quantity = 9
+    Bob->>Storage: Write quantity = 9 (Clobbers update!)
+
+`}
+/>
+
+Both customers completed their checkout, but the final inventory reads `9` instead of `8`. Customer B's write completely clobbered Customer A's deduction.
+
+### Naive Application Implementation
+
+In application memory or flat files, preventing this requires manual mutex locking, which fails across multiple application instances:
+
+```typescript
+// Broken across multiple server instances:
+async function purchaseItem(itemId: string) {
+  const item = await readFile(`items/${itemId}.json`);
+  if (item.stock > 0) {
+    item.stock -= 1;
+    // Window of vulnerability: another process writes here
+    await writeFile(`items/${itemId}.json`, item);
+  }
+}
+```
+
+---
+
+## How Databases Coordinate Concurrent Access
+
+Database management systems employ two primary strategies to handle concurrent operations without corruption:
+
+### 1. Pessimistic Locking
+
+The engine acquires locks before allowing access to resources:
+
+- **Shared Lock (S-Lock)**: Acquired when reading data. Multiple transactions can hold shared locks on the same row simultaneously.
+- **Exclusive Lock (X-Lock)**: Acquired when modifying data (via `UPDATE`, `DELETE`, or `INSERT`). Only one transaction can hold an exclusive lock on a row, blocking all other readers and writers until the transaction completes.
+
+```sql
+-- Atomic update using database row locking
+BEGIN;
+SELECT stock FROM items WHERE id = 'item_42' FOR UPDATE;
+-- Database locks this exact row; concurrent transactions pause until COMMIT
+UPDATE items SET stock = stock - 1 WHERE id = 'item_42';
+COMMIT;
+```
+
+Alternatively, single-statement atomic operations avoid explicit transaction locks entirely:
+
+```sql
+UPDATE items SET stock = stock - 1 WHERE id = 'item_42' AND stock > 0;
+```
+
+### 2. Multi-Version Concurrency Control (MVCC)
+
+Modern engines like PostgreSQL and MySQL InnoDB use MVCC so that **readers do not block writers, and writers do not block readers**.
+
+- Instead of overwriting rows in place, the engine writes a new version of the row with creation and expiration transaction identifiers (`xmin` and `xmax` in PostgreSQL).
+- When a query executes, the engine takes a snapshot of the active transaction state and presents the reader with a consistent view of data committed prior to the query's start.
+- While Transaction A writes an update to row 5, Transaction B continues reading the previous committed version of row 5 without delay.
+
+---
+
+## Granularity of Concurrency
+
+The level at which a database manages concurrency directly dictates system throughput:
+
+| Granularity             | Performance Under High Load                                  | Implementation Simplicity | Systems                              |
+| :---------------------- | :----------------------------------------------------------- | :------------------------ | :----------------------------------- |
+| **Database-Level Lock** | All operations queue in a single line                        | Simplest                  | SQLite (write lock on whole DB file) |
+| **Table-Level Lock**    | Operations on different tables proceed; same-table ops queue | Moderate                  | MySQL MyISAM engine, DDL operations  |
+| **Page-Level Lock**     | Operations on different 8 KB pages proceed simultaneously    | High                      | Legacy storage engines               |
+| **Row-Level Lock**      | Operations on different rows proceed fully in parallel       | Highest                   | PostgreSQL, MySQL InnoDB, Oracle     |
+
+<Callout type="info">
+  Row-level locking enables high-throughput systems to process thousands of simultaneous writes to
+  the same table, provided those writes target different primary keys.
+</Callout>

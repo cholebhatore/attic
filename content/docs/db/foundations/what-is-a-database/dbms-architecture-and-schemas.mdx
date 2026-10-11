@@ -1,0 +1,102 @@
+---
+title: DBMS, Databases, Servers, and Schemas
+description: Untangling core terminology across management engines, physical storage files, background server processes, and logical schemas.
+---
+
+In casual conversation, engineers use the word "database" interchangeably to describe a software binary, a cloud host, a SQL file, or a specific schema. In production systems, each of these terms identifies a distinct layer of the architecture.
+
+---
+
+## Architectural Hierarchy
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph Host["Host Machine or Container"]
+        subgraph Server["Database Server (Daemon Process: e.g. postgres, mysqld)"]
+            Engine["DBMS Core Engine (Buffer Manager, Lock Manager, Query Planner)"]
+            Port["Network Socket (e.g. Port 5432)"]
+
+            subgraph DBCluster["Database Cluster (Storage Hierarchy)"]
+                subgraph DB1["Database: production_app"]
+                    subgraph Schema1["Schema: public"]
+                        TableA["Table: users"]
+                        TableB["Table: orders"]
+                    end
+                    subgraph Schema2["Schema: analytics"]
+                        TableC["Table: daily_metrics"]
+                    end
+                end
+                subgraph DB2["Database: background_jobs"]
+                    subgraph Schema3["Schema: public"]
+                        TableD["Table: queue_tasks"]
+                    end
+                end
+            end
+        end
+    end
+
+`}
+/>
+
+---
+
+## 1. The DBMS (Database Management System)
+
+The DBMS is the software suite responsible for creating, querying, updating, and administering databases. It controls how data moves between disk and memory, coordinates concurrent transactions, and enforces data integrity rules.
+
+A DBMS includes internal subsystems:
+
+- **Storage Engine**: Reads and writes data blocks (pages) to disk, manages the write-ahead log (WAL), and performs space allocation. Examples include PostgreSQL's heap storage, MySQL's InnoDB, and SQLite's B-Tree engine.
+- **Buffer Pool Manager**: Maintains a cache of disk pages in RAM to minimize physical I/O.
+- **Query Parser, Planner, and Executor**: Converts SQL text into an executable access plan.
+- **Lock Manager**: Tracks locks on tables, pages, and rows to coordinate concurrent access.
+- **Transaction Manager**: Enforces ACID properties and recovery procedures.
+
+---
+
+## 2. The Database Server
+
+The database server is the running operating system process (daemon) executing the DBMS software on a physical or virtual machine.
+
+- It listens on a designated network socket (for example, TCP port `5432` for PostgreSQL, `3306` for MySQL).
+- It manages client connections, handles TLS encryption handshakes, authenticates credentials, and spawns dedicated worker threads or worker processes for active sessions.
+- In containerized environments, the database server runs as the primary container process (PID 1).
+
+---
+
+## 3. The Database
+
+A database is a discrete physical and logical collection of structured data files managed by a database server.
+
+- On disk, a database corresponds to a specific directory containing data files, transaction logs, catalog tables, and indexes.
+- In PostgreSQL, a single server instance can manage multiple distinct databases (such as `prod_store` and `internal_tools`). Each database is isolated; queries cannot join tables across different databases within the same standard connection.
+
+---
+
+## 4. The Schema
+
+A schema is a logical namespace inside a single database. It organizes database objects—such as tables, views, stored procedures, and custom types—into distinct administrative boundaries.
+
+- Schemas prevent naming collisions. A single database can contain `billing.invoices` and `shipping.invoices`.
+- Schemas enable granular security policies. A web application user role can be granted read/write permissions to the `app` schema while restricted from accessing the `audit` schema.
+- In PostgreSQL, every newly initialized database includes a default schema named `public`. When a query references a table without prefixing the schema name (e.g. `SELECT * FROM users`), the server searches schemas according to the session's `search_path` configuration.
+
+---
+
+## Terminology Mapping Across Systems
+
+Different database engines use slightly different names for these boundaries:
+
+| Term                       | PostgreSQL                | MySQL                           | Oracle                               | SQLite                           |
+| :------------------------- | :------------------------ | :------------------------------ | :----------------------------------- | :------------------------------- |
+| **Server Process**         | `postgres` daemon         | `mysqld` daemon                 | Oracle instance (SGA + BG processes) | None (embedded C library in app) |
+| **Top-Level Container**    | Database cluster          | Server instance                 | CDB (Container Database)             | Single `.sqlite3` disk file      |
+| **Isolated Data Boundary** | Database                  | Database (synonym for schema)   | PDB (Pluggable Database)             | Database attached via `ATTACH`   |
+| **Namespace inside DB**    | Schema (`public`, `auth`) | Not distinguished from Database | Schema (tied to user account)        | Schema                           |
+| **Storage Unit on Disk**   | Tablespace / Data files   | Tablespace (`.ibd` files)       | Datafiles (`.dbf`)                   | Single disk file                 |
+
+<Callout type="info">
+  In MySQL, `CREATE DATABASE shop;` and `CREATE SCHEMA shop;` are exact synonyms. In PostgreSQL, a
+  database is a separate physical boundary containing one or more schemas.
+</Callout>

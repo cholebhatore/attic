@@ -1,0 +1,115 @@
+---
+title: Conceptual, Logical, and Physical Data Modeling
+description: The three architectural stages of database modeling from business requirements to physical storage engine implementations.
+---
+
+Designing a database schema without a systematic modeling framework leads to structural drift: tables missing essential constraints, redundant data duplicated across columns, and query bottlenecks under scale. Data modeling structures this process across three abstraction levels.
+
+---
+
+## The Three Levels of Modeling
+
+<Mermaid
+  chart={`
+flowchart TD
+    Req["Business Requirements & User Stories"] --> Conceptual["1. Conceptual Model (Entities & Domain Rules)"]
+    Conceptual --> Logical["2. Logical Model (Normalized Relations & Keys)"]
+    Logical --> Physical["3. Physical Model (Vendor Types, Indexes & Storage Parameters)"]
+`}
+/>
+
+| Level          | Audience                                    | Scope & Technology                                                                                       | Output Artifact                                    |
+| :------------- | :------------------------------------------ | :------------------------------------------------------------------------------------------------------- | :------------------------------------------------- |
+| **Conceptual** | Product managers, domain experts, engineers | High-level entities, relationship cardinality, business constraints. Technology agnostic.                | Entity-Relationship Diagram (ERD), domain glossary |
+| **Logical**    | Software architects, database engineers     | Formal normalization (3NF), primary keys, foreign keys, attribute data types. DBMS-agnostic.             | Detailed Relational Schema Diagram                 |
+| **Physical**   | Backend engineers, database administrators  | Target engine data types (`TIMESTAMPTZ`, `UUID`), B-tree indexes, table partitions, storage compression. | Target DDL (`schema.sql`, Prisma schema)           |
+
+---
+
+## Worked Example: Order Management System
+
+To observe how a business requirement evolves through each stage, trace an order placement feature:
+
+### 1. Conceptual Model
+
+We identify the business concepts and their interactions:
+
+- A **Customer** has a name and email.
+- A **Customer** can place multiple **Orders** over time.
+- An **Order** must contain one or more **Order Items**.
+- Each **Order Item** references a specific **Product** and records the unit price paid at that time.
+
+<Mermaid
+  chart={`
+flowchart LR
+    Customer["Customer"] ---|"Places (1:N)"| Order["Order"]
+    Order ---|"Contains (1:N)"| LineItem["Order Item"]
+    Product["Product"] ---|"Referenced by (1:N)"| LineItem
+`}
+/>
+
+---
+
+### 2. Logical Model
+
+We formalize attributes, normalize relations, and assign keys:
+
+- **Entity `Customer`**:
+  - `customer_id` (Identifier)
+  - `email` (Unique, Mandatory)
+  - `name` (Mandatory)
+- **Entity `Order`**:
+  - `order_id` (Identifier)
+  - `customer_id` (Mandatory, References `Customer`)
+  - `ordered_at` (Mandatory)
+  - `status` (Mandatory: pending, paid, shipped, cancelled)
+- **Entity `OrderItem`**:
+  - `order_item_id` (Identifier)
+  - `order_id` (Mandatory, References `Order`)
+  - `product_id` (Mandatory, References `Product`)
+  - `quantity` (Mandatory, Positive Integer)
+  - `price_cents` (Mandatory, Non-negative Integer)
+
+---
+
+### 3. Physical Model (PostgreSQL Target)
+
+We choose concrete database data types, index access paths, and storage parameters:
+
+```sql
+CREATE TABLE customers (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email VARCHAR(255) NOT NULL,
+    full_name VARCHAR(120) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_customers_email UNIQUE (email)
+);
+
+CREATE TABLE orders (
+    id BIGSERIAL PRIMARY KEY,
+    customer_id UUID NOT NULL REFERENCES customers(id) ON DELETE RESTRICT,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    ordered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_orders_status
+        CHECK (status IN ('pending', 'paid', 'shipped', 'cancelled'))
+);
+
+CREATE INDEX idx_orders_customer_id ON orders (customer_id);
+CREATE INDEX idx_orders_ordered_at ON orders (ordered_at DESC);
+
+CREATE TABLE order_items (
+    id BIGSERIAL PRIMARY KEY,
+    order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    product_id UUID NOT NULL,
+    quantity INT NOT NULL CHECK (quantity > 0),
+    unit_price_cents INT NOT NULL CHECK (unit_price_cents >= 0)
+);
+
+CREATE INDEX idx_order_items_order_id ON order_items (order_id);
+```
+
+<Callout type="info">
+  Notice the physical design decisions: we created explicit B-Tree indexes on `customer_id` and
+  `order_id` because foreign key columns are not automatically indexed by default in PostgreSQL, and
+  queries regularly join across these relationships.
+</Callout>

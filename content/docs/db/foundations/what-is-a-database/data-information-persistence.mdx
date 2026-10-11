@@ -1,0 +1,83 @@
+---
+title: Data, Information, and Persistence
+description: Distinguishing raw values from structured facts, volatile memory from durable storage, and the hardware mechanisms behind data persistence.
+---
+
+Applications consume and produce raw numbers, strings, and timestamps during runtime. A database exists to convert those raw values into structured, queryable information and guarantee they survive hardware power loss, process crashes, and server reboots.
+
+---
+
+## Data vs Information
+
+The terms _data_ and _information_ represent different stages in processing:
+
+- **Data** consists of uninterpreted values, characters, or symbols. The integer `1499` or the string `USD` alone has no semantic meaning.
+- **Information** is data placed into an interpreted context with rules, relationships, and schema constraints. When `1499` maps to an `amount_cents` column and `USD` maps to `currency` attached to `order_id = 4281` with an established foreign key to a customer account, it becomes actionable information.
+
+```
+[ Raw Data ]                [ Schema & Context ]               [ Information ]
+1499, "USD", 4281   --->   orders(id, cents, currency)   --->   Order #4281 costs $14.99 USD
+```
+
+A database engine enforces this transformation. It validates that values match declared data types, satisfy domain invariants (such as non-negative amounts), and maintain valid relationships to other records before writing them to disk.
+
+---
+
+## Volatile vs Persistent Storage
+
+Computers store data across a hierarchy of physical storage media. Each tier trades access latency against volatility and cost per gigabyte.
+
+| Storage Tier           | Typical Latency | Volatile? | Retention on Power Loss |
+| :--------------------- | :-------------- | :-------- | :---------------------- |
+| **CPU Registers**      | `< 1 ns`        | Yes       | Lost immediately        |
+| **L1 / L2 / L3 Cache** | `1 – 15 ns`     | Yes       | Lost immediately        |
+| **Main Memory (DRAM)** | `50 – 100 ns`   | Yes       | Lost immediately        |
+| **NVMe SSD (PCIe)**    | `10 – 100 µs`   | No        | Retained                |
+| **SATA SSD**           | `50 – 200 µs`   | No        | Retained                |
+| **Rotational HDD**     | `4 – 10 ms`     | No        | Retained                |
+
+DRAM requires active electrical refresh cycles to preserve bit states inside capacitors. When power cuts off or the operating system encounters a kernel panic, all DRAM contents evaporate within milliseconds.
+
+Non-volatile media (NAND flash in SSDs, magnetic platters in HDDs) physically trap charge in floating-gate transistors or magnetic domains. Data stored on these media persists across restarts.
+
+<Callout type="warn">
+  RAM is roughly 1,000 times faster than an NVMe SSD, but zero percent durable. Every database
+  architecture reflects this fundamental tension: how to achieve the read and write speed of memory
+  while providing the durability guarantees of disk.
+</Callout>
+
+---
+
+## Operating System Caching and the `fsync()` Barrier
+
+When an application calls `write()` in standard programming languages, the operating system does not immediately write the bytes to physical flash cells or platters. Instead, the OS kernel copies the bytes into an in-memory page cache and returns control to the calling application immediately.
+
+<Mermaid
+  chart={`
+flowchart LR
+    App["Application"] -->|"write()"| PageCache["OS Page Cache (RAM)"]
+    PageCache -.->|"Delayed Dirty Page Flush"| Disk["Physical Disk"]
+    App -->|"fsync() / fdatasync()"| DiskBarrier["Flush Cache to Non-Volatile Media"]
+`}
+/>
+
+This asynchronous write-back mechanism creates a durability hazard:
+
+1. The application executes `write()` and receives a success code.
+2. The bytes sit in volatile OS memory.
+3. The server suffers an unexpected power cut.
+4. The OS never flushed the modified pages to disk. The data is permanently lost.
+
+To provide genuine durability, a database engine must bypass or flush this cache using system calls such as `fsync()` or `fdatasync()` on Linux, or open files with direct I/O flags (`O_DIRECT`). These calls force the storage controller to commit all pending writes to non-volatile medium before the database acknowledges a transaction commit to the client.
+
+---
+
+## Why Application Memory Fails as State Storage
+
+Every backend service holds internal variables, dictionaries, and heaps in its process memory space. Storing business state exclusively in application memory breaks under standard production events:
+
+- **Process restarts**: Deploying new code versions, routine garbage collection pauses, or Out-Of-Memory (OOM) kills terminate the process and flush its heap.
+- **Horizontal scaling**: Running three instances of an API behind a load balancer means each process has an isolated memory space. Request A updates instance 1; request B routed to instance 2 cannot observe that change.
+- **Crash consistency**: An uncaught runtime exception halts execution mid-way through a multi-step operation, leaving partial state without rollback capability.
+
+A database runs as a dedicated, specialized system designed to outlive ephemeral application servers, coordinate concurrent updates across many clients, and guarantee that accepted writes survive hardware disruptions.

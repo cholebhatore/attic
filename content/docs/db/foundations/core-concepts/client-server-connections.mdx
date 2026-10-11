@@ -1,0 +1,98 @@
+---
+title: Client-Server Architecture and Connections
+description: How applications establish, authenticate, maintain, and pool connections to database engines over TCP sockets.
+---
+
+A database server operates as an independent network daemon listening on a designated port. Every database query executed by your application depends on a multi-stage network communication exchange.
+
+---
+
+## The Connection Lifecycle
+
+Opening a connection to a database is an expensive multi-step process across the network:
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant App as Application Client
+    participant DB as Database Server (e.g. Postgres)
+
+    Note over App, DB: Step 1: TCP Handshake (1 RTT)
+    App->>DB: SYN
+    DB->>App: SYN-ACK
+    App->>DB: ACK
+
+    Note over App, DB: Step 2: TLS Negotiation (1-2 RTTs)
+    App->>DB: ClientHello
+    DB->>App: ServerHello + Certificate
+    App->>DB: Finished (Encrypted)
+
+    Note over App, DB: Step 3: Auth & Startup (1-2 RTTs)
+    App->>DB: StartupMessage (User, Database)
+    DB->>App: AuthenticationSASL (SCRAM challenge)
+    App->>DB: SASLResponse (Proof)
+    DB->>App: AuthenticationOk + ParameterStatus
+
+    Note over App, DB: Ready for Queries
+    App->>DB: Query ("SELECT * FROM users...")
+    DB->>App: DataRows + CommandComplete
+
+`}
+/>
+
+Opening a brand new database connection on every HTTP request adds **50 ms to 150 ms of network latency** before the database even begins parsing the SQL query.
+
+---
+
+## Memory Overhead per Connection
+
+In addition to latency, active database connections consume physical server resources:
+
+- **PostgreSQL Process Model**: PostgreSQL utilizes a process-per-connection architecture. For every accepted TCP client socket, the operating system forks a separate `postgres` backend process. Each worker process allocates **5 MB to 10 MB of RAM** for private session memory (`work_mem`, stack space, catalog caches).
+- **MySQL / SQL Server Thread Model**: MySQL allocates an isolated worker thread per connection, requiring 1 MB to 2 MB of stack and buffer memory per client.
+
+If 1,000 application instances simultaneously connect to a single PostgreSQL database, the server exhausts 5 GB to 10 GB of RAM purely holding idle connection sockets, starving the database buffer pool of memory needed for caching disk blocks.
+
+---
+
+## The Role of Connection Pooling
+
+A **Connection Pool** maintains a warm pool of long-lived, pre-authenticated database connections. When application threads need to execute a query, they borrow an active connection from the pool, execute their query, and return the connection immediately.
+
+<Mermaid
+  chart={`
+flowchart LR
+    App1["API Request 1"] --> Pool["Connection Pool (e.g. PgBouncer / HikariCP)"]
+    App2["API Request 2"] --> Pool
+    App3["API Request 3"] --> Pool
+
+    Pool ===|"Warm persistent connections (e.g. 20 connections)"| DB[("PostgreSQL Server")]
+
+`}
+/>
+
+### Connection Pool Modes
+
+1. **Session Pooling**: A client leases a connection for the entire duration of its login session.
+2. **Transaction Pooling**: The pool leases a server connection to a client only for the lifetime of a single transaction (`BEGIN` to `COMMIT`). As soon as the transaction finishes, the connection is instantly recycled for another client. This allows 5,000 web clients to share 50 physical database connections.
+3. **Statement Pooling**: Leases connections per statement. Does not support multi-statement transactions.
+
+---
+
+## The Sizing Formula
+
+A common misconception is that increasing connection pool size improves system throughput. In reality, setting connection pool sizes too high causes CPU context-switching thrashing and degrades performance.
+
+The standard formula for sizing a database connection pool (derived from PostgreSQL and HikariCP benchmarks) is:
+
+```
+connections = (core_count * 2) + effective_spindle_count
+```
+
+For a modern server with 8 CPU cores and an NVMe SSD:
+
+```
+connections = (8 * 2) + 1 = 17 connections
+```
+
+A properly sized pool of 20 connections will consistently outperform a misconfigured pool of 500 connections because the CPU cores spend their cycles executing queries rather than context-switching between competing worker threads.
