@@ -17,6 +17,9 @@ import {
   BookOpen,
   Cloud,
   Globe,
+  Package,
+  GitBranch,
+  Code,
 } from 'lucide-react';
 
 function getNodeText(node: React.ReactNode): string {
@@ -91,6 +94,9 @@ export function getMDXComponents(components?: MDXComponents) {
     BookOpen,
     Cloud,
     Globe,
+    Package,
+    GitBranch,
+    Code,
     ...components,
   } satisfies MDXComponents;
 }

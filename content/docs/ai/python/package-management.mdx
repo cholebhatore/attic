@@ -1,0 +1,245 @@
+---
+title: Package Management
+description: Dependency resolution, project workflows, and virtual environments with uv and pip.
+---
+
+Package management in Python has shifted from loosely coupled command-line tools to unified, lockfile-driven project management. `pip` remains the standard package installer, while `uv` replaces `pip`, `venv`, `pip-tools`, `poetry`, and `pyenv` in a single toolchain written in Rust.
+
+---
+
+## Tooling architecture: pip vs uv
+
+`pip` is Python's traditional package installer, standardized under PEP 453. It downloads wheels and source distributions from PyPI and unpacks them into the current environment's `site-packages` directory. It does not manage Python runtime versions, create virtual environments automatically, or maintain deterministic lockfiles.
+
+`uv` is an all-in-one package and project manager developed by Astral. It implements the PubGrub dependency resolution algorithm in Rust and uses a global, content-addressable cache with hardlinks. This design yields 10x to 100x faster package installation compared to standard `pip`.
+
+<Mermaid
+  chart={`
+flowchart TD
+  subgraph Traditional["Traditional Workflow (Fragmented)"]
+    T1["pyenv (Python version)"] --> T2["python -m venv (.venv)"]
+    T2 --> T3["pip install (Packages)"]
+    T3 --> T4["pip freeze (requirements.txt)"]
+  end
+
+subgraph Modern["Modern Workflow with uv (Unified)"]
+U1["uv python (Runtimes)"] --> U2["uv init / pyproject.toml"]
+U2 --> U3["uv add (Dependencies + uv.lock)"]
+U3 --> U4["uv run (Isolated Execution)"]
+end
+`}
+/>
+
+| Dimension                     | `pip`                                      | `uv`                                     |
+| :---------------------------- | :----------------------------------------- | :--------------------------------------- |
+| **Engine Language**           | Python                                     | Rust                                     |
+| **Package Resolution**        | Sequential backtracking                    | Multithreaded PubGrub                    |
+| **Virtual Environments**      | Requires `python -m venv`                  | Handled automatically                    |
+| **Python Version Management** | External (`pyenv`, system installers)      | Built-in (`uv python install`)           |
+| **Project Manifest**          | `requirements.txt` (loose conventions)     | `pyproject.toml` (PEP 621 standard)      |
+| **Lockfile Support**          | Requires third-party tools (`pip-compile`) | Native cross-platform `uv.lock`          |
+| **Global Disk Cache**         | Download wheel cache only                  | Content-addressable cache with hardlinks |
+
+---
+
+## Creating a project: pip vs uv
+
+### Traditional pip workflow
+
+Setting up a project with `pip` requires manually coordinating multiple tools:
+
+<Steps>
+  <Step>
+    ### Create and activate the virtual environment
+
+    ```bash
+    python -m venv .venv
+    # Windows PowerShell:
+    .venv\Scripts\Activate.ps1
+    # macOS / Linux:
+    source .venv/bin/activate
+    ```
+
+  </Step>
+  <Step>
+    ### Install dependencies
+
+    ```bash
+    pip install fastapi uvicorn
+    ```
+
+  </Step>
+  <Step>
+    ### Freeze dependencies to requirements.txt
+
+    ```bash
+    pip freeze > requirements.txt
+    ```
+
+  </Step>
+</Steps>
+
+<Callout type="warn">
+  `pip freeze` captures every transitive dependency installed in `.venv` as a flat list. It does not
+  record which packages are primary dependencies versus secondary sub-dependencies, making upgrades
+  difficult to audit.
+</Callout>
+
+### Modern uv workflow
+
+`uv` handles environment creation, manifest configuration, and locking in a single command flow:
+
+<Steps>
+  <Step>
+    ### Initialize the project
+
+    ```bash
+    uv init my-api
+    cd my-api
+    ```
+
+    This creates `pyproject.toml`, `.python-version`, and a starter `hello.py`.
+
+  </Step>
+  <Step>
+    ### Add dependencies
+
+    ```bash
+    uv add fastapi uvicorn
+    ```
+
+    `uv` creates the `.venv` directory automatically, pins dependencies in `uv.lock`, and updates `pyproject.toml`.
+
+  </Step>
+  <Step>
+    ### Execute applications
+
+    ```bash
+    uv run uvicorn main:app --reload
+    ```
+
+    `uv run` runs commands within the project environment without requiring manual shell activation.
+
+  </Step>
+</Steps>
+
+---
+
+## Project mode vs environment mode: uv add vs uv pip install
+
+`uv` operates in two distinct operational modes: **Project Mode** and **Environment Mode**.
+
+### uv add: project-level dependency management
+
+Adding a package with `uv add` treats the workspace as an integrated project:
+
+```bash
+uv add fastapi
+```
+
+This operation updates three discrete layers:
+
+1. **`pyproject.toml`**: Adds `fastapi` to the `dependencies` array.
+2. **`uv.lock`**: Resolves the full dependency tree, pinning exact versions, hashes, and platform markers.
+3. **`.venv`**: Synchronizes the virtual environment to match the updated lockfile.
+
+```
+pyproject.toml updated · uv.lock updated · Package installed
+```
+
+### uv pip install: environment-level installation
+
+Running `uv pip install` bypasses project tracking entirely:
+
+```bash
+uv pip install fastapi
+```
+
+This operation modifies only the target virtual environment:
+
+1. **`pyproject.toml`**: Unchanged.
+2. **`uv.lock`**: Unchanged.
+3. **`.venv`**: Package installed directly into `site-packages`.
+
+```
+pyproject.toml unchanged · uv.lock unchanged · Package installed
+```
+
+### Side-by-side comparison
+
+| Action                 | `pyproject.toml` | `uv.lock`   | `.venv`     | Use Case                                                     |
+| :--------------------- | :--------------- | :---------- | :---------- | :----------------------------------------------------------- |
+| `uv add <pkg>`         | **Updated**      | **Updated** | **Updated** | Building applications, libraries, and tracked repositories   |
+| `uv pip install <pkg>` | Unchanged        | Unchanged   | **Updated** | Ephemeral containers, scripts, and legacy requirements files |
+
+---
+
+## When to use uv pip install
+
+`uv pip install` provides a drop-in, high-speed replacement for legacy `pip` commands without forcing a migration to `pyproject.toml`.
+
+<Accordions>
+  <Accordion title="1. Containerized Docker builds with existing requirements.txt">
+    In container environments, the container image itself provides process and filesystem isolation. Creating a `.venv` inside an isolated container often adds unnecessary path indirection.
+
+    ```dockerfile title="Dockerfile"
+    FROM python:3.12-slim
+    COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
+
+    WORKDIR /app
+    COPY requirements.txt .
+
+    # Install packages directly into system Python with uv speed
+    RUN uv pip install --system -r requirements.txt
+
+    COPY . .
+    CMD ["python", "main.py"]
+    ```
+
+  </Accordion>
+  <Accordion title="2. Legacy repositories and existing pipelines">
+    Teams working on large codebases that rely on `setup.py` or existing `requirements.txt` pipelines can substitute `pip` with `uv pip` in CI/CD without rewriting configuration files.
+  </Accordion>
+  <Accordion title="3. Ad-hoc testing in an existing virtual environment">
+    When debugging an isolated issue inside an active virtual environment, you can install an inspection utility (such as `ipython` or `scalene`) without adding it to the repository's `pyproject.toml`.
+  </Accordion>
+  <Accordion title="4. Drop-in CI speedups">
+    In GitHub Actions or GitLab CI, replacing `pip install -r requirements.txt` with `uv pip install --system -r requirements.txt` reduces installation steps from minutes to seconds.
+  </Accordion>
+</Accordions>
+
+---
+
+## Managing Python runtimes and versions
+
+`uv` downloads and manages standalone Python releases independently of system package managers.
+
+```bash
+# Install a specific Python version
+uv python install 3.12
+
+# Pin the active project to Python 3.12
+uv python pin 3.12
+
+# List all discovered and managed runtimes
+uv python list
+```
+
+When pinned, `uv` ensures that all project commands executed via `uv run` utilize the pinned interpreter, eliminating version drift between developer machines and CI.
+
+---
+
+## Tooling comparison: Python vs JavaScript / TypeScript
+
+Engineers familiar with the Node.js and TypeScript ecosystems can map Python concepts directly to equivalent tools:
+
+| Concept / Task                 | Traditional Python                           | Modern Python (`uv`)          | JavaScript / TypeScript                |
+| :----------------------------- | :------------------------------------------- | :---------------------------- | :------------------------------------- |
+| **Project Manifest**           | `requirements.txt` / `setup.py`              | `pyproject.toml`              | `package.json`                         |
+| **Lockfile**                   | `requirements.txt` (via `pip-compile`)       | `uv.lock`                     | `package-lock.json` / `pnpm-lock.yaml` |
+| **Runtime Management**         | `pyenv` / system Python                      | `uv python`                   | `nvm` / `fnm` / `volta`                |
+| **Add Dependency**             | `pip install pkg && pip freeze > reqs`       | `uv add pkg`                  | `pnpm add pkg` / `npm install pkg`     |
+| **Ad-hoc Environment Install** | `pip install pkg`                            | `uv pip install pkg`          | `npm install pkg --no-save`            |
+| **Run Project Script**         | `source .venv/bin/activate && python app.py` | `uv run app.py`               | `pnpm run app` / `bun run app.py`      |
+| **Global CLI Tool Runner**     | `pipx run ruff`                              | `uvx ruff`                    | `npx ruff` / `bunx ruff`               |
+| **Package Cache Strategy**     | Per-user download cache                      | Content-addressable hardlinks | `pnpm` global content store            |

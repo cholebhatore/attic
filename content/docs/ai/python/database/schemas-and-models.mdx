@@ -1,0 +1,162 @@
+---
+title: Schemas vs Models
+description: Differentiating API validation contracts from database table definitions.
+---
+
+A common source of confusion in modern Python web and AI applications is the distinction between **schemas** and **models**. Both describe data structures using Python classes, but they operate at completely different layers of the software architecture.
+
+---
+
+## Core conceptual distinction
+
+- **Schemas (Pydantic)**: Define the shape, validation rules, and serialization contracts of data that the application accepts and returns over HTTP, WebSockets, or background tasks.
+- **Models (SQLAlchemy / ORM)**: Define the structural blueprint of physical database tables, column types, constraints, foreign keys, and indexes.
+
+<Mermaid
+  chart={`
+flowchart LR
+  subgraph HTTP["HTTP Request / Response Boundary"]
+    Req["Request Payload (JSON)"] --> S1["Schema: UserCreate (Pydantic)"]
+    S2["Schema: UserResponse (Pydantic)"] --> Res["Response Payload (JSON)"]
+  end
+
+subgraph Service["Application Logic"]
+S1 --> Logic["Business Logic & Password Hashing"]
+Logic --> M["Model: UserModel (SQLAlchemy)"]
+M --> S2
+end
+
+subgraph Database["Database Persistence"]
+M <--> DB[("PostgreSQL users Table")]
+end
+`}
+/>
+
+| Dimension                  | Pydantic Schema                                  | SQLAlchemy Model                                    |
+| :------------------------- | :----------------------------------------------- | :-------------------------------------------------- |
+| **Role**                   | API validation & serialization contract          | Database table blueprint                            |
+| **Execution Layer**        | Application boundary (HTTP/RPC)                  | Database persistence layer                          |
+| **Base Class**             | `pydantic.BaseModel`                             | `DeclarativeBase`                                   |
+| **Type Annotations**       | Standard Python types (`str`, `int`, `datetime`) | `Mapped[str]`, `Mapped[int]`                        |
+| **Field Constraints**      | `Field(min_length=8, max_length=128)`            | `mapped_column(String(128), nullable=False)`        |
+| **Database Dependency**    | None (pure in-memory validation)                 | Bound to database engine and session                |
+| **Primary Risk Mitigated** | Malformed payloads, type errors                  | Schema corruption, relational constraint violations |
+
+---
+
+## Why separating schemas and models matters
+
+Coupling database models directly to API endpoints introduces architectural and security vulnerabilities:
+
+1. **Mass Assignment Attacks**: If an endpoint deserializes input directly into a database model, an attacker could supply `{ "is_admin": true }` in their JSON payload. A dedicated `UserCreate` schema restricts fields to only those the client is permitted to provide.
+2. **Data Leakage**: Database models include sensitive fields like `hashed_password` or internal audit logs. A dedicated `UserResponse` schema guarantees sensitive fields are omitted before serializing to JSON.
+3. **Decoupled Evolution**: Database tables often evolve at a different pace than external public API versions. Schemas preserve backwards compatibility when underlying tables are normalized or split.
+
+---
+
+## Implementation pattern
+
+Below is the standard production pattern separating schemas from models in a modern FastAPI service:
+
+### 1. Database model (SQLAlchemy 2.0)
+
+```python title="models.py"
+from datetime import datetime
+from sqlalchemy import String, DateTime, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+class Base(DeclarativeBase):
+    pass
+
+class UserModel(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    is_active: Mapped[bool] = mapped_column(default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+```
+
+### 2. API schemas (Pydantic v2)
+
+```python title="schemas.py"
+from datetime import datetime
+from pydantic import BaseModel, EmailStr, Field, ConfigDict
+
+class UserBase(BaseModel):
+    email: EmailStr
+
+class UserCreate(UserBase):
+    password: str = Field(min_length=8, max_length=100)
+
+class UserResponse(UserBase):
+    id: int
+    is_active: bool
+    created_at: datetime
+
+    # Instructs Pydantic to read attributes from ORM model instances
+    model_config = ConfigDict(from_attributes=True)
+```
+
+### 3. Service integration (FastAPI)
+
+```python title="main.py"
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
+from models import UserModel
+from schemas import UserCreate, UserResponse
+
+app = FastAPI()
+
+@app.post("/users", response_model=UserResponse, status_code=201)
+async def create_user(payload: UserCreate, db: AsyncSession = Depends(get_db)):
+    # 1. Payload arrives validated against UserCreate schema
+    # 2. Hash password before writing to the database model
+    new_user = UserModel(
+        email=payload.email,
+        hashed_password=hash_password(payload.password),
+    )
+    db.add(new_user)
+    await db.commit()
+    await db.refresh(new_user)
+
+    # 3. FastAPI automatically maps UserModel into UserResponse schema
+    return new_user
+```
+
+---
+
+## Unifying schemas and models: SQLModel
+
+For projects where maintaining parallel class definitions introduces too much boilerplate, **SQLModel** combines Pydantic and SQLAlchemy into a single class:
+
+```python title="sqlmodel_example.py"
+from sqlmodel import SQLModel, Field
+
+# Defines both a Pydantic schema AND a database table blueprint
+class User(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    email: str = Field(index=True, unique=True)
+    hashed_password: str
+    is_active: bool = Field(default=True)
+```
+
+<Callout type="info">
+  SQLModel is effective for rapid prototyping and straightforward CRUD applications. For complex
+  enterprise applications with composite keys, polymorphic inheritance, or strict separation of
+  public API contracts, explicit SQLAlchemy 2.0 models paired with Pydantic schemas remain the
+  industry standard.
+</Callout>
+
+---
+
+## Comparison with JavaScript / TypeScript
+
+| Python Concept       | JavaScript / TypeScript Equivalent                                         | Role                                                                |
+| :------------------- | :------------------------------------------------------------------------- | :------------------------------------------------------------------ |
+| **Pydantic Schema**  | **Zod schema** (`z.object({...})`) / TS Interface                          | Validates client inputs, strips unexpected fields, types responses  |
+| **SQLAlchemy Model** | **Prisma model** (`model User {...}`) / **Drizzle table** (`pgTable(...)`) | Defines database columns, relational foreign keys, and indexes      |
+| **SQLModel**         | **Drizzle Zod** (`createInsertSchema(users)`)                              | Derives validation schemas directly from database table definitions |

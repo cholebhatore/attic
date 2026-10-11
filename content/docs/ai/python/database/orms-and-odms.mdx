@@ -1,0 +1,162 @@
+---
+title: ORMs and ODMs
+description: Object-relational and object-document mapping with SQLAlchemy, SQLModel, and Beanie.
+---
+
+Data persistence in modern Python applications relies on Object-Relational Mappers (ORMs) for relational SQL engines and Object-Document Mappers (ODMs) for document-based NoSQL stores. These abstractions translate database records into typed Python objects while handling connection pooling, query building, and asynchronous I/O.
+
+---
+
+## Architectural difference: ORM vs ODM
+
+- **ORM (Object-Relational Mapping)**: Bridges the relational tabular model (tables, rows, foreign keys, ACID constraints) to object-oriented code. Examples: **SQLAlchemy 2.0**, **SQLModel**, **Tortoise ORM**.
+- **ODM (Object-Document Mapping)**: Bridges nested JSON-like document structures (collections, documents, embedded subdocuments) to object-oriented code. Examples: **Beanie**, **MongoEngine**.
+
+<Mermaid
+  chart={`
+flowchart TD
+  subgraph SQL["Relational Persistence (SQL)"]
+    S_Code["Python Class (DeclarativeBase)"] <--> S_ORM["SQLAlchemy 2.0 ORM"]
+    S_ORM <--> S_Driver["asyncpg / aiosqlite Driver"]
+    S_Driver <--> S_DB[("PostgreSQL / SQLite Tables")]
+  end
+
+subgraph NoSQL["Document Persistence (NoSQL)"]
+N_Code["Python Class (Beanie Document)"] <--> N_ODM["Beanie ODM (Pydantic-based)"]
+N_ODM <--> N_Driver["Motor Async Driver"]
+N_Driver <--> N_DB[("MongoDB Collections")]
+end
+`}
+/>
+
+---
+
+## SQL ORMs: SQLAlchemy 2.0
+
+SQLAlchemy 2.0 is the foundational standard for SQL persistence in Python. It supports strict typing via `Mapped[...]`, declarative schemas, and non-blocking asynchronous execution.
+
+### Asynchronous engine and session setup
+
+```python title="database.py"
+import os
+from collections.abc import AsyncGenerator
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.orm import DeclarativeBase
+
+# Database URL for PostgreSQL via asyncpg driver
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql+asyncpg://postgres:postgres@localhost:5432/app_db"
+)
+
+# Create engine with connection pooling and health checks
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,  # Discards stale connections automatically
+)
+
+# Async session factory
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+)
+
+class Base(DeclarativeBase):
+    pass
+
+# FastAPI dependency for session lifecycle management
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    async with AsyncSessionLocal() as session:
+        yield session
+```
+
+---
+
+## Local vs hosted database configurations
+
+The database driver and connection URL vary depending on whether the application runs locally or targets managed cloud infrastructure:
+
+| Environment           | Database Engine     | Connection Driver URL Format                                     | Characteristics                                                    |
+| :-------------------- | :------------------ | :--------------------------------------------------------------- | :----------------------------------------------------------------- |
+| **Local Prototype**   | SQLite              | `sqlite+aiosqlite:///./dev.db`                                   | Zero infrastructure, file-based, in-process execution              |
+| **Local Containers**  | PostgreSQL (Docker) | `postgresql+asyncpg://user:pass@localhost:5432/db`               | Matches production SQL dialect, supports native extensions         |
+| **Hosted Serverless** | Neon / Supabase     | `postgresql+asyncpg://user:pass@ep-xyz.neon.tech/db?ssl=require` | Scalable compute, connection pooling required via pooler endpoints |
+| **Managed Cloud**     | AWS RDS / Cloud SQL | `postgresql+asyncpg://user:pass@db.internal:5432/db`             | Dedicated instances within private VPC subnets                     |
+
+<Callout type="warn">
+  When connecting to serverless PostgreSQL providers like Neon or Supabase over asynchronous
+  drivers, always connect via their pooled port (typically port 6543 / pooled host) to avoid
+  exhausting PostgreSQL server connection limits during high-concurrency traffic bursts.
+</Callout>
+
+---
+
+## NoSQL ODMs: Beanie for MongoDB
+
+In AI and agentic workflows, document databases provide flexibility for unstructured message histories, nested agent tool calls, and dynamic execution traces.
+
+**Beanie** is an asynchronous ODM for MongoDB built natively on top of Pydantic and Motor (the official async MongoDB driver).
+
+### Defining documents and queries
+
+```python title="models_mongo.py"
+from beanie import Document, Indexed, init_beanie
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import Field
+from datetime import datetime
+
+class ConversationTranscript(Document):
+    session_id: Indexed(str)
+    user_id: str
+    messages: list[dict] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    class Settings:
+        name = "transcripts"
+
+# Application startup initialization
+async def init_mongo():
+    client = AsyncIOMotorClient("mongodb://localhost:27017")
+    await init_beanie(
+        database=client.agent_memory,
+        document_models=[ConversationTranscript]
+    )
+```
+
+### Performing CRUD operations with Beanie
+
+```python title="operations.py"
+# Insert a new conversation
+transcript = ConversationTranscript(
+    session_id="sess_123",
+    user_id="user_456",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+await transcript.insert()
+
+# Query by index
+found = await ConversationTranscript.find_one(
+    ConversationTranscript.session_id == "sess_123"
+)
+```
+
+---
+
+## Tooling comparison: Python vs JavaScript / TypeScript
+
+| Category                                   | Python Ecosystem                          | JavaScript / TypeScript Ecosystem            |
+| :----------------------------------------- | :---------------------------------------- | :------------------------------------------- |
+| **Relational ORM (Strict / Schema-first)** | **SQLAlchemy 2.0**                        | **Prisma** / **TypeORM**                     |
+| **Lightweight SQL Query Builder**          | **SQLModel** / Peewee                     | **Drizzle ORM** / Kysely                     |
+| **Async PostgreSQL Driver**                | `asyncpg`                                 | `pg` / `postgres.js`                         |
+| **Document NoSQL ODM (MongoDB)**           | **Beanie** / MongoEngine                  | **Mongoose**                                 |
+| **Async MongoDB Driver**                   | `motor`                                   | `mongodb` (native driver)                    |
+| **Connection Pooling Strategy**            | Built-in `QueuePool` with `pool_pre_ping` | Built-in poolers in `pg` / Prisma Accelerate |

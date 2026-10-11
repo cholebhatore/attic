@@ -1,0 +1,190 @@
+---
+title: Alembic Migrations
+description: Schema versioning, autogeneration, and lifecycle commands using Alembic and uv.
+---
+
+Database migrations manage relational database schema changes incrementally over time. While development scripts often rely on `Base.metadata.create_all()`, production applications require versioned migration files generated and executed by **Alembic**.
+
+---
+
+## Why Alembic over create_all
+
+Beginner tutorials often initialize database schemas by calling `Base.metadata.create_all(bind=engine)`. In real-world applications, this approach quickly breaks down.
+
+| Requirement                            | `Base.metadata.create_all()`       | Alembic Migrations                                   |
+| :------------------------------------- | :--------------------------------- | :--------------------------------------------------- |
+| **Create Missing Tables**              | Yes                                | Yes                                                  |
+| **Add New Columns to Existing Tables** | **No** (silently ignores changes)  | **Yes** (`op.add_column`)                            |
+| **Modify Column Types or Nullability** | **No**                             | **Yes** (`op.alter_column`)                          |
+| **Add or Drop Indexes**                | **No**                             | **Yes** (`op.create_index`)                          |
+| **Roll Back Unwanted Changes**         | **No**                             | **Yes** (`downgrade` scripts)                        |
+| **Version History & Audit Trails**     | None                               | Recorded in `alembic_version` table                  |
+| **Team Branch Merging**                | Causes immediate schema collisions | Resolves divergent branch heads with `alembic merge` |
+
+<Callout type="warn">
+  `create_all()` only issues `CREATE TABLE IF NOT EXISTS`. If a table already exists in the
+  database, `create_all()` never inspects or updates its columns, leaving the database out of sync
+  with your application models.
+</Callout>
+
+---
+
+## How Alembic tracks schema state
+
+Alembic records migration versions inside an internal tracking table named `alembic_version` stored directly in your target database.
+
+<Mermaid
+  chart={`
+flowchart LR
+  subgraph Models["SQLAlchemy Models"]
+    M["UserModel (updated columns)"]
+  end
+
+subgraph Engine["Alembic Engine"]
+Diff["Diff: Models vs Live DB"]
+Rev["Revision Script: 8a4f91b_add_bio.py"]
+end
+
+subgraph Database["Database (Postgres)"]
+T[("users table")]
+V[("alembic_version table\\ncurrent: 8a4f91b")]
+end
+
+M --> Diff
+Database --> Diff
+Diff --> Rev
+Rev -->|uv run alembic upgrade head| Database
+`}
+/>
+
+When you run `alembic upgrade head`, Alembic reads the current hash in `alembic_version`, compares it with the revision dependency chain inside `alembic/versions/`, and applies only the unexecuted delta scripts in sequence.
+
+---
+
+## Step-by-step setup guide with uv
+
+### 1. Add Alembic to the project
+
+```bash
+uv add alembic
+```
+
+### 2. Initialize the Alembic directory
+
+```bash
+uv run alembic init alembic
+```
+
+This generates the following files in your repository:
+
+```
+my-project/
+├── alembic.ini             # Main Alembic configuration file
+├── alembic/
+│   ├── env.py              # Python runtime script that executes migrations
+│   ├── script.py.mako      # Template for newly generated migration files
+│   └── versions/           # Directory where migration scripts are stored
+└── pyproject.toml
+```
+
+### 3. Configure env.py
+
+Open `alembic/env.py` and connect Alembic to your SQLAlchemy model metadata and environment variables:
+
+```python title="alembic/env.py"
+import os
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config, pool
+from alembic import context
+
+# 1. Import your SQLAlchemy declarative Base
+from models import Base
+
+# Alembic Config object
+config = context.config
+
+# 2. Overwrite sqlalchemy.url dynamically from environment variables
+database_url = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:postgres@localhost:5432/app_db"
+)
+# If using asyncpg in your app, use standard postgresql:// driver for synchronous Alembic runs
+if database_url.startswith("postgresql+asyncpg://"):
+    database_url = database_url.replace("postgresql+asyncpg://", "postgresql://")
+
+config.set_main_option("sqlalchemy.url", database_url)
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+# 3. Provide model metadata for autogeneration diffing
+target_metadata = Base.metadata
+```
+
+### 4. Generate an automated migration
+
+Whenever you add or modify a model in `models.py`, generate a new migration revision:
+
+```bash
+uv run alembic revision --autogenerate -m "create users table"
+```
+
+Alembic inspects `target_metadata`, compares it against the live database schema, and generates a timestamped file inside `alembic/versions/` containing `upgrade()` and `downgrade()` functions:
+
+```python title="alembic/versions/a1b2c3d4_create_users_table.py"
+def upgrade() -> None:
+    op.create_table(
+        'users',
+        sa.Column('id', sa.Integer(), nullable=False),
+        sa.Column('email', sa.String(length=255), nullable=False),
+        sa.Column('hashed_password', sa.String(length=255), nullable=False),
+        sa.PrimaryKeyConstraint('id'),
+        sa.UniqueConstraint('email')
+    )
+
+def downgrade() -> None:
+    op.drop_table('users')
+```
+
+### 5. Apply the migration to the database
+
+```bash
+uv run alembic upgrade head
+```
+
+### 6. Roll back a migration
+
+If you need to revert the most recent migration:
+
+```bash
+uv run alembic downgrade -1
+```
+
+---
+
+## Useful command reference
+
+| Command                                               | Purpose                                                        |
+| :---------------------------------------------------- | :------------------------------------------------------------- |
+| `uv run alembic init alembic`                         | Initialize Alembic directory structure and configuration       |
+| `uv run alembic revision --autogenerate -m "message"` | Inspect models and generate an automated migration script      |
+| `uv run alembic upgrade head`                         | Apply all pending migrations to the latest revision            |
+| `uv run alembic downgrade -1`                         | Revert the latest migration                                    |
+| `uv run alembic downgrade base`                       | Revert all migrations back to an empty database state          |
+| `uv run alembic current`                              | Display the current migration revision applied to the database |
+| `uv run alembic history`                              | Display chronological history of all migration revisions       |
+| `uv run alembic heads`                                | Display current unmerged branch heads                          |
+| `uv run alembic merge heads -m "merge"`               | Merge divergent migration branches into a single revision      |
+
+---
+
+## Comparison with JavaScript / TypeScript migration tools
+
+| Task                        | Python (`alembic`)                                | Node / TS (`prisma`)                | Node / TS (`drizzle-kit`)             | Node / TS (`typeorm`)               |
+| :-------------------------- | :------------------------------------------------ | :---------------------------------- | :------------------------------------ | :---------------------------------- |
+| **Initialize Config**       | `uv run alembic init alembic`                     | `npx prisma init`                   | `drizzle-kit` via `drizzle.config.ts` | `typeorm migration:create`          |
+| **Generate Migration**      | `uv run alembic revision --autogenerate -m "..."` | `npx prisma migrate dev --name ...` | `npx drizzle-kit generate`            | `typeorm migration:generate -n ...` |
+| **Apply Migrations**        | `uv run alembic upgrade head`                     | `npx prisma migrate deploy`         | `npx drizzle-kit migrate`             | `typeorm migration:run`             |
+| **Roll Back**               | `uv run alembic downgrade -1`                     | Requires manual down migration      | Requires manual SQL rollback script   | `typeorm migration:revert`          |
+| **Inspect Current Version** | `uv run alembic current`                          | `npx prisma migrate status`         | `npx drizzle-kit check`               | `typeorm migration:show`            |
+| **Migration Files**         | Python scripts (`upgrade`/`downgrade`)            | Pure SQL files (`migration.sql`)    | Pure SQL files (`0001_xxx.sql`)       | TypeScript / JS migration classes   |
