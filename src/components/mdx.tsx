@@ -1,6 +1,7 @@
 import defaultMdxComponents from 'fumadocs-ui/mdx';
 import type { MDXComponents } from 'mdx/types';
 import { Mermaid } from './mermaid';
+import { Callout as BaseCallout } from 'fumadocs-ui/components/callout';
 import { Tabs, Tab } from 'fumadocs-ui/components/tabs';
 import { Steps, Step } from 'fumadocs-ui/components/steps';
 import { Accordions, Accordion } from 'fumadocs-ui/components/accordion';
@@ -48,9 +49,14 @@ function MdxImageZoom({ children, ...props }: React.ComponentProps<typeof ImageZ
   );
 }
 
+function Callout({ icon = false, ...props }: React.ComponentProps<typeof BaseCallout>) {
+  return <BaseCallout icon={icon} {...props} />;
+}
+
 export function getMDXComponents(components?: MDXComponents) {
   return {
     ...defaultMdxComponents,
+    Callout,
     pre: (props) => {
       const isMermaid =
         (props as Record<string, unknown>)['data-language'] === 'mermaid' ||
