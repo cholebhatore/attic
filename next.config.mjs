@@ -9,8 +9,23 @@ const config = {
     return [
       {
         source: '/',
-        destination: '/cloud',
+        destination: '/archive',
         permanent: false,
+      },
+      {
+        source: '/esloquees',
+        destination: '/archive',
+        permanent: true,
+      },
+      {
+        source: '/esloquees/:path*',
+        destination: '/archive/:path*',
+        permanent: true,
+      },
+      {
+        source: '/archive/folder-structures-and-architecture',
+        destination: '/archive/architecture',
+        permanent: true,
       },
     ];
   },

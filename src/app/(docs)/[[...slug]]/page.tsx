@@ -16,7 +16,7 @@ import { gitConfig } from '@/lib/shared';
 export default async function Page(props: PageProps<'/[[...slug]]'>) {
   const params = await props.params;
   if (!params.slug || params.slug.length === 0) {
-    redirect('/cloud');
+    redirect('/archive');
   }
   const page = source.getPage(params.slug);
   if (!page) notFound();

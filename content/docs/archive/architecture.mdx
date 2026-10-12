@@ -1,0 +1,444 @@
+---
+title: Architecture Patterns
+description: Guide to UI patterns, application layering, folder grouping, and monorepo architectures for TypeScript and Python.
+---
+
+Software structure involves three distinct decisions that are frequently conflated: how code inside a single request is organized, how an application is layered, and how files are grouped on disk. When treated as separate concerns, these patterns combine into a clean system rather than competing with one another.
+
+---
+
+## Three separate architectural questions
+
+| Axis                         | Question it answers                                     | Examples                                              | Scope               |
+| :--------------------------- | :------------------------------------------------------ | :---------------------------------------------------- | :------------------ |
+| **UI and request patterns**  | How is code for one screen or endpoint divided?         | MVC, MVT, MVP, MVVM, Flux, Zustand                    | Request / Component |
+| **Application architecture** | How is an app layered, and what can depend on what?     | Layered, Hexagonal, Onion, Clean, DDD, Vertical Slice | Single Application  |
+| **Folder grouping**          | Where do files live on disk?                            | Layer-based, feature-based, domain-based, modular     | File System         |
+| **System architecture**      | How many deployables exist and how do they communicate? | Monolith, modular monolith, microservices, serverless | Deployment Unit     |
+
+The governing rule across all scales: organize by domain or feature first, by technical layer second, and keep dependencies pointing in a single direction.
+
+---
+
+## UI and request-level patterns
+
+These patterns partition the logic for a single screen or API endpoint into data, display, and coordination. They differ primarily in which component manages coordination.
+
+| Pattern            | Components              | Core mechanism                                                 | Common contexts                                          |
+| :----------------- | :---------------------- | :------------------------------------------------------------- | :------------------------------------------------------- |
+| **MVC**            | Model, View, Controller | Controller receives input, updates Model, selects View         | Rails, Spring MVC, Laravel; Express and FastAPI handlers |
+| **MVT**            | Model, View, Template   | Django variant: View acts as Controller, Template acts as View | Django                                                   |
+| **MVP**            | Model, View, Presenter  | Passive View with all UI logic placed in Presenter             | Android and desktop desktop clients                      |
+| **MVVM**           | Model, View, ViewModel  | View binds bidirectionally or reactively to ViewModel state    | Angular, SwiftUI, Android Jetpack                        |
+| **Flux / Zustand** | Store, Actions, View    | Unidirectional flow: actions update store, UI reads store      | Modern React applications                                |
+
+### Key distinctions
+
+- **MVC in practice**: The Model holds data and validation logic. The View renders the visual output. The Controller coordinates input and model updates. In a JSON API without HTML rendering, the View simplifies to response serialization.
+- **Scope limitation**: These patterns organize code inside an endpoint handler or UI component. They do not dictate directory layouts.
+- **Common pitfall**: Creating top-level folders named `models/`, `views/`, and `controllers/` is technical-layer grouping. It scatters a single feature across distant directories and scales poorly as the application grows.
+
+---
+
+## Application architecture and layering
+
+Application architecture sets boundaries between business rules, frameworks, and storage drivers. The goal is keeping business logic decoupled from infrastructure details.
+
+| Architecture                     | Core concept                                                                                     | Practical application                                    |
+| :------------------------------- | :----------------------------------------------------------------------------------------------- | :------------------------------------------------------- |
+| **Layered (N-tier)**             | Presentation, business logic, data access in downward dependency order                           | Controller calls service; service calls repository       |
+| **Hexagonal (Ports & Adapters)** | Business logic is central; talks to outside world via interfaces (ports) implemented by adapters | Simplifies testing and infrastructure swaps              |
+| **Onion**                        | Concentric rings with dependencies pointing inward                                               | Conceptually identical to Hexagonal                      |
+| **Clean Architecture**           | Explicit rings: entities, use cases, interface adapters, frameworks                              | Inward dependency rule with formal terminology           |
+| **DDD (Domain-Driven Design)**   | Models complex business domains using bounded contexts and ubiquitous language                   | Strategic design philosophy rather than folder structure |
+| **Vertical Slice**               | Features contain dedicated handlers, validation, and storage logic                               | Theoretical basis for feature-based directories          |
+
+### Layered versus Hexagonal in TypeScript
+
+In a standard layered application, the service imports concrete repository classes directly:
+
+```ts title="billing.service.ts (Layered)"
+import { BillingRepository } from './billing.repository';
+
+export class BillingService {
+  constructor(private repo = new BillingRepository()) {}
+
+  charge(userId: string, cents: number) {
+    return this.repo.createInvoice(userId, cents);
+  }
+}
+```
+
+In Hexagonal architecture, the service depends on an interface that it owns, while the adapter implements that interface:
+
+```ts title="billing.ports.ts (Hexagonal)"
+export interface InvoiceStore {
+  createInvoice(userId: string, cents: number): Promise<Invoice>;
+}
+```
+
+```ts title="billing.service.ts (Hexagonal)"
+import type { InvoiceStore } from './billing.ports';
+
+export class BillingService {
+  constructor(private store: InvoiceStore) {}
+
+  charge(userId: string, cents: number) {
+    return this.store.createInvoice(userId, cents);
+  }
+}
+```
+
+```ts title="billing.prisma-store.ts (Adapter)"
+import type { InvoiceStore } from './billing.ports';
+import { prisma } from '@/infra/db';
+
+export class PrismaInvoiceStore implements InvoiceStore {
+  async createInvoice(userId: string, cents: number): Promise<Invoice> {
+    return prisma.invoice.create({ data: { userId, amountCents: cents } });
+  }
+}
+```
+
+This decoupling allows injecting in-memory stubs during testing without spinning up database containers. In Python, ports are implemented via `typing.Protocol` or abstract base classes.
+
+<Callout type="info">
+  Start with standard layered architecture for straightforward features. Apply Hexagonal boundary
+  interfaces to critical business logic and external dependencies like payment gateways, email
+  providers, and LLM APIs.
+</Callout>
+
+---
+
+## Folder grouping styles
+
+Folder structure dictates where files reside on disk. The recommended approach for medium to large applications is domain or feature grouping with enforced module boundaries and layered code inside each module.
+
+### 1. Layer-based ("Package by Layer")
+
+Files are segregated by technical role:
+
+<Files>
+  <Folder name="src" defaultOpen>
+    <Folder name="controllers" />
+    <Folder name="services" />
+    <Folder name="repositories" />
+    <Folder name="models" />
+    <Folder name="utils" />
+  </Folder>
+</Files>
+
+- **Pros**: Easy to grasp for small projects and tutorials.
+- **Cons**: Every feature is fragmented across multiple directories. Modifying one flow requires navigating multiple folders.
+- **Appropriate for**: Throwaway scripts, prototypes, or services with fewer than 5 entities.
+
+### 2. Feature-based ("Vertical Slices")
+
+Files are organized by product capabilities:
+
+<Files>
+  <Folder name="src" defaultOpen>
+    <Folder name="features" defaultOpen>
+      <Folder name="auth (components, hooks, api, types, store)" />
+      <Folder name="billing" />
+      <Folder name="dashboard" />
+    </Folder>
+  </Folder>
+</Files>
+
+- **Pros**: Changes remain localized. Adding or removing a feature touches one directory.
+- **Cons**: Requires explicit lint rules to prevent features from importing each other's private internals.
+- **Appropriate for**: Medium to large web applications and frontends.
+
+### 3. Domain-based (Bounded Contexts)
+
+Structures files around business domains rather than UI screens:
+
+<Files>
+  <Folder name="src" defaultOpen>
+    <Folder name="ordering (Order, OrderLine, pricing rules)" />
+    <Folder name="inventory" />
+    <Folder name="shipping" />
+    <Folder name="customers" />
+  </Folder>
+</Files>
+
+- **Pros**: Aligns codebase with business entities. Allows domain models (e.g. `Customer` in billing vs. `Customer` in support) to evolve independently.
+- **Appropriate for**: Complex backend services and multi-team environments.
+
+### 4. Modular (Enforced Public APIs)
+
+Encapsulates feature internals behind a minimal public entry point:
+
+<Files>
+  <Folder name="modules" defaultOpen>
+    <Folder name="billing" defaultOpen>
+      <Folder name="internal (private implementation)" />
+      <File name="index.ts (sole allowed public export)" />
+    </Folder>
+    <Folder name="users" />
+  </Folder>
+</Files>
+
+### Style comparison
+
+| Style             | Grouping axis         | Target scale         | Primary risk                              |
+| :---------------- | :-------------------- | :------------------- | :---------------------------------------- |
+| **Layer-based**   | Technical function    | Small                | Scattered features, cluttered directories |
+| **Feature-based** | User-facing feature   | Medium to large      | Uncontrolled cross-feature imports        |
+| **Domain-based**  | Business domain       | Large / Enterprise   | Over-engineering simple services          |
+| **Modular**       | Bounded encapsulation | Medium to Enterprise | Boundary linting configuration overhead   |
+| **Atomic Design** | UI component size     | Design systems only  | Subjective classification debates         |
+
+---
+
+## System architecture: deployable units
+
+System architecture defines deployment boundaries and inter-process communication.
+
+| Style                     | Characteristics                                            | Primary benefit                                    | Main tradeoff                                                      |
+| :------------------------ | :--------------------------------------------------------- | :------------------------------------------------- | :----------------------------------------------------------------- |
+| **Monolith**              | Single deployable binary without internal walls            | Simple deployment and operations                   | Code entanglement as team grows                                    |
+| **Modular Monolith**      | Single deployable with strict internal module boundaries   | Operational simplicity with clean extraction seams | Requires linting discipline in CI                                  |
+| **Microservices**         | Multiple independently deployed services with private data | Autonomous scaling and releases                    | Network failures, distributed transactions, observability overhead |
+| **Serverless**            | Managed ephemeral functions billed per call                | Zero idle server cost, auto-scaling                | Cold start latency, connection limits                              |
+| **Event-driven**          | Asynchronous message queues and event brokers              | Decoupled consumers, traffic buffering             | Complex tracing and eventual consistency                           |
+| **CQRS / Event Sourcing** | Segregated read/write models with immutable append logs    | Complete audit history, optimized read projections | Substantial operational and modeling complexity                    |
+
+### Why start with a modular monolith?
+
+Microservices address organizational bottlenecks and massive scale, but introduce network latency, distributed state, and deployment overhead immediately.
+
+A modular monolith delivers strict domain boundaries within a single process. If a specific module outgrows the monolith, extracting it requires only swapping in-process method calls for HTTP or queue interfaces.
+
+Extract a module into a standalone service only when:
+
+- It requires independent horizontal scaling or hardware profiles (e.g. GPU compute).
+- It runs on a different runtime (e.g. Python for ML alongside a Node.js API).
+- A dedicated team requires an isolated release pipeline.
+- It requires specific security or compliance isolation.
+
+---
+
+## Pattern stacking: how they combine
+
+Architectural patterns solve problems at different layers and stack together seamlessly:
+
+<Mermaid
+  chart={`
+flowchart TD
+    A["System Level: Modular Monolith"] --> B["Folder Level: Feature & Domain Slices"]
+    B --> C["Code Level: Controller -> Service -> Repository"]
+    C --> D["State Level: Unidirectional Stores (Zustand / Flux)"]
+`}
+/>
+
+1. **System level**: A modular monolith defines deployment topology.
+2. **Directory level**: Feature-based slices organize code on disk.
+3. **Application level**: Controller $\rightarrow$ Service $\rightarrow$ Repository layers govern runtime dependencies.
+4. **State level**: Unidirectional stores manage client-side state.
+
+---
+
+## Monorepo structure: TypeScript and Python
+
+A monorepo structure housing Next.js, a TypeScript API, a Python service, and shared packages:
+
+<Files>
+  <Folder name="repo" defaultOpen>
+    <Folder name="apps" defaultOpen>
+      <Folder name="web (Next.js frontend - App Router)" />
+      <Folder name="api (TypeScript modular monolith)" />
+      <Folder name="ai-service (Python FastAPI service)" />
+    </Folder>
+    <Folder name="packages" defaultOpen>
+      <Folder name="contracts (OpenAPI specs, Zod schemas, generated client SDKs)" />
+      <Folder name="ui (shared design system)" />
+      <Folder name="eslint-config" />
+      <Folder name="tsconfig" />
+    </Folder>
+    <Folder name="infra (Terraform, Docker compose)" />
+    <Folder name="docs (Architecture Decision Records)" />
+    <File name="pnpm-workspace.yaml" />
+    <File name="turbo.json" />
+    <File name="package.json" />
+  </Folder>
+</Files>
+
+Use `pnpm` and `Turborepo` for TypeScript workspace tooling. Keep Python dependencies isolated using `uv` and its own `pyproject.toml`, executing Python commands through Turborepo task runners without forcing Python into Node package managers.
+
+### Frontend structure (Next.js App Router)
+
+Next.js requires file-based routing inside `app/`. Keep route handlers thin and colocate business logic within a sibling `features/` directory:
+
+<Files>
+  <Folder name="apps/web/src" defaultOpen>
+    <Folder name="app (routing and layouts only)" defaultOpen>
+      <Folder name="(auth)/login">
+        <File name="page.tsx" />
+      </Folder>
+      <Folder name="dashboard">
+        <File name="page.tsx" />
+      </Folder>
+      <File name="layout.tsx" />
+    </Folder>
+    <Folder name="features" defaultOpen>
+      <Folder name="auth" defaultOpen>
+        <Folder name="components" />
+        <Folder name="hooks" />
+        <Folder name="actions (Server Actions)" />
+        <Folder name="api" />
+        <Folder name="store (Zustand feature store)" />
+        <Folder name="types" />
+        <File name="index.ts (public module interface)" />
+      </Folder>
+      <Folder name="billing" />
+    </Folder>
+    <Folder name="shared" defaultOpen>
+      <Folder name="components/ui (shadcn primitives)" />
+      <Folder name="hooks" />
+      <Folder name="lib" />
+    </Folder>
+    <Folder name="config">
+      <File name="env.ts (validated environment variables)" />
+    </Folder>
+  </Folder>
+</Files>
+
+### Module boundary rules
+
+1. `shared/` never imports from `features/`.
+2. `features/*` may import from `shared/*` and `config/*`.
+3. Features do not import internals of other features; they interact only via the public `index.ts` entry point or compose at the `app/` level.
+4. Route files (`page.tsx`) only fetch data and compose feature components.
+5. Server Components remain the default; `'use client'` is restricted to interactive leaf components.
+6. Server Actions reside within the feature that owns the mutation.
+
+---
+
+## Backend structures
+
+Both backends share identical organizational principles: domain modules containing a routing controller, business service, and data repository.
+
+### TypeScript backend (modular monolith)
+
+<Files>
+  <Folder name="apps/api/src" defaultOpen>
+    <Folder name="modules" defaultOpen>
+      <Folder name="auth" defaultOpen>
+        <File name="auth.routes.ts" />
+        <File name="auth.controller.ts (HTTP validation and status codes)" />
+        <File name="auth.service.ts (domain business logic)" />
+        <File name="auth.repository.ts (direct database queries)" />
+        <File name="auth.schemas.ts (Zod validation schemas)" />
+        <File name="auth.types.ts" />
+        <File name="index.ts (public API for other modules)" />
+      </Folder>
+      <Folder name="billing" />
+    </Folder>
+    <Folder name="shared (middleware, errors, logger)" />
+    <Folder name="infra (database client, queues, cache)" />
+    <File name="server.ts" />
+  </Folder>
+</Files>
+
+### Python backend (FastAPI)
+
+<Files>
+  <Folder name="apps/ai-service" defaultOpen>
+    <File name="pyproject.toml" />
+    <Folder name="src/ai_service" defaultOpen>
+      <File name="main.py (FastAPI factory)" />
+      <Folder name="core (config, logging, security)" />
+      <Folder name="modules" defaultOpen>
+        <Folder name="evaluation" defaultOpen>
+          <File name="router.py" />
+          <File name="service.py" />
+          <File name="repository.py" />
+          <File name="schemas.py (Pydantic schemas)" />
+          <File name="__init__.py (module exports)" />
+        </Folder>
+        <Folder name="retrieval" />
+      </Folder>
+      <Folder name="shared" />
+    </Folder>
+    <Folder name="tests" />
+  </Folder>
+</Files>
+
+---
+
+## Contract-driven integration between TypeScript and Python
+
+Shared API contracts serve as the single source of truth between TypeScript and Python services:
+
+<Mermaid chart={`
+flowchart TD
+    subgraph Apps ["apps/"]
+        Web["web (Next.js)"]
+        API["api (TypeScript Modular Monolith)"]
+        AI["ai-service (Python FastAPI)"]
+    end
+
+    subgraph Packages ["packages/"]
+        Contracts["contracts (OpenAPI & Zod)"]
+    end
+
+    Web -->|Calls HTTP| API
+    API -->|Calls HTTP / Queue| AI
+    Web -.->|Imports types & clients| Contracts
+    API -.->|Imports types & schemas| Contracts
+    AI -.->|Generates spec into| Contracts
+
+`} />
+
+### Integration workflow
+
+1. FastAPI generates an OpenAPI JSON specification from Pydantic schemas on build.
+2. The spec is exported into `packages/contracts/`.
+3. An automated script generates typed TypeScript API clients from the OpenAPI specification.
+4. Both `web` and `api` consume the generated SDK rather than manual `fetch` calls.
+5. A CI validation step fails the build if the committed TypeScript client does not match the latest Python OpenAPI definition.
+
+---
+
+## Rules for maintaining codebase health
+
+Directory structures degrade unless enforced by automated tooling:
+
+1. **Module first, layer second**: Group files by domain first; place controllers, services, and repositories inside each module.
+2. **Access via public surfaces**: Enter modules exclusively through `index.ts` (TypeScript) or `__init__.py` (Python).
+3. **Unidirectional dependencies**: `app` depends on `features`, which depends on `shared`. Across the repository, applications depend on `packages/`, never the reverse.
+4. **Promote on second use**: Move code to `shared/` only when two or more distinct features require it, or when it contains zero business logic (e.g. utility debounce, currency formatter).
+5. **Enforce boundaries via linting**: Use `eslint-plugin-boundaries` for TypeScript and `import-linter` for Python in CI pipelines.
+6. **Document decisions via ADRs**: Maintain one-page Architecture Decision Records in `docs/adr/`.
+7. **Avoid preemptive symmetry**: Small modules with two files should not have empty placeholder directories.
+
+### Architecture Decision Record (ADR) template
+
+```markdown title="docs/adr/0003-use-modular-monolith.md"
+# ADR 0003: Use a modular monolith for the API
+
+Status: Accepted
+Context: Small team, unified database, no requirement for independent scaling.
+Decision: Single deployable with domain module boundaries enforced in CI.
+Consequences: Operational simplicity; extraction into independent services remains viable later.
+```
+
+---
+
+## Production conventions and pitfalls
+
+### Implementation guidelines
+
+- **Environment variables**: Centralize configuration access in a typed `config/env.ts` (using Zod) and Python `pydantic-settings`. Do not reference raw `process.env` in application logic.
+- **DTOs vs. database models**: Never return raw database records directly from API endpoints. Map entities to explicit response schemas within the service layer.
+- **Dependency injection**: Pass repository instances and HTTP clients into services via constructors or FastAPI `Depends` to enable unit test mocking.
+- **Colocated tests**: Place unit tests adjacent to the implementation file (`billing.service.test.ts`), reserving top-level `tests/` directories for integration and end-to-end suites.
+
+### Common antipatterns
+
+- Turning `shared/` into a generic dumping ground for loosely organized helpers.
+- Adding `index.ts` barrel files to every nested subdirectory, creating circular reference cycles.
+- Leaking database models across service boundaries instead of versioned contracts.
+- Scattering business rules inside UI route files or HTTP controllers.

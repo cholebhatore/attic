@@ -1,0 +1,200 @@
+---
+title: Jev Decision Model
+description: Architecture, cost economics, calibrated confidence, and execution mechanics of non-autoregressive decision models.
+---
+
+Jev is a specialized decision model developed by TypeSafe AI. It evaluates structured inputs and returns typed values, classification scores, and calibrated probabilities without generating natural language text.
+
+---
+
+## What is a decision model?
+
+Most modern language systems rely on generative large language models (LLMs). Generative models predict the next token in an open-ended sequence, making them suitable for long-form drafting, summarization, and multi-step reasoning.
+
+Decision models target a different layer of software logic. They execute System 1 tasks: immediate, repetitive, schema-bounded evaluations such as content moderation, ticket routing, sentiment scoring, intent detection, and policy verification.
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Raw State (Text / JSON)"] --> B["Jev Evaluator"]
+    B --> C["Classification Head"]
+    B --> D["Confidence Score"]
+    B --> E["Routing Flag"]
+    C --> F["Typed Code Branch"]
+    D --> F
+    E --> F
+`}
+/>
+
+Jev processes an input state alongside predefined, typed questions. Instead of streaming text tokens, it outputs structured data types directly into application code.
+
+---
+
+## Why decision models differ from LLMs
+
+A common question is why a dedicated decision model is needed when modern LLMs already support structured output via JSON mode or schema validation.
+
+```
+Why is this different from an LLM? I can get structured output from an LLM too.
+```
+
+The difference lies in the underlying execution architecture:
+
+### 1. Autoregressive generation versus parallel evaluation
+
+When an LLM produces structured output, it still operates autoregressively. The model samples every punctuation mark, quotation mark, key name, and whitespace character one token at a time:
+
+```json
+{ "category": "billing", "urgent": true }
+```
+
+Generating this 12-token JSON payload requires 12 sequential forward passes through the model's transformer layers. If the context window is large, each forward pass recomputes attention across past tokens.
+
+Jev is non-autoregressive. It uses a parallel sampler that maps the input state directly to the allowed values in a single forward pass. It never emits `{`, `"`, or `:` characters. It evaluates the representations and populates the schema fields in one step.
+
+### 2. Output space constraints
+
+LLMs sample from a broad vocabulary of roughly 100,000 tokens. Even when constrained by grammar engines, the generative backbone retains the potential to hallucinate field values, drift into syntax errors on edge cases, or exceed token limits.
+
+Jev restricts the output space to developer-defined types (enums, booleans, bounded numeric ranges). Because it lacks an open text generator, it cannot invent imaginary entities or output unparseable syntax.
+
+---
+
+## Performance and latency
+
+Autoregressive LLM latency scales with the number of generated tokens. Even small JSON payloads take between 1,500 ms and 6,000 ms on frontier models.
+
+Jev eliminates the autoregressive decode loop. Inference is bounded by a single representation pass over the input payload:
+
+| Metric                  | Generative LLMs (e.g. GPT-5)    | Jev Decision Model           |
+| :---------------------- | :------------------------------ | :--------------------------- |
+| **Inference latency**   | 1,500 ms – 6,000 ms             | 70 ms – 500 ms               |
+| **Execution pattern**   | Sequential token-by-token loop  | Single parallel forward pass |
+| **Relative speed**      | Baseline (1x)                   | 4x to 200x faster            |
+| **Multi-field latency** | Increases with every output key | Constant across all fields   |
+
+Because Jev evaluates schema fields in parallel, adding additional questions to the evaluation schema does not increase response latency.
+
+---
+
+## Cost comparison: Jev versus GPT-5
+
+Generative models bill for both input tokens and generated output tokens. Output tokens on frontier models like GPT-5 carry premium pricing due to the computational cost of sequential decoding steps.
+
+Jev removes output token billing entirely because it returns typed states and tensors directly instead of streaming strings.
+
+| Metric                     | GPT-5 | Jev       | Cost Ratio                |
+| :------------------------- | :---- | :-------- | :------------------------ |
+| **Input (per 1M tokens)**  | ₹119  | ₹4        | Jev is ~30x cheaper       |
+| **Output (per 1M tokens)** | ₹956  | Free (₹0) | Output billing eliminated |
+
+### Monthly workload projection
+
+Consider a production application processing 1,000,000 decision requests per month, where each request contains 800 input tokens and produces a 50-token structured judgment:
+
+- **GPT-5**:
+  - Input: `800M tokens * (₹119 / 1M) = ₹95,200`
+  - Output: `50M tokens * (₹956 / 1M) = ₹47,800`
+  - **Total**: ₹143,000 / month
+- **Jev**:
+  - Input: `800M tokens * (₹4 / 1M) = ₹3,200`
+  - Output: ₹0
+  - **Total**: ₹3,200 / month
+
+For high-throughput triage, routing, and classification, Jev reduces infrastructure expenses by over 97%.
+
+---
+
+## Multiple questions in one pass
+
+Production pipelines often need multiple checks on the same piece of data. For example, a customer support ticket requires checking urgency, sentiment, category, policy violations, and language.
+
+Handling this with an LLM presents two inefficient options:
+
+1. **Multiple API requests**: Fire five distinct prompts. This multiplies input token costs fivefold and increases network overhead.
+2. **One large prompt**: Combine all questions into a complex prompt. This increases output token length, inflates generation time, and raises the likelihood of malformed JSON.
+
+<Mermaid chart={`
+flowchart TD
+    subgraph LLM ["Generative LLM (Sequential)"]
+        L1["Input State"] --> L2["Token 1: {"]
+        L2 --> L3["Token 2: 'urgency'"]
+        L3 --> L4["... Sequential Generation (N Tokens)"]
+    end
+
+    subgraph JevArchitecture ["Jev (Single Pass)"]
+        J1["Input State"] --> J2["Shared Encoder"]
+        J2 --> K1["Head: Urgency"]
+        J2 --> K2["Head: Sentiment"]
+        J2 --> K3["Head: Category"]
+        J2 --> K4["Head: Policy Violation"]
+    end
+
+`} />
+
+Jev evaluates all target questions simultaneously against the same input representation. Adding ten classification heads to a single pass incurs negligible extra compute.
+
+---
+
+## Calibrated confidence scoring
+
+Generative LLMs do not produce reliable confidence metrics. When prompted with questions like "How confident are you from 1 to 10?", models output verbalized estimations shaped by conversational tone and reinforcement learning with human feedback (RLHF). These self-reports correlate poorly with actual accuracy.
+
+Similarly, extracting token log probabilities from an autoregressive stream produces scores distorted by sequence length and syntax tokens.
+
+Jev is trained using **Reinforcement Learning for Calibrated Decisions (RLCD)**. Instead of optimizing for conversational preferences, RLCD trains the model's output probabilities to match empirical error rates.
+
+```typescript
+interface DecisionResult {
+  category: 'refund' | 'technical_support' | 'account_access';
+  isEscalationRequired: boolean;
+  confidence: number; // Statistically calibrated [0.0 - 1.0]
+}
+
+// Calibrated scores enable direct thresholding in code
+if (result.confidence >= 0.88 && !result.isEscalationRequired) {
+  await dispatchAutoReply(ticket, result.category);
+} else {
+  await routeToHumanAgent(ticket);
+}
+```
+
+When Jev outputs a confidence score of 0.85, the judgment is statistically accurate 85% of the time across that probability bucket. This calibration makes the confidence score usable as an automated gate in production logic.
+
+---
+
+## Hallucination immunity
+
+Hallucination in language models occurs because generation is an open search problem over human vocabulary. Given an ambiguous prompt, a generative model will synthesize plausible words to complete the sentence.
+
+Jev cannot hallucinate because it has no generative vocabulary head:
+
+1. **Closed schema**: The output is bounded by explicit types (enumerations, booleans, floats).
+2. **Discriminative evaluation**: Rather than asking what words come next, Jev scores predefined choices against the context vector.
+3. **Determinism**: If an input does not match any valid category with high confidence, Jev outputs a low confidence score across all candidates, rather than fabricating a non-existent option.
+
+---
+
+## Architectural integration
+
+Jev is designed to work alongside generative LLMs rather than replace them entirely. In production systems, Jev operates as the high-throughput decision filter in front of heavier generative models.
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Incoming Event / Request"] --> B["Jev Decision Filter"]
+    B -- "High Confidence Classification" --> C["Deterministic Code Execution"]
+    B -- "Requires Long-Form Text / Complex Reasoning" --> D["Generative LLM (GPT-5 / Claude)"]
+    B -- "Low Confidence / Ambiguous Policy" --> E["Human in the Loop Review"]
+`}
+/>
+
+### Choosing between Jev and generative models
+
+| Task                                | Recommended Model | Rationale                                                                 |
+| :---------------------------------- | :---------------- | :------------------------------------------------------------------------ |
+| **Support ticket triage**           | Jev               | Needs sub-second routing, discrete labels, and high throughput.           |
+| **Email drafting**                  | Generative LLM    | Requires creative phrasing, open-ended context, and fluent prose.         |
+| **Input safety & policy guardrail** | Jev               | Needs deterministic rejection, low latency, and zero hallucinated passes. |
+| **Code synthesis & debugging**      | Generative LLM    | Requires multi-step reasoning, variable tracking, and syntax generation.  |
+| **Lead qualification scoring**      | Jev               | Needs numerical probability calibration directly consumable by CRM APIs.  |
