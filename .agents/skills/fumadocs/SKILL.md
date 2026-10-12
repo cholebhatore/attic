@@ -46,19 +46,18 @@ Read these companion files **before writing any docs**:
 > Never default to raw paragraphs or plain markdown lists when a richer component
 > exists. The component library is there to make docs **visually excellent**.
 
-| Content Pattern                                       | Correct Component                                                                           | Do NOT Use                                                                 |
-| :---------------------------------------------------- | :------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------- |
-| **Navigation hub** (section index linking sub-pages)  | `<Cards>` with `<Card>` per sub-page, each with `icon`, `title`, `description`, `href`      | Bulleted link lists                                                        |
-| **Warnings / important notes / info**                 | `<Callout type="info\|warn\|error">`                                                        | Bold text or blockquotes                                                   |
-| **Step-by-step instructions**                         | `<Steps>` with `<Step>` per numbered step                                                   | Ordered lists `1. 2. 3.`                                                   |
-| **Parallel alternatives** (e.g., npm vs pnpm vs yarn) | `<Tabs items={[...]}>` with `<Tab>` per variant                                             | Multiple code blocks stacked                                               |
-| **FAQs or collapsible detail**                        | `<Accordions>` with `<Accordion>` per item                                                  | Static paragraphs or Card grids                                            |
-| **File / folder structure**                           | `<Files>` with `<Folder>` and `<File>`                                                      | Code-fenced `tree` output                                                  |
-| **Architecture / flow diagrams**                      | ` ```mermaid ``` ` fenced code block or `<Mermaid chart="..." />` (requires renderer setup) | ASCII diagrams                                                             |
-| **Tabular data, comparisons, API params**             | Markdown `\| table \|` syntax                                                               | Nested lists or cards                                                      |
-| **Time & Space Complexities, Variables**              | Inline code `` `O(1)` ``, `` `O(n)` ``, `` `k` ``                                           | Raw LaTeX math `$...$` (renders literal dollar signs without math plugins) |
-| **KPIs / metrics / status values**                    | Inline `<code>` with `font-mono tabular-nums`                                               | Plain text numbers                                                         |
-| **Long page with many headings**                      | `<InlineTOC>` at the top after intro paragraph                                              | No TOC at all                                                              |
+| Content Pattern                                       | Correct Component                                                                      | Do NOT Use                                                                 |
+| :---------------------------------------------------- | :------------------------------------------------------------------------------------- | :------------------------------------------------------------------------- |
+| **Navigation hub** (section index linking sub-pages)  | `<Cards>` with `<Card>` per sub-page, each with `icon`, `title`, `description`, `href` | Bulleted link lists                                                        |
+| **Warnings / important notes / info**                 | `<Callout type="info\|warn\|error">`                                                   | Bold text or blockquotes                                                   |
+| **Step-by-step instructions**                         | `<Steps>` with `<Step>` per numbered step                                              | Ordered lists `1. 2. 3.`                                                   |
+| **Parallel alternatives** (e.g., npm vs pnpm vs yarn) | `<Tabs items={[...]}>` with `<Tab>` per variant                                        | Multiple code blocks stacked                                               |
+| **FAQs or collapsible detail**                        | `<Accordions>` with `<Accordion>` per item                                             | Static paragraphs or Card grids                                            |
+| **Architecture / flow diagrams**                      | `<Mermaid chart={`...`} />` JSX component (**NEVER** fenced code blocks)               | Fenced ` ```mermaid ` blocks, ASCII diagrams                               |
+| **Tabular data, comparisons, API params**             | Markdown `\| table \|` syntax                                                          | Nested lists or cards                                                      |
+| **Time & Space Complexities, Variables**              | Inline code `` `O(1)` ``, `` `O(n)` ``, `` `k` ``                                      | Raw LaTeX math `$...$` (renders literal dollar signs without math plugins) |
+| **KPIs / metrics / status values**                    | Inline `<code>` with `font-mono tabular-nums`                                          | Plain text numbers                                                         |
+| **Long page with many headings**                      | `<InlineTOC>` at the top after intro paragraph                                         | No TOC at all                                                              |
 
 ### 1.3 Icon Usage in Cards
 
@@ -191,16 +190,22 @@ Every folder **must** have an `index.mdx` that:
 ### 4.3 Mermaid Diagrams
 
 > [!IMPORTANT]
-> **Mermaid is NOT Built-In**: Neither Fumadocs nor Fumapress includes a Mermaid renderer out of the box. Without a configured renderer, ` ```mermaid ` code blocks display as raw plain text with a copy button.
+> **Always Use `<Mermaid chart={`...`} />` (Never Fenced Code Blocks)**:
+> In Fumadocs (Next.js), the Shiki code-highlighting rehype pipeline processes fenced ` ```mermaid ` code blocks at compile time into static syntax-highlighted code blocks with a copy button. Because Shiki tokenizes the block before client hydration, fenced code blocks will **never** render as interactive SVG flowcharts.
 >
-> **Recommended Setup (Client Component with `mermaid`)**:
+> **You MUST always invoke the `<Mermaid />` JSX component directly:**
 >
-> 1. Install `mermaid` and `next-themes` (`npm install mermaid next-themes`).
-> 2. Create `src/components/mermaid.tsx` using `mermaid.initialize()` and client-side hydration guard.
-> 3. Register `Mermaid` in `src/components/mdx.tsx` (Fumadocs / Next.js) or `press.config.tsx` (Fumapress) under `getMDXComponents`.
-> 4. In MDX, invoke directly: `<Mermaid chart={`flowchart TD ...`} />`.
+> ```mdx
+> <Mermaid
+>   chart={`
+> flowchart LR
+>     A["Raw State (Text / JSON)"] --> B["Evaluator"]
+>     B --> C["Result"]
+> `}
+> />
+> ```
 >
-> _(Alternatively, install `beautiful-mermaid` for a lighter server-rendered SVG approach)._
+> Neither Fumadocs nor Fumapress includes a built-in client Mermaid renderer out of the box. Ensure `src/components/mermaid.tsx` is implemented and registered in `getMDXComponents`.
 
 #### Fixing Blurry Shadows, Colored Tints & Oversized Diagrams
 
@@ -337,11 +342,11 @@ To ensure diagrams are crisp, solid, uncolored (neutral monochrome), and comfort
 | Repeating parent section/folder name in child titles (stuttering) | Degrades sidebar scannability, wastes horizontal space causing truncation, and duplicates breadcrumb/switcher context (e.g., 'Auth > Auth Overview') | Strip the parent prefix: use 'Overview', 'Quickstart', 'Configuration', 'Architecture'           |
 | Plain bulleted link list for navigation                           | Looks like a plain README, not a docs site                                                                                                           | Use `<Cards>` with icons                                                                         |
 | Raw LaTeX dollar signs for math/Big-O (`$O(n)$`, `$k$`, `$\le$`)  | MDX without KaTeX/MathJax plugins renders literal `$` signs, and braces like `${...}` or `2^{h+1}` trigger Acorn JSX syntax errors                   | Use inline code backticks: `` `O(1)` ``, `` `O(n)` ``, `` `O(log n)` ``, `` `k` ``, `` `<= e` `` |
-| Relying on Mermaid without configuring a renderer                 | Fenced ` ```mermaid ` blocks render as plain raw code text                                                                                           | Install `beautiful-mermaid` and configure `CustomPre` + `<Mermaid>` in `press.config.tsx`        |
+| Using fenced ` ```mermaid ` code blocks                           | In Fumadocs, Shiki highlights fenced blocks at compile time into static code blocks with copy buttons; diagrams will never render                    | Always invoke `<Mermaid chart={`...`} />` JSX component directly                                 |
 | Ordered list for setup instructions                               | Missing visual step indicators                                                                                                                       | Use `<Steps>` / `<Step>`                                                                         |
 | Bold text for warnings                                            | Easy to miss, no visual weight                                                                                                                       | Use `<Callout type="warn">`                                                                      |
 | Multiple code blocks for package manager variants                 | Cluttered, repetitive                                                                                                                                | Use `<Tabs>` with npm/pnpm/yarn                                                                  |
-| ASCII art for diagrams                                            | Breaks on different screens, ugly                                                                                                                    | Use Mermaid fenced blocks or `<Mermaid>`                                                         |
+| ASCII art for diagrams                                            | Breaks on different screens, ugly                                                                                                                    | Use `<Mermaid chart={`...`} />` component                                                        |
 | No `description` in frontmatter                                   | Empty subtitle, bad SEO                                                                                                                              | Always provide description                                                                       |
 | Manual `# Title` heading                                          | Duplicates the rendered frontmatter title                                                                                                            | Remove manual `# Title`                                                                          |
 | Walls of text with no components                                  | Unscalable, hard to scan                                                                                                                             | Break with `<Callout>`, tables, diagrams                                                         |

@@ -330,7 +330,10 @@ This page covers all modules. Use the table of contents below to jump to any sec
 Renders Mermaid diagrams as responsive SVGs with automatic dark/light theme switching.
 
 > [!IMPORTANT]
-> **Setup Required**: Neither Fumadocs nor Fumapress ships with a built-in Mermaid renderer. Without setup, ` ```mermaid ` code blocks display as raw syntax-highlighted code.
+> **Always Use `<Mermaid chart={`...`} />` (Never Fenced Code Blocks)**:
+> In Fumadocs, the Shiki syntax-highlighting pipeline processes fenced ` ```mermaid ` code blocks into static syntax-highlighted code blocks with a copy button. Fenced code blocks will **never** render as interactive SVG diagrams.
+>
+> You MUST use the `<Mermaid chart={`...`} />` JSX component directly in MDX.
 >
 > Install `mermaid` (`npm i mermaid next-themes`), create `src/components/mermaid.tsx`, and register `Mermaid` in `getMDXComponents`.
 
