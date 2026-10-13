@@ -1,0 +1,159 @@
+---
+title: What is an LLM
+description: The two-file anatomy of an AI model, how weights and biases work using a house price analogy, and calculating model size across precisions.
+---
+
+When people talk about Large Language Models (LLMs), they often describe them like abstract artificial brains. But when you look at how a model actually exists on a hard drive, it is surprisingly simple.
+
+At its core, any LLM comes down to **two files**:
+
+1. **`model.py` (Architecture code)**: Around 500 lines of standard Python, C, or PyTorch code that defines the neural network architecture (like the transformer). It describes the math operations, attention loops, and matrix multiplications.
+2. **`parameters.bin` (Learned weights)**: A massive binary file containing billions of floating-point numbers produced by training on terabytes of text.
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Large Dataset<br/>(Web scrapes, books, code)"] --> B["Training Cluster<br/>(Runs model.py + optimizer)"]
+    B --> C["parameters.bin<br/>(140GB - 400GB of learned weights)"]
+`}
+/>
+
+By itself, `model.py` is an empty shell with zero intelligence. It just defines how numbers should be multiplied. The "intelligence" and knowledge of the model live entirely inside `parameters.bin`.
+
+---
+
+## What are weights and biases?
+
+Weights are **learned numerical values** stored inside an AI model.
+
+Whenever you send input into a neural network, that input passes through many layers of mathematical calculations before producing output probabilities. Every connection between neurons has a number attached to it called a **weight**.
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Input Tokens"] --> B["Layer 1"]
+    W1["weights"] -.-> B
+    B --> C["Layer 2"]
+    W2["weights"] -.-> C
+    C --> D["..."]
+    D --> E["Layer N"]
+    WN["weights"] -.-> E
+    E --> F["Output Probabilities"]
+`}
+/>
+
+When a model is first initialized before training, every weight is set to a random number. If you ask it to complete a sentence, it outputs gibberish.
+
+During training, the model reads vast amounts of text and tries to guess the next token. Every time its guess is wrong, the training algorithm calculates the error and nudges each weight slightly (using an algorithm called backpropagation). After reading trillions of tokens, the weights settle into numbers that are exceptionally good at predicting what word comes next.
+
+At the simplest level, every calculation follows this formula:
+
+```
+output = (input * weight) + bias
+```
+
+Where:
+
+- **`input`**: The incoming numerical value.
+- **`weight`**: The multiplier determining how strongly this input influences the output.
+- **`bias`**: An offset number added to shift the baseline result up or down, regardless of the input.
+
+---
+
+## The house price analogy
+
+To understand how weights work in practice without getting lost in 70 billion parameters, look at how a machine learning model predicts real estate prices.
+
+Imagine you want to predict the sale price of a house based on three features: **bedrooms**, **square feet**, and **balconies**.
+
+### 1. Training dataset
+
+You collect historical sales data from recent house sales:
+
+| Bedrooms | Square Feet | Balconies | Actual Sale Price ($) |
+| :------- | :---------- | :-------- | :-------------------- |
+| 2        | 1,100       | 1         | $215,000              |
+| 3        | 1,500       | 2         | $305,000              |
+| 4        | 2,200       | 3         | $440,000              |
+| 2        | 950         | 1         | $198,000              |
+
+### 2. Finding the weights
+
+Before training, the model does not know how much a bedroom or a square foot is worth.
+
+During training, the algorithm tests different numbers until it finds weights that accurately predict the prices in the dataset. When training finishes, the algorithm outputs the optimal weights and bias:
+
+- `w1` (weight for bedrooms) = **27,000**
+- `w2` (weight for square feet) = **94**
+- `w3` (weight for balconies) = **21,000**
+- `b` (base bias) = **45,000**
+
+These learned values are saved into your `parameters.bin` file.
+
+The formula to calculate any price is:
+
+```
+price = (w1 * bedrooms) + (w2 * square_feet) + (w3 * balconies) + bias
+```
+
+### 3. Making a prediction
+
+Now, suppose a new house enters the market with **3 bedrooms**, **1,625 square feet**, and **2 balconies**. You plug the inputs into the formula using the weights stored in `parameters.bin`:
+
+```
+price = (27,000 * 3) + (94 * 1,625) + (21,000 * 2) + 45,000
+price = 81,000 + 152,750 + 42,000 + 45,000
+price = $320,750
+```
+
+The model did not memorize the new house. It used the learned weights to calculate the output from the inputs.
+
+An LLM works on this exact same principle. The only difference is scale: instead of 3 inputs (bedrooms, sqft, balconies), an LLM takes thousands of vector numbers representing words. And instead of 3 weights, an LLM has 7 billion, 70 billion, or 400 billion weights arranged across dozens of transformer layers.
+
+---
+
+## What lives inside parameters.bin?
+
+When an LLM exports its weights into a binary checkpoint file (like `.bin` or modern `.safetensors` files), it stores several types of learned parameters:
+
+| Parameter Type            | What It Stores                                                                                |
+| :------------------------ | :-------------------------------------------------------------------------------------------- |
+| **Token Embeddings**      | A lookup table mapping every token ID in the vocabulary to an initial high-dimensional vector |
+| **Attention Weights**     | Matrices (`W_q`, `W_k`, `W_v`, `W_o`) that let the model decide which prior words to focus on |
+| **Feed-Forward Weights**  | Dense linear layers (`W_gate`, `W_up`, `W_down`) that store factual associations and patterns |
+| **Normalization Weights** | Scaling parameters (`RMSNorm` or `LayerNorm`) to stabilize activations between layers         |
+| **Biases**                | Constant offset vectors added after linear projections (many modern models omit these)        |
+| **Language Model Head**   | Projection matrix mapping final hidden states back to vocabulary token probabilities          |
+
+---
+
+## Model size and precision calculation
+
+How do you know how much disk space or GPU RAM an AI model requires? It comes down to one formula:
+
+```
+Model Size (in bytes) = Number of Parameters * Bytes per Parameter
+```
+
+The number of bytes per parameter is determined by its **numerical precision**:
+
+- **FP32 (Single Precision)**: 32 bits = **4 bytes** per parameter. The traditional precision used in scientific computing.
+- **FP16 / BF16 (Half Precision / Bfloat16)**: 16 bits = **2 bytes** per parameter. The standard precision used for training and serving modern models.
+- **INT8 (8-bit Quantization)**: 8 bits = **1 byte** per parameter. Weights are converted to 8-bit integers to cut memory usage by half with minimal loss in accuracy.
+- **INT4 (4-bit Quantization)**: 4 bits = **0.5 bytes** per parameter. Aggressive compression enabling models to run on consumer laptops and edge hardware.
+
+### Memory footprint comparison table
+
+| Model            | Parameter Count | FP32 (4 bytes) | FP16 / BF16 (2 bytes) | INT8 (1 byte) | INT4 (0.5 bytes) |
+| :--------------- | :-------------- | :------------- | :-------------------- | :------------ | :--------------- |
+| **Llama 3 8B**   | 8 Billion       | ~32 GB         | ~16 GB                | ~8 GB         | ~4 GB            |
+| **Llama 2 70B**  | 70 Billion      | ~280 GB        | ~140 GB               | ~70 GB        | ~35 GB           |
+| **Llama 3 405B** | 405 Billion     | ~1,620 GB      | ~810 GB               | ~405 GB       | ~202.5 GB        |
+
+<Callout type="warn">
+  **VRAM Overhead in Production**: The table above calculates pure model weights on disk. When
+  running inference in GPU memory (VRAM), you must account for additional overhead: the **KV Cache**
+  (storing past token states across the context window), activation memory, and CUDA context
+  buffers. A 70B model at FP16 requires around 140 GB just to load the weights, and typically 160
+  GB+ of VRAM to serve longer prompts.
+</Callout>

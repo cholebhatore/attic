@@ -1,0 +1,139 @@
+---
+title: Inference Lifecycle
+description: Tracing a prompt through tokenization, embedding vectors, transformer forward passes, and detokenization.
+---
+
+Running an LLM (often called **inference**) sounds intimidating, but it is just executing code with inputs.
+
+To run a model on your own machine, you only need two files:
+
+1. **`model.py`**: The model architecture code (around 500 lines of standard Python or C).
+2. **`parameters.bin`**: The trained parameters file (weights, embeddings, and normalization values).
+
+When you give an LLM a prompt like `"he is a good"`, it does not think in human words. It passes the text through a deterministic pipeline that turns characters into numbers, processes those numbers through matrix multiplications, and turns the resulting numbers back into words.
+
+---
+
+## The end-to-end prompt pipeline
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Raw Prompt<br/>'he is a good'"] --> B["1. Tokenization<br/>IDs: [633, 318, 257, 922]"]
+    B --> C["2. Embedding Lookup<br/>Vectors: 4096-dim arrays"]
+    C --> D["3. Forward Pass<br/>model.py + parameters.bin"]
+    D --> E["4. Output Logits<br/>Softmax Probabilities"]
+    E --> F["5. Detokenization<br/>Token 3715 -> 'person'"]
+    F --> G["Output Text<br/>'he is a good person'"]
+`}
+/>
+
+---
+
+## Step 1: Tokenization
+
+Computers cannot do math on raw English words. Before any computation happens, the text is split into chunks called **tokens** and converted into numerical IDs using a tokenizer.
+
+Modern models use tokenizers like Byte-Pair Encoding (BPE). Words are looked up in a fixed dictionary of tokens (typically 32,000 to 128,000 tokens):
+
+| Text Slice | Token ID | Note                                 |
+| :--------- | :------- | :----------------------------------- |
+| `"he"`     | `633`    | Lowercase word                       |
+| `" is"`    | `318`    | Notice the leading space             |
+| `" a"`     | `257`    | Common single-letter word with space |
+| `" good"`  | `922`    | Adjective with leading space         |
+
+The prompt `"he is a good"` becomes a simple array of integers:
+
+```python
+input_tokens = [633, 318, 257, 922]
+```
+
+---
+
+## Step 2: Embedding lookup
+
+A token ID like `633` is just an arbitrary index in a list. It has no mathematical meaning (token `634` is not "one unit more" than `633`).
+
+To give the tokens meaning, the model looks up each token ID in an **Embedding Matrix** stored inside `parameters.bin`.
+
+This converts each integer ID into a long list of numbers called a **vector** (for example, 4,096 numbers per token in an 8B model):
+
+```python
+# Embedding table lookup inside parameters.bin:
+token_633_vector = [-0.042,  0.187,  0.009,  0.512, ... -0.091]  # 'he'
+token_318_vector = [ 0.115, -0.003,  0.421, -0.089, ...  0.034]  # ' is'
+token_257_vector = [-0.008,  0.021, -0.114,  0.003, ... -0.044]  # ' a'
+token_922_vector = [ 0.312, -0.045,  0.812,  0.104, ...  0.220]  # ' good'
+```
+
+Next, **Positional Encodings** (like RoPE / Rotary Position Embeddings) are added to these vectors so the network knows the sequence order—that `"he"` comes first, `"is"` comes second, and `"good"` comes last.
+
+---
+
+## Step 3: Forward pass through model.py
+
+Now the vectors enter the neural network defined in `model.py`.
+
+The vectors pass through 32 to 80 transformer layers stacked on top of each other. In each layer, two main calculations occur:
+
+1. **Self-Attention**: The token vectors communicate with each other. The vector for `"good"` looks back at `"he"` and `"is"` to figure out the context (e.g., who is good? what is the subject of the sentence?).
+2. **Feed-Forward Networks (MLP)**: Each vector is multiplied by massive weight matrices in `parameters.bin` (using the `output = (input * weight) + bias` formula). This is where the model retrieves stored patterns and associations.
+
+By the time the calculations reach the final layer, the vector for the last position contains a numerical representation of what should logically follow.
+
+---
+
+## Step 4: Output logits and probabilities
+
+The final hidden vector is multiplied by an **unembedding matrix** (also called the Language Model Head).
+
+This produces a single score for every single token in the entire vocabulary (e.g. 128,000 numbers). These raw scores are called **logits**.
+
+To turn logits into usable percentages, they pass through a **Softmax** function, which normalizes them into probabilities between 0% and 100%:
+
+| Candidate Token | Raw Logit Score | Softmax Probability |
+| :-------------- | :-------------- | :------------------ |
+| `" person"`     | `14.2`          | **38.4%**           |
+| `" boy"`        | `13.8`          | **26.1%**           |
+| `" man"`        | `13.3`          | **16.2%**           |
+| `" friend"`     | `12.5`          | **7.3%**            |
+| `" guy"`        | `12.1`          | **5.0%**            |
+| `" apple"`      | `-2.4`          | **0.0001%**         |
+
+---
+
+## Step 5: Detokenization and sampling
+
+The model now chooses which token to pick:
+
+- **Greedy Decoding (`temperature = 0`)**: The model always picks the single highest probability token (`" person"`, Token ID `3715`).
+- **Sampling (`temperature > 0`)**: The model samples randomly from the top probabilities, introducing variety.
+
+Once the token ID is selected (e.g. `3715`), the tokenizer performs the reverse lookup:
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Token ID: 3715"] --> B["Vocabulary Lookup / Detokenizer"]
+    B --> C["' person'"]
+`}
+/>
+
+The model outputs `" person"`, appends it to the prompt, and repeats the entire cycle:
+
+```
+Round 1: "he is a good"        ──▶ predicts " person"
+Round 2: "he is a good person" ──▶ predicts " who"
+Round 3: "he is a good person who" ──▶ predicts " loves"
+```
+
+This autoregressive loop continues until the model outputs a special Stop Token (`<|end_of_text|>`) or reaches your token limit.
+
+---
+
+## Running models locally
+
+Because inference only needs `model.py` and `parameters.bin`, you do not need third-party cloud APIs to run LLMs.
+
+Tools like **`llama.cpp`** and **Ollama** package the architecture logic into an optimized C++ binary and convert `parameters.bin` into a single file format (such as `.gguf`). The C++ runtime loads the weights directly into your computer's RAM or GPU VRAM and runs the exact forward pass described above.

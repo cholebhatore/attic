@@ -21,6 +21,11 @@ import {
   Package,
   GitBranch,
   Code,
+  Brain,
+  Binary,
+  Sparkles,
+  Calculator,
+  Bot,
 } from 'lucide-react';
 
 function getNodeText(node: React.ReactNode): string {
@@ -103,6 +108,11 @@ export function getMDXComponents(components?: MDXComponents) {
     Package,
     GitBranch,
     Code,
+    Brain,
+    Binary,
+    Sparkles,
+    Calculator,
+    Bot,
     ...components,
   } satisfies MDXComponents;
 }
