@@ -1,0 +1,251 @@
+---
+title: Matrix Multiplication
+description: 'Hadamard products against matmul, the mm/bmm/matmul family, broadcasting rules, einsum notation, and why matmul dominates model cost.'
+---
+
+Two operators that both look like multiplication do completely different work. `*` multiplies element by element. `@` contracts an axis. Almost all compute in a neural network is `@`, and almost all shape bugs come from writing one where the other was meant.
+
+---
+
+## Hadamard product versus matmul
+
+```python title="hadamard_vs_matmul.py"
+import torch
+
+p = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+q = torch.tensor([[5.0, 6.0], [7.0, 8.0]])
+
+print((p * q).tolist())    # [[5.0, 12.0], [21.0, 32.0]]
+print((p @ q).tolist())    # [[19.0, 22.0], [43.0, 50.0]]
+```
+
+`p * q` is the **Hadamard product**: same shape in, same shape out, each output element depends on exactly one pair of inputs. It broadcasts, so shapes need only be compatible rather than equal.
+
+`p @ q` is a matrix product. The output element `(i, j)` is the dot product of row `i` of `p` with column `j` of `q`, summing over the contracted axis:
+
+```
+(p @ q)[i, j] = sum over k of p[i, k] * q[k, j]
+```
+
+The inner dimensions must agree. `(2, 3) @ (3, 5)` gives `(2, 5)`. `(2, 3) @ (5, 3)` raises.
+
+Two consequences follow from that sum. A matmul costs `M * K * N` multiply-accumulate operations, so it is `O(n^3)` on square inputs where the Hadamard product is `O(n^2)`. And every output element reads an entire row and an entire column, which is what makes matmul memory-bandwidth bound and worth specialized hardware.
+
+Where the Hadamard product does appear in models: gating in GLU and SwiGLU feed-forward blocks, element-wise masks, and the rescaling step in RMSNorm.
+
+---
+
+## The matmul family
+
+| Function             | Inputs                   | Output                  | Broadcasts batch dims      |
+| :------------------- | :----------------------- | :---------------------- | :------------------------- |
+| `torch.mv(A, v)`     | `(m, k)`, `(k,)`         | `(m,)`                  | No                         |
+| `torch.mm(A, B)`     | `(m, k)`, `(k, n)`       | `(m, n)`                | No                         |
+| `torch.bmm(A, B)`    | `(b, m, k)`, `(b, k, n)` | `(b, m, n)`             | No, batch sizes must match |
+| `torch.matmul(A, B)` | anything compatible      | follows the rules below | Yes                        |
+| `A @ B`              | alias for `matmul`       | same                    | same                       |
+
+```python title="matmul_family.py"
+import torch
+
+A2 = torch.zeros(3, 4)
+B2 = torch.zeros(4, 5)
+v = torch.zeros(4)
+A3 = torch.zeros(6, 3, 4)
+B3 = torch.zeros(6, 4, 5)
+
+print(tuple(torch.mm(A2, B2).shape))     # (3, 5)
+print(tuple(torch.mv(A2, v).shape))      # (3,)
+print(tuple(torch.bmm(A3, B3).shape))    # (6, 3, 5)
+
+print(tuple((A3 @ B2).shape))            # (6, 3, 5) - 2-D operand broadcast
+print(tuple((A3 @ torch.zeros(1, 4, 5)).shape))   # (6, 3, 5) - size-1 batch broadcast
+
+# A3[:2] @ B3  raises ValueError: batch dimensions do not broadcast
+```
+
+`matmul` is the general case and the one to reach for by default. It follows three rules:
+
+1. If both operands are 1-D, it is a dot product and returns a scalar.
+2. If both are 2-D, it is a plain matrix multiply.
+3. Otherwise the leading dimensions are treated as a batch and broadcast against each other, while the last two dimensions do the matrix multiply. A 1-D operand gets a `1` prepended for the multiply and removed afterward.
+
+`bmm` predates broadcasting in `matmul` and survives mostly in older code. Its one advantage is that it refuses mismatched batch shapes instead of silently broadcasting, which catches bugs.
+
+---
+
+## Linear layers store weights transposed
+
+`nn.Linear` holds `W` of shape `(out_features, in_features)` and computes:
+
+```
+y = x @ W.T + b
+```
+
+```python title="linear.py"
+import torch
+import torch.nn.functional as F
+
+x = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+W = torch.ones(4, 3)
+b = torch.ones(4)
+
+manual = x @ W.T + b
+print(tuple(manual.shape))                                  # (2, 4)
+print(torch.equal(manual, F.linear(x, W, b)))               # True
+```
+
+The convention exists so that each _row_ of `W` is one output neuron's weight vector. Slicing `W[i]` gives the weights producing output `i`, which makes pruning, LoRA, and per-neuron analysis straightforward. The transpose is free at runtime, being a stride permutation, so nothing is lost.
+
+`F.linear` also fuses the multiply and the bias add into a single kernel when it can, which is why it is preferred over writing `x @ W.T + b` by hand.
+
+---
+
+## einsum
+
+`torch.einsum` writes the summation explicitly. Indices that appear on both sides are summed over. Indices that appear only on the left are contracted away. Indices that appear only on the right would be an error.
+
+```python title="einsum.py"
+import torch
+
+torch.manual_seed(0)
+
+A = torch.randn(2, 3, 4)
+B = torch.randn(2, 4, 5)
+
+print(torch.equal(torch.einsum("bij,bjk->bik", A, B), A @ B))          # True
+print(torch.equal(torch.einsum("...ij,...jk->...ik", A, B), A @ B))    # True
+
+M = torch.randn(4, 4)
+print(torch.allclose(torch.einsum("ii->", M), torch.trace(M)))         # True
+
+X = torch.randn(6, 7)
+print(torch.allclose(torch.einsum("bi->i", X), X.sum(dim=0)))          # True
+print(torch.equal(torch.einsum("ij->ji", X), X.T))                     # True
+
+a = torch.randn(3)
+b = torch.randn(5)
+print(tuple(torch.einsum("i,j->ij", a, b).shape))                      # (3, 5)
+```
+
+The `...` form treats all leading dimensions as a broadcastable batch, which is usually what you want and avoids naming axes you do not care about.
+
+The patterns worth memorizing:
+
+| Notation       | Operation               |
+| :------------- | :---------------------- |
+| `ij,jk->ik`    | Matrix multiply         |
+| `ij,ji->`      | Trace of the product    |
+| `ii->`         | Trace                   |
+| `ij->ji`       | Transpose               |
+| `ij,ij->`      | Frobenius inner product |
+| `bi,bi->b`     | Row-wise dot product    |
+| `bi->i`        | Sum over the batch      |
+| `i,j->ij`      | Outer product           |
+| `bij,bjk->bik` | Batched matrix multiply |
+
+`einsum` is not faster than `matmul`. PyTorch rewrites it into the same underlying calls. Its value is that the expression states the contraction once, in a form that can be checked by reading, rather than as a sequence of transposes whose correctness depends on the order they were applied.
+
+---
+
+## Attention written three ways
+
+The attention computation is two matmuls with a softmax between them. Here it is in each of the three notations.
+
+<Tabs items={['matmul', 'einsum', 'bmm']}>
+  <Tab value="matmul">
+    ```python
+    import math
+    import torch
+
+    # Q, K, V are (batch, heads, seq, head_dim)
+    scores = Q @ K.mT / math.sqrt(head_dim)     # (b, h, seq, seq)
+    weights = torch.softmax(scores, dim=-1)
+    out = weights @ V                            # (b, h, seq, head_dim)
+    ```
+    `K.mT` swaps the last two axes without copying. The `1 / sqrt(head_dim)` scaling is covered in [Softmax and Logits](/ai/math-foundations/softmax-and-logits).
+
+  </Tab>
+  <Tab value="einsum">
+    ```python
+    import math
+    import torch
+
+    scores = torch.einsum("bhqd,bhkd->bhqk", Q, K) / math.sqrt(head_dim)
+    weights = torch.softmax(scores, dim=-1)
+    out = torch.einsum("bhqk,bhkv->bhqv", weights, V)
+    ```
+    The index names say what each axis means: `b` batch, `h` head, `q` query position, `k` key position, `v` head dimension. `d` and `v` are the same axis, contracted in the first expression and preserved in the second.
+
+  </Tab>
+  <Tab value="bmm">
+    ```python
+    import math
+    import torch
+
+    b, h, s, d = Q.shape
+    Qf = Q.reshape(b * h, s, d)
+    Kf = K.reshape(b * h, s, d)
+    Vf = V.reshape(b * h, s, d)
+
+    scores = torch.bmm(Qf, Kf.transpose(1, 2)) / math.sqrt(d)
+    out = torch.bmm(torch.softmax(scores, dim=-1), Vf)
+    out = out.reshape(b, h, s, d)
+    ```
+    Folding batch and head into one axis turns the operation into a single large batched matmul. This is what implementations did before `matmul` broadcast reliably, and it is still what you write when targeting a kernel that expects three dimensions.
+
+  </Tab>
+</Tabs>
+
+All three produce `(batch, heads, seq, seq)` scores and `(batch, heads, seq, head_dim)` output. Verified shapes for `Q`, `K`, `V` of `(2, 4, 8, 16)`: scores are `(2, 4, 8, 8)`, output is `(2, 4, 8, 16)`.
+
+---
+
+## Counting the cost
+
+A matmul producing an `(M, N)` result from a contracted dimension `K` performs `M * K * N` multiply-accumulate operations, which is `2 * M * K * N` floating-point operations counting the multiply and the add separately.
+
+```
+A(512, 1024) @ B(1024, 2048) -> C(512, 2048)
+
+MACs  = 512 * 1024 * 2048 = 1,073,741,824
+FLOPs = 2 * MACs          = 2,147,483,648
+```
+
+For one transformer attention block with `seq = 2048`, `head_dim = 128`, `n_heads = 32`, and therefore `d_model = 4096`:
+
+| Component                | Expression                     | FLOPs       |
+| :----------------------- | :----------------------------- | :---------- |
+| `Q @ K.mT`, all heads    | `2 * heads * seq^2 * head_dim` | 34.4e9      |
+| `weights @ V`, all heads | `2 * heads * seq^2 * head_dim` | 34.4e9      |
+| Q, K, V, O projections   | `4 * 2 * seq * d_model^2`      | 274.9e9     |
+| **Block total**          |                                | **343.6e9** |
+
+The two `seq^2` terms together are `4 * seq^2 * d_model`, which is exactly a quarter of the projection cost at this sequence length. Attention's quadratic term only overtakes the linear projections once the sequence gets long enough, which is why long-context work focuses on it and short-context work does not.
+
+This is also why model size is quoted in FLOPs per token. A forward pass through an `n`-parameter model costs roughly `2n` FLOPs per token, and training costs about three times the forward pass because the backward pass does two matmuls for every one in the forward.
+
+---
+
+## Why shape and layout matter
+
+Matmul is the one operation with dedicated hardware behind it. Tensor cores perform a small fused multiply-accumulate on tiles of a fixed size, so throughput depends on how well the problem divides into those tiles.
+
+Two effects show up in practice:
+
+**Dimension alignment.** Sizes that are multiples of 8, and better multiples of 16, map cleanly onto tile boundaries. A `d_model` of 4096 divides evenly; 4095 does not, and the ragged edge costs a partial tile on every row.
+
+**Contiguity.** A matmul on non-contiguous inputs may require a copy into a packed layout first. This is the cost behind calling `.contiguous()` after a `permute`, and the reason FlashAttention restructures the computation to avoid materializing the `(seq, seq)` score matrix at all.
+
+Neither is a correctness issue. Both are the difference between a model that trains at hardware peak and one that runs at a fraction of it.
+
+---
+
+## Interview questions
+
+- **What is the difference between `*` and `@` on tensors?** `*` is the element-wise Hadamard product with broadcasting, `O(n^2)` on square inputs. `@` contracts the inner dimension, `O(n^3)`, and requires the inner dimensions to match.
+- **When would you use `bmm` instead of `matmul`?** When you want mismatched batch dimensions to raise rather than broadcast. `matmul` is otherwise the general case.
+- **Why does `nn.Linear` store `W` as `(out, in)` rather than `(in, out)`?** So each row is one output neuron's weights. The transpose at runtime is a stride permutation and costs nothing.
+- **How do you read an einsum expression?** Indices appearing on both sides are summed over. Indices appearing only on the left are contracted away. Everything else is preserved in the output order given.
+- **How many FLOPs does one transformer attention block cost?** `4 * seq^2 * d_model` for the two attention matmuls plus `8 * seq * d_model^2` for the four projections.
+- **Why is a model's forward pass roughly `2n` FLOPs per token for `n` parameters?** Every parameter participates in one multiply-accumulate per token, and each MAC is two FLOPs.

@@ -1,0 +1,389 @@
+---
+title: Data Pipelines
+description: 'Map-style and iterable datasets, how DataLoader workers prefetch, collation, sizing num_workers, and sharded streaming with WebDataset.'
+---
+
+A GPU step on a vision model takes about a hundred milliseconds. Decoding and augmenting the batch feeding it takes closer to a second. If the two run in the same process, the GPU spends most of its life waiting, and no amount of model optimization recovers that time.
+
+The data pipeline exists to keep those two activities off each other's critical path.
+
+---
+
+## Two dataset styles
+
+|                     | Map-style                    | Iterable-style                         |
+| :------------------ | :--------------------------- | :------------------------------------- |
+| Base class          | `torch.utils.data.Dataset`   | `torch.utils.data.IterableDataset`     |
+| Required methods    | `__getitem__`, `__len__`     | `__iter__`                             |
+| Index access        | Random, by integer           | Sequential only                        |
+| Shuffling           | Free, via the sampler        | Must be done inside the dataset        |
+| Progress bar length | Known                        | Unknown without a separate count       |
+| Good for            | Data that fits on local disk | Streaming, remote, or sharded archives |
+
+Map-style is the default and covers most work. Iterable-style is what you reach for when the data is too large to index, is read over a network, or arrives as a stream.
+
+---
+
+## A map-style dataset
+
+```python title="dataset.py"
+from pathlib import Path
+
+import torch
+from torch.utils.data import Dataset
+from torchvision import io
+from torchvision.transforms import v2
+
+
+class ImageFolderFlat(Dataset):
+    def __init__(self, root: str, train: bool = True):
+        self.paths = sorted(Path(root).glob("*/*.jpg"))
+        classes = sorted({p.parent.name for p in self.paths})
+        self.labels = {name: i for i, name in enumerate(classes)}
+
+        ops = [v2.Resize(256 if train else 288)]
+        ops.append(v2.RandomCrop(224) if train else v2.CenterCrop(224))
+        if train:
+            ops.append(v2.RandomHorizontalFlip())
+        ops += [
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+        self.transform = v2.Compose(ops)
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int):
+        path = self.paths[idx]
+        image = io.read_image(path)
+        label = self.labels[path.parent.name]
+        return self.transform(image), label
+```
+
+Three things about this shape:
+
+**The file list is built once in `__init__`.** Scanning the directory per sample would dominate everything else. The paths are stored as a plain Python list, which is what you want for a dataset that forks into workers.
+
+**`__getitem__` does the I/O and the augmentation, and nothing else.** It runs inside a worker process. Anything expensive that can be hoisted to `__init__` should be, but the transform itself cannot be, because the randomness has to differ per sample and per epoch.
+
+**Augmentations belong in the dataset, not the model.** `RandomHorizontalFlip` inside `forward` would run on the GPU, once per epoch, on already-batched data, and would cost device memory for the flipped copies. On the CPU in a worker it is free relative to the decode.
+
+<Callout type="info">
+  ### Decode on the GPU instead
+
+`torchvision.io.decode_jpeg(..., device="cuda")` and `nvJPEG` move the decode off the CPU entirely, which matters when the augmentations are cheap and the images are large. It needs the raw bytes on the device first, so the pipeline becomes: read bytes on the CPU, transfer compressed, decode on the GPU. Compressed JPEG is roughly an order of magnitude smaller than the decoded array, so the transfer gets much cheaper too. A decoded `224x224x3` uint8 image is 150,528 bytes; as float32 it is 602,112.
+
+</Callout>
+
+---
+
+## DataLoader
+
+```python title="loader.py"
+import torch
+
+loader = torch.utils.data.DataLoader(
+    dataset,
+    batch_size=256,
+    shuffle=True,
+    num_workers=8,
+    pin_memory=True,
+    drop_last=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+    collate_fn=None,
+    worker_init_fn=None,
+    generator=torch.Generator().manual_seed(0),
+)
+```
+
+| Argument             | Default           | What it does                                                             |
+| :------------------- | :---------------- | :----------------------------------------------------------------------- |
+| `batch_size`         | `1`               | Samples per batch, or `None` to let `batch_sampler` decide               |
+| `shuffle`            | `None`            | Wraps the dataset in a `RandomSampler`                                   |
+| `num_workers`        | `0`               | Subprocesses that run `__getitem__`. Zero means the main process does it |
+| `collate_fn`         | `default_collate` | Turns a list of samples into a batch                                     |
+| `pin_memory`         | `False`           | Copies the batch into page-locked host memory before returning it        |
+| `drop_last`          | `False`           | Discard a final batch smaller than `batch_size`                          |
+| `timeout`            | `0`               | Seconds to wait for a worker before raising. Zero means wait forever     |
+| `worker_init_fn`     | `None`            | Called once inside each worker after it is seeded                        |
+| `prefetch_factor`    | `2`               | Batches each worker prepares ahead. Only valid when `num_workers > 0`    |
+| `persistent_workers` | `False`           | Keep workers alive between epochs                                        |
+| `generator`          | `None`            | RNG for the sampler and for worker base seeds                            |
+
+With `num_workers=8` and `prefetch_factor=4`, there are 32 batches prepared or in flight at any moment, plus whatever `pin_memory` is holding. At `batch_size=256` with `224x224x3` float32 images, one batch is 154 MB, so that pipeline is holding about 5 GB of host memory. Budget for it.
+
+---
+
+## What the workers do
+
+<Mermaid
+  chart={`
+flowchart LR
+    S["Sampler<br/>main process"] -->|indices| W0["worker 0<br/>getitem + collate"]
+    S -->|indices| W1["worker 1<br/>getitem + collate"]
+    S -->|indices| W2["worker 2<br/>getitem + collate"]
+    W0 --> R["result queue"]
+    W1 --> R
+    W2 --> R
+    R --> P["pin_memory thread<br/>main process"]
+    P --> L["training loop"]
+`}
+/>
+
+The main process never touches a sample. It generates indices from the sampler, hands a batch's worth of indices to whichever worker is idle, and collects finished batches. Each worker calls `__getitem__` for every index it receives and then runs `collate_fn` on the result, so collation is parallel too.
+
+Two consequences follow. The dataset object is copied into each worker at startup, and the copy is what the worker uses. On Linux that copy is a `fork`, so it starts as copy-on-write. On Windows and macOS it is a `spawn`, so everything the dataset holds must be picklable. A dataset that opens a file handle or a database connection in `__init__` will fail on Windows and silently share a broken handle on Linux unless the connection is opened lazily in `__getitem__` or in `worker_init_fn`.
+
+`pin_memory=True` starts one extra thread in the main process that copies each arriving batch into page-locked memory. That copy cannot overlap with the worker that produced it, so it lands on the critical path. It is still worth it: see [Devices and Precision](/ai/pytorch/devices-and-precision) for the transfer bandwidth it buys back.
+
+---
+
+## Sizing `num_workers`
+
+The right number is the smallest `W` such that `cpu_time_per_batch / W` is below the GPU step time.
+
+For a batch of 256 images at 3 ms each to decode and augment (768 ms of CPU work) against a 120 ms GPU step:
+
+| Workers | Effective CPU time | Step time | GPU utilization | Throughput     |
+| :------ | :----------------- | :-------- | :-------------- | :------------- |
+| 1       | 768 ms             | 768 ms    | 15.6%           | 333 samples/s  |
+| 2       | 384 ms             | 384 ms    | 31.2%           | 667 samples/s  |
+| 4       | 192 ms             | 192 ms    | 62.5%           | 1333 samples/s |
+| 6       | 128 ms             | 128 ms    | 93.8%           | 2000 samples/s |
+| 8       | 96 ms              | 120 ms    | 100%            | 2133 samples/s |
+| 16      | 48 ms              | 120 ms    | 100%            | 2133 samples/s |
+
+Sixteen workers buy nothing over eight and cost eight more processes worth of host memory. The usual guidance is two to four workers per GPU, then measure.
+
+Measure with the profiler or with a crude counter: time the loop with the model replaced by a `torch.cuda.synchronize()` and no compute. If that is still slower than the real step, you are data bound.
+
+<Callout type="warn">
+  ### More workers can make it slower
+
+Each worker holds its own copy of the dataset and its own Python interpreter state. With a dataset that loads a large lookup table, sixteen workers means sixteen copies. On Linux, `fork` starts as copy-on-write, but Python's reference counting writes to every object header it touches, which faults the pages in one by one and eventually materializes the copy anyway. Keep the shared read-only parts small, or memory-map them with `numpy.load(mmap_mode="r")` so the pages stay shared.
+
+</Callout>
+
+---
+
+## Collation
+
+`default_collate` takes a list of samples and produces a batch. It stacks tensors along a new leading dimension, converts NumPy arrays and scalars to tensors, recurses into tuples, lists, and dicts positionally, and leaves strings as lists.
+
+```python title="collate.py"
+import torch
+from torch.utils.data import default_collate
+
+samples = [(torch.zeros(3, 4, 4), 1, "cat"), (torch.ones(3, 4, 4), 0, "dog")]
+x, y, name = default_collate(samples)
+
+print(x.shape, x.dtype)     # torch.Size([2, 3, 4, 4]) torch.float32
+print(y)                     # tensor([1, 0])
+print(name)                  # ['cat', 'dog']
+```
+
+It fails on any batch where the shapes disagree, which is what happens with variable-length sequences. Write your own:
+
+```python title="pad_collate.py"
+import torch
+
+
+def pad_collate(batch):
+    texts, labels = zip(*batch)
+    lengths = torch.tensor([len(t) for t in texts])
+    longest = int(lengths.max())
+
+    padded = torch.full((len(texts), longest), -100, dtype=torch.long)
+    for i, t in enumerate(texts):
+        padded[i, : len(t)] = torch.tensor(t)
+
+    return padded, lengths, torch.tensor(labels)
+```
+
+Padding with `-100` rather than `0` lets `CrossEntropyLoss(ignore_index=-100)` skip those positions with no extra masking code.
+
+---
+
+## Determinism and worker seeding
+
+Each worker is seeded from `base_seed + worker_id`, where `base_seed` comes from the loader's generator. That seeds `random`, `torch`, and NumPy consistently across workers. Anything you install yourself does not inherit it, so derive it from the worker's own seed:
+
+```python title="seeding.py"
+import numpy as np
+import torch
+
+AUGMENTERS: dict[int, np.random.Generator] = {}
+
+
+def seed_worker(worker_id: int) -> None:
+    info = torch.utils.data.get_worker_info()
+    AUGMENTERS[worker_id] = np.random.default_rng(info.seed)
+
+
+g = torch.Generator().manual_seed(0)
+loader = torch.utils.data.DataLoader(
+    dataset, batch_size=64, num_workers=4, worker_init_fn=seed_worker, generator=g
+)
+```
+
+`info.seed` is the per-worker value PyTorch derived, so `default_rng(info.seed)` is both reproducible and distinct per worker. Seeding from a constant instead makes every worker produce the same augmentation sequence, which is a silent correctness bug: four workers, four identical random crops.
+
+Full reproducibility also needs `torch.use_deterministic_algorithms(True)`, which turns nondeterministic CUDA kernels into errors, and `CUBLAS_WORKSPACE_CONFIG=:4096:8` in the environment, which the cuBLAS path requires.
+
+---
+
+## Epoch boundaries
+
+Without `persistent_workers`, workers are torn down at the end of every epoch and re-spawned at the start of the next. That repeats the `fork`, re-copies the dataset, and re-runs `worker_init_fn`. On a small dataset with a fast epoch the overhead is measurable. With `persistent_workers=True` the same workers serve every epoch, and the sampler reshuffles by handing them a new index order.
+
+`persistent_workers` requires `num_workers > 0`. It also means any state a worker accumulates across epochs survives, so a dataset that caches decoded images in a dictionary will grow without bound.
+
+---
+
+## Distributed sampling
+
+With `DistributedSampler`, each rank sees a disjoint slice of the indices.
+
+```python title="distributed.py"
+import torch
+
+sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True, drop_last=True)
+loader = torch.utils.data.DataLoader(dataset, batch_size=64, sampler=sampler, num_workers=8)
+
+for epoch in range(EPOCHS):
+    sampler.set_epoch(epoch)      # without this, every epoch has the same order
+    for batch in loader:
+        ...
+```
+
+`sampler.set_epoch(epoch)` reseeds the permutation from `seed + epoch`. Skipping it gives every rank the same order every epoch, which means dropout-free shuffling and a model that sees identical batches in the same sequence throughout training.
+
+Passing both `shuffle=True` and a `sampler` raises `ValueError`, because they are two ways of specifying the same thing.
+
+The effective batch size becomes `batch_size * num_workers_independent * world_size`. Learning rate and warmup usually need to scale with it.
+
+---
+
+## Iterable datasets
+
+An iterable dataset yields samples instead of serving them by index. It has no `__len__` requirement and no sampler.
+
+```python title="iterable.py"
+import torch
+
+
+class ShardedLines(torch.utils.data.IterableDataset):
+    def __init__(self, shards: list[str]):
+        self.shards = shards
+
+    def __iter__(self):
+        info = torch.utils.data.get_worker_info()
+        if info is not None:
+            mine = self.shards[info.id :: info.num_workers]
+        else:
+            mine = self.shards
+
+        for shard in mine:
+            with open(shard) as fh:
+                for line in fh:
+                    yield parse(line)
+```
+
+The sharding line `self.shards[info.id :: info.num_workers]` is the whole point. Without it, every worker iterates the full list and every sample appears `num_workers` times in each epoch. With it, worker 0 takes shards 0, 4, 8 and worker 1 takes 1, 5, 9 for four workers.
+
+Shuffling in an iterable dataset has to be buffered, because you cannot shuffle a stream you have not read. The standard approach is a reservoir of a few thousand samples: fill it, then repeatedly pick a random element to yield and replace it with the next one from the stream. That gives an approximately uniform shuffle over the reservoir size, and it is exactly what WebDataset implements.
+
+---
+
+## WebDataset
+
+WebDataset stores samples as POSIX tar archives. Each sample is a group of files sharing a basename, so `000123.jpg` and `000123.json` in the same tar are one sample with keys `jpg` and `json`.
+
+```python title="wds.py"
+import torch
+import webdataset as wds
+from torchvision.transforms import v2
+
+transform = v2.Compose([
+    v2.Resize(256), v2.RandomCrop(224), v2.RandomHorizontalFlip(),
+    v2.ToImage(), v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+dataset = (
+    wds.SimpleShardList("shards-{000000..000099}.tar")
+    .shuffle(100)                                  # shard order
+    .split_by_worker                               # then by rank, if distributed
+    .tarfile_to_samples(handler=wds.warn_and_continue)
+    .shuffle(2000)                                 # sample buffer
+    .decode("pil")
+    .to_tuple("jpg", "cls")
+    .map_tuple(transform, int)
+    .batched(64)
+)
+
+loader = wds.WebLoader(dataset, batch_size=None, num_workers=8, pin_memory=True)
+```
+
+`batch_size=None` on the loader is required. The dataset already emits batches, so the loader must not batch again.
+
+`wds.WebDataset(urls)` is the shorthand for the first four stages. Writing them out is what lets you insert the shard-order shuffle in the right place.
+
+### Three levels of shuffle
+
+A tar archive is read sequentially, so a naive pass returns every sample from shard 0, then every sample from shard 1. If shards were written in class order, that is a catastrophic training distribution.
+
+| Level        | Call                                      | Buffer size             | Cost                        |
+| :----------- | :---------------------------------------- | :---------------------- | :-------------------------- |
+| Shard order  | `.shuffle(100)` before `split_by_worker`  | 100 shard names         | Nothing, they are strings   |
+| Sample order | `.shuffle(2000)` before `decode`          | 2000 undecoded samples  | Host memory, small          |
+| Epoch order  | `resampled=True`, or epoch-dependent URLs | Whole dataset logically | Resampling with replacement |
+
+Shuffling before `decode` buffers compressed bytes rather than decoded images, which is why the buffer can be large. Two thousand JPEGs at about 15 KB each is 30 MB. The same two thousand decoded at `224x224x3` float32 is 1.2 GB.
+
+### Shard sizing
+
+| Samples per shard | Sample size | Shard size |
+| :---------------- | :---------- | :--------- |
+| 100,000           | 10 KB       | 1.0 GB     |
+| 50,000            | 10 KB       | 0.5 GB     |
+| 10,000            | 150 KB      | 1.5 GB     |
+
+One gigabyte per shard is the target. Small shards mean many HTTP requests and a lot of tar overhead. Large shards mean a worker that draws an unlucky shard sits on data no one else can use, and shuffling has less room to work.
+
+### Why shards at all
+
+Sequential reads beat random reads by a wide margin on every storage medium, and by an order of magnitude on object storage where each random access is an HTTP request with tens of milliseconds of latency. A tar archive turns a million small random reads into a thousand large sequential ones.
+
+The same property makes WebDataset usable straight off S3 or GCS with no local copy: `wds.WebDataset("s3://bucket/shards-{000..099}.tar")` streams. Combined with `resampled=True`, workers pick shards independently at random, which needs no coordination between ranks and survives a worker restarting mid-epoch.
+
+The costs are a shuffle that is only approximate, a dataset size you have to track separately because there is no `__len__`, and a build step to produce the tars.
+
+---
+
+## Choosing
+
+| Situation                                             | Use                                           |
+| :---------------------------------------------------- | :-------------------------------------------- |
+| Under a few hundred GB on local NVMe                  | Map-style `Dataset` with `num_workers`        |
+| Small enough to fit in RAM                            | Map-style, with arrays held in memory         |
+| Terabytes on object storage                           | WebDataset                                    |
+| Text or token streams                                 | Iterable over shards, or memory-mapped arrays |
+| Variable-length sequences needing a bucketing sampler | Map-style with a custom `batch_sampler`       |
+| Data arriving continuously                            | Iterable                                      |
+
+---
+
+## Interview questions
+
+- **What is the difference between a map-style and an iterable dataset?** Map-style serves samples by integer index and gets its order from a sampler. Iterable-style yields samples in a fixed order and must handle its own shuffling and its own worker sharding.
+- **How do you choose `num_workers`?** Find the CPU time per batch and the GPU step time. You need `num_workers` such that `cpu_time / num_workers` is below the GPU time. Past that point more workers cost memory and buy nothing.
+- **Where does `collate_fn` run?** In the worker process, after the `__getitem__` calls for that batch. Collation is therefore parallel across workers, which is why padding variable-length sequences there is cheap.
+- **Why does `persistent_workers` help?** Without it workers are torn down and re-spawned every epoch, repeating the fork, the dataset copy, and `worker_init_fn`. With it the same workers survive and only the index order changes.
+- **What breaks if you forget `sampler.set_epoch(epoch)` under DDP?** Every epoch uses the same permutation, so the model sees identical batches in the same order for the whole run and the shuffle provides no regularization.
+- **Why does an iterable dataset need `shards[info.id :: info.num_workers]`?** Otherwise every worker iterates the full shard list and each sample appears `num_workers` times per epoch.
+- **Why does WebDataset shuffle at three levels?** Tar archives are read sequentially. Shuffling only within a shard leaves class-ordered shards intact; shuffling only shard order leaves samples in file order within each shard. You need both, plus per-epoch resampling.
+- **Why shuffle before `decode` rather than after?** The buffer holds compressed bytes instead of decoded arrays, so a 2000-sample buffer costs about 30 MB rather than 1.2 GB.

@@ -1,0 +1,338 @@
+---
+title: Autograd Engine
+description: 'requires_grad and leaf tensors, the dynamic graph, backward and retain_graph, detach against no_grad, hooks, and what torch.compile changes.'
+---
+
+[Backprop from Scratch](/ai/math-foundations/backprop-from-scratch) built the chain rule out of scalar values. PyTorch does the same traversal over tensors, with three additions that change how you write code: the graph is rebuilt on every forward pass, only leaf tensors keep their gradients by default, and the graph is freed as soon as backward finishes.
+
+Every pitfall on this page comes from one of those three facts.
+
+---
+
+## Leaves and non-leaves
+
+Setting `requires_grad=True` marks a tensor as something the optimizer will later update. Any tensor computed from it inherits the flag, and the operations that produced it get recorded.
+
+```python title="leaves.py"
+import torch
+
+w = torch.tensor([2.0, 3.0], requires_grad=True)
+x = torch.tensor([1.0, 1.0])
+
+y = w * x
+loss = y.sum()
+
+print(w.requires_grad, x.requires_grad)   # True False
+print(w.is_leaf, x.is_leaf)               # True True
+print(y.is_leaf)                          # False - y was computed
+print(loss.grad_fn is not None)           # True
+```
+
+A **leaf** is a tensor you created directly, not one produced by an operation. Leaves are where gradients land, because leaves are the parameters.
+
+```python title="grad_lands.py"
+import torch
+
+w = torch.tensor([2.0, 3.0], requires_grad=True)
+loss = (w * w).sum()
+
+print(w.grad)                  # None before backward
+loss.backward()
+print(w.grad.tolist())         # [4.0, 6.0] - d/dw of w^2 is 2w
+print(loss.grad)               # None - loss is not a leaf
+```
+
+Non-leaf tensors have `grad == None` after backward even though a gradient flowed through them. PyTorch discards it to save memory, since a large model has far more intermediates than parameters. Call `retain_grad()` on an intermediate before backward if you need to inspect it:
+
+```python title="retain_grad.py"
+import torch
+
+w = torch.tensor([2.0], requires_grad=True)
+y = w * 3
+y.retain_grad()
+(y * y).backward()
+
+print(y.grad.tolist())         # [12.0] - d/dy of y^2 is 2y, with y = 6
+print(w.grad.tolist())         # [36.0] - 6 * dy/dw
+```
+
+---
+
+## The graph is dynamic
+
+PyTorch is define-by-run. There is no compilation step and no persistent graph object. Each forward pass builds a fresh one out of `grad_fn` nodes, and backward walks and then destroys it.
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["forward pass"] --> B["grad_fn nodes linked into a DAG"]
+    B --> C["backward() traverses in reverse topological order"]
+    C --> D["graph freed, buffers released"]
+    D --> E["next forward pass builds a new graph"]
+`}
+/>
+
+This has consequences that a static-graph framework does not have.
+
+**Control flow is ordinary Python.** An `if` that changes which layers run is just an `if`. The graph reflects whatever executed. There is no need to express the branch as an operation.
+
+**Shapes can change between iterations.** Variable sequence lengths, dynamic batch sizes, and early-exit branches all work without recompilation.
+
+**Nothing is reused across steps.** The graph from iteration `n` has no relationship to the one from iteration `n + 1`. Holding a reference to a tensor from an old graph keeps that whole graph in memory.
+
+That last point is the most common memory leak in PyTorch training code:
+
+```python title="leak.py"
+losses = []
+for step in range(1000):
+    loss = model(x)
+    losses.append(loss)         # keeps 1000 graphs alive
+    loss.backward()
+```
+
+`loss` is a tensor with a `grad_fn` pointing at the entire backward graph. Appending it pins every intermediate activation for that step. The fix is to append the number:
+
+```python
+losses.append(loss.item())      # a Python float, graph freed immediately
+```
+
+---
+
+## backward()
+
+`backward()` seeds the output gradient at 1.0 and walks the graph in reverse topological order, exactly as the scalar engine does. It requires a scalar output.
+
+```python title="backward_scalar.py"
+import torch
+
+w = torch.randn(4, requires_grad=True)
+loss = (w * w).sum()        # a scalar
+loss.backward()
+print(tuple(w.grad.shape))  # (4,) - grad always matches the tensor's shape
+```
+
+Backwarding a non-scalar raises, because there is no single well-defined gradient of a vector with respect to a vector without specifying which direction to project onto. Supply it explicitly:
+
+```python title="backward_vector.py"
+import torch
+
+w = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+y = w * 2                     # y is a vector
+
+# y.backward()  raises: grad can be implicitly created only for scalar outputs
+y.backward(gradient=torch.ones(3))
+print(w.grad.tolist())        # [2.0, 2.0, 2.0]
+```
+
+Passing `torch.ones(3)` computes the sum of the per-element gradients, which is what a scalar loss would have produced anyway.
+
+### Running backward twice
+
+The graph is freed after backward. A second call on the same output raises. Two arguments control this:
+
+```python title="twice.py"
+import torch
+
+w = torch.tensor([2.0], requires_grad=True)
+
+shared = w * 3
+loss_a = (shared * shared).sum()
+loss_b = (shared * 5).sum()
+
+loss_a.backward(retain_graph=True)     # keep the graph alive
+loss_b.backward()                      # now free it
+
+print(w.grad.tolist())                 # [36.0 + 15.0] = [51.0]
+```
+
+Both gradients accumulate into `w.grad`, which is the same `+=` behavior that makes gradient accumulation work and that makes forgetting `zero_grad()` a bug. See [Backprop from Scratch](/ai/math-foundations/backprop-from-scratch).
+
+`retain_graph=True` is for multiple losses sharing a subgraph, such as a generator and discriminator in a GAN or a multi-task loss. It is not something to add speculatively to silence an error, because it holds memory.
+
+### create_graph and second derivatives
+
+`create_graph=True` records the backward pass itself as a graph, so you can differentiate through it.
+
+```python title="double_backward.py"
+import torch
+
+w = torch.tensor([3.0], requires_grad=True)
+y = w ** 3
+
+grad = torch.autograd.grad(y, w, create_graph=True)[0]
+print(grad.item())                       # 27.0 - dy/dw = 3w^2
+
+grad2 = torch.autograd.grad(grad, w)[0]
+print(grad2.item())                      # 18.0 - d2y/dw2 = 6w
+```
+
+This is what MAML, gradient penalties in WGAN-GP, and some meta-learning methods need. It roughly doubles backward-pass memory, since the gradient computation itself has to be stored.
+
+`torch.autograd.grad` is the functional form. It returns gradients as a tuple instead of writing into `.grad`, which makes it easier to use for one-off inspection.
+
+---
+
+## Turning autograd off
+
+Four mechanisms, with different scopes and different guarantees.
+
+| Mechanism                      | Scope                   | Effect                                                   |
+| :----------------------------- | :---------------------- | :------------------------------------------------------- |
+| `with torch.no_grad():`        | A block                 | No graph is built inside it                              |
+| `x.detach()`                   | One tensor              | Returns a new tensor sharing storage, cut from the graph |
+| `p.requires_grad_(False)`      | One tensor, permanently | Excluded from the graph and from the optimizer           |
+| `with torch.inference_mode():` | A block                 | No graph, and no version counting at all                 |
+
+```python title="turning_off.py"
+import torch
+
+w = torch.tensor([2.0], requires_grad=True)
+
+with torch.no_grad():
+    y = w * 3
+print(y.requires_grad)             # False
+print(y.grad_fn)                   # None
+
+t = w * 3
+z = t.detach()
+print(z.requires_grad)             # False
+print(z.data_ptr() == t.data_ptr())   # True - detach shares storage, does not copy
+
+w.requires_grad_(False)
+print((w * 2).requires_grad)       # False
+```
+
+`detach()` returns a tensor that shares memory with the original. Mutating one changes the other. That is what makes it the right tool for pulling a value out of a graph without paying for a copy, and the wrong tool when you need independence. Use `.clone().detach()` for that.
+
+`inference_mode` is strictly more aggressive than `no_grad`. It also disables the version counting PyTorch uses to detect in-place modification of tensors needed for backward. That makes it faster and it is what inference servers use. The cost is that tensors created inside `inference_mode` cannot later take part in autograd at all, so it is wrong for anything that might feed a training step.
+
+<Callout type="info">
+  ### `model.eval()` is not one of these `eval()` changes the behavior of `Dropout` and `BatchNorm`.
+  It does not disable gradient tracking. Validation loops need both: ```python model.eval() with
+  torch.no_grad(): ... ``` Forgetting `no_grad()` makes validation slower and leaks memory.
+  Forgetting `eval()` makes dropout fire during evaluation and gives you a noisy, pessimistic
+  metric.
+</Callout>
+
+---
+
+## Freezing parameters
+
+Setting `requires_grad_(False)` on a subset of parameters is how transfer learning and LoRA work. The frozen parameters still take part in the forward pass but contribute nothing to the backward pass, and their gradients are never allocated.
+
+```python title="freezing.py"
+import torch
+import torch.nn as nn
+
+model = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 4))
+
+for p in model[0].parameters():
+    p.requires_grad_(False)
+
+trainable = [p for p in model.parameters() if p.requires_grad]
+print(sum(p.numel() for p in model.parameters()))     # 212
+print(sum(p.numel() for p in trainable))              # 68
+```
+
+The optimizer must be constructed from the same filtered list. Passing `model.parameters()` to an optimizer whose entries have `requires_grad == False` is not an error, but it wastes the optimizer state allocation for parameters that will never move.
+
+---
+
+## Hooks
+
+Hooks run a callback during backward. They are how gradient clipping, activation capture, and debugging tools are built.
+
+```python title="hooks.py"
+import torch
+
+w = torch.tensor([4.0], requires_grad=True)
+
+
+def scale_by_half(grad):
+    return grad * 0.5
+
+
+handle = w.register_hook(scale_by_half)
+(w * w).backward()
+print(w.grad.tolist())      # [4.0] - the true gradient is 8.0, halved by the hook
+
+handle.remove()
+w.grad = None
+(w * w).backward()
+print(w.grad.tolist())      # [8.0]
+```
+
+A tensor hook receives the gradient and may return a replacement. A module hook registered with `register_full_backward_hook` receives the module plus its input and output gradients, and is the standard way to inspect what a specific layer is doing without editing the model.
+
+`handle.remove()` detaches the hook. Forgetting to remove hooks on tensors that outlive their purpose is a slow leak.
+
+---
+
+## torch.compile
+
+`torch.compile` wraps a callable and returns a faster one. It was introduced in PyTorch 2.0 and does not change the model's semantics.
+
+```python title="compile.py"
+import torch
+import torch.nn as nn
+
+model = nn.Sequential(nn.Linear(512, 512), nn.GELU(), nn.Linear(512, 512))
+compiled = torch.compile(model)
+
+y = compiled(torch.randn(32, 512))    # first call traces and compiles, slowly
+y = compiled(torch.randn(32, 512))    # subsequent calls run the compiled artifact
+```
+
+Two components do the work. **TorchDynamo** intercepts Python bytecode at runtime and extracts the tensor operations into an FX graph, leaving the surrounding Python alone. **TorchInductor** turns that graph into fused kernels, Triton for GPU and C++ with OpenMP for CPU.
+
+The speedup comes from fusion. An eager `y = relu(x @ w + b)` launches three separate kernels and writes intermediate results to memory twice. A compiled version emits one kernel that reads `x` and `w` and writes `y`. On memory-bandwidth-bound models, which is most of them at inference batch size 1, that is the entire win.
+
+### Graph breaks
+
+Dynamo cannot trace every Python construct. When it hits something unsupported, it ends the current graph, falls back to the interpreter for that section, and starts a new graph afterward. That boundary is a **graph break**, and it prevents fusion across it.
+
+```python title="graph_breaks.py"
+import torch
+
+@torch.compile(fullgraph=True)
+def f(x):
+    if x.sum().item() > 0:      # .item() forces a GPU sync and a break
+        return x * 2
+    return x * 3
+```
+
+`fullgraph=True` turns a silent performance problem into an immediate error, which is why it belongs in tests. Common causes: `.item()`, `.tolist()`, `.cpu()`, printing a tensor, data-dependent control flow, and calls into unsupported libraries.
+
+`torch._dynamo.explain(f)(x)` prints a report of where the breaks are and why.
+
+### Modes and dynamic shapes
+
+| Argument                 | Effect                                                                           |
+| :----------------------- | :------------------------------------------------------------------------------- |
+| `mode="default"`         | Balanced compile time and runtime                                                |
+| `mode="reduce-overhead"` | Uses CUDA graphs to cut kernel launch overhead. Best for small models            |
+| `mode="max-autotune"`    | Benchmarks several kernel implementations and picks the fastest. Slow to compile |
+| `dynamic=True`           | Compiles for symbolic shapes instead of recompiling per shape                    |
+| `backend="eager"`        | Traces but generates no fused code. Useful for isolating bugs                    |
+
+By default `torch.compile` assumes static shapes. A model that sees a new batch size recompiles, which costs seconds each time. Training loops with a ragged final batch hit this constantly, and `dynamic=True` or `drop_last=True` in the data loader are the two fixes.
+
+<Callout type="warn">
+  Compilation is not free and not always worth it. The first call can take tens of seconds to
+  minutes. Short scripts, notebooks, and models whose time is dominated by a single large matmul see
+  little benefit, because there is nothing to fuse. It pays off on models with many small
+  element-wise operations, which describes most transformers.
+</Callout>
+
+---
+
+## Interview questions
+
+- **What is a leaf tensor, and why does only it get a `.grad`?** A tensor created directly rather than by an operation, typically a parameter or an input. Non-leaf gradients are discarded to save memory, since intermediates outnumber parameters by orders of magnitude.
+- **Why does `backward()` fail on a vector output?** There is no unique gradient of a vector with respect to a vector without choosing a projection direction. Pass `gradient=` to supply one.
+- **What does `retain_graph=True` do, and when is it appropriate?** Keeps the graph alive after backward so a second backward can run through shared nodes. Appropriate for multi-loss models. It holds memory, so it is not a general-purpose error suppressant.
+- **How do `detach()`, `no_grad()`, and `requires_grad_(False)` differ?** `detach` cuts one tensor out of the graph while sharing its storage. `no_grad` prevents graph construction inside a block. `requires_grad_(False)` permanently excludes a parameter, which is how freezing works.
+- **What is the difference between `no_grad` and `inference_mode`?** `inference_mode` also turns off version counting, so it is faster, but tensors created inside it can never participate in autograd afterward.
+- **Why does appending a loss tensor to a list leak memory?** The tensor holds a `grad_fn` referencing the whole backward graph, pinning every activation from that step. Append `loss.item()` instead.
+- **What is a graph break in `torch.compile`?** A point where TorchDynamo cannot trace the Python and falls back to the interpreter, splitting the graph and preventing fusion across the boundary.
+- **Does `model.eval()` disable gradients?** No. It switches `Dropout` and `BatchNorm` to inference behavior. Validation needs `eval()` and `no_grad()` together.

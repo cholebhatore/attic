@@ -1,0 +1,255 @@
+---
+title: Combining and Permuting
+description: 'cat versus stack, transpose versus permute, the multi-head reshape idiom, expand versus repeat, and named-axis reshaping with einops.'
+---
+
+Tensors get assembled, taken apart, and have their axes reordered constantly. Four operations do most of that work, and each one has a twin that looks almost identical but does something different. Confusing the pairs is the most common source of shape bugs in model code.
+
+| Do this     | Not this  | Difference                                                    |
+| :---------- | :-------- | :------------------------------------------------------------ |
+| `cat`       | `stack`   | `cat` joins along an existing axis, `stack` creates a new one |
+| `transpose` | `permute` | `transpose` swaps two axes, `permute` reorders all of them    |
+| `expand`    | `repeat`  | `expand` returns a stride-0 view, `repeat` copies             |
+| `reshape`   | `permute` | `reshape` regroups elements, `permute` reorders axes          |
+
+---
+
+## cat and stack
+
+`torch.cat` concatenates along an axis that already exists. Every input must match on all the other axes. `torch.stack` requires every input to have identical shapes and inserts a new axis to hold them.
+
+```python title="cat_stack.py"
+import torch
+
+a = torch.ones(2, 3)
+b = torch.full((2, 3), 2.0)
+
+print(tuple(torch.cat([a, b], dim=0).shape))    # (4, 3)
+print(tuple(torch.cat([a, b], dim=1).shape))    # (2, 6)
+print(tuple(torch.stack([a, b], dim=0).shape))  # (2, 2, 3)
+print(tuple(torch.stack([a, b], dim=1).shape))  # (2, 2, 3)
+
+print(torch.cat([a, b], dim=1)[0].tolist())     # [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]
+print(torch.stack([a, b], dim=0)[0].tolist())   # [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]
+```
+
+Stacking two `(2, 3)` tensors gives `(2, 2, 3)` regardless of whether the new axis goes at position 0 or 1. Only the meaning of the axes changes, not the element count. `stack` along `dim=0` is equivalent to unsqueezing each input and then catting:
+
+```python
+print(torch.equal(torch.stack([a, b], dim=0),
+                  torch.cat([a.unsqueeze(0), b.unsqueeze(0)], dim=0)))   # True
+```
+
+Both operations allocate a new tensor. Neither one can be a view, because the result's elements come from two separate buffers.
+
+### Where cat shows up in real models
+
+The KV cache is a `cat` along the sequence axis, run once per generated token:
+
+```python title="kv_cache.py"
+import torch
+
+past_k = torch.zeros(1, 8, 128, 64)     # (batch, heads, seq_so_far, head_dim)
+new_k = torch.zeros(1, 8, 1, 64)        # the single new token
+
+k = torch.cat([past_k, new_k], dim=2)
+print(tuple(k.shape))                   # (1, 8, 129, 64)
+```
+
+That copy happens at every decoding step, which is why preallocated ring buffers replace it in serious inference engines. See Phase 10.
+
+---
+
+## transpose and permute
+
+`transpose(dim0, dim1)` swaps two axes. `permute(*dims)` reorders all of them at once. Both are stride permutations and neither copies data.
+
+```python title="permute.py"
+import torch
+
+x = torch.zeros(2, 3, 4)
+print(x.stride())                            # (12, 4, 1)
+
+t = x.transpose(0, 1)
+print(tuple(t.shape))                        # (3, 2, 4)
+print(t.stride())                            # (4, 12, 1)
+
+p = x.permute(2, 0, 1)
+print(tuple(p.shape))                        # (4, 2, 3)
+print(p.stride())                            # (1, 12, 4)
+
+print(t.is_contiguous(), p.is_contiguous())  # False False
+```
+
+The strides are the original `(12, 4, 1)` reordered to match. No element moved.
+
+For two-dimensional tensors, `.T` is shorthand for `transpose(0, 1)`. For anything higher-dimensional it raises, because reversing all axes is rarely what a caller meant:
+
+```python title="dot_T.py"
+import torch
+
+m = torch.zeros(3, 4)
+print(tuple(m.T.shape))       # (4, 3)
+
+b = torch.zeros(2, 3, 4)
+print(tuple(b.mT.shape))      # (2, 4, 3) - swaps the last two axes only
+# b.T raises RuntimeError for any tensor with more than 2 dimensions
+```
+
+`.mT` is the batched version and is what attention code uses to transpose `K` inside `Q @ K.mT`.
+
+---
+
+## The multi-head reshape
+
+Splitting a projection into attention heads is the single most repeated shape operation in transformer code. It is a reshape followed by a transpose, and the order matters.
+
+```python title="heads.py"
+import torch
+
+batch, seq, n_heads, head_dim = 2, 5, 4, 8
+d_model = n_heads * head_dim            # 32
+
+q = torch.randn(batch, seq, d_model)    # (2, 5, 32)
+
+split = q.reshape(batch, seq, n_heads, head_dim)   # (2, 5, 4, 8)
+heads = split.transpose(1, 2)                      # (2, 4, 5, 8)
+
+print(tuple(heads.shape))       # (2, 4, 5, 8)
+print(heads.stride())           # (160, 8, 32, 1)
+print(heads.is_contiguous())    # False
+```
+
+The reshape splits the last axis into `(n_heads, head_dim)` while leaving the element order untouched. The transpose then moves the head axis ahead of the sequence axis so that each head's `(seq, head_dim)` matrix is addressable as a single batch element.
+
+The resulting stride `(160, 8, 32, 1)` reads as: 160 elements to the next batch item, 8 to the next head, 32 to the next token. The head stride being smaller than the token stride is what makes the layout non-contiguous, and it is why the following matmul may need a copy.
+
+Going back is the mirror image:
+
+```python title="heads_merge.py"
+import torch
+
+heads = torch.randn(2, 4, 5, 8)
+merged = heads.transpose(1, 2).reshape(2, 5, 32)
+print(tuple(merged.shape))      # (2, 5, 32)
+```
+
+`transpose` then `reshape`. Since `reshape` copies when it has to, this works without an explicit `.contiguous()` call, though adding one makes the cost visible.
+
+<Callout type="info">
+  ### Why the order is reshape-then-transpose Doing it the other way, transposing before splitting,
+  interleaves the heads incorrectly. The projection matrix writes head 0's 8 values, then head 1's 8
+  values, contiguously along `d_model`. Reshaping `(32,)` into `(4, 8)` preserves that grouping. Any
+  axis reordering before the split would scatter each head's values across memory and silently
+  produce a different, wrong attention pattern.
+  <br />
+  <br />
+  The bug does not raise. The shapes all line up. The model just learns something worse, which is
+  what makes it expensive to find.
+</Callout>
+
+---
+
+## expand and repeat
+
+`expand` broadcasts a tensor to a larger shape by setting strides to zero. `repeat` tiles it by copying.
+
+```python title="expand_repeat.py"
+import torch
+
+v = torch.arange(3, dtype=torch.float32)
+
+e = v.expand(4, 3)
+r = v.repeat(4, 1)
+
+print(tuple(e.shape), tuple(r.shape))   # (4, 3) (4, 3)
+print(e.stride())                       # (0, 1)
+print(r.stride())                       # (3, 1)
+print(e.data_ptr() == v.data_ptr())     # True - same buffer
+print(r.data_ptr() == v.data_ptr())     # False - new buffer
+print(e.numel() * e.element_size())     # 48 bytes of addressable data
+print(v.numel() * v.element_size())     # 12 bytes allocated
+```
+
+Both produce a `(4, 3)` tensor with identical contents. `expand` allocates nothing and reports a stride of 0 on the new axis, meaning every row reads the same three elements. `repeat` allocates four times the memory.
+
+`expand` requires the expanded axis to have size 1 in the original. `v.expand(4, 5)` on a `(3,)` tensor raises, while `v.unsqueeze(0).expand(4, 3)` works.
+
+Use `expand` for positional encodings, attention masks, and bias additions. Use `repeat` only when downstream code genuinely needs distinct memory, such as before an in-place operation.
+
+---
+
+## einops
+
+`einops` replaces shape arithmetic with named axes. The same head split reads as a single declarative statement:
+
+```python title="einops_heads.py"
+from einops import rearrange, repeat, reduce
+import torch
+
+q = torch.randn(2, 5, 32)
+
+heads = rearrange(q, "b s (h d) -> b h s d", h=4)
+print(tuple(heads.shape))       # (2, 4, 5, 8)
+
+merged = rearrange(heads, "b h s d -> b s (h d)")
+print(tuple(merged.shape))      # (2, 5, 32)
+```
+
+Only the axes whose size cannot be inferred from the input need a number. `b` and `s` come from `q.shape`, and `d` is solved as `32 / h`.
+
+The three functions cover most reshaping needs:
+
+| Function    | Does                             | Example                                    |
+| :---------- | :------------------------------- | :----------------------------------------- |
+| `rearrange` | Reorder, split, and merge axes   | `"b s (h d) -> b h s d"`                   |
+| `repeat`    | Expand with copying              | `"b d -> b h d"` with `h=8`                |
+| `reduce`    | Combine an axis with a reduction | `"b c h w -> b c"` with `reduction="mean"` |
+
+`reduce` replaces the pattern of reshaping to two dimensions, calling `mean`, and reshaping back:
+
+```python title="einops_reduce.py"
+from einops import reduce
+import torch
+
+x = torch.randn(4, 8, 16)
+
+pooled = reduce(x, "b c t -> b c", "mean")
+print(tuple(pooled.shape))      # (4, 8)
+
+global_pool = reduce(x, "b c t -> b", "max")
+print(tuple(global_pool.shape)) # (4,)
+```
+
+The operations also exist as `nn.Module` subclasses in `einops.layers.torch`, which lets them sit inside an `nn.Sequential` without a wrapper class.
+
+`einops` costs nothing at runtime beyond the reshape and transpose it would have done anyway, and it catches axis-order bugs at construction time instead of letting them produce wrong numbers later.
+
+---
+
+## Copying and when it matters
+
+Every operation above is either free or a full copy, and knowing which is which explains most tensor-related performance problems.
+
+| Operation                            | Cost                      |
+| :----------------------------------- | :------------------------ |
+| `transpose`, `permute`, `mT`         | Free. Stride permutation. |
+| `expand`                             | Free. Stride zero.        |
+| `view` on a contiguous tensor        | Free. Metadata only.      |
+| `reshape` on a non-contiguous tensor | `O(n)` copy.              |
+| `contiguous()`                       | `O(n)` copy.              |
+| `cat`, `stack`, `repeat`             | `O(n)` copy.              |
+| Boolean or integer-array indexing    | `O(k)` copy.              |
+
+The practical rule is that `permute` and `contiguous` should not sit next to each other in a hot loop without a reason. If a matmul requires contiguous inputs, restructure the computation so the layout is already correct rather than paying for the copy on every forward pass.
+
+---
+
+## Interview questions
+
+- **What is the difference between `cat` and `stack`?** `cat` joins along an existing axis and requires the other axes to match. `stack` requires identical shapes and creates a new axis, so the result has one more dimension than its inputs.
+- **Does `transpose` copy memory?** No. It swaps two stride entries and reports a new shape. The buffer is untouched, which is why the result is non-contiguous.
+- **Walk through the multi-head attention reshape.** A `(batch, seq, n_heads * head_dim)` tensor is reshaped to `(batch, seq, n_heads, head_dim)` and then transposed to `(batch, n_heads, seq, head_dim)`, so each head becomes a batch element for the following matmul.
+- **Why reshape before transposing rather than after?** The projection writes each head's values contiguously. Splitting first preserves that grouping. Reordering first scatters each head across memory and silently produces wrong results.
+- **What is the difference between `expand` and `repeat`?** `expand` returns a view with stride 0 on the broadcast axis and allocates nothing. `repeat` tiles the data into a new buffer.
+- **Why does `.T` fail on a 3-D tensor?** PyTorch refuses to guess whether you mean reverse-all-axes or swap-the-last-two. `.mT` does the latter explicitly and works at any rank.

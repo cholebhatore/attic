@@ -1,0 +1,276 @@
+---
+title: Indexing and Shapes
+description: 'Slicing, boolean masks, and fancy indexing, plus view versus reshape and when a shape change silently copies memory.'
+---
+
+Indexing in PyTorch comes in three flavors, and they behave differently in the one way that matters most: whether the result shares memory with the original tensor. Getting this wrong produces aliases that corrupt data at a distance, or copies that blow up memory.
+
+| Index kind    | Example                     | Returns             | Shares memory |
+| :------------ | :-------------------------- | :------------------ | :------------ |
+| Basic slice   | `x[0]`, `x[:, 1]`, `x[1:3]` | A strided view      | Yes           |
+| Boolean mask  | `x[x > 0]`                  | A packed 1-D tensor | No            |
+| Integer array | `x[[0, 2, 1]]`              | A gathered tensor   | No            |
+
+---
+
+## Basic slicing
+
+Slicing never copies. It adjusts the shape and stride metadata and points at an offset inside the same buffer.
+
+```python title="slicing.py"
+import torch
+
+x = torch.arange(24).reshape(2, 3, 4)
+
+print(tuple(x.shape))            # (2, 3, 4)
+print(x.stride())                # (12, 4, 1)
+
+print(tuple(x[0].shape))         # (3, 4)
+print(tuple(x[:, 1].shape))      # (2, 4)
+print(x[:, 1].stride())          # (12, 1)
+print(x[:, 1].storage_offset())  # 4
+print(x[:, 1].is_contiguous())   # False
+
+print(x[0, 1, 2].item())         # 6
+```
+
+`x[:, 1]` takes every row's second entry. The stride `(12, 1)` says: skip 12 elements to move to the next row, skip 1 to move along the last axis. The middle axis of size 3 is gone, so its stride of 4 disappears with it. The result is a valid tensor that reads 8 of the original 24 elements and is not contiguous, because those 8 are not adjacent in memory.
+
+The ellipsis stands in for as many full slices as needed to reach the last axes:
+
+```python title="ellipsis.py"
+import torch
+
+x = torch.arange(24).reshape(2, 3, 4)
+
+print(tuple(x[..., 0].shape))    # (2, 3) - same as x[:, :, 0]
+print(tuple(x[0, ...].shape))    # (3, 4) - same as x[0, :, :]
+print(tuple(x[..., 0].stride())) # (12, 4)
+```
+
+Ellipsis is what makes indexing code work regardless of how many leading batch dimensions a tensor has. Attention implementations use `x[..., :d]` so the same code runs on `(seq, dim)` and `(batch, heads, seq, dim)`.
+
+<Callout type="warn">
+  ### A slice is a live reference Writing through a slice writes through to the original buffer, as
+  shown in the views example on the previous page. That is a feature for in-place normalization and
+  a bug when you meant to keep the original. Call `.clone()` when you want an independent copy.
+</Callout>
+
+---
+
+## Boolean masking
+
+A boolean tensor of the same shape selects elements. The result is always a new one-dimensional tensor, because the selected elements are generally not contiguous in memory.
+
+```python title="masking.py"
+import torch
+
+x = torch.arange(24).reshape(2, 3, 4)
+mask = x > 12
+
+print(mask.dtype)              # torch.bool
+print(int(mask.sum()))         # 11
+print(x[mask].tolist())        # [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+print(tuple(x[mask].shape))    # (11,) - flattened, regardless of x's shape
+```
+
+The output shape does not depend on the mask's shape beyond its element count, which is why masking cannot be reversed without storing the indices. `torch.nonzero(mask)` returns them.
+
+Masking also assigns:
+
+```python title="mask_assign.py"
+import torch
+
+x = torch.arange(6, dtype=torch.float32)
+x[x % 2 == 0] = 0.0
+print(x.tolist())              # [0.0, 1.0, 0.0, 3.0, 0.0, 5.0]
+```
+
+This is how causal masking works in attention. The mask is a boolean or `-inf`-filled tensor the same shape as the score matrix, and it is applied before softmax so that masked positions get zero probability. See [Softmax and Logits](/ai/math-foundations/softmax-and-logits).
+
+---
+
+## Fancy indexing
+
+An integer tensor used as an index gathers along that axis. Duplicates are allowed, order is preserved, and the index axis replaces the axis being indexed.
+
+```python title="fancy.py"
+import torch
+
+x = torch.arange(24).reshape(2, 3, 4)
+idx = torch.tensor([0, 1, 1, 0])
+
+out = x[idx, :, 0]
+print(out.tolist())
+# [[0, 4, 8], [12, 16, 20], [12, 16, 20], [0, 4, 8]]
+print(tuple(out.shape))        # (4, 3)
+```
+
+### Token embedding is fancy indexing
+
+The embedding layer at the front of every language model is this operation with a different name.
+
+```python title="embedding.py"
+import torch
+
+vocab_size, d_model = 6, 4
+E = torch.arange(vocab_size * d_model, dtype=torch.float32).reshape(vocab_size, d_model)
+tokens = torch.tensor([2, 0, 2, 5])
+
+print(E[2].tolist())           # [8.0, 9.0, 10.0, 11.0]
+print(tuple(E[tokens].shape))  # (4, 4)
+print(E[tokens].tolist())
+# [[8.0, 9.0, 10.0, 11.0],
+#  [0.0, 1.0, 2.0, 3.0],
+#  [8.0, 9.0, 10.0, 11.0],
+#  [20.0, 21.0, 22.0, 23.0]]
+
+print(torch.equal(E[tokens], torch.nn.functional.embedding(tokens, E)))   # True
+```
+
+`nn.Embedding` is a lookup table with a gradient that only updates the rows that were touched. Token `2` appears twice, so row 2 of `E.grad` receives the sum of both contributions, exactly the accumulate-don't-assign rule from [Backprop from Scratch](/ai/math-foundations/backprop-from-scratch).
+
+A vocabulary of 128,256 tokens at `d_model = 4096` makes this table `128256 * 4096 * 4 = 2.1 GB` in float32. It is often the single largest tensor in a small model.
+
+### Gather and scatter
+
+`torch.gather` selects along one axis using an index tensor of matching rank, which is what you need when the index differs per row.
+
+```python title="gather.py"
+import torch
+
+logits = torch.tensor([[2.0, 9.0, 1.0], [7.0, 3.0, 8.0]])
+labels = torch.tensor([1, 2])
+
+picked = logits.gather(1, labels.unsqueeze(1)).squeeze(1)
+print(picked.tolist())         # [9.0, 8.0]
+```
+
+`labels` needs the extra dimension because `gather` requires the index tensor to have the same number of dimensions as the source. `unsqueeze(1)` turns `(2,)` into `(2, 1)`, and `squeeze(1)` removes it again afterward.
+
+This is precisely what `F.cross_entropy` does internally: gather the logit at the true label, negate it, average over the batch. `torch.scatter` is the reverse operation and is how a one-hot target gets built.
+
+---
+
+## Shape manipulation
+
+### view versus reshape
+
+`view` reinterprets the existing buffer with a new shape. That is only possible when the elements you want to group are already adjacent, which is exactly what contiguity means. `reshape` tries `view` first and falls back to a copy.
+
+```python title="view_reshape.py"
+import torch
+
+x = torch.arange(24).reshape(2, 3, 4)
+t = x.transpose(1, 2)
+
+print(tuple(t.shape))          # (2, 4, 3)
+print(t.is_contiguous())       # False
+
+print(tuple(t.reshape(6, 4).shape))   # (6, 4) - copies, then views
+print(t.reshape(6, 4).is_contiguous())  # True
+
+# t.view(6, 4) raises:
+# RuntimeError: view size is not compatible with input tensor's size and stride
+print(x.view(6, 4).is_contiguous())   # True - x is already contiguous, no copy
+```
+
+The error from `view` is informative rather than fatal, and it tells you something true: the operation you asked for cannot be done without moving memory. Whether that matters depends on where it sits in the model.
+
+<Callout type="info">
+  Prefer `reshape` unless you specifically want the guarantee that no copy happens. `view` failing
+  loudly is useful in a hot path where an accidental copy is a performance bug. Everywhere else,
+  `reshape` says what you mean.
+</Callout>
+
+### Inferring a dimension with -1
+
+Exactly one dimension may be `-1`, and PyTorch solves for it from `numel()`.
+
+```python title="infer_dim.py"
+import torch
+
+x = torch.arange(24)
+
+print(tuple(x.reshape(2, -1).shape))    # (2, 12)
+print(tuple(x.reshape(-1, 8).shape))    # (3, 8)
+print(tuple(x.reshape(6, -1).shape))    # (6, 4)
+print(tuple(x.reshape(2, 3, -1).shape)) # (2, 3, 4)
+
+# x.reshape(5, -1) raises: shape '[5, -1]' is invalid for input of size 24
+```
+
+Two `-1`s are ambiguous and rejected.
+
+### squeeze and unsqueeze
+
+`unsqueeze(dim)` inserts a size-1 axis. `squeeze()` removes them.
+
+```python title="squeeze.py"
+import torch
+
+x = torch.zeros(2, 3, 4)
+
+print(tuple(x.unsqueeze(0).shape))    # (1, 2, 3, 4)
+print(tuple(x.unsqueeze(2).shape))    # (2, 3, 1, 4)
+print(tuple(x.unsqueeze(-1).shape))   # (2, 3, 4, 1)
+
+s = torch.zeros(1, 3, 1, 4)
+print(tuple(s.squeeze().shape))       # (3, 4)  - removes every size-1 axis
+print(tuple(s.squeeze(0).shape))      # (3, 1, 4)
+print(tuple(s.squeeze(2).shape))      # (1, 3, 4)
+```
+
+Bare `squeeze()` on a batch of one is a classic bug. A tensor of shape `(1, 10)` becomes `(10,)`, and the code that expects a batch dimension fails two operations later with a confusing shape error. Pass the dimension explicitly.
+
+`squeeze()` on a `(1,)` tensor produces a zero-dimensional tensor, which has `ndim == 0`. Zero-dimensional tensors behave like scalars in arithmetic but still carry a dtype and device.
+
+### flatten
+
+`flatten(start, end)` collapses a range of axes into one.
+
+```python title="flatten.py"
+import torch
+
+x = torch.zeros(2, 3, 4)
+
+print(tuple(x.flatten().shape))       # (24,)
+print(tuple(x.flatten(1).shape))      # (2, 12)
+print(tuple(x.flatten(0, 1).shape))   # (6, 4)
+```
+
+`flatten(1)` is the standard move before a classifier head: it keeps the batch axis and merges everything else. `flatten(0, 1)` merges batch into the sequence axis, which is how a transformer folds `(batch, seq, dim)` into `(batch * seq, dim)` so a single large matmul can run instead of many small ones.
+
+---
+
+## Splitting
+
+```python title="splitting.py"
+import torch
+
+t = torch.arange(10)
+
+print([c.tolist() for c in torch.split(t, 2)])
+# [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
+
+print([c.tolist() for c in torch.split(t, [3, 3, 3, 1])])
+# [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9]]
+
+print([c.tolist() for c in torch.chunk(t, 5)])
+# [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
+
+print(tuple(t.unbind(0)[0].shape))    # () - each element is a 0-dim tensor
+```
+
+`split` takes a chunk size or an explicit list of sizes. `chunk` takes a chunk _count_ and rounds up, so `chunk(t, 3)` on ten elements yields pieces of 4, 4, and 2, not 4, 3, 3. `unbind` removes the dimension entirely rather than leaving size-1 slices behind.
+
+---
+
+## Interview questions
+
+- **Which indexing operations return views and which return copies?** Basic slicing returns a strided view. Boolean masks and integer-array indexing return copies, because the selected elements are not generally adjacent in memory.
+- **Why can't you `view` a transposed tensor?** The transpose rearranges strides without moving data, so the elements that the new shape wants to group are no longer adjacent. `view` refuses; `reshape` copies first.
+- **What does `storage_offset()` tell you?** Where in the shared buffer this tensor's first element sits, in elements. It is non-zero for any slice that does not start at the beginning.
+- **How does an embedding layer work, and why is it cheap?** It is fancy indexing into a `(vocab_size, d_model)` table. The forward pass copies `batch * seq` rows. The backward pass only writes gradient into the rows that were read.
+- **Why does `gather` need `unsqueeze` on the index tensor?** `gather` requires the index to have the same number of dimensions as the source, and the index axis to be the one being gathered along.
+- **What is wrong with a bare `squeeze()`?** It removes every size-1 axis, including a batch dimension that happens to be 1. The failure surfaces later as a shape mismatch. Pass the dimension.

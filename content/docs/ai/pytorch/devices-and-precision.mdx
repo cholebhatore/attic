@@ -1,0 +1,329 @@
+---
+title: Devices and Precision
+description: 'Moving tensors between CPU and GPU, pinned memory and transfer costs, and how FP32, FP16 and BF16 change what a training step costs.'
+---
+
+A tensor carries its device and its dtype with it. Those two attributes decide whether a step runs at all, how fast it runs, and whether the gradients survive the round trip through low precision. This page covers both.
+
+---
+
+## Where a tensor lives
+
+Every tensor has exactly one device. Operations between tensors on different devices raise rather than silently copying:
+
+```python title="placement.py"
+import torch
+
+x = torch.randn(4, 4)
+print(x.device)                        # cpu
+
+if torch.cuda.is_available():
+    g = x.to("cuda")
+    print(g.device)                    # cuda:0
+    print(x.device)                    # cpu - .to() does not move in place
+
+    try:
+        x + g
+    except RuntimeError as e:
+        print(str(e).splitlines()[0])
+```
+
+`.to()` returns a new tensor. When the source and destination devices match, it returns the same object, which is why chaining `.to(device).to(dtype)` is cheap. `.cuda()` and `.cpu()` are shorthands for the same thing.
+
+The idiomatic pattern keeps the device decision in one place:
+
+```python title="device_choice.py"
+import torch
+
+device = (
+    "cuda" if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available()
+    else "cpu"
+)
+print(device)
+
+model = Model().to(device)
+batch = next(iter(loader))
+batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+```
+
+`non_blocking=True` returns immediately and lets the copy overlap with other work. It is only meaningful when the host tensor is pinned, which is covered below.
+
+<Callout type="warn">
+  ### Module state follows the module
+
+`model.to(device)` moves every registered parameter and buffer in place and returns the module itself. It does not move the optimizer, which already holds direct references to the same parameter tensors, so there is nothing to do. It also does not move your input data. A `RuntimeError` about expected all tensors to be on the same device is almost always an input that skipped the trip.
+
+</Callout>
+
+Buffers registered with `register_buffer` move with the module. Plain Python attributes holding tensors do not, which is a common source of stray CPU tensors inside a model that otherwise lives on the GPU.
+
+---
+
+## Why the GPU wins
+
+Two numbers matter more than the FLOP count.
+
+**Memory bandwidth.** A GPU reads its own memory an order of magnitude faster than a CPU does.
+
+| Device    | Memory | Bandwidth | FP32 peak   | Tensor-core peak     |
+| :-------- | :----- | :-------- | :---------- | :------------------- |
+| V100 SXM2 | HBM2   | 900 GB/s  | 15.7 TFLOPS | 125 TFLOPS FP16      |
+| A100 40GB | HBM2e  | 1555 GB/s | 19.5 TFLOPS | 312 TFLOPS BF16/FP16 |
+| RTX 4090  | GDDR6X | 1008 GB/s | 82.6 TFLOPS | 165 TFLOPS BF16      |
+| H100 SXM  | HBM3   | 3350 GB/s | 67 TFLOPS   | 989 TFLOPS BF16      |
+
+**Arithmetic intensity.** Whether an operation is limited by bandwidth or by FLOPS depends on how many FLOPs it performs per byte it moves. That ratio has a threshold, called the ridge point, at `peak_flops / peak_bandwidth`. On an A100 the FP32 ridge is `19.5e12 / 1555e9 = 12.5` FLOP/byte, and the BF16 tensor-core ridge is `312e12 / 1555e9 = 200` FLOP/byte. Anything below the ridge is memory bound and adding compute does nothing.
+
+For `C = A @ B` with `A` of shape `(M, K)` and `B` of shape `(K, N)`, the intensity is:
+
+```
+2 * M * N * K / (bytes_per_element * (M*K + K*N + M*N))
+```
+
+At `N = K = 4096`:
+
+| `M` (batch x seq) | FP32   | FP16    |
+| :---------------- | :----- | :------ |
+| 1                 | 0.50   | 1.00    |
+| 8                 | 3.98   | 7.97    |
+| 64                | 31.03  | 62.06   |
+| 512               | 204.80 | 409.60  |
+| 4096              | 682.67 | 1365.33 |
+
+One row at a time is memory bound by a factor of 25 on FP32. Four thousand rows at a time clears the tensor-core ridge with room to spare. This single table is why training uses large batches and why LLM decoding does not.
+
+An elementwise operation like `y = a * b` in FP32 moves three tensors for one FLOP per element, giving `1/12 = 0.083` FLOP/byte. It is memory bound no matter how you batch it. Fusing those operations into a single kernel pass is exactly what `torch.compile` does, and the win comes from removing memory traffic, not from faster arithmetic.
+
+---
+
+## The decode ceiling
+
+Generating one token reads every weight once and does two FLOPs per weight. For a 7B model stored in FP16, that is 14 GB of reads per token:
+
+| Device    | Ceiling      |
+| :-------- | :----------- |
+| V100 SXM2 | 64 tokens/s  |
+| RTX 4090  | 72 tokens/s  |
+| A100 40GB | 111 tokens/s |
+| A100 80GB | 146 tokens/s |
+| H100 SXM  | 239 tokens/s |
+
+Real servers land at roughly 60 to 80 percent of these numbers after accounting for the KV cache and kernel launch overhead. Batching raises the ceiling almost linearly, because the same weight read serves every sequence in the batch. That is the entire economic argument for continuous batching, and Phase 11 covers it.
+
+Prefill is the opposite case. One pass over 2048 prompt tokens reads the weights once for all of them, which is why prefill is compute bound and decode is not.
+
+---
+
+## Crossing the PCIe boundary
+
+The link between host and device is far slower than device memory.
+
+| Link            | Theoretical | Achievable | 1 GB  | 14 GB  |
+| :-------------- | :---------- | :--------- | :---- | :----- |
+| PCIe 3.0 x16    | 15.75 GB/s  | ~12 GB/s   | 83 ms | 1.17 s |
+| PCIe 4.0 x16    | 31.5 GB/s   | ~25 GB/s   | 40 ms | 560 ms |
+| PCIe 5.0 x16    | 63 GB/s     | ~50 GB/s   | 20 ms | 280 ms |
+| NVLink 3 (A100) | 600 GB/s    | ~500 GB/s  | 2 ms  | 28 ms  |
+
+Loading a 7B model in FP16 from host memory takes over a second on PCIe 3.0. Doing it per training step would be fatal, which is why the data pipeline exists as a separate concern with its own prefetch machinery.
+
+**Pinned memory** is host memory the operating system has agreed not to page out. A normal pageable transfer has to be staged through an internal pinned buffer first, which costs a full extra memcpy. Allocating pinned up front removes that stage and roughly doubles achievable bandwidth, from about 6 to 9 GB/s up to about 12 to 13 GB/s on PCIe 3.0.
+
+```python title="pinned.py"
+import torch
+
+x = torch.randn(1024, 1024)
+p = torch.empty(1024, 1024, pin_memory=True)
+print(p.is_pinned())                   # True
+
+p.copy_(x)
+if torch.cuda.is_available():
+    g = p.to("cuda", non_blocking=True)   # DMA proceeds without blocking the host
+```
+
+`DataLoader(pin_memory=True)` does this for you on a dedicated collation thread. It only helps when there is a GPU to transfer to, and it consumes non-swappable host memory, so a large `pin_memory` buffer on a host with limited RAM can trigger the OOM killer.
+
+Copies run on a CUDA stream. A `non_blocking=True` copy returns as soon as the transfer is queued, so the host thread continues while the DMA engine works. Synchronization happens implicitly at the next operation that depends on the result. `torch.cuda.synchronize()` forces a wait and is the right tool for benchmarking, never for production code.
+
+<Callout type="info">
+  ### Timing GPU code
+
+CUDA calls are asynchronous, so `time.perf_counter()` around a GPU operation measures how long it took to enqueue work, not to do it. Either call `torch.cuda.synchronize()` on both sides of the region, or use `torch.utils.benchmark.Timer`, which handles it. The first call in a region also pays for kernel compilation and autotuning, so discard at least a few warmup iterations.
+
+</Callout>
+
+---
+
+## Numerical formats
+
+The three formats that matter all trade exponent range against mantissa precision, and they trade it in different places.
+
+```
+float32   S EEEEEEEE MMMMMMMMMMMMMMMMMMMMMMM  8 exponent, 23 mantissa
+bfloat16  S EEEEEEEE MMMMMMM                  8 exponent,  7 mantissa
+float16   S EEEEE MMMMMMMMMM                  5 exponent, 10 mantissa
+```
+
+| Format   | Bytes            | Largest finite | Smallest normal | Decimal digits |
+| :------- | :--------------- | :------------- | :-------------- | :------------- |
+| FP32     | 4                | `3.40e38`      | `1.18e-38`      | ~7.2           |
+| TF32     | 4 stored, 3 used | `3.40e38`      | `1.18e-38`      | ~3.3           |
+| BF16     | 2                | `3.39e38`      | `1.18e-38`      | ~2.4           |
+| FP16     | 2                | `65504`        | `6.10e-05`      | ~3.3           |
+| FP8 E4M3 | 1                | `448`          | `1.56e-02`      | ~1.2           |
+| FP8 E5M2 | 1                | `57344`        | `6.10e-05`      | ~0.9           |
+
+`65504` is the number that causes every FP16 training failure. An activation of 70000 is finite in FP32 and infinite in FP16, and an `inf` in a loss poisons every gradient in the model.
+
+BF16 keeps FP32's exponent field verbatim, which means anything that does not overflow FP32 does not overflow BF16. What it gives up is precision: seven mantissa bits is about two and a half decimal digits, so `bf16(1.0000001) == 1.0` and `bf16(0.1) == 0.10009765625`. FP16 is more precise and far narrower: `fp16(0.1) == 0.0999755859375` is closer, but `fp16(1e-40) == 0.0` where BF16 still represents `9.18e-41`.
+
+<Callout type="info">
+  ### Hardware support
+
+BF16 tensor cores require compute capability 8.0 or later, meaning Ampere onward. On a Turing card such as a GTX 1650 at capability 7.5, `torch.cuda.is_bf16_supported()` returns `False` and BF16 falls back to slow software emulation. FP16 tensor cores are available from Volta (7.0). FP8 needs Ada (8.9) or Hopper (9.0). Check before choosing a format, because the wrong choice is silently slow rather than loudly broken.
+
+</Callout>
+
+---
+
+## Why FP16 needs help and BF16 does not
+
+Gradients in a deep network are small. By the time a loss signal reaches early layers it has been multiplied through many Jacobians, and values in the `1e-7` to `1e-9` range are normal rather than pathological. FP16 cannot hold them:
+
+| Gradient | Stored as FP16          | Stored as FP16 after `x 65536` | Recovered   |
+| :------- | :---------------------- | :----------------------------- | :---------- |
+| `1e-05`  | `1.001e-05`             | `0.6553`                       | `9.999e-06` |
+| `1e-07`  | `1.192e-07` (subnormal) | `6.554e-03`                    | `1.000e-07` |
+| `1e-08`  | `0.0`                   | `6.552e-04`                    | `9.997e-09` |
+| `1e-09`  | `0.0`                   | `6.557e-05`                    | `1.000e-09` |
+
+The last two rows are the whole argument. A gradient of `1e-9` is exactly zero in FP16, and a parameter whose gradient is zero never updates. Multiplying by `2^16 = 65536` shifts every value sixteen binades up the exponent scale, into FP16's normal range, where the ten mantissa bits still give useful relative precision. Dividing by the same factor afterwards restores the true magnitude. Scaling is exact because a power of two only changes the exponent field.
+
+The cost is headroom at the top. The largest representable scaled gradient is `65504 / 65536 = 0.9995`, so any true gradient above about `1.0` overflows. That overflow is detectable and recoverable, which is what the scaler exploits.
+
+BF16 needs none of this. It has the same exponent field as FP32, so `1e-9` is representable directly. The trade is that its seven mantissa bits give a relative error around `2^-8 = 0.0039` on every value, roughly eight times worse than FP16's `2^-11 = 0.0005`.
+
+---
+
+## Automatic mixed precision
+
+The two pieces are a context manager for the forward pass and a scaler for the backward pass.
+
+```python title="amp.py"
+import torch
+from torch import nn
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+use_scaler = dtype == torch.float16
+
+model = nn.Sequential(nn.Linear(784, 256), nn.ReLU(), nn.Linear(256, 10)).to(device)
+optim = torch.optim.AdamW(model.parameters(), lr=3e-4)
+scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+
+for x, y in loader:
+    x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+    optim.zero_grad(set_to_none=True)
+
+    with torch.autocast(device_type=device, dtype=dtype):
+        loss = nn.functional.cross_entropy(model(x), y)
+
+    scaler.scale(loss).backward()
+    scaler.unscale_(optim)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    scaler.step(optim)
+    scaler.update()
+```
+
+`autocast` runs each operation in whichever dtype is appropriate for it, casting on the fly. `GradScaler` multiplies the loss before backward, then divides the gradients before the optimizer step.
+
+Three details in that listing are easy to get wrong:
+
+**`unscale_` must come before gradient clipping.** `clip_grad_norm_` computes a norm over the scaled gradients. Left to itself it would clip against a threshold that is 65536 times too small, and every step would be clipped to almost nothing. Calling `scaler.unscale_(optim)` first puts the gradients back in their true units. `scaler.step` calls `unscale_` internally, so if you do not clip you can skip the explicit call.
+
+**Master weights stay in FP32.** `autocast` casts activations inside the forward pass. The parameters themselves are never converted, so the optimizer's `param -= lr * grad` update runs in FP32 against FP32 state. This matters because a typical update is around `1e-5` relative to a weight of order `0.1`. Adding `1e-5` to `0.1` in BF16, whose ulp at 0.1 is about `4e-4`, rounds straight back to `0.1` and the parameter never moves. FP32's ulp at 0.1 is `7.5e-9`.
+
+**`enabled=False` turns the scaler into a passthrough.** Passing the flag beats branching around the scaler calls, and it is what lets one script target both BF16 and FP16 hardware.
+
+### What autocast casts
+
+| Runs in low precision              | Runs in FP32 regardless                                      |
+| :--------------------------------- | :----------------------------------------------------------- |
+| `matmul`, `linear`, `conv1d/2d/3d` | `softmax`, `log_softmax`, `cross_entropy`                    |
+| `bmm`, `addmm`, `mm`               | `layer_norm`, `group_norm`, `batch_norm`                     |
+| `prelu`, `relu`, `hardtanh`        | `sum`, `prod`, `mean`, `pow`, `reciprocal`                   |
+| `embedding`, `one_hot`             | `exp`, `log`, `mse_loss`, `binary_cross_entropy_with_logits` |
+
+The rule behind the split is that matmuls and convolutions are throughput bound and tolerate rounding, while reductions and normalizations accumulate over many elements and lose their result to cancellation if the partial sums are rounded. Losses stay in FP32 because the value being compared across runs needs to be exact enough to be meaningful.
+
+---
+
+## TF32
+
+TF32 is a compute mode rather than a storage format. Tensors stay in FP32 in memory. Ampere and later tensor cores truncate the mantissa to ten bits on the way into a matmul and accumulate in FP32 on the way out.
+
+```python title="tf32.py"
+import torch
+
+print(torch.backends.cuda.matmul.allow_tf32)     # False since PyTorch 1.12
+print(torch.backends.cudnn.allow_tf32)           # True by default
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")       # equivalent, and the portable spelling
+```
+
+The precision settings are `"highest"` (true FP32), `"high"` (TF32 or BF16 internally), and `"medium"` (BF16 on hardware that supports it). Setting `"high"` is a one-line change that typically buys 2 to 3x on matmul-heavy models with no measurable quality loss on most tasks. PyTorch turned TF32 off by default for matmul in 1.12 after reports of silent accuracy regressions, so it is your decision to make explicitly rather than something you inherit.
+
+---
+
+## Memory accounting
+
+Mixed precision halves activation memory and leaves parameter memory alone, because parameters stay FP32.
+
+For a model with `P` parameters trained with Adam under AMP, the bytes per parameter are:
+
+| Component           | Bytes per parameter |
+| :------------------ | :------------------ |
+| FP32 master weights | 4                   |
+| FP32 gradient       | 4                   |
+| FP32 Adam momentum  | 4                   |
+| FP32 Adam variance  | 4                   |
+| **Total**           | **16**              |
+
+A 7B model costs 112 GB in optimizer and weight state before a single activation is stored. Activations dominate for long sequences and large batches, and activations are what AMP halves. For a transformer at batch 8, sequence 2048, `d_model` 4096, the attention score tensor alone is `(8, 32, 2048, 2048)`, which is 4.29 GB in FP32 and 2.15 GB in BF16.
+
+`torch.cuda.max_memory_allocated()` reports the high-water mark of live tensors. `torch.cuda.memory_reserved()` reports what the caching allocator has taken from the driver, which is always larger, because freed blocks are pooled rather than returned. Neither includes activation memory that has already been freed by the time you look, so call `reset_peak_memory_stats()` at the start of the region you are measuring.
+
+<Callout type="warn">
+  ### OOM is not always a model size problem
+
+The caching allocator cannot satisfy a request that needs a contiguous block even when the total free memory is sufficient. Fragmentation from a workload with widely varying tensor sizes shows up as an OOM at a batch size that worked minutes earlier. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` lets the allocator grow segments instead of splitting them and resolves most of these. `torch.cuda.empty_cache()` returns pooled blocks to the driver, which helps other processes on the same GPU and does nothing for yours.
+
+</Callout>
+
+---
+
+## `torch.compile` and the backend
+
+`torch.compile` traces the model into a graph and hands it to TorchInductor, which generates fused Triton kernels for the GPU. Two effects pay for themselves:
+
+**Fusion.** Elementwise chains that would each round-trip to memory become one kernel that reads once and writes once. At `0.083` FLOP/byte, this is a pure bandwidth win.
+
+**Kernel reduction.** Fewer launches means less time waiting on the host. A model with hundreds of small operations spends a measurable fraction of each step in launch overhead alone.
+
+The details, including graph breaks and the `mode` argument, are on the [Autograd Engine](/ai/pytorch/autograd-engine) page. What matters here is that compilation and precision compose: an AMP forward pass inside a compiled region still runs in the autocast dtype, and Inductor generates kernels for that dtype. Compile once, outside the training loop, and expect the first call to take tens of seconds.
+
+---
+
+## Interview questions
+
+- **Why does BF16 not need loss scaling while FP16 does?** BF16 keeps FP32's eight exponent bits, so small gradients stay representable. FP16 has five exponent bits and a smallest normal of `6.10e-5`, which zeroes out gradients in the `1e-8` to `1e-9` range that deep networks routinely produce.
+- **Why do master weights stay in FP32 under AMP?** A typical update is around `1e-5` relative to a weight near `0.1`. In BF16 the ulp at `0.1` is about `4e-4`, so the update rounds away and the parameter never moves.
+- **What is arithmetic intensity and why does it decide your batch size?** FLOPs performed per byte moved. Below the ridge point `peak_flops / peak_bandwidth` the operation is memory bound, so more compute does nothing. A matmul at `M = 1` runs at 1 FLOP/byte in FP16 against an A100 ridge of 200.
+- **Why is LLM decoding bandwidth bound?** One token reads every weight once for two FLOPs each. A 7B FP16 model is 14 GB per token, so an A100 at 1555 GB/s caps out near 111 tokens/s regardless of how much compute is idle.
+- **What does pinned memory buy?** Host memory the OS cannot page out can be DMA'd straight to the device without staging through an internal pinned buffer. That roughly doubles achievable PCIe bandwidth, and it is what lets a `non_blocking=True` transfer overlap with compute.
+- **Why must `scaler.unscale_(optimizer)` run before `clip_grad_norm_`?** The gradients are still scaled by 65536, so clipping against a threshold of 1.0 would trigger on essentially every step and destroy the update.
+- **What is TF32?** A compute mode where FP32 tensors are stored normally but matmuls truncate the mantissa to ten bits and accumulate in FP32 on tensor cores. It costs no memory and typically gives 2 to 3x on matmul-heavy models.
+- **How do you diagnose an OOM that happens at a batch size that worked before?** Fragmentation in the caching allocator. `memory_allocated()` and `memory_reserved()` diverge, and `expandable_segments:True` usually fixes it.

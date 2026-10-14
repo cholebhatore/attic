@@ -1,0 +1,446 @@
+---
+title: Training Loop
+description: 'nn.Module, parameter registration, the canonical five-step training harness, validation, schedulers, clipping and gradient accumulation.'
+---
+
+Everything on the previous pages exists to support about forty lines of code. This page builds them: how `nn.Module` registers state, the five steps that make up one update, and the variants that appear in real training scripts.
+
+---
+
+## What `nn.Module` gives you
+
+A `nn.Module` subclass needs two methods. `__init__` builds the pieces, `forward` composes them.
+
+```python title="module.py"
+import torch
+from torch import nn
+
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, out_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden)
+        self.act = nn.ReLU()
+        self.norm = nn.LayerNorm(hidden)
+        self.fc2 = nn.Linear(hidden, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(self.act(self.norm(self.fc1(x))))
+
+model = MLP(784, 256, 10)
+print(sum(p.numel() for p in model.parameters()))   # 204042
+print([n for n, _ in model.named_parameters()])
+```
+
+Output:
+
+```text
+204042
+['fc1.weight', 'fc1.bias', 'norm.weight', 'norm.bias', 'fc2.weight', 'fc2.bias']
+```
+
+`204042` is `784*256 + 256` for `fc1`, `256 + 256` for the `LayerNorm` affine, and `256*10 + 10` for `fc2`.
+
+Calling `super().__init__()` first is not optional. It creates the `_parameters`, `_buffers`, and `_modules` dictionaries that every subsequent assignment writes into. Skipping it raises `AttributeError` on the first `nn.Linear` assignment.
+
+Never call `model.forward(x)` directly. `model(x)` runs `__call__`, which dispatches forward pre-hooks, the forward pass, and forward post-hooks. Calling `forward` skips all three, which silently breaks profiling, quantization, and anything else attached to the module.
+
+---
+
+## Registration
+
+Assignment to `self` is intercepted. What gets registered depends on the type:
+
+| Assigned value                 | Registered in | Moved by `.to()` | Saved in `state_dict` |
+| :----------------------------- | :------------ | :--------------- | :-------------------- |
+| `nn.Parameter`                 | `_parameters` | Yes              | Yes                   |
+| `nn.Module`                    | `_modules`    | Yes              | Yes, recursively      |
+| `register_buffer(name, t)`     | `_buffers`    | Yes              | Yes                   |
+| Plain `torch.Tensor` attribute | Nothing       | No               | No                    |
+| Python `list` of modules       | Nothing       | No               | No                    |
+| Python `dict` of modules       | Nothing       | No               | No                    |
+
+The last three rows are the trap.
+
+```python title="registration.py"
+import torch
+from torch import nn
+
+class Broken(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = [nn.Linear(4, 4) for _ in range(3)]   # not registered
+        self.cache = torch.zeros(4)                          # not registered
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x + self.cache
+
+b = Broken()
+print(len(list(b.parameters())))     # 0
+print(len(b.state_dict()))           # 0
+```
+
+Twelve parameters exist in memory and none of them are visible to `model.parameters()`, so an optimizer built from it is empty and nothing trains. The fix is `nn.ModuleList` and `register_buffer`:
+
+```python title="fixed.py"
+import torch
+from torch import nn
+
+class Fixed(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList(nn.Linear(4, 4) for _ in range(3))
+        self.register_buffer("cache", torch.zeros(4))
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x + self.cache
+
+f = Fixed()
+print(len(list(f.parameters())))                  # 6
+print(sum(p.numel() for p in f.parameters()))     # 60
+print(len(f.state_dict()))                        # 7
+```
+
+Six parameter tensors of `4*4` and `4` elements each, so 60 values. Seven `state_dict` entries adds the buffer.
+
+Use a buffer for anything that must travel with the model and be saved but must not receive a gradient: running statistics, positional encodings, attention masks, a vocabulary.
+
+<Callout type="warn">
+  ### Parameter groups
+
+`optim.SGD(model.parameters(), lr=0.1)` flattens the generator into a list at construction time. If you reassign `model = Model(...)` afterwards, or move parameters into new modules, the optimizer still points at the old tensors and updates them silently while your model does something else. Build the optimizer last, after the model is final and on its device.
+
+</Callout>
+
+---
+
+## Loss functions
+
+| Loss                | For                 | Input                                       | Notes                             |
+| :------------------ | :------------------ | :------------------------------------------ | :-------------------------------- |
+| `CrossEntropyLoss`  | Multi-class         | Raw logits `(N, C)`, integer targets `(N,)` | Applies `log_softmax` internally  |
+| `BCEWithLogitsLoss` | Binary, multi-label | Raw logits, float targets                   | Stable sigmoid plus log           |
+| `NLLLoss`           | Multi-class         | Log-probabilities                           | Requires an explicit `LogSoftmax` |
+| `MSELoss`           | Regression          | Any shape                                   | Sensitive to outliers             |
+| `L1Loss`            | Regression          | Any shape                                   | Robust to outliers                |
+| `SmoothL1Loss`      | Regression          | Any shape                                   | Quadratic near zero, linear far   |
+| `KLDivLoss`         | Distillation        | Log-probabilities and a target distribution | Expects log input by default      |
+
+The one mistake that shows up constantly is passing softmax output to `CrossEntropyLoss`. That applies `log_softmax` to values already in `(0, 1)`, so the model is trained on `log(softmax(softmax(x)))`. Loss decreases slowly and plateaus high rather than diverging, which makes it hard to spot.
+
+For language modeling, `CrossEntropyLoss(ignore_index=-100)` skips padded positions. The target tensor carries `-100` wherever a token should not contribute, and those positions are excluded from both the sum and the count.
+
+---
+
+## Optimizers
+
+| Optimizer | Defaults                                                      | Use it when                                     |
+| :-------- | :------------------------------------------------------------ | :---------------------------------------------- |
+| `SGD`     | `lr` required, `momentum=0`                                   | Vision, with `momentum=0.9` and `nesterov=True` |
+| `Adam`    | `lr=1e-3`, `betas=(0.9, 0.999)`, `eps=1e-8`, `weight_decay=0` | You want L2 inside the adaptive step            |
+| `AdamW`   | Same, with `weight_decay=1e-2`                                | Transformers, and most work by default          |
+| `RMSprop` | `lr=1e-2`, `alpha=0.99`                                       | RNNs, legacy code                               |
+
+Adam and AdamW differ in where weight decay enters. Adam adds `wd * p` to the gradient, so the decay term then gets divided by `sqrt(v)` along with everything else, making the effective decay depend on the gradient history of each parameter. AdamW applies `p -= lr * wd * p` directly, which is what the weight decay in the original papers meant. With `weight_decay=0` they are identical.
+
+`eps` is not a numerical footnote. At `1e-8` in FP32 it is fine. Under mixed precision, if the second-moment estimate `v` is stored in a low-precision dtype, `1e-8` can round to zero and produce `inf` updates. This is why Adam state stays in FP32 even under AMP.
+
+---
+
+## The five steps
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["1. zero_grad"] --> B["2. forward"]
+    B --> C["3. loss"]
+    C --> D["4. backward"]
+    D --> E["5. step"]
+    E --> A
+`}
+/>
+
+```python
+optimizer.zero_grad(set_to_none=True)   # 1  clear the previous gradients
+output = model(inputs)                  # 2  forward, builds the graph
+loss = criterion(output, targets)       # 3  a scalar
+loss.backward()                         # 4  reverse traversal, fills .grad
+optimizer.step()                        # 5  update the parameters
+```
+
+That is the entire training contract. Every framework, every paper, every production trainer is those five lines with things wrapped around them.
+
+Order matters in two places. `zero_grad` must precede `backward`, because `.grad` accumulates rather than assigns. And `backward` must precede `step`, because `step` reads `.grad`.
+
+`set_to_none=True` has been the default since PyTorch 2.0. It sets each `.grad` to `None` instead of filling it with zeros, which skips a full memset over the gradient tensors. Code that checks `if p.grad is not None` handles both cases; code that assumes `.grad` is a tensor after `zero_grad()` does not.
+
+---
+
+## A complete toy run
+
+Deterministic initialization makes the whole trajectory reproducible, which is worth doing once so you can see the five steps produce the numbers you expect.
+
+```python title="linear_regression.py"
+import torch
+from torch import nn
+
+x = torch.linspace(-1, 1, 5).unsqueeze(1)     # (5, 1)
+y = 3 * x + 2                                 # (5, 1)
+
+model = nn.Linear(1, 1)
+with torch.no_grad():
+    model.weight.fill_(0.0)
+    model.bias.fill_(0.0)
+
+criterion = nn.MSELoss()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+for epoch in range(6):
+    optimizer.zero_grad(set_to_none=True)
+    pred = model(x)
+    loss = criterion(pred, y)
+    loss.backward()
+    optimizer.step()
+    print(f"epoch {epoch}  loss {loss.item():.4f}   w {model.weight.item():.4f}  b {model.bias.item():.4f}")
+```
+
+Note that `loss.item()` is called after `step()`, so it reports the loss measured before this update, which is the value computed in step 3. Output:
+
+```text
+epoch 0  loss 8.5000   w 0.3000  b 0.4000
+epoch 1  loss 6.2050   w 0.5700  b 0.7200
+epoch 2  loss 4.5908   w 0.8130  b 0.9760
+epoch 3  loss 3.4401   w 1.0317  b 1.1808
+epoch 4  loss 2.6082   w 1.2285  b 1.3446
+epoch 5  loss 1.9985   w 1.4057  b 1.4757
+```
+
+The weight moves toward 3 and the bias toward 2. At `lr=0.1` on full-batch gradient descent this reaches a loss below `1e-8` in 94 steps and settles at `w=3.0000, b=2.0000`. At `lr=0.5` it takes 14.
+
+The Hessian of this loss with respect to `(w, b)` is `(2/5) * A^T A` where `A` stacks `x` and a column of ones. Its eigenvalues are `1.0` and `2.0`, so gradient descent is stable only while `lr < 2 / lambda_max = 1.0`. At `lr=1.5` the loss grows without bound. At exactly `lr=1.0` the eigenvalue-2 direction neither converges nor diverges; it multiplies its error by `-1` each step, so the bias oscillates between 0 and 4 and the loss stalls at precisely `4.0`.
+
+---
+
+## Validation
+
+Two context changes, for two unrelated reasons.
+
+```python title="validation.py"
+import torch
+from torch import nn
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader, criterion, device: str) -> float:
+    model.eval()
+    total, count = 0.0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        loss = criterion(model(x), y)
+        total += loss.item() * x.size(0)
+        count += x.size(0)
+    model.train()
+    return total / count
+```
+
+`torch.no_grad()` stops the graph from being built. It is what makes validation fast and keeps activation memory flat, and it is a pure performance and memory concern.
+
+`model.eval()` flips a flag that modules read. `Dropout` returns its input unchanged instead of zeroing elements, and `BatchNorm` uses its stored running statistics instead of the batch statistics. It is a pure correctness concern and has no effect on autograd.
+
+They are orthogonal. `eval()` without `no_grad()` builds graphs you throw away. `no_grad()` without `eval()` validates against a model with dropout active, which produces a different and noisier number than the one you will get at inference.
+
+Accumulating `loss.item() * batch_size` and dividing by the sample count rather than averaging batch losses is what handles a final partial batch correctly. Averaging per-batch means weights the last small batch the same as every full one.
+
+`model.train()` at the end matters if the model object is reused, which it always is inside an epoch loop.
+
+---
+
+## Learning rate schedules
+
+| Scheduler           | `step()` called            | Behavior                                     |
+| :------------------ | :------------------------- | :------------------------------------------- |
+| `StepLR`            | Per epoch                  | Multiply by `gamma` every `step_size` epochs |
+| `MultiStepLR`       | Per epoch                  | Multiply by `gamma` at listed milestones     |
+| `ExponentialLR`     | Per epoch                  | Multiply by `gamma` every epoch              |
+| `CosineAnnealingLR` | Per epoch                  | Cosine curve down to `eta_min` over `T_max`  |
+| `LinearLR`          | Per epoch                  | Linear ramp from `start_factor` to 1         |
+| `ReduceLROnPlateau` | Per epoch, with the metric | Halve when the metric stops improving        |
+| `OneCycleLR`        | Per batch                  | Warmup then anneal over `total_steps`        |
+
+Two of these are the most common source of "my scheduler does nothing" bugs. `ReduceLROnPlateau.step(val_loss)` takes the metric, not nothing, and it only fires after `patience` non-improving calls. `OneCycleLR` is designed to step once per batch across the whole run, so calling it per epoch leaves it stuck near the start of the warmup.
+
+Cosine annealing computes:
+
+```
+lr = eta_min + (base_lr - eta_min) * (1 + cos(pi * T_cur / T_max)) / 2
+```
+
+With `base_lr=1e-3`, `eta_min=0`, `T_max=10`:
+
+| Epoch | Learning rate |
+| :---- | :------------ |
+| 0     | `1.000e-3`    |
+| 1     | `9.755e-4`    |
+| 2     | `9.045e-4`    |
+| 5     | `5.000e-4`    |
+| 10    | `0.0`         |
+
+Warmup plus cosine is the standard transformer recipe, composed with `SequentialLR`:
+
+```python title="schedule.py"
+import torch
+
+optim = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+
+warmup = torch.optim.lr_scheduler.LinearLR(optim, start_factor=1e-2, total_iters=500)
+cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=9500, eta_min=3e-5)
+sched = torch.optim.lr_scheduler.SequentialLR(optim, [warmup, cosine], milestones=[500])
+
+for step, batch in enumerate(loader):
+    ...
+    sched.step()          # per batch, not per epoch
+```
+
+Warmup exists because Adam's second-moment estimate `v` starts at zero and is bias-corrected, which makes early updates disproportionately large relative to the signal the optimizer has seen so far. Ramping `lr` up over a few hundred steps lets `v` accumulate before the full step size applies.
+
+---
+
+## Gradient clipping and accumulation
+
+Clipping goes after `backward` and before `step`:
+
+```python
+loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+optimizer.step()
+```
+
+`clip_grad_norm_` computes the global L2 norm across all parameters together, and if it exceeds `max_norm` it scales every gradient by `max_norm / total_norm`. Scaling all of them by the same factor preserves the direction of the update and shrinks only its length. `clip_grad_value_` clamps each element independently and does change the direction; it is rarely what you want.
+
+Under AMP, `scaler.unscale_(optimizer)` must run first. See [Devices and Precision](/ai/pytorch/devices-and-precision).
+
+Accumulation trades batch size for memory:
+
+```python title="accumulation.py"
+import torch
+
+ACCUM = 4
+optimizer.zero_grad(set_to_none=True)
+
+for i, (x, y) in enumerate(loader):
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss = criterion(model(x), y) / ACCUM      # divide, or gradients are 4x too large
+    loss.backward()
+
+    if (i + 1) % ACCUM == 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+```
+
+The division is required because `.grad` accumulates by addition, and each micro-batch loss is already a mean over its own samples. Without it the effective learning rate is four times what you set.
+
+The effective batch size is `batch_size * ACCUM * world_size`. Two caveats: `BatchNorm` statistics are still computed per micro-batch, so accumulation does not reproduce a large batch for models with normalization that sees the data. And gradient noise scales with the accumulated batch, so a four-times-larger effective batch usually wants a higher learning rate.
+
+---
+
+## The full harness
+
+```python title="train.py"
+import time
+
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+
+
+def train_one_epoch(model, loader, criterion, optimizer, scaler, sched, device, epoch):
+    model.train()
+    running, seen, t0 = 0.0, 0, time.perf_counter()
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=device == "cuda"):
+            loss = criterion(model(x), y)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        sched.step()
+
+        running += loss.item() * x.size(0)
+        seen += x.size(0)
+
+    dt = time.perf_counter() - t0
+    print(f"epoch {epoch:3d}  train {running / seen:.4f}  {seen / dt:.0f} samples/s")
+    return running / seen
+
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(0)
+
+    train_set, val_set = build_datasets()
+    train_loader = DataLoader(train_set, batch_size=256, shuffle=True,
+                              num_workers=4, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_set, batch_size=1024, shuffle=False,
+                            num_workers=2, pin_memory=True)
+
+    model = build_model().to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+    steps = len(train_loader) * EPOCHS
+    sched = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=3e-4, total_steps=steps)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)   # bf16 needs no scaling
+
+    best = float("inf")
+    for epoch in range(EPOCHS):
+        train_one_epoch(model, train_loader, criterion, optimizer, scaler, sched, device, epoch)
+        val = evaluate(model, val_loader, criterion, device)
+        if val < best:
+            best = val
+            torch.save(model.state_dict(), "best.pt")
+        print(f"           val   {val:.4f}  (best {best:.4f})")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+`drop_last=True` on the training loader keeps every batch the same size, which matters for `BatchNorm` and lets `torch.compile` avoid recompiling for a new shape. The validation loader keeps everything, because you want the metric computed on the full set.
+
+Saving on improvement rather than at the end is what makes early stopping possible and what keeps the run recoverable after a crash. [Checkpointing](/ai/pytorch/checkpointing) covers what belongs in the file.
+
+---
+
+## Failure modes
+
+| Symptom                                        | Usual cause                                                         | Check                                                 |
+| :--------------------------------------------- | :------------------------------------------------------------------ | :---------------------------------------------------- |
+| Loss is `nan` on step 1                        | `log(0)` or division by zero in a custom loss, or `lr` far too high | `torch.isfinite(loss)` before `backward`              |
+| Loss is `nan` after a while                    | FP16 overflow, or `eps` underflowing in Adam state                  | Switch to BF16, inspect `GradScaler` scale            |
+| Loss does not move                             | `optimizer.step()` missing, or the optimizer holds stale parameters | Print `p.grad.norm()` for one parameter               |
+| Train loss falls, val loss rises               | Overfitting                                                         | Weight decay, dropout, more data, early stop          |
+| Val loss worse than the same data at inference | `model.eval()` missing, so dropout is active                        | Wrap evaluation in a helper that sets it              |
+| Memory grows every epoch                       | `losses.append(loss)` keeps the graph alive                         | Append `loss.item()` instead                          |
+| `p.grad` is `None`                             | The parameter is not in the graph, or `requires_grad=False`         | `p.requires_grad`, and check the forward path uses it |
+| Two ranks diverge under DDP                    | A `forward` branch that not every rank takes                        | All ranks must call the same collectives              |
+
+---
+
+## Interview questions
+
+- **What are the five steps of a PyTorch training iteration?** `zero_grad`, forward, loss, `backward`, `step`. Gradients accumulate rather than assign, which is why the first step exists, and `step` reads `.grad`, which fixes the order of the last two.
+- **Why does assigning a Python list of `nn.Linear` modules break training?** Assignment is only intercepted for `nn.Module` and `nn.Parameter` values. A list lands in `__dict__` untouched, so `model.parameters()` is empty and the optimizer has nothing to update.
+- **What is the difference between `model.eval()` and `torch.no_grad()`?** `eval()` sets a flag that `Dropout` and `BatchNorm` read, changing the forward computation. `no_grad()` stops graph construction, changing only memory and speed. You need both during validation.
+- **Why does `CrossEntropyLoss` take raw logits?** It applies `log_softmax` internally in a numerically stable way, subtracting the row maximum before exponentiating. Feeding it softmax output double-applies the nonlinearity.
+- **How does AdamW differ from Adam with weight decay?** Adam adds `wd * p` to the gradient, so the decay is then divided by `sqrt(v)` and becomes history-dependent. AdamW applies it directly to the parameter, which is the decoupled form the weight decay was originally meant to be.
+- **Why divide the loss by the accumulation count?** `.grad` adds. Four micro-batch means summed give four times the gradient a true large batch would, so the effective learning rate is four times what you set.
+- **What does `clip_grad_norm_` preserve that `clip_grad_value_` does not?** The global norm scales every gradient by one factor, so the update direction is unchanged and only its length shrinks. Per-element clamping changes the direction.
+- **Why do transformers warm up the learning rate?** Adam's second-moment estimate starts at zero and is bias-corrected, so early steps are large relative to the information the optimizer has. A ramp lets `v` accumulate first.

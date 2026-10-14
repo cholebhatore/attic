@@ -1,0 +1,342 @@
+---
+title: Tensor Fundamentals
+description: 'How tensors are constructed, the dtype bit layouts that decide their numeric range, device placement, strides, and byte accounting.'
+---
+
+A PyTorch tensor is six pieces of metadata wrapped around one flat buffer of memory. Almost every surprising behavior in the framework comes from confusing the metadata with the buffer, or from assuming that two tensors that look alike hold separate copies.
+
+```python title="anatomy.py"
+import torch
+
+x = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+
+print("shape     :", tuple(x.shape))            # (3, 4)
+print("dtype     :", x.dtype)                   # torch.float32
+print("device    :", x.device)                  # cpu
+print("strides   :", x.stride())                # (4, 1)
+print("numel     :", x.numel())                 # 12
+print("elem_size :", x.element_size())          # 4 bytes per element
+print("bytes     :", x.numel() * x.element_size())   # 48
+print("contiguous:", x.is_contiguous())         # True
+```
+
+| Field           | Question it answers                                                |
+| :-------------- | :----------------------------------------------------------------- |
+| `shape`         | How many elements along each axis                                  |
+| `dtype`         | How each element is encoded, and therefore its precision and range |
+| `device`        | Which memory the buffer lives in, host RAM or GPU VRAM             |
+| `stride`        | How many elements to skip to advance one step along each axis      |
+| `requires_grad` | Whether the autograd engine records operations on this tensor      |
+| storage         | The actual flat buffer, which several tensors can share            |
+
+---
+
+## Creating tensors
+
+Constructors fall into three groups: from existing data, filled with a constant, or filled with a distribution.
+
+```python title="constructors.py"
+import torch
+
+# From data. The dtype is inferred: Python ints give int64, Python floats give float32.
+a = torch.tensor([[1, 2], [3, 4]])
+b = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+print(a.dtype, b.dtype)          # torch.int64 torch.float32
+
+# Filled with a constant. empty() skips initialization and holds whatever was in the buffer.
+z = torch.zeros(2, 3)
+o = torch.ones(2, 3)
+f = torch.full((2, 3), 7.5)
+e = torch.empty(2, 3)
+print(tuple(z.shape), z.dtype)   # (2, 3) torch.float32
+
+# Match an existing tensor's shape, dtype, and device without copying its values.
+like = torch.zeros_like(b)
+print(like.dtype, like.device)   # torch.float32 cpu
+
+# Sequences. arange takes a step, linspace takes an endpoint count.
+print(torch.arange(0, 10, 2).tolist())      # [0, 2, 4, 6, 8]
+print(torch.linspace(0, 1, 5).tolist())     # [0.0, 0.25, 0.5, 0.75, 1.0]
+print(torch.arange(5).dtype)                # torch.int64
+print(torch.arange(5.0).dtype)              # torch.float32
+```
+
+`torch.empty` is not a zero-filled tensor. It allocates the buffer and returns it without writing, so the contents are whatever that memory previously held. Use it when you are about to overwrite every element anyway and want to skip the memset.
+
+### Special tensors
+
+```python title="special.py"
+import torch
+
+torch.manual_seed(0)
+
+print(torch.eye(3).tolist())
+# [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+u = torch.rand(2, 2)      # uniform on [0, 1)
+n = torch.randn(2, 2)     # standard normal, mean 0 variance 1
+i = torch.randint(0, 10, (2, 2))   # integers, low inclusive, high exclusive
+
+print(tuple(u.shape), tuple(n.shape), tuple(i.shape))   # (2, 2) (2, 2) (2, 2)
+print(i.dtype)                                          # torch.int64
+print(bool((u >= 0).all() and (u < 1).all()))           # True
+```
+
+`torch.manual_seed(0)` seeds the CPU generator. It does not seed CUDA; that needs `torch.cuda.manual_seed_all(0)`. Seeding makes `rand` and `randn` reproducible, which is what lets a failing test be debugged at all.
+
+<Callout type="info">
+  `torch.rand` and `torch.randn` differ by one letter and mean entirely different things. `rand` is
+  uniform on `[0, 1)`. `randn` is a standard normal sample, so it produces negative values and
+  values above 1. Weight initialization uses `randn` scaled by a fan-in-dependent factor; `rand`
+  would put every initial weight in the same positive band and break symmetry between neurons.
+</Callout>
+
+---
+
+## Data types
+
+The dtype decides three things at once: how much memory a tensor occupies, how precise each value is, and how large or small a value can be before it overflows or flushes to zero.
+
+| dtype      | Bits | Sign | Exponent | Mantissa | Largest finite | Smallest normal | Typical use                                      |
+| :--------- | :--- | :--- | :------- | :------- | :------------- | :-------------- | :----------------------------------------------- |
+| `float64`  | 64   | 1    | 11       | 52       | `1.80e308`     | `2.23e-308`     | Gradient checking, scientific code               |
+| `float32`  | 32   | 1    | 8        | 23       | `3.40e38`      | `1.18e-38`      | Default. Training, anything numerically delicate |
+| `float16`  | 16   | 1    | 5        | 10       | `65504`        | `6.10e-5`       | Mixed-precision training with loss scaling       |
+| `bfloat16` | 16   | 1    | 8        | 7        | `3.39e38`      | `1.18e-38`      | Mixed-precision training without loss scaling    |
+| `int64`    | 64   | 1    | —        | —        | `9.22e18`      | —               | Token ids, indices. The default integer type     |
+| `int8`     | 8    | 1    | —        | —        | `127`          | —               | Quantized inference                              |
+| `bool`     | 8    | —    | —        | —        | —              | —               | Masks. One byte per element, not one bit         |
+
+The split between exponent bits and mantissa bits is the whole story. Exponent bits buy **range**. Mantissa bits buy **precision**. `float16` and `bfloat16` are both sixteen bits wide, and they spend that budget differently:
+
+```
+float32   S EEEEEEEE MMMMMMMMMMMMMMMMMMMMMMM  8 exponent, 23 mantissa
+bfloat16  S EEEEEEEE MMMMMMM                  8 exponent,  7 mantissa
+float16   S EEEEE MMMMMMMMMM                  5 exponent, 10 mantissa
+```
+
+`bfloat16` keeps float32's exponent field verbatim, so it spans the same range with a quarter of the precision. `float16` trades range for precision, which is why it needs loss scaling and `bfloat16` does not. That trade is covered in [Devices and Precision](/ai/pytorch/devices-and-precision).
+
+A `bfloat16` value is a `float32` value with 16 of its 23 mantissa bits removed. Converting `float32` down to `bfloat16` loses precision. Converting back up is exact, because `bfloat16`'s exponent and mantissa fields are both strict subsets of float32's. That asymmetry is why the format works for training: weights can round-trip through the low-precision path without drifting.
+
+<Callout type="warn">
+  ### Hardware support varies Native `bfloat16` arithmetic needs an NVIDIA Ampere GPU (compute
+  capability 8.0) or newer, a Google TPU, or a recent AMD/Intel part. On a Turing card (compute
+  capability 7.5, which covers the GTX 16 series and RTX 20 series) `bfloat16` tensors allocate and
+  convert fine but most operations fall back to emulation or raise. Check with
+  `torch.cuda.get_device_capability(0)` before choosing a mixed-precision dtype.
+</Callout>
+
+---
+
+## Type promotion
+
+Adding two tensors of different dtypes does not error. PyTorch picks a result dtype by rule, and the rule differs from NumPy in a way that silently costs memory.
+
+PyTorch groups dtypes into categories: floating point, integral, boolean. A higher category wins outright, so any float beats any integer regardless of width. Within a category, the wider type wins.
+
+```python title="promotion.py"
+import torch
+
+i = torch.tensor([1, 2], dtype=torch.int64)
+f = torch.tensor([0.5, 0.5], dtype=torch.float32)
+
+r = i + f
+print(r.dtype)             # torch.float32 - the float category wins
+print(r.tolist())          # [1.5, 2.5]
+
+print(torch.result_type(torch.empty((), dtype=torch.int64),
+                        torch.empty((), dtype=torch.float16)))   # torch.float16
+print(torch.result_type(torch.empty((), dtype=torch.float16),
+                        torch.empty((), dtype=torch.float32)))   # torch.float32
+```
+
+<Callout type="warn">
+  ### This is where PyTorch and NumPy disagree NumPy 2.x promotes `int64 + float32` to `float64`,
+  because not every `int64` value is exactly representable in `float32`. PyTorch promotes the same
+  pair to `float32`.
+  <br />
+  <br />
+  Code ported from NumPy that relies on integer exactness will lose precision in PyTorch without any
+  warning. The fix is to be explicit: `x.to(torch.float64)` before the arithmetic rather than
+  trusting the promotion rule.
+</Callout>
+
+Python scalars follow a weaker rule. A wrapped number never promotes a tensor to a wider float type, so `torch.tensor([1.0], dtype=torch.float16) + 0.5` stays `float16` rather than widening to `float32`. It does cross categories when it has to: adding `0.5` to an `int64` tensor produces `float32`, because no integer type can hold the result.
+
+---
+
+## Device placement
+
+A tensor lives in exactly one memory space. Operations between tensors on different devices raise rather than silently copying.
+
+```python title="devices.py"
+import torch
+
+x = torch.randn(2, 3)
+print(x.device)                    # cpu
+
+if torch.cuda.is_available():
+    g = x.to("cuda")               # copies host RAM to GPU VRAM
+    print(g.device)                # cuda:0
+    print(g.dtype)                 # torch.float32 - .to() preserves dtype here
+
+    back = g.cpu()                 # copies back
+    print(back.device)             # cpu
+
+    # This raises: Expected all tensors to be on the same device
+    # x + g
+```
+
+`.to()` is the one call that handles both moves at once. It returns the same object when the device and dtype already match, and a new tensor otherwise:
+
+```python
+y = x.to(device="cuda", dtype=torch.bfloat16)
+```
+
+Three behaviors matter in practice:
+
+| Operation                             | Copies memory?                      | Returns                |
+| :------------------------------------ | :---------------------------------- | :--------------------- |
+| `x.to("cuda")` from CPU               | Yes, a full host-to-device transfer | A new tensor           |
+| `x.to("cuda")` when already on `cuda` | No                                  | The same tensor object |
+| `x.float()` on a `float32` tensor     | No                                  | The same tensor object |
+| `x.cpu()` from GPU                    | Yes, a device-to-host transfer      | A new tensor           |
+
+Because a no-op `.to()` returns the original object, chaining `.to()` calls is free when the tensor is already where you want it. That is why the idiom `x = x.to(device)` appears at the top of almost every forward pass.
+
+Setting the default device avoids sprinkling `.to()` calls through model construction:
+
+```python title="default_device.py"
+import torch
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_default_device(device)
+
+x = torch.randn(2, 3)
+print(x.device)          # cuda:0 on a GPU machine, cpu otherwise
+```
+
+---
+
+## Strides and contiguity
+
+The buffer is flat. Shape and stride together describe how to read that flat buffer as an n-dimensional array.
+
+For a contiguous tensor of shape `(d0, d1, d2)`, the stride is `(d1 * d2, d2, 1)`. To move one step along axis 0 you skip a whole `(d1, d2)` slab. To move one step along the last axis you skip a single element.
+
+```python title="strides.py"
+import torch
+
+x = torch.zeros(2, 3, 4)
+print(tuple(x.shape))           # (2, 3, 4)
+print(x.stride())               # (12, 4, 1)
+print(x.is_contiguous())        # True
+
+# Element (i, j, k) sits at flat offset i*12 + j*4 + k*1
+print(1 * 12 + 2 * 4 + 3 * 1)   # 23
+print(x.flatten()[23].item())   # 0.0
+
+t = x.transpose(0, 1)
+print(tuple(t.shape))           # (3, 2, 4)
+print(t.stride())               # (4, 12, 1) - two entries swapped, no data moved
+print(t.is_contiguous())        # False
+
+c = t.contiguous()
+print(c.stride())               # (8, 4, 1) - freshly packed
+print(c.is_contiguous())        # True
+```
+
+`transpose` did not move a single byte. It swapped two stride entries and reported a new shape, which is why it is `O(1)` while `contiguous()` is `O(n)`.
+
+Strides are what make broadcasting free, as covered in [Tensor Broadcasting](/ai/math-foundations/tensor-broadcasting). A dimension of stride `0` repeats the same memory location on every step, so adding a bias of shape `(512,)` to an activation of shape `(8, 512)` never materializes the `8 x 512` copy of that bias.
+
+---
+
+## Views share storage
+
+Several tensors can point at the same buffer. Mutating one changes all of them.
+
+```python title="views.py"
+import torch
+
+x = torch.arange(12).reshape(3, 4)
+row = x[1]                      # a view, not a copy
+row[0] = 99
+
+print(x.tolist())
+# [[0, 1, 2, 3], [99, 5, 6, 7], [8, 9, 10, 11]]
+
+print(row.data_ptr() == x.data_ptr() + row.storage_offset() * x.element_size())
+# True
+
+print(x.untyped_storage().nbytes())     # 96 - one shared buffer, 12 int64 elements
+print(row.untyped_storage().nbytes())   # 96 - same buffer, even though row has 4 elements
+```
+
+Operations whose names end in an underscore modify in place and preserve aliasing: `add_`, `zero_`, `fill_`, `copy_`, `mul_`. Operations without the underscore return new tensors. `x.add(1)` leaves `x` alone; `x.add_(1)` does not.
+
+<Callout type="warn">
+  ### In-place operations and autograd do not mix well Reverse-mode differentiation needs the value
+  of each intermediate activation to compute its local derivative. An in-place edit overwrites that
+  value. PyTorch tracks a version counter on every tensor and raises `RuntimeError: one of the
+  variables needed for gradient computation has been modified by an inplace operation` when a
+  backward pass reaches a stale one.
+  <br />
+  <br />
+  The error is a safety net, not a nuisance. Use the out-of-place form unless you have measured that
+  the in-place one is what saves the memory.
+</Callout>
+
+---
+
+## Byte accounting
+
+Memory questions reduce to `numel() * element_size()`, and getting the arithmetic right is most of capacity planning.
+
+```python title="bytes.py"
+import torch
+
+for dtype in (torch.float32, torch.bfloat16, torch.int8, torch.int64):
+    t = torch.empty(8, 512, dtype=dtype)
+    print(f"{str(dtype):>18}  element_size={t.element_size()}  bytes={t.numel() * t.element_size()}")
+```
+
+```text
+     torch.float32  element_size=4  bytes=16384
+    torch.bfloat16  element_size=2  bytes=8192
+         torch.int8  element_size=1  bytes=4096
+        torch.int64  element_size=8  bytes=32768
+```
+
+The same multiplication sizes a whole model. Multiply parameter count by bytes per parameter:
+
+| Parameters | `float32` | `bfloat16` | `int8`  | 4-bit   |
+| :--------- | :-------- | :--------- | :------ | :------ |
+| 7B         | 28.0 GB   | 14.0 GB    | 7.0 GB  | 3.5 GB  |
+| 70B        | 280.0 GB  | 140.0 GB   | 70.0 GB | 35.0 GB |
+
+Those numbers cover weights only. Mixed-precision training with Adam costs sixteen bytes per parameter, because the optimizer keeps its own copies at higher precision than the model:
+
+| Component                | Bytes per parameter | 7B model   |
+| :----------------------- | :------------------ | :--------- |
+| `bfloat16` weights       | 2                   | 14 GB      |
+| `bfloat16` gradients     | 2                   | 14 GB      |
+| `float32` master weights | 4                   | 28 GB      |
+| `float32` Adam momentum  | 4                   | 28 GB      |
+| `float32` Adam variance  | 4                   | 28 GB      |
+| **Total**                | **16**              | **112 GB** |
+
+Activations sit on top of that and scale with batch size and sequence length, which is why a 7B model that fits in 14 GB for inference needs several GPUs to train. Inference at batch size 1 costs the weights plus the KV cache and nothing else.
+
+---
+
+## Interview questions
+
+- **What does `tensor.stride()` return, and what does a stride of zero mean?** The number of elements to skip to advance one step along each axis. A zero stride means every position along that axis reads the same memory, which is how broadcasting avoids copying.
+- **Why is `transpose` cheap and `contiguous` expensive?** `transpose` swaps two stride entries and changes the reported shape without touching the buffer. `contiguous` allocates a new buffer and copies every element into packed order.
+- **What is the difference between `float16` and `bfloat16`?** Both are sixteen bits. `float16` has 5 exponent and 10 mantissa bits, capping at `65504`. `bfloat16` has 8 exponent and 7 mantissa bits, matching float32's range at lower precision.
+- **Why does `bfloat16` not need loss scaling?** Its exponent field is float32's, so the tiny gradients that underflow in `float16` are still representable.
+- **What does `torch.empty` contain?** Whatever was in the allocated buffer. It is uninitialized, not zeroed.
+- **Why does PyTorch raise when you add a CPU tensor to a CUDA tensor?** There is no implicit host-to-device transfer. The framework refuses to hide a copy that costs milliseconds behind an operator that looks like arithmetic.
+- **How do you tell whether two tensors share memory?** Compare `data_ptr()`, or mutate one and read the other. `x[1]` returns a view; `x[[0, 1]]` returns a copy.

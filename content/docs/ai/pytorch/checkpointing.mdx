@@ -1,0 +1,422 @@
+---
+title: Checkpointing
+description: 'state_dict serialization, safe loading with weights_only, the safetensors format, sharded checkpoints, and moving weights to and from Keras and TensorFlow.'
+---
+
+A checkpoint is a resumable description of a training run, not a snapshot of a Python object. The distinction decides whether your files survive a refactor, whether loading one can execute code, and whether you can move weights between frameworks.
+
+---
+
+## What `state_dict` is
+
+Every `nn.Module` and every `Optimizer` exposes a `state_dict()`: a flat mapping from dotted string keys to tensors.
+
+```python title="state_dict.py"
+import torch
+from torch import nn
+
+model = nn.Sequential(nn.Linear(4, 8), nn.ReLU(), nn.LayerNorm(8), nn.Linear(8, 2))
+sd = model.state_dict()
+
+for k, v in sd.items():
+    print(f"{k:14s} {tuple(v.shape)!s:12s} {v.dtype}")
+print(len(sd), sum(t.numel() for t in sd.values()))
+```
+
+Output:
+
+```text
+0.weight     (8, 4)       torch.float32
+0.bias       (8,)         torch.float32
+2.weight     (8,)         torch.float32
+2.bias       (8,)         torch.float32
+3.weight     (2, 8)       torch.float32
+3.bias       (2,)         torch.float32
+6 74
+```
+
+Modules are named by position when you use `nn.Sequential`, which is why the keys are `0`, `2`, `3`. Give layers real names in a custom module and the keys become readable and stable across edits.
+
+The returned tensors are references into the live model, not copies. Mutating `sd["0.weight"]` mutates the model. That is also what makes `load_state_dict` work after the optimizer is built: it copies values into the existing parameter tensors in place, so every reference the optimizer holds stays valid.
+
+Buffers registered with `register_buffer` appear here too. That is how `BatchNorm` running statistics, rotary position tables, and attention masks survive a save.
+
+---
+
+## What goes in a resumable checkpoint
+
+```python title="save_ckpt.py"
+import os
+import random
+import tempfile
+
+import numpy as np
+import torch
+
+
+def save_checkpoint(path, model, optimizer, scheduler, scaler, epoch, best, loader):
+    state = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "best": best,
+        "step": loader.step,
+        "rng": {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        },
+    }
+
+    # write to a temp file in the same directory, then rename
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+    os.close(fd)
+    try:
+        torch.save(state, tmp)
+        os.replace(tmp, path)      # atomic on POSIX and on Windows
+    except BaseException:
+        os.unlink(tmp)
+        raise
+```
+
+`os.replace` is atomic, so a crash mid-write leaves either the old file or the new one and never a truncated one. Writing straight to the destination risks losing the last good checkpoint along with the current one.
+
+The four RNG states are what make a resumed run bit-identical to one that never stopped. Without them, dropout masks and data augmentation diverge at the resume point.
+
+### Optimizer state is the bulk of the file
+
+`Optimizer.state_dict()` returns `{"state": {...}, "param_groups": [...]}`. For Adam, `state` holds `step`, `exp_avg`, and `exp_avg_sq` per parameter, and the two moment tensors are each the size of the parameter.
+
+| Component                     | 7B model in FP32 |
+| :---------------------------- | :--------------- |
+| Model weights                 | 28 GB            |
+| Adam `exp_avg` + `exp_avg_sq` | 56 GB            |
+| Resume file total             | 84 GB            |
+| Inference-only, BF16          | 14 GB            |
+
+Saving optimizer state triples the file. For a run you only intend to do inference from, save the model alone and keep the full resume file separately with a short retention window.
+
+<Callout type="warn">
+  ### Optimizer state is keyed by position, not by name
+
+`state` maps integer parameter indices to their moments. Those indices come from the order `model.parameters()` yields. Load a checkpoint into a model whose layers were reordered, inserted, or removed and the counts will usually mismatch loudly. When they do not, the moments land on the wrong parameters silently and training degrades in a way that looks like a bad learning rate. If the architecture changed, load the model state and start a fresh optimizer.
+
+</Callout>
+
+---
+
+## Loading
+
+```python title="load_ckpt.py"
+import torch
+
+ckpt = torch.load("run.pt", map_location="cpu", weights_only=True)
+
+model = build_model()
+model.load_state_dict(ckpt["model"])
+model.to(device).eval()
+
+# resume training
+optimizer = build_optimizer(model)
+optimizer.load_state_dict(ckpt["optimizer"])
+scheduler.load_state_dict(ckpt["scheduler"])
+scaler.load_state_dict(ckpt["scaler"])
+start_epoch = ckpt["epoch"] + 1
+```
+
+`map_location="cpu"` matters whenever the checkpoint was written from a GPU. Without it, PyTorch tries to restore every tensor to the device it came from, and loading a `cuda:3` checkpoint on a single-GPU or CPU-only machine fails. Passing `"cpu"` and then calling `.to(device)` explicitly is the portable pattern.
+
+`weights_only=True` is the default since PyTorch 2.6. Before that it defaulted to `False`, and a great deal of existing code passes nothing at all.
+
+---
+
+## Why `torch.save(model)` is wrong
+
+Three separate problems, in increasing order of severity.
+
+**It pickles a class reference, not a definition.** Loading requires the same import path to resolve to the same class. Rename the file the model lives in, move it into a package, or refactor a method, and every checkpoint written before the change fails to load.
+
+**It stores the device.** A model saved from `cuda:0` restores onto `cuda:0` even when you are loading on a laptop.
+
+**Loading a pickle executes code.** `torch.load` with `weights_only=False` runs `__reduce__` on whatever the file contains. A crafted checkpoint can run arbitrary Python at load time with your privileges. This is not a theoretical concern: model files are downloaded from public hubs, and there have been published exploits against exactly this path.
+
+`weights_only=True` restricts the unpickler to tensors, primitives, containers, and a small allowlist of safe types. It rejects class instances, which is why a checkpoint holding a `Namespace` or an `argparse` object fails to load under it. Either store plain dicts, or extend the allowlist:
+
+```python
+torch.serialization.add_safe_globals([MyConfig, torch.dtype])
+```
+
+Since PyTorch 1.6, `torch.save` writes a zip archive by default, with `data.pkl` holding the object graph and separate entries for each tensor storage. `torch.load(..., mmap=True)` memory-maps those storages instead of reading them into fresh allocations, which makes loading a large checkpoint much faster and roughly halves peak host memory.
+
+---
+
+## Safetensors
+
+Safetensors is a flat tensor container with a JSON index and no executable content.
+
+```
+byte 0    : u64 little-endian, the header size N
+byte 8    : N bytes of JSON
+byte 8+N  : raw tensor data, concatenated
+```
+
+The JSON maps each tensor name to a dtype tag, a shape, and a byte range into the data section:
+
+```json
+{
+  "weight": { "dtype": "F32", "shape": [4, 4], "data_offsets": [0, 64] },
+  "bias": { "dtype": "F32", "shape": [4], "data_offsets": [64, 80] },
+  "__metadata__": { "format": "pt" }
+}
+```
+
+Dtype tags are `F64`, `F32`, `F16`, `BF16`, `I64`, `I32`, `I16`, `I8`, `U8`, `BOOL`, `F8_E4M3`, and `F8_E5M2`. The library validates that the ranges do not overlap and cover the buffer, which catches truncation.
+
+```python title="safetensors_io.py"
+import torch
+from safetensors.torch import load_file, save_file
+
+save_file(model.state_dict(), "model.safetensors", metadata={"version": "1.0"})
+
+weights = load_file("model.safetensors", device="cpu")
+model.load_state_dict(weights)
+```
+
+For a model you do not want fully in memory, open it lazily:
+
+```python title="lazy_load.py"
+from safetensors import safe_open
+
+with safe_open("model.safetensors", framework="pt", device="cpu") as f:
+    print(f.keys())
+    print(f.metadata())
+    for name in f.keys():
+        t = f.get_tensor(name)     # mmap-backed, no full-file read
+```
+
+`safe_open` mmaps the file. Each `get_tensor` call returns a tensor whose storage points into that mapping, so a 70 GB model can be inspected and copied layer by layer from a machine with 8 GB of RAM. There is no deserialization step, no Python objects constructed from file content, and nothing that can execute.
+
+The trade is that safetensors holds tensors only. No optimizer state, no epoch counter, no RNG. Real projects save `model.safetensors` for distribution and a separate `training_state.pt` for resuming.
+
+---
+
+## Format comparison
+
+| Format                         | Contents                                       | Load                             | Code execution on load          | Resharding |
+| :----------------------------- | :--------------------------------------------- | :------------------------------- | :------------------------------ | :--------- |
+| `torch.save` (`.pt`)           | Any picklable object                           | Full deserialize, or `mmap=True` | Yes, unless `weights_only=True` | No         |
+| safetensors                    | Tensors plus a metadata dict                   | Memory-mapped, near-instant      | No                              | No         |
+| `torch.distributed.checkpoint` | Sharded tensors plus `.metadata`               | Per-shard, parallel              | No                              | Yes        |
+| `.keras`                       | `config.json` plus `model.weights.h5` in a zip | Medium                           | No                              | No         |
+| TF `SavedModel`                | Protobuf graph plus variable bundles           | Medium                           | No, the graph is data           | No         |
+| ONNX                           | Protobuf graph plus initializers               | Medium                           | No                              | No         |
+| GGUF                           | Header plus tensors with quantization metadata | Memory-mapped                    | No                              | No         |
+
+GGUF is what `llama.cpp` and most local inference tools consume. It carries per-tensor quantization scales alongside the data, which safetensors leaves to the loader.
+
+---
+
+## Partial loads and architecture changes
+
+`load_state_dict(..., strict=False)` skips missing keys and ignores unexpected ones instead of raising. It returns a `_IncompatibleKeys` namedtuple with both lists, and you should print them:
+
+```python title="partial.py"
+import torch
+
+result = model.load_state_dict(ckpt["model"], strict=False)
+print("missing   :", result.missing_keys)
+print("unexpected:", result.unexpected_keys)
+```
+
+This is the standard move for transfer learning: load a pretrained backbone into a model with a new head, confirm that the only missing keys are the head's, and let the head initialize randomly. It is also how you recover from a checkpoint written by a slightly different version of your own model.
+
+Leaving `strict=False` in permanently is how a renamed layer goes unnoticed for a thousand steps while that layer trains from scratch.
+
+---
+
+## Distributed and sharded checkpoints
+
+Under FSDP or tensor parallelism, no single rank holds the whole model. `torch.save` of a sharded `state_dict` produces one file per rank that is meaningless without the others, and cannot be loaded by a job with a different world size.
+
+`torch.distributed.checkpoint` solves this. Each rank writes its own shard plus a shared `.metadata` file describing the global shape and layout of every tensor:
+
+```python title="dcp.py"
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import get_model_state_dict, get_optimizer_state_dict
+
+state = {
+    "model": get_model_state_dict(model),
+    "optim": get_optimizer_state_dict(model, optimizer),
+}
+dcp.save(state, checkpoint_id="ckpt/step-1000")
+
+# later, possibly with a different world size
+dcp.load(state, checkpoint_id="ckpt/step-1000")
+```
+
+`get_model_state_dict` returns full-shaped `DTensor` views rather than local shards, so the metadata is global. `dcp.load` reshards on the fly, which means a checkpoint written by 64 ranks loads into 8 ranks and vice versa. Writes are parallel across ranks and land directly on the shared filesystem, so saving a 70B model takes seconds rather than the minutes a single-rank gather would need.
+
+To produce a plain single-file checkpoint from a sharded run, gather onto rank 0 first:
+
+```python
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+full = get_model_state_dict(model, options=opts)
+if dist.get_rank() == 0:
+    save_file(full, "model.safetensors")
+```
+
+---
+
+## Exporting for inference
+
+| Path                                   | Produces                   | Use it for                                                       |
+| :------------------------------------- | :------------------------- | :--------------------------------------------------------------- |
+| `torch.export.export`                  | An `ExportedProgram` graph | The supported 2.x export path, and the input to everything below |
+| `torch.onnx.export(..., dynamo=True)`  | An ONNX model              | Cross-runtime deployment, ONNX Runtime, TensorRT                 |
+| `torch.jit.trace` / `torch.jit.script` | TorchScript                | Legacy code. Not where new work should go                        |
+| `torch.compile`                        | Fused kernels in-process   | Serving from Python without leaving PyTorch                      |
+
+`torch.export` traces with real or symbolic shapes and produces a graph with no Python control flow left in it. Dynamic dimensions are declared up front:
+
+```python title="export.py"
+import torch
+
+batch = torch.export.Dim("batch", min=1, max=64)
+ep = torch.export.export(model, (example_input,),
+                         dynamic_shapes={"x": {0: batch}})
+ep.module()      # back to something callable
+```
+
+Declaring the batch dimension dynamic avoids a recompile for every new batch size at the serving layer.
+
+---
+
+## Cross-framework: Keras 3
+
+Keras 3 is a multi-backend frontend. The same model code runs on TensorFlow, JAX, or PyTorch, selected by the `KERAS_BACKEND` environment variable, and `keras.ops` dispatches to whichever is active.
+
+```python title="keras_backend.py"
+import keras
+import os
+
+print(os.environ.get("KERAS_BACKEND"))      # tensorflow, jax, or torch
+print(keras.backend.backend())
+
+model = keras.Sequential([
+    keras.layers.Dense(8, activation="relu", input_shape=(4,)),
+    keras.layers.Dense(2),
+])
+model.save("model.keras")
+```
+
+A `.keras` file is a zip containing `config.json`, which is the full layer graph, and `model.weights.h5`. Reading the config alone tells you the architecture without loading any weights.
+
+With `KERAS_BACKEND=torch`, `layer.weights` are actual PyTorch tensors and `model.state_dict()` is available, so conversion is a direct copy. With the TensorFlow or JAX backend the weights are backend-native and need to go through NumPy.
+
+### Keras to PyTorch
+
+The layer order differs, so weights need permuting.
+
+| Keras layer          | Keras weight shape                | PyTorch module              | PyTorch shape                           | Transform               |
+| :------------------- | :-------------------------------- | :-------------------------- | :-------------------------------------- | :---------------------- |
+| `Dense(in, out)`     | kernel `(in, out)`, bias `(out,)` | `nn.Linear(in, out)`        | weight `(out, in)`, bias `(out,)`       | Transpose the kernel    |
+| `Conv2D(out, k)`     | kernel `(kh, kw, in_c, out_c)`    | `nn.Conv2d(in_c, out_c, k)` | weight `(out_c, in_c, kh, kw)`          | `transpose(3, 2, 0, 1)` |
+| `BatchNormalization` | gamma, beta, mean, var            | `nn.BatchNorm1d/2d`         | weight, bias, running_mean, running_var | Direct                  |
+| `Embedding(v, d)`    | `(v, d)`                          | `nn.Embedding(v, d)`        | `(v, d)`                                | Direct                  |
+
+```python title="keras_to_torch.py"
+import numpy as np
+import torch
+from safetensors.torch import save_file
+
+kmodel = keras.models.load_model("model.keras")
+
+mapping = {
+    "0.weight": lambda w: torch.from_numpy(w[0].T.copy()),
+    "0.bias":   lambda w: torch.from_numpy(w[1].copy()),
+    "1.weight": lambda w: torch.from_numpy(w[2].T.copy()),
+    "1.bias":   lambda w: torch.from_numpy(w[3].copy()),
+}
+out = {k: fn(kmodel.weights) for k, fn in mapping.items()}
+save_file(out, "model.safetensors")
+```
+
+The `.copy()` calls are not optional. `w[0].T` is a strided view, and `torch.from_numpy` on a non-contiguous view produces a tensor whose strides PyTorch will carry through the whole conversion. Copying materializes a C-contiguous array first.
+
+Going the other way, the same table read backwards: transpose `nn.Linear.weight` back to `(in, out)` and build a Keras model from `config.json` before calling `set_weights`.
+
+---
+
+## Cross-framework: legacy TensorFlow `SavedModel`
+
+A `SavedModel` directory is:
+
+```text
+saved_model/
+  saved_model.pb              # graph and signature definitions
+  variables/
+    variables.index           # name -> bundle offset
+    variables.data-00000-of-00001
+  assets/
+  fingerprint.pb
+```
+
+Inspect the signatures without running anything:
+
+```python title="inspect_savedmodel.py"
+import tensorflow as tf
+
+loaded = tf.saved_model.load("saved_model")
+print(list(loaded.signatures.keys()))        # ['serving_default']
+
+fn = loaded.signatures["serving_default"]
+print(fn.structured_input_signature)
+print(fn.structured_outputs)
+```
+
+Or from the shell:
+
+```bash
+saved_model_cli show --dir saved_model --tag_set serve --signature_def serving_default
+```
+
+The variables are a TF checkpoint bundle, readable without constructing the graph:
+
+```python title="read_variables.py"
+import tensorflow as tf
+from safetensors.numpy import save_file
+
+reader = tf.train.load_checkpoint("saved_model/variables/variables")
+shapes = reader.get_variable_to_shape_map()
+dtypes = reader.get_variable_to_dtype_map()
+
+for name in sorted(shapes):
+    print(f"{name:40s} {shapes[name]!s:16s} {dtypes[name].name}")
+
+arrays = {n.replace("/", "_").replace(":", "_"): reader.get_tensor(n) for n in shapes}
+save_file(arrays, "tf_weights.safetensors")
+```
+
+Names have to be sanitized because `/` and `:` are legal in TF variable names and are separators in PyTorch `state_dict` keys. `tf.float32` maps cleanly to `F32`; `tf.bfloat16` NumPy arrays need an explicit conversion because NumPy has no native bfloat16 dtype.
+
+For anything with real graph structure, `tf2onnx` converts a `SavedModel` to ONNX directly, and ONNX then loads into PyTorch through `torch.onnx` utilities or any ONNX runtime. Reimplementing the graph by hand from the weight names is only worth it for small, well-understood models.
+
+---
+
+## Interview questions
+
+- **What does `state_dict()` return?** A flat ordered mapping from dotted string keys to parameter and buffer tensors. The tensors are references into the live module, and `load_state_dict` copies into them in place, which is why it works after an optimizer already holds those references.
+- **Why is `torch.save(model)` worse than `torch.save(model.state_dict())`?** It pickles a class reference, so loading requires the original import path to still resolve. It stores the source device. And loading it executes arbitrary code unless `weights_only=True`.
+- **What does `weights_only=True` restrict?** The unpickler accepts tensors, primitives, containers, and a small allowlist of safe types. Class instances are rejected, which is why checkpoints holding an `argparse.Namespace` need `add_safe_globals`.
+- **Why is safetensors able to load a 70 GB model on 8 GB of RAM?** The format is a JSON index followed by raw tensor bytes at known offsets. `safe_open` mmaps the file and returns tensors whose storage points into the mapping, so nothing is deserialized or copied.
+- **What is in a resumable checkpoint that is not in an inference checkpoint?** Optimizer moments, the scheduler state, the AMP scaler state, the epoch and step counters, and the Python, NumPy, and CUDA RNG states.
+- **Why does `map_location="cpu"` matter?** Tensors record the device they were saved from. Without a remap, loading a `cuda:3` checkpoint on a CPU-only or single-GPU machine fails.
+- **What goes wrong if you load optimizer state into a reordered model?** The state is keyed by integer position in `model.parameters()`. Different counts raise, but a same-count reordering silently attaches the wrong moments to the wrong parameters.
+- **What does `torch.distributed.checkpoint` add?** Per-rank shards plus a global `.metadata` file describing full tensor shapes, so a checkpoint written at one world size can be resharded and loaded at another.
+- **How do you convert a Keras `Dense` weight to an `nn.Linear` weight?** Transpose it. Keras stores `(in, out)` and PyTorch stores `(out, in)`. Convolution kernels need `transpose(3, 2, 0, 1)` because Keras is channels-last and PyTorch is channels-first.
