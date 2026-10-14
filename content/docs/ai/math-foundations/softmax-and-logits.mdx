@@ -1,0 +1,291 @@
+---
+title: Softmax and Logits
+description: How raw model scores become probabilities, temperature scaling, the log-sum-exp trick, and why softmax saturation drives attention scaling.
+---
+
+A language model's final layer outputs one raw number per vocabulary token. Those numbers are **logits**: unbounded, unnormalized, and not probabilities. Softmax converts them into a distribution the model can sample from and the loss function can score.
+
+This page is tagged interview-core because the conversion, its temperature parameter, and its numerical stability come up in almost every LLM engineering conversation.
+
+---
+
+## Logits
+
+The LM head is a linear projection from the hidden state to the vocabulary:
+
+```
+logits = h @ W_vocab.T        # h is (d_model,), W_vocab is (V, d_model)
+```
+
+For a model with `d_model = 4096` and `V = 128256`, that projection produces 128256 floats per token position. They can be any real number, positive or negative, and they do not sum to anything meaningful.
+
+```python title="logits.py"
+import numpy as np
+
+hidden = np.random.randn(4096)
+W_vocab = np.random.randn(128256, 4096) * 0.02
+
+logits = hidden @ W_vocab.T
+print(logits.shape)        # (128256,)
+print(logits.min(), logits.max())    # arbitrary reals, not probabilities
+```
+
+The name comes from the connection to log-odds. For a binary classifier, the logit is `log(p / (1 - p))`, the logarithm of the odds ratio. Softmax generalizes that idea to `V` classes.
+
+---
+
+## The softmax function
+
+Given a logit vector `z` of length `K`, softmax produces:
+
+```
+softmax(z)_i = exp(z_i) / sum over j of exp(z_j)
+```
+
+Three things happen: exponentiation makes everything positive, summing gives a normalizer, and dividing makes the vector sum to 1.
+
+```python title="softmax.py"
+def softmax(z):
+    e = np.exp(z)
+    return e / e.sum()
+
+z = np.array([2.0, 1.0, 0.1])
+p = softmax(z)
+print(p)             # [0.6590 0.2424 0.0986]
+print(p.sum())       # 1.0
+```
+
+### Why exponentiate
+
+Any positive monotonic function would produce a valid distribution after normalization. The exponential is chosen for four reasons:
+
+1. **Positivity.** `exp(x)` is always positive, so no probability can go negative.
+2. **Amplification.** Differences in logits become multiplicative differences in probability. A logit gap of 2 becomes a probability ratio of `e^2`, about 7.4x. This makes the distribution appropriately confident.
+3. **Clean gradients.** Combined with cross-entropy loss, the derivative collapses to `p - y`, the predicted distribution minus the target. Phase 6's loss pages and the backprop page both depend on this cancellation.
+4. **Maximum entropy justification.** Softmax is the distribution that maximizes entropy subject to matching the expected logits, which makes it the least committal choice consistent with the scores.
+
+### Properties worth memorizing
+
+| Property            | Statement                                                       |
+| :------------------ | :-------------------------------------------------------------- |
+| Output range        | Every entry in `(0, 1)`, and the vector sums to exactly 1       |
+| Order preservation  | `z_i > z_j` implies `p_i > p_j`; ranking is unchanged           |
+| Shift invariance    | `softmax(z) == softmax(z + c)` for any scalar `c`               |
+| Not scale invariant | `softmax(c * z)` differs from `softmax(z)`; this is temperature |
+| Monotone in the gap | Probability ratios depend only on logit differences             |
+
+Shift invariance is the property that makes numerical stability possible, and it is the reason the log-sum-exp trick works.
+
+---
+
+## Temperature scaling
+
+Dividing the logits by a temperature `T` before softmax controls how sharp the distribution is:
+
+```
+softmax(z / T)_i = exp(z_i / T) / sum over j of exp(z_j / T)
+```
+
+| `T`      | Effect                                                    |
+| :------- | :-------------------------------------------------------- |
+| `T -> 0` | Distribution approaches one-hot at the argmax; greedy     |
+| `T = 1`  | The model's calibrated default                            |
+| `T > 1`  | Flatter distribution, more entropy, more diverse sampling |
+| `T < 1`  | Sharper distribution, more confident, more repetitive     |
+
+```python title="temperature.py"
+z = np.array([2.0, 1.0, 0.1])
+
+for T in [0.1, 0.5, 1.0, 2.0, 10.0]:
+    p = np.exp(z / T)
+    p /= p.sum()
+    entropy = -(p * np.log(p + 1e-12)).sum()
+    print(f"T={T:<5} p={p.round(4)} entropy={entropy:.4f}")
+```
+
+Output:
+
+```text
+T=0.1   p=[1.     0.     0.    ] entropy=0.0005
+T=0.5   p=[0.8638 0.1169 0.0193] entropy=0.4537
+T=1.0   p=[0.6590 0.2424 0.0986] entropy=0.8467
+T=2.0   p=[0.5017 0.3043 0.1940] entropy=1.0262
+T=10.0  p=[0.3661 0.3312 0.3027] entropy=1.0956
+```
+
+Entropy rises monotonically with temperature and approaches `log(3) = 1.0986`, the uniform distribution. At low temperature the model commits to its top choice; at high temperature it barely distinguishes between options.
+
+<Callout type="warn">
+  Temperature is a sampling-time control, not a training-time one. Changing it does not make the
+  model more knowledgeable, it only redistributes probability mass the model already computed.
+  Setting `T = 0` (in practice, argmax) removes all randomness and produces deterministic but often
+  repetitive text. Phase 6 covers how temperature interacts with top-k and top-p sampling, and where
+  each fails.
+</Callout>
+
+---
+
+## Numerical stability and log-sum-exp
+
+`exp` overflows fast. `exp(1000)` is `inf` in float64 and in float32 it overflows at about `exp(88)`. Real logits reach those ranges, especially at low temperature where you divide by a small `T`.
+
+```python title="overflow.py"
+z = np.array([1000.0, 999.0, 998.0])
+
+naive = np.exp(z) / np.exp(z).sum()
+print(naive)         # [nan nan nan]
+```
+
+The naive version produces `inf / inf`, which is `nan`. The fix uses shift invariance: subtract the maximum logit first.
+
+```
+softmax(z)_i = exp(z_i - m) / sum over j of exp(z_j - m)     where m = max(z)
+```
+
+After the shift, the largest exponent is `exp(0) = 1` and every other exponent is at most 1, so nothing overflows. Underflow to zero is harmless because those terms genuinely contribute nothing.
+
+```python title="stable_softmax.py"
+def stable_softmax(z):
+    m = np.max(z, axis=-1, keepdims=True)
+    e = np.exp(z - m)
+    return e / e.sum(axis=-1, keepdims=True)
+
+z = np.array([1000.0, 999.0, 998.0])
+print(stable_softmax(z))    # [0.6652 0.2447 0.0900]
+
+# verify it matches the naive version where the naive version is safe
+small = np.array([2.0, 1.0, 0.1])
+print(np.allclose(stable_softmax(small), np.exp(small) / np.exp(small).sum()))   # True
+```
+
+Note the `keepdims=True` on the max reduction. Without it the subtraction would not broadcast back against a batch, which is the same rule from the broadcasting page.
+
+### Log-softmax and the log-sum-exp trick
+
+Training needs `log(p)`, not `p`. Computing `log(softmax(z))` in two steps throws away accuracy, because `softmax` can underflow to exactly zero and `log(0)` is `-inf`. **Log-softmax** keeps everything in log space:
+
+```
+log_softmax(z)_i = z_i - log(sum over j of exp(z_j))
+```
+
+The term `log(sum(exp(z)))` is the **log-sum-exp** (LSE), and it has the same stabilized form:
+
+```
+LSE(z) = m + log(sum over j of exp(z_j - m))
+```
+
+```python title="log_softmax.py"
+def log_softmax(z):
+    m = np.max(z, axis=-1, keepdims=True)
+    return z - m - np.log(np.exp(z - m).sum(axis=-1, keepdims=True))
+
+z = np.array([2.0, 1.0, 0.1])
+print(log_softmax(z))       # [-0.4170 -1.4170 -2.3170]
+print(np.exp(log_softmax(z)).sum())    # 1.0
+```
+
+Always use the fused `log_softmax` in training code. In PyTorch that means `F.cross_entropy(logits, target)`, which applies log-softmax internally, rather than `F.nll_loss(F.softmax(logits), target)`.
+
+---
+
+## Softmax saturation and vanishing gradients
+
+Softmax has a practical failure mode. When one logit dominates, the output approaches a one-hot vector and the gradients approach zero.
+
+The Jacobian of softmax is:
+
+```
+dp_i/dz_j = p_i * (delta_ij - p_j)
+```
+
+where `delta_ij` is 1 when `i == j` and 0 otherwise. Every term carries a factor of `p_i` and a factor involving `p_j`. When the distribution saturates, one `p` is near 1 and the rest are near 0, so every product is near zero and the gradient dies.
+
+| Distribution           | Max `p` | Gradient magnitude |
+| :--------------------- | :------ | :----------------- |
+| Uniform over 3 classes | 0.333   | Large              |
+| Moderately confident   | 0.659   | Healthy            |
+| Saturated              | 0.999   | Near zero          |
+
+### Why attention divides by sqrt(d_k)
+
+This is the exact mechanism behind the scaling factor in scaled dot-product attention. The attention score is a dot product between query and key vectors of dimension `d_k`:
+
+```
+score = q . k = sum of d_k terms
+```
+
+If the components of `q` and `k` are independent with mean 0 and variance 1, then the dot product has mean 0 and **variance `d_k`**. Its standard deviation is `sqrt(d_k)`.
+
+For `d_k = 128`, scores typically land around plus or minus 11. Feeding values of that magnitude into softmax produces a nearly one-hot distribution, which by the argument above produces nearly zero gradients. Training stalls.
+
+Dividing by `sqrt(d_k)` restores unit variance:
+
+```
+attention = softmax((q . k) / sqrt(d_k))
+```
+
+```python title="dk_scaling.py"
+d_k = 128
+q = np.random.randn(d_k)
+k = np.random.randn(d_k)
+
+raw = q @ k
+scaled = raw / np.sqrt(d_k)
+print(f"unscaled std over many samples: ~{np.sqrt(d_k):.2f}")
+
+# distribution of dot products over many random pairs
+raws = np.array([np.random.randn(d_k) @ np.random.randn(d_k) for _ in range(20000)])
+print(f"measured std of raw dot products:    {raws.std():.2f}")
+print(f"measured std after /sqrt(d_k):       {(raws/np.sqrt(d_k)).std():.2f}")
+```
+
+The measured standard deviation comes out near 11.3 for raw dot products and near 1.0 after scaling, matching the theory. Phase 5 derives this fully and implements attention end to end.
+
+<Callout type="info">
+  Some modern architectures add a learned or fixed query-key normalization (QK-Norm in Qwen 3, for
+  example) that RMS-normalizes `q` and `k` before the dot product. That bounds score magnitude
+  structurally instead of relying on a fixed `1/sqrt(d_k)` constant, which helps at large `d_k` and
+  long context lengths.
+</Callout>
+
+---
+
+## Softmax over which axis
+
+Softmax always normalizes along one specified axis, and picking the wrong one is a common bug.
+
+```python title="axis.py"
+def stable_softmax_axis(z, axis=-1):
+    m = np.max(z, axis=axis, keepdims=True)
+    e = np.exp(z - m)
+    return e / e.sum(axis=axis, keepdims=True)
+
+batch_logits = np.random.randn(4, 10)      # 4 examples, 10 classes
+
+p_last = stable_softmax_axis(batch_logits, axis=-1)
+print(p_last.sum(axis=-1))    # [1. 1. 1. 1.]  - correct: each row is a distribution
+```
+
+For a language model with logits shaped `(batch, seq, vocab)`, softmax runs on `axis=-1` so that each position holds one distribution over the vocabulary. Summing over `axis=-2` instead would normalize across sequence positions, which is meaningless.
+
+```python title="batch_softmax.py"
+def stable_softmax_axis(z, axis=-1):
+    m = np.max(z, axis=axis, keepdims=True)
+    e = np.exp(z - m)
+    return e / e.sum(axis=axis, keepdims=True)
+
+logits = np.random.randn(2, 8, 50257)         # batch 2, 8 tokens, vocab 50257
+probs = stable_softmax_axis(logits, axis=-1)
+print(probs.shape)                            # (2, 8, 50257)
+print(np.allclose(probs.sum(axis=-1), 1.0))   # True
+```
+
+---
+
+## Interview questions
+
+- **What is the difference between a logit and a probability?** A logit is an unbounded raw score from the final linear layer; a probability is the normalized output of softmax over the logits, bounded in `(0, 1)` and summing to 1.
+- **Why subtract the max before exponentiating?** To prevent overflow. Softmax is shift-invariant, so subtracting `max(z)` caps the largest exponent at `exp(0) = 1` without changing the result.
+- **What does temperature do, and what happens as it approaches zero?** It divides the logits before softmax, controlling sharpness. As `T -> 0` the output approaches a one-hot at the argmax, which is greedy decoding.
+- **Why does attention scale by `1/sqrt(d_k)`?** Dot products of `d_k`-dimensional unit-variance vectors have variance `d_k`, so scores grow large and push softmax into saturation where gradients vanish. Dividing by `sqrt(d_k)` restores unit variance.
+- **When would you use log-softmax instead of softmax?** In training, always. It avoids underflow to zero followed by `log(0)`, and fused implementations like `F.cross_entropy` are both faster and more stable.

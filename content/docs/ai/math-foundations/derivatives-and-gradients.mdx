@@ -1,0 +1,289 @@
+---
+title: Derivatives and Gradients
+description: Partial derivatives, the chain, product, and quotient rules, gradient vectors, Jacobians, directional derivatives, and saddle points.
+---
+
+Training a model means finding parameters that make a loss small. The only scalable way to do that is to ask the loss which direction increases it, then step the other way. Derivatives answer that question for one variable, gradients answer it for millions.
+
+---
+
+## The derivative
+
+The derivative of `f` at `x` is its instantaneous rate of change, defined as the limit of the average rate over a shrinking interval:
+
+```
+f'(x) = lim (h -> 0) of [f(x + h) - f(x)] / h
+```
+
+The expression `[f(x + h) - f(x)] / h` is a **slope**. As `h` shrinks toward zero it stops being an average over an interval and becomes the slope at a single point, which is the slope of the tangent line.
+
+Two readings that both matter:
+
+- **Geometric.** `f'(x)` is the slope of the tangent to the curve at `x`.
+- **Practical.** `f'(x)` tells you how much `f` changes per unit change in `x`. A derivative of `-3.5` means increasing `x` by a small amount decreases `f` by about 3.5 times that amount.
+
+That second reading is the entire basis of gradient descent. The derivative is not an abstraction, it is a sensitivity coefficient.
+
+```python title="derivative.py"
+def numerical_derivative(f, x, h=1e-5):
+    return (f(x + h) - f(x - h)) / (2 * h)
+
+f = lambda x: x ** 2
+print(numerical_derivative(f, 3.0))   # 6.000000..., matches f'(x) = 2x at x = 3
+```
+
+The centered difference `(f(x+h) - f(x-h)) / 2h` is more accurate than the one-sided form because the first-order error terms cancel. You will use this exact formula to verify backpropagation on the last page of this phase.
+
+---
+
+## Partial derivatives
+
+A function of several variables, like `f(x, y) = x^2 * y + sin(y)`, has one **partial derivative** per variable. To take the partial with respect to `x`, treat `y` as a constant and differentiate normally.
+
+```
+f(x, y)  = x^2 * y + sin(y)
+
+df/dx    = 2x * y              (y held constant, sin(y) is a constant so it vanishes)
+df/dy    = x^2 + cos(y)        (x held constant, x^2 is a coefficient)
+```
+
+```python title="partials.py"
+import numpy as np
+
+def f(x, y):
+    return x ** 2 * y + np.sin(y)
+
+def partial(f, arg_index, point, h=1e-5):
+    p = np.array(point, dtype=float)
+    plus = p.copy();  plus[arg_index] += h
+    minus = p.copy(); minus[arg_index] -= h
+    return (f(*plus) - f(*minus)) / (2 * h)
+
+point = (1.0, 2.0)
+print(partial(f, 0, point))   # ~4.0,  matches 2xy = 2 * 1 * 2
+print(partial(f, 1, point))   # ~0.58, matches x^2 + cos(y) = 1 + cos(2)
+```
+
+A neural network loss is a function of every parameter in the model. Each partial derivative says how the loss responds to nudging that one weight, holding all others fixed.
+
+---
+
+## Differentiation rules
+
+Three rules generate almost every gradient in deep learning.
+
+### Product rule
+
+For `f(x) = u(x) * v(x)`:
+
+```
+f'(x) = u'(x) * v(x) + u(x) * v'(x)
+```
+
+Example with `u = x^2`, `v = sin(x)`:
+
+```
+d/dx [x^2 * sin(x)] = 2x * sin(x) + x^2 * cos(x)
+```
+
+Gated activations use this directly. SwiGLU computes `gate * up` where both are learned projections, so its backward pass is a product rule application.
+
+### Quotient rule
+
+For `f(x) = u(x) / v(x)`:
+
+```
+f'(x) = [u'(x) * v(x) - u(x) * v'(x)] / v(x)^2
+```
+
+Example:
+
+```
+d/dx [sin(x) / x] = [cos(x) * x - sin(x)] / x^2
+```
+
+Softmax differentiation produces a quotient rule, since softmax is `exp(zi) / sum(exp(zj))`.
+
+### Chain rule
+
+For a composition `f(x) = g(h(x))`:
+
+```
+f'(x) = g'(h(x)) * h'(x)
+```
+
+Worked example with `g(u) = u^3` and `h(x) = 2x + 1`:
+
+```
+f(x)  = (2x + 1)^3
+g'(u) = 3u^2
+h'(x) = 2
+f'(x) = 3 * (2x + 1)^2 * 2 = 6 * (2x + 1)^2
+```
+
+At `x = 1`: `f'(1) = 6 * 9 = 54`.
+
+```python title="chain_rule.py"
+x = 1.0
+h = 2 * x + 1              # 3.0        forward pass
+f = h ** 3                 # 27.0       forward pass
+
+df_dh = 3 * h ** 2         # 27.0       local derivative
+dh_dx = 2.0                # 2.0        local derivative
+df_dx = df_dh * dh_dx      # 54.0       chain rule
+```
+
+Notice the structure of that code: compute the forward values, store intermediates, then multiply local derivatives backwards through the chain. That is backpropagation. Every framework does exactly this, just at scale and automatically.
+
+<Callout type="info">
+  The chain rule is why deep networks have vanishing and exploding gradients. A 96-layer network
+  multiplies roughly 96 local derivatives together on the way back. If each averages 0.5, the
+  product is `0.5^96`, effectively zero. If each averages 2, it overflows. Residual connections and
+  normalization layers exist to keep those products near 1.
+</Callout>
+
+---
+
+## The gradient
+
+The **gradient** collects every partial derivative into one vector:
+
+```
+grad f(x, y) = [df/dx, df/dy]
+```
+
+For `n` inputs it is an `n`-dimensional vector. Two properties make it the core object of optimization:
+
+1. **It points in the direction of steepest ascent.** Moving a small step along `grad f` increases `f` faster than moving in any other direction.
+2. **Its magnitude is the steepness in that direction.** A large norm means a sharp slope, a near-zero norm means flat terrain.
+
+Therefore `-grad f` points downhill, and gradient descent is one line:
+
+```
+w = w - lr * grad f(w)
+```
+
+```python title="gradient.py"
+def grad_f(point):
+    x, y = point
+    return np.array([2 * x * y, x ** 2 + np.cos(y)])
+
+w = np.array([1.0, 2.0])
+lr = 0.01
+
+for step in range(5):
+    g = grad_f(w)
+    w = w - lr * g
+    print(f"step {step}: w={w.round(4)}  |grad|={np.linalg.norm(g):.4f}")
+```
+
+The gradient norm shrinking toward zero is the signal that you are approaching a stationary point. Monitoring it during training is standard practice, and gradient clipping in Phase 4 caps it to stop exploding values from wrecking a step.
+
+---
+
+## Directional derivatives
+
+The gradient points uphill, but you often want the rate of change along an arbitrary direction `u` (a unit vector). That is the **directional derivative**:
+
+```
+D_u f = grad f . u
+```
+
+It is a dot product, which explains the geometric behavior:
+
+| Angle between `u` and `grad f` | `D_u f` | Meaning                      |
+| :----------------------------- | :------ | :--------------------------- |
+| 0°                             | Max     | Steepest ascent              |
+| 90°                            | 0       | Moving along a level contour |
+| 180°                           | Min     | Steepest descent             |
+
+Since `grad f . u = ||grad f|| * cos(theta)`, the value is largest at `theta = 0`. This is the same cosine relationship from the previous page doing the same work.
+
+---
+
+## Jacobians
+
+When a function outputs a **vector** rather than a scalar, one gradient is not enough. You need every output's derivative with respect to every input, arranged in a matrix. That is the **Jacobian**.
+
+For `f: R^n -> R^m`, the Jacobian `J` has shape `(m, n)`:
+
+```
+        [ df1/dx1  df1/dx2  ...  df1/dxn ]
+    J = [ df2/dx1  df2/dx2  ...  df2/dxn ]
+        [   ...                           ]
+        [ dfm/dx1  dfm/dx2  ...  dfm/dxn ]
+```
+
+Row `i` is the gradient of output `i`.
+
+```python title="jacobian.py"
+def f(v):
+    x, y = v
+    return np.array([x ** 2 + y, x * y])
+
+# analytic Jacobian
+def J(v):
+    x, y = v
+    return np.array([[2 * x, 1.0],
+                     [y,     x]])
+
+v = np.array([1.0, 2.0])
+print(J(v))    # [[2. 1.]
+               #  [2. 1.]]
+
+# numerical check
+h = 1e-5
+numeric = np.column_stack([(f(v + np.eye(2)[i] * h) - f(v - np.eye(2)[i] * h)) / (2 * h)
+                           for i in range(2)])
+print(np.allclose(J(v), numeric, atol=1e-5))   # True
+```
+
+A scalar-valued loss over a vector-valued layer is the common case, and the gradient is just a `1 x n` Jacobian.
+
+### Jacobian-vector products
+
+Backpropagation never materializes full Jacobians. For a layer with `n` inputs and `m` outputs, the Jacobian is `m x n`, which for a `4096 x 11008` feed-forward layer is 45 million entries. Instead, frameworks compute a **vector-Jacobian product** (VJP): they take the incoming gradient from downstream (shape `m`) and multiply it by the Jacobian to produce the gradient for the inputs (shape `n`).
+
+```
+grad_input = J.T @ grad_output
+```
+
+This costs one matrix multiplication instead of building and storing a matrix, and it is the reason reverse-mode autodiff scales to billions of parameters. Phase 3 derives the same identity layer by layer.
+
+---
+
+## Stationary points: minima, maxima, saddles
+
+A **stationary point** has zero gradient. Three kinds exist, and telling them apart matters because gradient descent stops at all of them.
+
+| Type          | 1D second derivative | Behavior in high dimensions                  |
+| :------------ | :------------------- | :------------------------------------------- |
+| Local minimum | Positive             | Curves up in every direction                 |
+| Local maximum | Negative             | Curves down in every direction               |
+| Saddle point  | Mixed signs          | Curves down in some directions, up in others |
+
+For a single-variable function, `f''(x) > 0` at a stationary point confirms a minimum. For many variables, the equivalent test uses the **Hessian** matrix of second partial derivatives: all eigenvalues positive means a local minimum, all negative means a maximum, mixed signs means a saddle.
+
+<Callout type="warn">
+  The popular fear that gradient descent gets trapped in bad local minima is largely misplaced for
+  deep networks. With `n` parameters, a stationary point is a local minimum only if all `n` Hessian
+  eigenvalues are positive. For large `n` that is combinatorially unlikely, so most stationary
+  points are saddles. The practical problem is not getting stuck in a wrong minimum, it is crawling
+  through flat saddle regions where the gradient is near zero. Momentum in Adam exists to keep
+  moving when the local gradient provides almost no signal.
+</Callout>
+
+---
+
+## Where this shows up later
+
+| Concept                       | Later use                                                |
+| :---------------------------- | :------------------------------------------------------- |
+| Centered numerical derivative | Gradient checking in `backprop-from-scratch`             |
+| Chain rule                    | Backpropagation through every layer, Phase 3             |
+| Product rule                  | SwiGLU and gated activations, Phases 3 and 6             |
+| Quotient rule                 | Softmax backward pass, Phase 5                           |
+| Gradient direction            | Gradient descent and all optimizers, Phase 3             |
+| Gradient norm                 | Gradient clipping for RNNs and transformers, Phase 4     |
+| Vector-Jacobian product       | How autograd engines actually compute gradients, Phase 2 |
+| Saddle points                 | Why momentum and adaptive step sizes exist, Phase 3      |

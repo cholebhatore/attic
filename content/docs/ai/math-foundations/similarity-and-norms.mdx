@@ -1,0 +1,229 @@
+---
+title: Similarity and Norms
+description: Dot products, vector projections, cosine similarity, unit-normalized embeddings, and how L1 and L2 norms shape regularization.
+---
+
+Retrieval, attention, and regularization all reduce to two questions: how much do these vectors point the same way, and how large is this vector. The dot product answers the first. Norms answer the second.
+
+---
+
+## The dot product
+
+For two vectors of equal length, the dot product (inner product) multiplies matching entries and sums the results:
+
+```
+a . b = a1*b1 + a2*b2 + ... + an*bn
+```
+
+```python title="dot_product.py"
+import numpy as np
+
+a = np.array([1.0, 2.0, 3.0])
+b = np.array([4.0, -5.0, 6.0])
+
+print(np.dot(a, b))     # 4 - 10 + 18 = 12
+print(a @ b)            # 12, same operation
+print(np.sum(a * b))    # 12, element-wise multiply then reduce
+```
+
+The same quantity has a geometric form:
+
+```
+a . b = ||a|| * ||b|| * cos(theta)
+```
+
+where `theta` is the angle between the two vectors. This identity is the bridge between arithmetic and geometry, and it gives you the sign rules that make similarity work:
+
+| `a . b`  | Angle       | Meaning                         |
+| :------- | :---------- | :------------------------------ |
+| Positive | Under 90°   | Pointing broadly the same way   |
+| Zero     | Exactly 90° | Orthogonal, no shared direction |
+| Negative | Over 90°    | Pointing broadly opposite ways  |
+
+---
+
+## Projection
+
+The **projection** of `a` onto `b` is the component of `a` that lies along `b`. It answers: how much of `a` is explained by the direction of `b`?
+
+The scalar projection (a length) is:
+
+```
+comp_b(a) = (a . b) / ||b||
+```
+
+The vector projection (an actual vector along `b`) is:
+
+```
+proj_b(a) = ((a . b) / ||b||^2) * b
+```
+
+```python title="projection.py"
+a = np.array([3.0, 4.0])
+b = np.array([1.0, 0.0])
+
+scalar = (a @ b) / np.linalg.norm(b)
+vector = ((a @ b) / np.linalg.norm(b) ** 2) * b
+
+print(scalar)   # 3.0
+print(vector)   # [3. 0.]
+```
+
+The residual `a - proj_b(a)` is orthogonal to `b`, which is the geometric content of least-squares fitting: you have removed everything the direction `b` can explain.
+
+Projections are the mechanism inside attention. A query vector is effectively projected against key vectors, and the dot product score measures how much of the query lies along each key.
+
+---
+
+## Cosine similarity
+
+The dot product mixes direction with magnitude. A vector of length 1000 pointing roughly your way out-scores a vector of length 2 pointing exactly your way. **Cosine similarity** removes magnitude and keeps only the angle:
+
+```
+cos_sim(a, b) = (a . b) / (||a|| * ||b||)
+```
+
+It is bounded in `[-1, 1]`:
+
+| Value | Angle | Interpretation      |
+| :---- | :---- | :------------------ |
+| `1`   | 0°    | Identical direction |
+| `0.7` | 45°   | Strongly related    |
+| `0`   | 90°   | Unrelated           |
+| `-1`  | 180°  | Exact opposite      |
+
+```python title="cosine.py"
+def cosine_similarity(a, b):
+    return float(a @ b / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+query = np.array([0.9, 0.1, 0.0])
+doc_a = np.array([18.0, 2.0, 0.0])    # same direction, huge magnitude
+doc_b = np.array([0.5, 0.5, 0.5])
+
+print(cosine_similarity(query, doc_a))   # 1.0
+print(cosine_similarity(query, doc_b))   # 0.6376
+```
+
+A raw dot product would have ranked `doc_a` enormously higher purely on length. Cosine sees that `doc_a` is a perfect directional match and `doc_b` is not.
+
+### Why unit normalization makes cosine free
+
+If both vectors are normalized to length 1, then `||a|| = ||b|| = 1` and the denominator disappears:
+
+```
+cos_sim(a, b) = a . b        when ||a|| == ||b|| == 1
+```
+
+This is why vector databases normalize embeddings at index time. Every retrieval query then costs one dot product instead of a dot product plus two norm computations, and the same hardware instruction path serves both inner-product and cosine indexes.
+
+```python title="normalized_index.py"
+embeddings = np.random.randn(10000, 768)
+embeddings /= np.linalg.norm(embeddings, axis=1, keepdims=True)
+
+query = np.random.randn(768)
+query /= np.linalg.norm(query)
+
+scores = embeddings @ query           # one matrix-vector product
+top_5 = np.argsort(scores)[-5:][::-1]
+```
+
+<Callout type="info">
+  Magnitude is not always noise. Some embedding models encode confidence or frequency in vector
+  length, and normalizing discards it. Check the model card before assuming cosine is the intended
+  metric. OpenAI and most general-purpose text embedding models expect cosine.
+</Callout>
+
+---
+
+## Distance metrics compared
+
+Cosine similarity measures angle. Distances measure separation. They are related but not interchangeable.
+
+| Metric          | Formula                  | Range         | Magnitude sensitive |
+| :-------------- | :----------------------- | :------------ | :------------------ |
+| Cosine distance | `1 - cos_sim(a, b)`      | `[0, 2]`      | No                  |
+| L2 (Euclidean)  | `sqrt(sum((ai - bi)^2))` | `[0, inf)`    | Yes                 |
+| L1 (Manhattan)  | `sum(abs(ai - bi))`      | `[0, inf)`    | Yes                 |
+| Dot product     | `sum(ai * bi)`           | `(-inf, inf)` | Yes                 |
+
+For unit-normalized vectors, L2 distance and cosine distance rank identically. Expanding the L2 formula:
+
+```
+||a - b||^2 = ||a||^2 + ||b||^2 - 2 * (a . b)
+            = 2 - 2 * (a . b)
+```
+
+Since the first two terms are constant at 1, minimizing L2 distance is the same as maximizing the dot product. That equivalence is why HNSW and IVF indexes in Phase 9 can serve cosine queries using an L2 or inner-product kernel without changing results.
+
+---
+
+## L1 and L2 norms
+
+A **norm** assigns a length to a vector. The two that matter in machine learning are:
+
+```
+L1: ||v||_1 = |v1| + |v2| + ... + |vn|
+L2: ||v||_2 = sqrt(v1^2 + v2^2 + ... + vn^2)
+```
+
+```python title="norms.py"
+v = np.array([3.0, -4.0])
+print(np.linalg.norm(v, 1))    # 7.0
+print(np.linalg.norm(v, 2))    # 5.0
+print(np.abs(v).sum())         # 7.0
+```
+
+Their unit circles have different shapes, and the shape explains everything about how they regularize.
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Constraint: norm <= t"] --> B["L1 ball: diamond with corners on the axes"]
+    A --> C["L2 ball: circle"]
+    B --> D["Loss contour touches a corner"]
+    D --> E["Some weights exactly zero: sparse"]
+    C --> F["Loss contour touches a smooth edge"]
+    F --> G["All weights shrunk evenly: dense"]
+`}
+/>
+
+The L1 ball has sharp corners sitting on the coordinate axes. When you minimize a loss subject to `||w||_1 <= t`, the optimal point lands on a corner with high probability, and a corner has some coordinates equal to exactly zero. The L2 ball is smooth, so the optimum lands somewhere along a curve and shrinks every weight a little without zeroing any.
+
+### Lasso and Ridge
+
+That geometry becomes two regularization schemes. Adding a norm penalty to a loss function:
+
+```
+Lasso (L1):  loss + lambda * sum(|w|)
+Ridge (L2):  loss + lambda * sum(w^2)
+```
+
+| Property          | L1 / Lasso                   | L2 / Ridge                    |
+| :---------------- | :--------------------------- | :---------------------------- |
+| Solution          | Sparse, exact zeros          | Dense, small values           |
+| Feature selection | Built in                     | None                          |
+| Gradient at zero  | Constant, does not vanish    | Proportional to `w`, vanishes |
+| Solved in         | Linear models, sparse coding | Weight decay in deep learning |
+
+L1's derivative is a constant `lambda * sign(w)` regardless of how small `w` is, so it keeps pushing weights all the way to zero. L2's derivative is `2 * lambda * w`, which weakens as `w` shrinks, so weights settle at small non-zero values.
+
+<Callout type="warn">
+  Modern LLM training uses **decoupled weight decay** in AdamW, which is L2-style shrinkage applied
+  directly to the parameters rather than added to the loss. The distinction matters: adding it to
+  the loss makes the penalty interact with Adam's adaptive per-parameter scaling, which weakens it
+  unevenly. Phase 3 covers the AdamW formulation.
+</Callout>
+
+---
+
+## Where this shows up later
+
+| Concept                  | Later use                                                    |
+| :----------------------- | :----------------------------------------------------------- |
+| Dot product              | Attention scores `Q @ K.T` in Phase 5                        |
+| Cosine similarity        | Embedding retrieval and reranking in Phase 9                 |
+| Unit normalization       | Vector database indexing, RMSNorm in Phase 3                 |
+| Projection               | Query-key interaction, LoRA low-rank updates in Phase 7      |
+| L2 equivalence to cosine | ANN index metric selection in Phase 9                        |
+| L1 sparsity              | Sparse coding, pruning, expert routing intuitions in Phase 6 |
+| L2 weight decay          | AdamW optimizer in Phase 3                                   |

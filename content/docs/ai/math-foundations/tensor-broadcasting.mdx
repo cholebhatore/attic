@@ -1,0 +1,269 @@
+---
+title: Tensor Broadcasting
+description: Implicit dimension expansion rules, strides and contiguity, zero-copy views, and writing vectorized array code instead of Python loops.
+---
+
+Broadcasting lets arrays of different shapes combine element-wise without copying data. Every bias addition, positional encoding injection, and attention mask in a transformer depends on it. Misreading a broadcast rule is the single most common source of silent shape bugs in numerical code.
+
+---
+
+## The problem broadcasting solves
+
+You have a batch of 8 token vectors, each 512 wide, and one shared bias vector of length 512. You want to add the bias to every row.
+
+The naive version writes a loop:
+
+```python title="loop_version.py"
+import numpy as np
+
+X = np.random.randn(8, 512)
+b = np.random.randn(512)
+
+out = np.empty_like(X)
+for i in range(X.shape[0]):
+    for j in range(X.shape[1]):
+        out[i, j] = X[i, j] + b[j]
+```
+
+The broadcast version writes one expression:
+
+```python title="broadcast_version.py"
+out = X + b        # (8, 512) + (512,) -> (8, 512)
+```
+
+Both produce identical results. The broadcast version runs in compiled C over contiguous memory, typically one to two orders of magnitude faster, and it states the intent in six characters instead of five lines.
+
+---
+
+## The three rules
+
+Broadcasting aligns shapes from the **trailing** dimension forward and checks each pair:
+
+1. **Right-align the shapes.** Pad the shorter shape with leading 1s.
+2. **Each dimension pair must match, or one of them must be 1.** A dimension of size 1 is stretched (virtually) to match the other.
+3. **Missing leading dimensions count as 1.**
+
+```
+X.shape = (8, 512)
+b.shape = (   512)     -> padded to (1, 512)
+
+dim 1: 512 vs 512   match
+dim 0:    8 vs   1   one of them is 1, stretch to 8
+
+result: (8, 512)
+```
+
+No memory is allocated for the stretch. NumPy and PyTorch adjust the stride so the same 512 floats are read repeatedly.
+
+### Worked shape examples
+
+| A shape       | B shape    | Result        | Valid | Reason                                |
+| :------------ | :--------- | :------------ | :---- | :------------------------------------ |
+| `(8, 512)`    | `(512,)`   | `(8, 512)`    | Yes   | B padded to `(1, 512)`                |
+| `(8, 512)`    | `(8, 1)`   | `(8, 512)`    | Yes   | Column vector stretched across        |
+| `(8, 1)`      | `(1, 512)` | `(8, 512)`    | Yes   | Outer-product style expansion         |
+| `(4, 8, 512)` | `(512,)`   | `(4, 8, 512)` | Yes   | B padded to `(1, 1, 512)`             |
+| `(8, 512)`    | `(8,)`     | error         | No    | Trailing `512` vs `8` mismatch        |
+| `(8, 512)`    | `(256,)`   | error         | No    | Trailing `512` vs `256`, neither is 1 |
+
+The two failures are the ones that surprise people. `(8, 512)` and `(8,)` look compatible because they share the value 8, but broadcasting compares the **last** dimensions first: `512` against `8`. It fails rather than guessing.
+
+To add an `(8,)` vector down the columns of an `(8, 512)` matrix, you must make the axis explicit:
+
+```python title="explicit_axis.py"
+X = np.random.randn(8, 512)
+col = np.random.randn(8)
+
+# X + col                     # ValueError
+X + col[:, None]              # (8, 1) + (8, 512) -> (8, 512)
+X + col.reshape(-1, 1)        # identical
+# X + np.expand_dims(col, 0)  # (1, 8) vs (8, 512): trailing 8 vs 512, ValueError
+```
+
+`col[:, None]` inserts a new axis, turning `(8,)` into `(8, 1)`. Now the trailing dimensions are `1` vs `512`, which broadcasts correctly.
+
+---
+
+## The unsqueeze idiom
+
+`None` in an index (equivalently `np.newaxis` or `torch.unsqueeze`) inserts a length-1 axis. This is how you choose which dimension broadcasts.
+
+```python title="unsqueeze.py"
+v = np.arange(6)          # shape (6,)
+
+v[None, :]                # shape (1, 6)  - a row
+v[:, None]                # shape (6, 1)  - a column
+v[None, None, :]          # shape (1, 1, 6)
+
+# pairwise difference matrix without a loop
+diff = v[:, None] - v[None, :]     # (6, 6)
+print(diff.shape)                  # (6, 6)
+```
+
+That last line builds a full `6 x 6` difference matrix in one operation. The same idiom at scale is how attention computes all pairwise query-key scores.
+
+---
+
+## Strides, contiguity, and views
+
+A tensor in memory is a flat buffer plus a **shape** and a **stride**. The stride says how many elements to skip in the buffer to advance one step along each axis.
+
+For a contiguous `(3, 4)` float array holding `[0..11]`:
+
+```
+shape  = (3, 4)
+stride = (4, 1)      # skip 4 elements to move one row, 1 element to move one column
+```
+
+Element `(i, j)` sits at flat offset `i * 4 + j * 1`.
+
+```python title="strides.py"
+a = np.arange(12).reshape(3, 4)
+print(a.strides)        # (32, 8) in bytes for int64 -> (4, 1) elements
+
+t = a.T                 # transpose
+print(t.shape)          # (4, 3)
+print(t.strides)        # (8, 32) -> strides swapped
+print(t.flags['C_CONTIGUOUS'])   # False
+```
+
+The transpose did not move any data. It swapped the strides, producing a **view** onto the same buffer. That is why it is free, and also why the result is no longer contiguous: walking down a column now jumps backwards through memory.
+
+### When views are impossible
+
+`reshape` returns a view when the stride math allows it and a copy when it does not. `view` in PyTorch refuses instead of silently copying:
+
+```python title="reshape_vs_view.py"
+import torch
+
+x = torch.arange(12).reshape(3, 4)
+y = x.t()                      # non-contiguous view, shape (4, 3)
+
+z = y.reshape(12)              # works, silently copies
+# w = y.view(12)               # RuntimeError: view size is not compatible
+
+y2 = y.contiguous()            # explicit copy into contiguous layout
+w = y2.view(12)                # now works, no further copy
+```
+
+<Callout type="warn">
+  Prefer `.reshape()` in PyTorch when you do not care about aliasing, and `.view()` when you want an
+  error instead of an unexpected allocation. A silent copy inside a training loop shows up as a
+  mysterious memory and throughput regression, and it is easy to miss because the numbers stay
+  correct.
+</Callout>
+
+### Broadcasting reads with zero stride
+
+Broadcasting a length-1 dimension works by giving that axis a stride of 0. Advancing along it never moves in memory, so the same value is read repeatedly with no copy. That is the mechanism behind `X + b` costing no more memory than `X`.
+
+---
+
+## Broadcasting in transformer code
+
+Four places this appears constantly.
+
+**Bias addition.** A `(batch, seq, d_model)` activation plus a `(d_model,)` bias:
+
+```python title="bias_add.py"
+act = np.random.randn(2, 128, 512)     # batch 2, 128 tokens, d_model 512
+bias = np.random.randn(512)
+out = act + bias                       # (2, 128, 512)
+```
+
+**Positional encoding.** Adding a `(seq, d_model)` table to a `(batch, seq, d_model)` activation:
+
+```python title="positional.py"
+pos = np.random.randn(128, 512)        # one position table shared by the batch
+out = act + pos                        # (2, 128, 512)
+```
+
+**Attention masking.** A causal mask of shape `(seq, seq)` applied to scores of shape `(batch, heads, seq, seq)`:
+
+```python title="causal_mask.py"
+seq = 8
+scores = np.random.randn(2, 4, seq, seq)          # batch 2, 4 heads
+mask = np.triu(np.full((seq, seq), -np.inf), k=1) # upper triangle is -inf
+
+masked = scores + mask                            # broadcasts to (2, 4, 8, 8)
+```
+
+The mask has no batch or head dimension, so one `(8, 8)` matrix serves all 8 attention planes. Phase 5 builds exactly this.
+
+**Normalization.** RMSNorm divides each vector by its own root-mean-square, computed per row with `keepdims`:
+
+```python title="rmsnorm.py"
+x = np.random.randn(2, 128, 512)
+rms = np.sqrt(np.mean(x ** 2, axis=-1, keepdims=True))   # (2, 128, 1)
+out = x / rms                                            # (2, 128, 512)
+```
+
+`keepdims=True` is what makes this work. Without it, `np.mean(..., axis=-1)` returns shape `(2, 128)` and the division fails the trailing-dimension check. Keeping the reduced axis as length 1 leaves it ready to broadcast back.
+
+<Callout type="info">
+  `keepdims=True` on any reduction is the standard trick for broadcasting a statistic back against
+  the tensor it came from. Batch statistics, softmax denominators, and attention normalizers all
+  rely on it.
+</Callout>
+
+---
+
+## Vectorization and performance
+
+Broadcasting is not only shorter, it is faster, for three reasons:
+
+1. **The loop runs in compiled code** rather than in the Python interpreter, which costs tens of nanoseconds per iteration.
+2. **Memory access stays contiguous**, so CPU caches and GPU memory coalescing work as designed.
+3. **No intermediate Python objects** are created per element.
+
+A rough measurement on a `(1024, 1024)` matrix:
+
+```python title="timing.py"
+import time
+import numpy as np
+
+X = np.random.randn(1024, 1024)
+b = np.random.randn(1024)
+
+start = time.perf_counter()
+loop_out = np.empty_like(X)
+for i in range(X.shape[0]):
+    for j in range(X.shape[1]):
+        loop_out[i, j] = X[i, j] + b[j]
+loop_time = time.perf_counter() - start
+
+start = time.perf_counter()
+vec_out = X + b
+vec_time = time.perf_counter() - start
+
+print(f"loop: {loop_time*1e3:.2f} ms   vectorized: {vec_time*1e3:.2f} ms")
+print(np.allclose(loop_out, vec_out))
+```
+
+The scalar double loop is roughly 100x to 500x slower on typical hardware, because it runs a million Python interpreter iterations instead of one compiled pass. Even a partially vectorized row loop (`loop_out[i] = X[i] + b`) is measurably slower than the single expression. On a GPU the gap widens further, since a Python loop forces per-element kernel launches or a transfer back to host memory.
+
+### Accidental memory blowups
+
+Broadcasting can also allocate more than you expect. `(1000, 1)` against `(1, 1000)` produces a `(1000, 1000)` result, a million elements from two thousand inputs:
+
+```python title="outer_product.py"
+a = np.random.randn(1000, 1)
+b = np.random.randn(1, 1000)
+c = a * b
+print(c.nbytes / 1e6)     # 8.0 MB for float64
+```
+
+That is legitimate when you want an outer product. In attention, the same expansion over `(batch, heads, seq, seq)` is the reason attention memory grows as `O(N^2)` and why Phase 6 discusses context window limits. FlashAttention exists specifically to avoid materializing that broadcast result.
+
+---
+
+## Where this shows up later
+
+| Pattern                              | Later use                                          |
+| :----------------------------------- | :------------------------------------------------- |
+| Bias broadcast `(d,)` into `(B,S,d)` | Every linear layer, Phase 3                        |
+| `unsqueeze` for pairwise scores      | Attention `Q @ K.T`, Phase 5                       |
+| Mask broadcast `(S,S)`               | Causal masking, Phase 5                            |
+| `keepdims` reductions                | RMSNorm, softmax denominator, Phases 3 and 5       |
+| Strides and `.contiguous()`          | Tensor views and `einops`, Phase 2                 |
+| `O(N^2)` broadcast blowup            | FlashAttention and context limits, Phases 6 and 10 |
