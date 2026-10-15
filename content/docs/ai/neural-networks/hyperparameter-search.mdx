@@ -1,0 +1,477 @@
+---
+title: Hyperparameter Search
+description: 'Why random beats grid, log-uniform spaces, successive halving and Hyperband budgets, TPE and Gaussian processes, and working Optuna and Ray Tune code.'
+---
+
+Learning rate matters more than every other hyperparameter combined. Get it wrong by a factor of three and nothing else you tune will save the run. Get it right and most of the remaining choices move the metric by less than a percent. That ordering decides how to spend a search budget, and most of this page is about spending it well.
+
+---
+
+## What is worth searching
+
+| Hyperparameter      | Scale        | Usual range         | Sensitivity |
+| :------------------ | :----------- | :------------------ | :---------- |
+| Learning rate       | log          | `1e-5` to `1e-1`    | very high   |
+| Batch size          | power of two | `16` to `4096`      | high        |
+| Weight decay        | log          | `1e-6` to `1e-1`    | medium      |
+| Dropout             | linear       | `0.0` to `0.5`      | medium      |
+| Warmup fraction     | log          | `0.001` to `0.1`    | medium      |
+| `Adam` `beta2`      | linear       | `0.9` to `0.999`    | low         |
+| Hidden width, depth | integer      | model dependent     | low         |
+| Schedule shape      | categorical  | cosine, linear, WSD | low         |
+| `eps`               | log          | `1e-8` to `1e-4`    | low         |
+
+Search the top of that list first and fix the bottom. A budget of 20 trials spent on learning rate and weight decay beats 200 spent on all nine.
+
+Two of these are not independent, which trips up every automatic search. Learning rate and batch size are coupled by the linear scaling rule: doubling the batch size halves the gradient noise and roughly doubles the learning rate you can use, or `sqrt(2)` times it for Adam-family optimizers. Searching them on independent axes wastes most of the budget on combinations that are wrong by construction. Either fix the batch size and search the rate, or search the ratio `lr / batch_size`.
+
+Weight decay and learning rate are coupled in the same way under AdamW, since the decay is applied as `lr * wd * p`. Halving the learning rate halves the effective decay. Search `wd` after the rate is settled, or search the product.
+
+---
+
+## Grid against random
+
+Random search beats grid search at equal budget, and the reason is arithmetic rather than subtle.
+
+A grid over `P` hyperparameters with `k` values each costs `k^P` trials and evaluates each axis at only `k` distinct values. Random search over the same `P` axes with the same budget evaluates each axis at `k^P` distinct values. If the loss depends strongly on one axis and weakly on the rest, the grid tests that axis `k` times while random tests it `k^P` times.
+
+| Axes `P` | Values per axis `k` | Grid trials | Distinct values per axis |
+| :------- | :------------------ | :---------- | :----------------------- |
+| 2        | 5                   | 25          | 5                        |
+| 3        | 4                   | 64          | 4                        |
+| 4        | 3                   | 81          | 3                        |
+| 5        | 3                   | 243         | 3                        |
+| 6        | 2                   | 64          | 2                        |
+
+Six axes on a two-point grid is 64 trials that only ever try two values of the learning rate. Nobody would design that experiment on purpose, and a grid search does it by default.
+
+Measured directly. The objective is a synthetic loss with a minimum at `lr = 3.7e-3`, deliberately placed off-grid, and a second axis that does not affect the score:
+
+```python title="grid_vs_random.py"
+import math
+import numpy as np
+
+LO, HI = math.log10(1e-5), math.log10(1e-1)
+LR_STAR = 3.7e-3
+
+def val_loss(lr, dropout):
+    return 1.20 + 8.0 * (math.log10(lr) + 2.4318) ** 2
+
+rng = np.random.default_rng(0)
+K = 5
+BUDGET = K ** 2
+
+grid_lr = np.logspace(LO, HI, K)
+grid_best = min(val_loss(x, 0.0) for x in grid_lr)
+grid_best_lr = min(grid_lr, key=lambda x: val_loss(x, 0.0))
+
+wins, bests, best_lrs = 0, [], []
+for _ in range(4000):
+    lrs = 10 ** rng.uniform(LO, HI, BUDGET)
+    drops = rng.uniform(0.0, 0.5, BUDGET)
+    scores = [val_loss(l, d) for l, d in zip(lrs, drops)]
+    i = int(np.argmin(scores))
+    bests.append(scores[i])
+    best_lrs.append(lrs[i])
+    wins += scores[i] < grid_best
+
+print(f"grid:   {K} log-spaced lr x {K} dropout = {BUDGET} trials, {K} distinct learning rates")
+print(f"grid best lr = {grid_best_lr:.4e}, loss = {grid_best:.4f}")
+print(f"random: {BUDGET} trials, {BUDGET} distinct learning rates")
+print(f"random median best = {np.median(bests):.4f}, mean = {np.mean(bests):.4f}, "
+      f"90th pct = {np.percentile(bests, 90):.4f}")
+print(f"random median best lr = {np.median(best_lrs):.4e}")
+print(f"P(random beats grid) = {wins / 40:.1f}%")
+```
+
+```text
+grid:   5 log-spaced lr x 5 dropout = 25 trials, 5 distinct learning rates
+grid best lr = 1.0000e-02, loss = 2.6916
+random: 25 trials, 25 distinct learning rates
+random median best = 1.2241, mean = 1.2905, 90th pct = 1.4503
+random median best lr = 3.7061e-03
+P(random beats grid) = 99.8%
+```
+
+Both methods spent 25 trials. The grid's best learning rate is `1e-2`, which is `0.43` in log10 away from the true optimum, and its loss sits `1.49` above the floor of `1.20`. The random search lands within `0.024` of the floor on a median run and beats the grid 99.8% of the time.
+
+The same experiment with a budget matched at around 25 trials across increasing numbers of axes:
+
+| Axes `P` | `k` | Grid trials | Distinct lr | Grid best | Random median | P(random wins) |
+| :------- | :-- | :---------- | :---------- | :-------- | :------------ | :------------- |
+| 1        | 25  | 25          | 25          | `1.2372`  | `1.2240`      | 58.0%          |
+| 2        | 5   | 25          | 5           | `2.6916`  | `1.2247`      | 99.8%          |
+| 3        | 3   | 27          | 3           | `3.7828`  | `1.2207`      | 100.0%         |
+| 4        | 2   | 16          | 2           | `17.6004` | `1.2593`      | 100.0%         |
+| 5        | 2   | 32          | 2           | `17.6004` | `1.2154`      | 100.0%         |
+
+At `P = 1` the two are equivalent, which is the correct sanity check: with one axis a grid is a set of distinct values and random just draws from the same distribution. The advantage appears at `P = 2` and grows from there.
+
+<Callout type="info">
+  ### When a grid is the right answer
+
+Grid search wins when you have one or two hyperparameters, when you need a reproducible sweep for a paper, or when you want to see the shape of the response surface rather than just its minimum. A 2D heatmap of loss against learning rate and weight decay tells you more about the problem than 100 random points, and it costs 25 runs. Random and Bayesian methods are for finding a good configuration; grids are for understanding.
+
+</Callout>
+
+---
+
+## Log-uniform spaces
+
+Learning rates, weight decays, and `eps` span orders of magnitude, and the useful values are distributed multiplicatively. `1e-4` and `1.1e-4` are the same configuration for any purpose; `1e-4` and `1e-3` are not. Sampling uniformly in linear space puts almost all of the budget at the top of the range.
+
+Sample uniformly in log space and exponentiate:
+
+```python
+lr = 10 ** rng.uniform(math.log10(1e-5), math.log10(1e-1))
+```
+
+Optuna and Ray Tune both have this as a primitive, `suggest_float(..., log=True)` and `tune.loguniform(...)` respectively, and it is the single most common thing people get wrong when they set up a search.
+
+Batch size is a special case: sample uniformly over the exponents, since only powers of two are meaningful. Same for layer counts and other small integers, where a log spacing keeps you from spending 90% of the budget on depths between 12 and 24.
+
+---
+
+## Pruning with successive halving
+
+Random search runs every trial to completion, and most trials are obviously bad within the first few epochs. Successive halving spends a small budget on everything and a large budget only on the survivors.
+
+Start with `n` configurations at budget `r`. Run all of them, keep the best `1 / eta` fraction, multiply the budget by `eta`, repeat until one is left or the budget reaches `R`.
+
+With `eta = 3` and `R = 81`:
+
+```python title="halving.py"
+import math
+
+ETA, R = 3, 81
+
+def halving(n, r0=1, r_max=R, eta=ETA):
+    ladder, k, r = [], n, r0
+    while k >= 1 and r <= r_max + 1e-9:
+        ladder.append((k, r))
+        k //= eta
+        r *= eta
+    return ladder
+
+print(f"successive halving, eta = {ETA}, R = {R}")
+for n in (9, 27, 81, 243):
+    ladder = halving(n)
+    cost = sum(k * r for k, r in ladder)
+    chain = " -> ".join(f"{k}@{r}" for k, r in ladder)
+    print(f"n={n:4d}: {chain:<46} cost={cost:5d}  rungs={len(ladder)}  n*rungs={n * len(ladder)}")
+
+print()
+s_max = int(math.floor(math.log(R) / math.log(ETA)))
+B = (s_max + 1) * R
+print(f"hyperband: s_max = floor(log_{ETA} {R}) = {s_max}, B = (s_max+1)*R = {B}")
+total = 0
+for s in range(s_max, -1, -1):
+    n = int(math.ceil((B / R) * ETA ** s / (s + 1)))
+    r = R * ETA ** (-s)
+    ladder = halving(n, r)
+    cost = sum(k * rr for k, rr in ladder)
+    total += cost
+    print(f"s={s}  n={n:3d}  r={r:6.4g}  rungs={len(ladder)}  budget={cost:5.0f}  budget/B={cost / B:.3f}")
+print(f"grand total = {total:.0f},  (s_max+1)*B = {(s_max + 1) * B}")
+```
+
+```text
+successive halving, eta = 3, R = 81
+n=   9: 9@1 -> 3@3 -> 1@9                              cost=   27  rungs=3  n*rungs=27
+n=  27: 27@1 -> 9@3 -> 3@9 -> 1@27                     cost=  108  rungs=4  n*rungs=108
+n=  81: 81@1 -> 27@3 -> 9@9 -> 3@27 -> 1@81            cost=  405  rungs=5  n*rungs=405
+n= 243: 243@1 -> 81@3 -> 27@9 -> 9@27 -> 3@81          cost= 1215  rungs=5  n*rungs=1215
+
+hyperband: s_max = floor(log_3 81) = 4, B = (s_max+1)*R = 405
+s=4  n= 81  r=     1  rungs=5  budget=  405  budget/B=1.000
+s=3  n= 34  r=     3  rungs=4  budget=  363  budget/B=0.896
+s=2  n= 15  r=     9  rungs=3  budget=  351  budget/B=0.867
+s=1  n=  8  r=    27  rungs=2  budget=  378  budget/B=0.933
+s=0  n=  5  r=    81  rungs=1  budget=  405  budget/B=1.000
+grand total = 1902,  (s_max+1)*B = 2025
+```
+
+Read `9@1` as nine configurations at budget one. The total cost is always `n` multiplied by the number of rungs, because each rung spends the same amount: `n` configs at `r` costs the same as `n / eta` configs at `r * eta`. That identity is what makes the Hyperband budget arithmetic work out, and the last six lines of the output are the Hyperband brackets that use it.
+
+Does the early stopping cost more than it saves? Simulated on the same synthetic objective, with per-observation noise of standard deviation `0.5 / sqrt(r)` so early measurements are unreliable but not random:
+
+```python title="prune_sim.py"
+import math
+import numpy as np
+
+rng = np.random.default_rng(1)
+
+def make_pool(n):
+    lrs = 10 ** rng.uniform(-5, -1, n)
+    drops = rng.uniform(0.0, 0.5, n)
+    finals = (1.20 + 8.0 * (np.log10(lrs) + 2.4318) ** 2 + 2.0 * drops
+              + rng.normal(0, 0.05, n))
+    return [{"final": f} for f in finals]
+
+def observe(cfg, r):
+    return cfg["final"] + rng.normal(0, 0.5 / math.sqrt(r))
+
+def successive_halving(pool, n, R=81, eta=3):
+    configs, r, spent = pool[:n], 1, 0
+    while configs and r <= R:
+        for c in configs:
+            c["score"] = observe(c, r)
+        spent += len(configs) * r
+        configs.sort(key=lambda c: c["score"])
+        configs = configs[: max(1, len(configs) // eta)]
+        r *= eta
+    return configs[0], spent
+
+def random_search(pool, budget, R=81):
+    n = max(1, budget // R)
+    return min(pool[:n], key=lambda c: observe(c, R)), n * R
+
+sh, rs = [], []
+for _ in range(300):
+    pool = make_pool(2000)
+    b1, spent = successive_halving(pool, 81)
+    b2, _ = random_search(pool[500:], spent)
+    sh.append(b1["final"])
+    rs.append(b2["final"])
+sh, rs = np.array(sh), np.array(rs)
+
+print(f"equal budget of {spent} config-epochs, R = 81, eta = 3, 300 repeats")
+print(f"  SH     : median final {np.median(sh):.4f}, mean {sh.mean():.4f}, "
+      f"90th pct {np.percentile(sh, 90):.4f}")
+print(f"  random : median final {np.median(rs):.4f}, mean {rs.mean():.4f}, "
+      f"90th pct {np.percentile(rs, 90):.4f}   ({spent // 81} configs x 81 epochs)")
+print(f"  P(SH better) = {(sh < rs).mean() * 100:.1f}%")
+```
+
+```text
+equal budget of 405 config-epochs, R = 81, eta = 3, 300 repeats
+  SH     : median final 1.3871, mean 1.4145, 90th pct 1.6118
+  random : median final 2.3074, mean 3.0406, 90th pct 4.9771   (5 configs x 81 epochs)
+  P(SH better) = 92.7%
+```
+
+Successive halving evaluates 81 configurations for the same 405 config-epochs that random search spends on five. It wins 92.7% of the time and its 90th percentile is three times tighter, because a bad configuration is discarded at rung one instead of consuming a full run.
+
+The assumption underneath all of this is that early loss correlates with final loss. That holds for learning rate and most regularization, and it fails for schedules that anneal late, for models whose training is unstable early, and for anything with a long warmup. If your configurations reorder themselves between epoch 5 and epoch 81, pruning will discard the winner.
+
+---
+
+## Hyperband
+
+Successive halving has a free parameter you cannot choose well. A large `n` gives you lots of configurations but only a few rungs, so nothing gets trained long enough to be trustworthy. A small `n` gives you full-length runs on barely any candidates.
+
+Hyperband runs several successive-halving brackets with different `n` and spends the same total budget on each. Given a maximum budget `R` and a reduction factor `eta`:
+
+```text
+s_max = floor(log_eta(R))
+B     = (s_max + 1) * R
+n_s   = ceil( (B / R) * eta^s / (s + 1) )
+r_s   = R * eta^(-s)
+```
+
+The last six lines of `halving.py` above compute this. For `R = 81` and `eta = 3`, `s_max = floor(log_3 81) = 4` and `B = 5 * 81 = 405`:
+
+| Bracket `s` | Configs `n` | Starting budget `r` | Rungs | Budget | Budget / `B` |
+| :---------- | :---------- | :------------------ | :---- | :----- | :----------- |
+| 4           | 81          | 1                   | 5     | 405    | `1.000`      |
+| 3           | 34          | 3                   | 4     | 363    | `0.896`      |
+| 2           | 15          | 9                   | 3     | 351    | `0.867`      |
+| 1           | 8           | 27                  | 2     | 378    | `0.933`      |
+| 0           | 5           | 81                  | 1     | 405    | `1.000`      |
+
+Bracket 4 is aggressive pruning: 81 configurations starting at one epoch. Bracket 0 is no pruning at all: five full 81-epoch runs. The brackets in between hedge. Every bracket costs roughly `B`, so the whole search costs about `5 * B = 2025` config-epochs, and the computed total is 1902 because the integer floors in `n_s` lose a few configurations in the middle brackets.
+
+You do not have to know in advance whether pruning helps for your problem, which is the point. Hyperband tries every level of aggressiveness at once and the best bracket wins.
+
+---
+
+## ASHA
+
+Hyperband runs its brackets one after another, and each bracket is a synchronous halving: nothing advances until every configuration at a rung has finished. On a cluster with 64 workers and a bracket of five configurations at the last rung, 59 workers sit idle.
+
+ASHA, the Asynchronous Successive Halving algorithm, promotes a configuration as soon as it lands in the top `1 / eta` of everything reported so far at that rung, without waiting for the rung to fill. Promotion decisions are made against partial information and are occasionally wrong, which costs a little accuracy, and the parallel efficiency gain is much larger. ASHA scales to thousands of concurrent trials where synchronous Hyperband stalls.
+
+This is what `HyperbandPruner` in Optuna and `ASHAScheduler` in Ray Tune implement. Use them whenever you have more than a handful of workers.
+
+---
+
+## Model-based search
+
+Pruning decides how long to run each trial. Model-based search decides which trial to run next, using the results of all previous trials rather than drawing independently.
+
+**Gaussian processes** (SMAC, BoTorch, spearmint) fit a GP over the configuration space, which gives a predicted mean and a predicted uncertainty at every untried point. An acquisition function, usually expected improvement, combines the two into a score and the next configuration is its argmax. GPs handle continuous spaces well and degrade past roughly 20 dimensions, since the covariance matrix has to be inverted and the length scales become hard to estimate.
+
+**TPE**, Tree-structured Parzen Estimator, is Optuna's default. It splits observed trials at a quantile `gamma` into a good set and a bad set, fits a density to each, and picks the configuration maximizing `l(x) / g(x)`, the ratio of the good density to the bad density. TPE does not model the loss value directly, only the density of configurations on either side of the threshold, which makes it cheaper and more tolerant of conditional and categorical spaces.
+
+Both need a warmup. TPE with `gamma = 0.25` on fewer than about ten observations is fitting densities to noise and does worse than random. Optuna's `TPESampler` therefore runs `n_startup_trials = 10` random trials before it starts modeling. If your budget is under 20 trials, use random search.
+
+The crossover point is around 20 to 30 trials. Below that, use random sampling with a pruner. Above it, TPE pulls ahead because it stops revisiting regions that already scored badly, and the gap widens as the space gets higher dimensional.
+
+---
+
+## Optuna
+
+`uv add optuna`
+
+```python title="optuna_search.py"
+import optuna
+
+def objective(trial):
+    lr = trial.suggest_float("lr", 1e-5, 1e-1, log=True)
+    wd = trial.suggest_float("wd", 1e-6, 1e-1, log=True)
+    dropout = trial.suggest_float("dropout", 0.0, 0.5)
+    layers = trial.suggest_int("layers", 2, 6)
+    use_norm = trial.suggest_categorical("norm", ["none", "layer", "batch"])
+
+    model = build_model(layers, dropout, use_norm)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
+    scheduler = make_schedule(optimizer, total_steps, warmup_steps=100)
+
+    for step in range(total_steps):
+        loss = train_step(model, optimizer, scheduler)
+        trial.report(loss, step)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+
+    return evaluate(model)
+
+study = optuna.create_study(
+    direction="minimize",
+    sampler=optuna.samplers.TPESampler(seed=0, n_startup_trials=10),
+    pruner=optuna.pruners.HyperbandPruner(min_resource=1, reduction_factor=3),
+)
+study.optimize(objective, n_trials=200, n_jobs=4)
+
+print(study.best_params, study.best_value)
+```
+
+`trial.report(value, step)` is what makes pruning possible. Without it the pruner has nothing to look at and every trial runs to completion. Call it once per epoch, or once per few hundred steps for long runs.
+
+The samplers and pruners:
+
+```python
+optuna.samplers.RandomSampler(seed=0)
+optuna.samplers.TPESampler(seed=0, n_startup_trials=10, gamma=0.25)
+optuna.samplers.CmaEsSampler()
+optuna.samplers.NSGAIISampler()          # multi-objective
+
+optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=0)
+optuna.pruners.PercentilePruner(25.0)
+optuna.pruners.HyperbandPruner(min_resource=1, reduction_factor=3)
+optuna.pruners.NopPruner()
+```
+
+`MedianPruner` kills any trial below the running median of its peers at the same step, which is successive halving with `eta = 2` and no fixed bracket. It is the right default when you do not want to think about budgets.
+
+Two things that cost people a day. Set a `seed` on the sampler or you cannot reproduce the study. And persist it: `optuna.create_study(storage="sqlite:///study.db", study_name="run1", load_if_exists=True)` lets a crashed search resume instead of starting over.
+
+---
+
+## Ray Tune
+
+`uv add "ray[tune]"`
+
+Ray Tune is the better choice when a single trial needs multiple GPUs or when you want the search distributed across a cluster, since it manages the resource allocation as well as the schedule.
+
+```python title="ray_search.py"
+from ray import tune
+from ray.tune.schedulers import ASHAScheduler
+
+def trainable(config):
+    model = build_model(config["layers"], config["dropout"])
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=config["lr"], weight_decay=config["wd"]
+    )
+    for epoch in range(config["epochs"]):
+        loss = train_epoch(model, optimizer)
+        tune.report(loss=loss, epoch=epoch)
+
+analysis = tune.run(
+    trainable,
+    config={
+        "lr": tune.loguniform(1e-5, 1e-1),
+        "wd": tune.loguniform(1e-6, 1e-1),
+        "dropout": tune.uniform(0.0, 0.5),
+        "layers": tune.randint(2, 7),
+        "epochs": 81,
+    },
+    num_samples=200,
+    scheduler=ASHAScheduler(max_t=81, grace_period=1, reduction_factor=3),
+    search_alg=tune.search.BasicVariantGenerator(),
+    resources_per_trial={"gpu": 1},
+    metric="loss",
+    mode="min",
+)
+print(analysis.best_config, analysis.best_result)
+```
+
+`tune.report` is the equivalent of `trial.report` and it is what ASHA uses to decide promotion. `grace_period=1` is the budget at the first rung, `reduction_factor=3` is `eta`, `max_t=81` is `R`. Those three numbers are the same Hyperband bracket arithmetic.
+
+Swapping `BasicVariantGenerator` for `BayesOptSearch` or `OptunaSearch` turns random sampling into model-based sampling without changing anything else. Ray Tune can drive Optuna as its search algorithm while keeping its own scheduler and resource management, which is the combination most large runs use.
+
+---
+
+## Population based training
+
+PBT is a different shape of algorithm and it is the only common method that tunes hyperparameters _during_ a run rather than choosing them once.
+
+Maintain a population of workers, each training its own copy of the model. Periodically, the worst performers copy the weights of the best performers and perturb their hyperparameters. The perturbations are multiplicative, usually drawing from `[0.8, 1.2]` or resampling from the prior.
+
+```text
+every T steps:
+    rank the population by validation score
+    for each worker in the bottom 20%:
+        copy weights from a randomly chosen top-20% worker
+        multiply its hyperparameters by a random factor, or resample them
+```
+
+The result is a hyperparameter schedule rather than a single value, discovered online. PBT is what produced the schedules in DeepMind's AlphaStar and in several strong image models, and it is the reason some published learning rate curves look irregular rather than smooth.
+
+It costs a population, so it is only worth it when you have the GPUs to run 10 to 20 workers in parallel and when the schedule genuinely matters, which is mostly reinforcement learning and long pretraining runs. Ray Tune implements it as `PopulationBasedTraining`.
+
+---
+
+## A protocol that works
+
+<Mermaid
+  chart={`
+flowchart TD
+    A["How many trials can you afford?"] --> B{"Fewer than 20?"}
+    B -->|"Yes"| C["Random search<br/>log-uniform on lr, then wd"]
+    B -->|"No"| D{"More than one worker?"}
+    D -->|"No"| E["TPE + MedianPruner<br/>20 to 200 trials"]
+    D -->|"Yes"| F["TPE + HyperbandPruner<br/>or Ray Tune with ASHA"]
+    F --> G{"10+ workers and the<br/>schedule matters?"}
+    G -->|"Yes"| H["Population based training"]
+    G -->|"No"| I["Take the top 3 configs<br/>re-run each with 2 seeds"]
+    E --> I
+    C --> I
+`}
+/>
+
+1. Fix the architecture and the data pipeline. Search one thing at a time only when you are diagnosing; otherwise search jointly.
+2. Sweep the learning rate alone, log-uniform over `1e-5` to `1e-1`, 20 random trials at a short budget. This tells you the right decade and whether the model trains at all.
+3. Set the rate to the best value and add a second axis, usually weight decay or batch size. 30 trials.
+4. Turn on `MedianPruner` or `HyperbandPruner` and search all four or five axes jointly with TPE, 100 to 200 trials, at the full budget.
+5. Take the top three configurations and re-run each with two different seeds. The spread between seeds is usually larger than the spread between the top ten configurations, and a configuration that wins by less than that spread is not a real winner.
+
+Step 5 is the one people skip, and skipping it is how a search produces a result that does not reproduce. Report mean and standard deviation over seeds, never a single best number.
+
+Budget matters more than algorithm. Going from 20 trials to 200 trials helps more than going from random search to TPE, and going from full-length trials to pruned trials helps more than both. Spend on the number of configurations you can evaluate, not on the sophistication of the sampler.
+
+---
+
+## Interview questions
+
+- **Why does random search beat grid search?** A grid over `P` axes with `k` values each costs `k^P` trials but only ever tests `k` distinct values on any single axis. Random tests `k^P` distinct values on every axis. When the objective depends strongly on one axis and weakly on the others, random covers the important one far better. Measured at equal budget of 25 trials on a two-axis problem, random beats the grid 99.8% of the time.
+- **When is a grid better?** One or two axes, or when you want to see the shape of the response surface rather than just its minimum. A 2D heatmap is worth more than a best score when you are trying to understand the problem.
+- **Why sample the learning rate log-uniformly?** Useful values are spread multiplicatively across orders of magnitude. `1e-4` and `1.1e-4` are the same configuration; `1e-4` and `1e-3` are not. A uniform linear sample puts nearly all of its budget at the top of the range.
+- **How does successive halving work?** Run `n` configurations at budget `r`, keep the top `1 / eta`, multiply `r` by `eta`, repeat. Total cost is `n` times the number of rungs, because each rung costs the same as the one before it.
+- **What does Hyperband add?** It removes the choice of `n` by running `s_max + 1` brackets with different `n` and equal budgets. `s_max = floor(log_eta(R))` and `B = (s_max + 1) * R`. For `R = 81` and `eta = 3` the brackets are 81, 34, 15, 8 and 5 configurations, starting at budgets 1, 3, 9, 27 and 81.
+- **What is ASHA?** Asynchronous successive halving. It promotes a configuration as soon as it reaches the top `1 / eta` of those reported so far at its rung, instead of waiting for the rung to fill. Slightly less accurate, far better parallel efficiency.
+- **How does TPE differ from a Gaussian process?** A GP models the loss surface and picks the point with the best expected improvement. TPE splits observed trials into good and bad at a quantile `gamma`, fits a density to each, and maximizes the ratio `l(x) / g(x)`. TPE never predicts the loss value, which makes it cheaper and better behaved on conditional and categorical spaces.
+- **Why does Optuna run random trials before TPE?** `n_startup_trials = 10`. Fitting a density to fewer than about ten observations models noise and does worse than random sampling.
+- **What does `trial.report` do?** It sends an intermediate score to the pruner. Without it there is nothing to prune on and every trial runs to completion.
+- **What is population based training?** A population of workers trains in parallel; periodically the worst copy the weights of the best and perturb their hyperparameters. It produces a hyperparameter schedule discovered online rather than a fixed value, which is why it is used in reinforcement learning and long pretraining.
+- **Why re-run the top configurations with several seeds?** Seed-to-seed spread is usually larger than the spread between the top configurations. A win smaller than the seed noise is not a win, and reporting a single best number produces results that do not reproduce.
+- **What should you spend search budget on?** More configurations, not a smarter sampler. Going from 20 to 200 trials helps more than going from random to TPE, and pruning helps more than either.

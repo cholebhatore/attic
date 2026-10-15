@@ -1,0 +1,466 @@
+---
+title: Optimizers
+description: 'SGD, momentum, Nesterov, RMSprop, Adam, AdamW, Lion and Adafactor, with measured convergence, stability limits, memory cost, and the L2 versus decoupled decay difference.'
+---
+
+An optimizer turns a gradient into a parameter update. Plain SGD uses the gradient directly. Everything else in this page does one of two things to it: accumulate it over time, which is momentum, or divide it by its own recent magnitude, which is adaptive scaling. Adam does both.
+
+---
+
+## The two problems
+
+Gradients in a neural network cause two separate difficulties, and the optimizer families split along that line.
+
+**The directions have very different curvature.** The Hessian of the loss has eigenvalues spread over several orders of magnitude. In the steep direction, a step large enough to make progress overshoots. In the flat direction, a step small enough to be safe barely moves. With a single learning rate you are forced to pick the safe one, and the flat directions take thousands of steps to traverse. This spread is the condition number, and it is the reason a loss curve plateaus.
+
+**The scale of the gradient changes during training.** Early on it is large, late it is small, and different layers differ by orders of magnitude at any given time. A learning rate tuned for one regime is wrong in the others.
+
+Momentum fixes the first by averaging out the oscillation in steep directions and adding up the consistent motion in flat ones. Adaptive scaling fixes the second by normalizing each coordinate by its own recent gradient magnitude.
+
+---
+
+## A test problem
+
+Every number on this page comes from one script. It runs each optimizer on two quadratics, where the answer is known in advance, so the comparison is not confounded by noise, architecture, or initialization.
+
+```python title="quadratic.py"
+import numpy as np
+
+MU, B1, B2, EPS = 0.9, 0.9, 0.999, 1e-8
+
+def optimize(kind, grad, p0, lr, steps):
+    p = np.array(p0, float)
+    buf = np.zeros_like(p)
+    m = np.zeros_like(p)
+    v = np.zeros_like(p)
+    for t in range(1, steps + 1):
+        g = grad(p)
+        if kind == "sgd":
+            p = p - lr * g
+        elif kind == "momentum":
+            buf = MU * buf + g
+            p = p - lr * buf
+        elif kind == "nesterov":
+            buf = MU * buf + g
+            p = p - lr * (g + MU * buf)
+        elif kind == "rmsprop":
+            v = 0.99 * v + 0.01 * g * g
+            p = p - lr * g / (np.sqrt(v) + EPS)
+        elif kind == "adam":
+            m = B1 * m + (1 - B1) * g
+            v = B2 * v + (1 - B2) * g * g
+            p = p - lr * (m / (1 - B1 ** t)) / (np.sqrt(v / (1 - B2 ** t)) + EPS)
+        elif kind == "lion":
+            p = p - lr * np.sign(B1 * m + (1 - B1) * g)
+            m = B1 * m + (1 - B1) * g
+    return p
+
+LAM = np.array([1.0, 100.0])
+quad = lambda p: 0.5 * np.sum(LAM * p * p)
+grad = lambda p: LAM * p
+kinds = ["sgd", "momentum", "nesterov", "rmsprop", "adam", "lion"]
+
+print(f"lambda = [1, 100], p0 = [1, 1], f(p0) = {quad(np.array([1.0, 1.0]))}, 2000 steps")
+print("lr      " + "".join(f"{k:<14}" for k in kinds))
+for lr in (1e-3, 1e-2, 2e-2, 1e-1):
+    cells = []
+    for k in kinds:
+        with np.errstate(over="ignore", invalid="ignore"):
+            val = quad(optimize(k, grad, [1.0, 1.0], lr, 2000))
+        cells.append(f"{val:.3e}" if np.isfinite(val) else "diverged")
+    print(f"{lr:<8}" + "".join(f"{c:<14}" for c in cells))
+
+print()
+print("stability thresholds, 2000 steps, f < 1e10 counts as stable")
+for k in ("sgd", "momentum", "nesterov"):
+    lo, hi = 1e-5, 0.2
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        with np.errstate(over="ignore", invalid="ignore"):
+            val = quad(optimize(k, grad, [1.0, 1.0], mid, 2000))
+        if np.isfinite(val) and val < 1e10:
+            lo = mid
+        else:
+            hi = mid
+    print(f"  {k:<10} {lo:.5f}")
+
+print()
+iso_grad = lambda p: p.copy()
+print("isotropic f = 0.5 * sum(p^2), p0 = [8, -8], 100 steps")
+for k, lr in (("sgd", 0.1), ("sgd", 0.01), ("momentum", 0.1), ("nesterov", 0.1)):
+    p = optimize(k, iso_grad, [8.0, -8.0], lr, 100)
+    print(f"  {k:<10} lr={lr:<6} norm(p) = {np.linalg.norm(p):.6e}")
+```
+
+```text
+lambda = [1, 100], p0 = [1, 1], f(p0) = 50.5, 2000 steps
+lr      sgd           momentum      nesterov      rmsprop       adam          lion
+0.001   9.140e-03     2.325e-20     3.764e-20     3.328e-210    2.156e-02     2.020e-04
+0.01    1.737e-18     3.640e-92     3.060e-101    1.258e-03     4.083e-85     2.020e-02
+0.02    5.000e+01     2.189e-90     diverged      6.027e-03     1.480e-90     1.840e-29
+0.1     diverged      diverged      diverged      1.262e-01     3.432e-92     2.020e+00
+
+stability thresholds, 2000 steps, f < 1e10 counts as stable
+  sgd        0.02005
+  momentum   0.03800
+  nesterov   0.01359
+
+isotropic f = 0.5 * sum(p^2), p0 = [8, -8], 100 steps
+  sgd        lr=0.1    norm(p) = 3.005079e-04
+  sgd        lr=0.01   norm(p) = 4.141183e+00
+  momentum   lr=0.1    norm(p) = 4.229894e-02
+  nesterov   lr=0.1    norm(p) = 2.672410e-04
+```
+
+The ill-conditioned problem has a condition number of 100, the isotropic one a condition number of 1. The isotropic case exists to show what momentum costs when there is nothing for it to fix.
+
+---
+
+## SGD and its stability limit
+
+```text
+p <- p - lr * g
+```
+
+On a quadratic `f(p) = 0.5 * p^T H p` this converges when `lr < 2 / lambda_max`, and diverges above it. The bound is exact and easy to hit. With `H = diag(1, 100)` the limit is `lr = 0.02`. Bisecting the threshold over 2000 steps:
+
+| Method                 | Measured threshold | Theory                                |
+| :--------------------- | :----------------- | :------------------------------------ |
+| SGD                    | `0.02005`          | `2 / lambda_max = 0.02000`            |
+| Heavy ball, `mu = 0.9` | `0.03800`          | `2 * (1 + mu) / lambda_max = 0.03800` |
+| Nesterov, PyTorch form | `0.01359`          | none, see below                       |
+
+The heavy-ball number lands on the formula exactly. The Nesterov number is lower than plain SGD, which surprises people. PyTorch implements it as `p <- p - lr * (g + mu * buf)` after `buf <- mu * buf + g`, so the current gradient is counted once directly and once through the buffer, giving an effective `(1 + mu)` multiplier on `g`. That multiplier raises the step size rather than lowering it, so the rate has to come down to compensate. When you switch `nesterov=True` on an existing run and it diverges, reduce `lr` by roughly `1 + mu`.
+
+---
+
+## Momentum
+
+```text
+buf <- mu * buf + g
+p   <- p - lr * buf
+```
+
+The buffer is an exponentially weighted sum of past gradients with a mean age of `1 / (1 - mu)` steps. At `mu = 0.9` that is 10 steps, at `0.99` it is 100.
+
+Gradients that alternate sign cancel. Gradients that keep pointing the same way add up, and can amplify the effective step size by as much as `1 / (1 - mu)`. In a valley, the steep direction alternates and cancels; the flat direction is consistent and accumulates. That is the whole mechanism.
+
+Convergence on `lambda = [1, 100]`, starting at `p0 = [1, 1]` where `f(p0) = 50.5`, after 2000 steps:
+
+| `lr`   | SGD         | SGD + momentum | Nesterov     | RMSprop      | Adam        | Lion        |
+| :----- | :---------- | :------------- | :----------- | :----------- | :---------- | :---------- |
+| `1e-3` | `9.140e-03` | `2.325e-20`    | `3.764e-20`  | `3.328e-210` | `2.156e-02` | `2.020e-04` |
+| `1e-2` | `1.737e-18` | `3.640e-92`    | `3.060e-101` | `1.258e-03`  | `4.083e-85` | `2.020e-02` |
+| `2e-2` | `5.000e+01` | `2.189e-90`    | diverged     | `6.027e-03`  | `1.480e-90` | `1.840e-29` |
+| `1e-1` | diverged    | diverged       | diverged     | `1.262e-01`  | `3.432e-92` | `2.020e+00` |
+
+At `lr = 1e-3`, momentum takes SGD from `9.1e-3` to `2.3e-20`. At `lr = 2e-2`, plain SGD is stuck at its starting value of `50.5` while momentum still converges. Both rows are the same statement: momentum widens the range of learning rates that work and speeds up convergence inside it.
+
+<Callout type="warn">
+  ### Momentum is not free on a well-conditioned problem
+
+On the isotropic quadratic `f = 0.5 * sum(p^2)` from `p0 = [8, -8]`, 100 steps:
+
+| Update                 | Final `norm(p)` |
+| :--------------------- | :-------------- |
+| SGD, `lr = 0.1`        | `3.005079e-04`  |
+| SGD, `lr = 0.01`       | `4.141183e+00`  |
+| Heavy ball, `lr = 0.1` | `4.229894e-02`  |
+| Nesterov, `lr = 0.1`   | `2.672410e-04`  |
+
+</Callout>
+
+Heavy ball is 140 times worse than plain SGD at the same rate. There is no oscillation to cancel here, so all the buffer does is add inertia that overshoots the minimum and rings. Momentum pays off in proportion to how anisotropic the problem is. Neural networks are anisotropic enough that it nearly always helps, but a run where momentum makes things worse is not a bug, it is a badly conditioned learning rate.
+
+---
+
+## Adaptive scaling
+
+RMSprop divides the gradient by the running root-mean-square of its own recent values:
+
+```text
+v <- alpha * v + (1 - alpha) * g^2
+p <- p - lr * g / (sqrt(v) + eps)
+```
+
+Each coordinate is normalized to have unit RMS over roughly the last `1 / (1 - alpha)` steps. Steep directions get divided by a large number, flat directions by a small one, which equalizes the step size across coordinates. Look at the `lr = 0.1` row of the comparison: RMSprop is the only method still finite there apart from Adam, because normalizing by the gradient magnitude removes the dependence on gradient scale that makes every other update blow up.
+
+The cost is that RMSprop no longer has any notion of gradient magnitude. The direction is preserved but the size is discarded, so a coordinate with a genuinely tiny gradient moves just as fast as one with a huge gradient. Near a minimum that means it cannot settle, which is why its residual at `lr = 1e-2` is `1.258e-03` while momentum, which does respect magnitude, is down at `3.640e-92`.
+
+---
+
+## Adam
+
+Adam combines both: a first-moment buffer for direction and a second-moment buffer for scale, each bias corrected.
+
+```text
+m <- b1 * m + (1 - b1) * g
+v <- b2 * v + (1 - b2) * g^2
+m_hat = m / (1 - b1^t)
+v_hat = v / (1 - b2^t)
+p <- p - lr * m_hat / (sqrt(v_hat) + eps)
+```
+
+Defaults are `b1 = 0.9`, `b2 = 0.999`, `eps = 1e-8`. The first moment averages over about 10 steps, the second over about 1000.
+
+### Why the bias correction exists
+
+Both buffers start at zero, so early estimates are biased toward zero. The second moment is the worse case, because `b2 = 0.999` means it takes around 1000 steps to reach its steady-state scale. Dividing by `1 - beta^t` undoes the shrinkage exactly for a constant gradient.
+
+Take a constant `g = 2.5` at `lr = 1e-3`:
+
+```text
+m1                = 2.500000e-01
+v1                = 6.250000e-03
+uncorrected step  = 3.162277e-03
+m_hat             = 2.500000
+v_hat             = 6.250000
+corrected step    = 1.000000e-03
+```
+
+Without correction the first step is 3.16 times too large. The factor is `sqrt((1 - b1)^2 / (1 - b2)) = sqrt(10)`, and it is not a coincidence: the numerator loses a factor of `1 - b1 = 0.1` while the denominator loses `(1 - b2) = 0.001` under a square root, so the ratio is `0.1 / sqrt(0.001)`.
+
+How long the correction matters, as the ratio of uncorrected to corrected step size:
+
+| `t`  | `1 - b1^t` | `1 - b2^t` | Uncorrected / corrected |
+| :--- | :--------- | :--------- | :---------------------- |
+| 1    | `0.10000`  | `0.00100`  | `3.16228`               |
+| 2    | `0.19000`  | `0.00200`  | `4.24959`               |
+| 5    | `0.40951`  | `0.00499`  | `5.79714`               |
+| 10   | `0.65132`  | `0.00996`  | `6.52788`               |
+| 100  | `0.99997`  | `0.09521`  | `3.24080`               |
+| 1000 | `1.00000`  | `0.63230`  | `1.25758`               |
+
+The correction peaks at step 10, where an uncorrected Adam would take steps 6.5 times too large, and is still 26% off at step 1000. The first-moment bias is gone after 50 steps; the second-moment bias takes a thousand. That window is exactly where warmup operates.
+
+### Scale invariance
+
+Multiply every gradient by a constant `c` and the update does not change. `m` scales by `c`, `sqrt(v)` scales by `c`, and the ratio is untouched. Measured as the mean absolute parameter change per step over 50 steps at `lr = 1e-3`:
+
+```python title="scale.py"
+import numpy as np
+
+B1, B2, EPS = 0.9, 0.999, 1e-8
+
+def mean_abs_step(gscale, steps=50, lr=1e-3):
+    p, m, v, total = 1.0, 0.0, 0.0, 0.0
+    for t in range(1, steps + 1):
+        g = gscale * 2.0
+        m = B1 * m + (1 - B1) * g
+        v = B2 * v + (1 - B2) * g * g
+        d = lr * (m / (1 - B1 ** t)) / (np.sqrt(v / (1 - B2 ** t)) + EPS)
+        p -= d
+        total += abs(d)
+    return total / steps
+
+for s in (1e-6, 1e-3, 1e0, 1e3, 1e6):
+    print(f"gradient scale {s:.0e}  ->  mean |delta p| = {mean_abs_step(s):.6e}")
+```
+
+```text
+gradient scale 1e-06  ->  mean |delta p| = 9.950249e-04
+gradient scale 1e-03  ->  mean |delta p| = 9.999950e-04
+gradient scale 1e+00  ->  mean |delta p| = 1.000000e-03
+gradient scale 1e+03  ->  mean |delta p| = 1.000000e-03
+gradient scale 1e+06  ->  mean |delta p| = 1.000000e-03
+```
+
+Across twelve orders of magnitude of gradient scale the step size stays at `lr`. Three consequences follow.
+
+Multiplying the loss by a constant does nothing. Rescaling the loss to "make gradients bigger" is a no-op under Adam, which is why loss scaling in mixed-precision training is safe: the factor exists only to keep float16 gradients out of the denormal range and Adam divides it straight back out.
+
+The learning rate has units of parameters, not of gradient. Under SGD, `lr = 0.1` means something different for every layer depending on its gradient magnitude. Under Adam, `lr = 1e-3` means every parameter moves by about `1e-3` per step regardless of layer. That is why Adam learning rates cluster around `1e-3` and `3e-4` across wildly different models while SGD rates cluster around `0.1`.
+
+The invariance has a floor at `eps`. Because `eps` is added after the square root, it dominates when `sqrt(v)` is comparable to it:
+
+```text
+g = 1e-09  ->  step / lr = 0.090909
+g = 1e-08  ->  step / lr = 0.500000
+g = 1e-06  ->  step / lr = 0.990099
+g = 1e-03  ->  step / lr = 0.999990
+g = 1e+00  ->  step / lr = 1.000000
+g = 1e+06  ->  step / lr = 1.000000
+```
+
+At `g = 1e-8`, equal to the default `eps`, the step is half of what it should be. Parameters whose gradients fall below that stop moving. This matters for float16 training, where gradients underflow to values in exactly this range, and it is why `eps` is sometimes raised to `1e-6` or `1e-4` rather than left at the default.
+
+### The step size is capped
+
+For a constant gradient the update is exactly `lr * sign(g)`. Starting at `p = 8.0` with `g = 1.0` and `lr = 1e-3`:
+
+| Steps | Distance travelled | `lr * steps` |
+| :---- | :----------------- | :----------- |
+| 10    | `0.010000`         | `0.010000`   |
+| 100   | `0.100000`         | `0.100000`   |
+| 1000  | `1.000000`         | `1.000000`   |
+
+Adam cannot take a step larger than `lr` in any coordinate, no matter how large the gradient is. That makes it forgiving of gradient spikes, and it also means a parameter 10 units from where it needs to be takes 10000 steps to get there at `lr = 1e-3`. The ill-conditioned comparison shows the downside: at `lr = 1e-3` Adam ends at `2.156e-02`, worse than plain SGD's `9.140e-03`, because it moves at most `1e-3` per step and the starting point is a full unit away in each coordinate.
+
+This is the reason Adam looks slower than SGD on problems where SGD is already well tuned, and the reason its learning rate is a distance rather than a gain.
+
+---
+
+## Weight decay, and why AdamW exists
+
+L2 regularization adds `wd * p` to the gradient. Under SGD that is equivalent to shrinking the parameters by `(1 - lr * wd)` each step. Under Adam it is not, because the added term goes through the second-moment normalization.
+
+Consider the cleanest case, a quadratic where `g = p`. The combined gradient is `(1 + wd) * p`, a pure rescaling of the original, and Adam is scale invariant, so the trajectory is unchanged. Measured over 200 steps from `p0 = [8, -8]` at `lr = 1e-3`, reporting the final value of `p[0]`:
+
+```python title="decay.py"
+import numpy as np
+
+B1, B2, EPS = 0.9, 0.999, 1e-8
+
+def run(wd, mode, lr=1e-3, steps=200, p0=8.0):
+    p = np.array([p0, -p0])
+    m = v = np.zeros(2)
+    for t in range(1, steps + 1):
+        g = p + wd * p if mode == "l2" else p.copy()
+        m = B1 * m + (1 - B1) * g
+        v = B2 * v + (1 - B2) * g * g
+        step = lr * (m / (1 - B1 ** t)) / (np.sqrt(v / (1 - B2 ** t)) + EPS)
+        if mode == "adamw":
+            p = p - step - lr * wd * p
+        else:
+            p = p - step
+    return p[0]
+
+print("wd    Adam+L2   AdamW     decay only")
+for wd in (0.0, 0.01, 0.1, 1.0):
+    print(f"{wd:<6}{run(wd, 'l2'):.5f}  {run(wd, 'adamw'):.5f}  {8.0 * (1 - 1e-3 * wd) ** 200:.5f}")
+```
+
+```text
+wd    Adam+L2   AdamW     decay only
+0.0   7.80102   7.80102   8.00000
+0.01  7.80102   7.78531   7.98402
+0.1   7.80102   7.64537   7.84158
+1.0   7.80102   6.37641   6.54919
+```
+
+The Adam+L2 column is identical for every value of `wd`. A hundredfold change in the regularization strength does nothing at all. The AdamW column tracks the pure-decay column, which is what regularization is supposed to do.
+
+Real networks are not exactly quadratic, so L2 does have some effect on Adam in practice, but the mechanism is still broken. The decay term is normalized by `sqrt(v)`, so parameters with large gradients receive proportionally less decay and parameters with small gradients receive more. That is backwards: the parameters you want to shrink are the ones contributing least, and they are the ones with small gradients and therefore small `sqrt(v)`.
+
+AdamW moves the decay outside the adaptive part:
+
+```text
+p <- p - lr * m_hat / (sqrt(v_hat) + eps) - lr * wd * p
+```
+
+Two independent updates. The gradient step is scaled adaptively; the decay step is not. This is the fix in Loshchilov and Hutter's _Decoupled Weight Decay Regularization_, and it is why `torch.optim.AdamW` is the default for transformer training rather than `torch.optim.Adam` with a weight decay argument.
+
+```python
+torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, nesterov=True, weight_decay=1e-4)
+torch.optim.RMSprop(model.parameters(), lr=1e-4, alpha=0.99, eps=1e-8)
+torch.optim.Adam(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8)
+torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
+```
+
+`AdamW` with `betas=(0.9, 0.95)` and `weight_decay=0.1` is the standard LLM pretraining configuration. Lowering `b2` from `0.999` to `0.95` shortens the second-moment window to about 20 steps, which makes the optimizer respond faster to gradient spikes at the cost of noisier normalization. Large runs favor the faster response.
+
+---
+
+## Lion
+
+Lion keeps one buffer instead of two and takes the sign of an interpolation:
+
+```text
+u <- sign(b * m + (1 - b) * g)
+p <- p - lr * (u + wd * p)
+m <- b * m + (1 - b) * g
+```
+
+Note the order: the update is applied before the buffer is updated, so `u` uses the previous momentum. Default `b = 0.9`.
+
+Because the update is a sign, every coordinate moves by exactly `lr` per step. There is no adaptive scaling and no `eps`. On the isotropic quadratic from `p0 = [8, -8]` at `lr = 0.1`, the parameters move `[7.9, -7.9]`, `[7.8, -7.8]`, `[7.7, -7.7]`, exactly `lr` each time.
+
+One buffer at 4 bytes per parameter instead of two at 8 is the main attraction, and Lion matches or beats AdamW on language modeling and vision for about 30% to 50% less optimizer memory. The trade is that it needs a learning rate roughly 3 to 10 times smaller than AdamW's, more warmup, and a weight decay about 3 to 10 times larger, because the sign removes all information about gradient magnitude.
+
+---
+
+## Adafactor
+
+Adafactor targets the second-moment buffer specifically. For a weight matrix of shape `(n, m)` it stores a row vector of length `n` and a column vector of length `m` and reconstructs the full matrix as their scaled outer product:
+
+```text
+r <- beta * r + (1 - beta) * sum(g^2, axis=1)
+c <- beta * c + (1 - beta) * sum(g^2, axis=0)
+v_hat = outer(r, c) / sum(r)
+```
+
+| Matrix shape    | Full `v`     | Factored `r + c` | Saving  |
+| :-------------- | :----------- | :--------------- | :------ |
+| `(4096, 4096)`  | `16,777,216` | `8,192`          | `2048x` |
+| `(4096, 11008)` | `45,088,768` | `15,104`         | `2985x` |
+| `(8192, 8192)`  | `67,108,864` | `16,384`         | `4096x` |
+
+Adafactor also skips the first moment when `beta1 = 0` and applies update clipping by RMS, which bounds the step relative to the parameter norm rather than absolutely. It was the optimizer behind T5 and much early large-scale transformer work, before AdamW plus ZeRO offloading made the memory argument less pressing.
+
+---
+
+## Memory cost
+
+Optimizer state is stored in the same precision as the master parameters, which for mixed-precision training means float32. Per-parameter cost:
+
+| Optimizer      | Buffers  | Bytes per parameter | 7B model |
+| :------------- | :------- | :------------------ | :------- |
+| SGD            | none     | 0                   | 0 GB     |
+| SGD + momentum | `buf`    | 4                   | 28 GB    |
+| RMSprop        | `v`      | 4                   | 28 GB    |
+| Lion           | `m`      | 4                   | 28 GB    |
+| Adam / AdamW   | `m`, `v` | 8                   | 56 GB    |
+| Adafactor      | `r`, `c` | ~0 for 2D weights   | ~0 GB    |
+
+Mixed precision does not improve the picture. A bf16 run keeps a float32 master copy of the parameters (4 bytes), float32 gradients (4 bytes), and float32 Adam state (8 bytes), which is 16 bytes per parameter and 112 GB for a 7B model. The bf16 weights used in the forward pass are a cast of the master copy and are usually counted on top. Optimizer state is the largest single term in that budget, which is why ZeRO shards it across ranks first and why Lion and Adafactor exist.
+
+---
+
+## Choosing
+
+<Mermaid
+  chart={`
+flowchart TD
+    A["What are you training?"] --> B{"Model type?"}
+    B -->|"Transformer / LLM"| C["AdamW<br/>lr 3e-4, wd 0.1, betas 0.9/0.95"]
+    B -->|"CNN on images"| D{"Reproducing a paper?"}
+    D -->|"Yes"| E["SGD + momentum 0.9<br/>lr 0.1, wd 1e-4, nesterov"]
+    D -->|"No"| C
+    B -->|"Memory limited"| F{"Can you retune lr?"}
+    F -->|"Yes"| G["Lion<br/>lr 3x to 10x smaller than AdamW"]
+    F -->|"No"| H["Adafactor or 8-bit Adam"]
+    C --> I["Add warmup, 1% to 10% of steps"]
+    E --> I
+    G --> I
+`}
+/>
+
+| Situation                              | Optimizer                               |
+| :------------------------------------- | :-------------------------------------- |
+| Transformer pretraining or fine-tuning | AdamW, `lr = 3e-4`, `wd = 0.1`          |
+| CNN, chasing a published accuracy      | SGD + momentum 0.9, `lr = 0.1`          |
+| Small model, quick experiments         | Adam, `lr = 1e-3`                       |
+| Optimizer state does not fit           | Lion, Adafactor, or 8-bit Adam          |
+| Very noisy gradients                   | Adam with `b2 = 0.95`                   |
+| Need the best final accuracy on vision | SGD + momentum with a long cosine decay |
+
+SGD with momentum still wins on image classification when the schedule is tuned carefully, and the gap is real rather than folklore. On language modeling AdamW wins and the gap is also real. The usual explanation is that Adam's per-coordinate normalization discards information about relative gradient magnitude that SGD uses, which biases it toward sharp minima; the evidence for that story is mixed, so treat it as a heuristic rather than a theorem.
+
+Two configuration details that are easy to get wrong. Put `weight_decay = 0` on biases, normalization weights, and embeddings, since decaying those toward zero hurts and serves no regularization purpose; this means two parameter groups. Clip gradients by global norm before `optimizer.step()`, and remember that because Adam is scale invariant, clipping interacts with it through the second-moment history rather than through the step size.
+
+---
+
+## Interview questions
+
+- **Why does Adam need bias correction?** Both moments initialize at zero, so early estimates are biased low. Dividing by `1 - beta^t` removes the bias exactly for a constant gradient. Without it the first step is `sqrt(10) = 3.16` times too large, and the error peaks at step 10 where it reaches 6.5x.
+- **What is the difference between Adam and RMSprop?** Adam adds a first-moment buffer and bias correction on both moments. RMSprop has only the second moment, so it normalizes direction but does not average it, and it has no bias correction.
+- **Why is AdamW preferred over Adam with `weight_decay`?** L2 added to the gradient passes through Adam's second-moment normalization, so the decay is divided by `sqrt(v)` per coordinate. On a quadratic where `g = p` the combined gradient is a pure rescaling and Adam's scale invariance cancels it exactly: the trajectory is identical for `wd = 0.01` and `wd = 1.0`. AdamW applies decay outside the adaptive step.
+- **What does Adam's scale invariance imply for mixed precision?** Multiplying the loss by a constant has no effect on the update, so loss scaling is safe. It also means you cannot fix a badly behaved run by rescaling the loss.
+- **When does `eps` matter?** When `sqrt(v)` is comparable to it. At `g = 1e-8` with the default `eps = 1e-8`, the step is halved. Gradients below that effectively freeze, which happens in float16 training.
+- **Why is Adam's learning rate usually around 1e-3 while SGD's is around 0.1?** Adam caps the per-coordinate step at roughly `lr`, so `lr` is a distance in parameter space. SGD's step is `lr` times the gradient, so its units depend on gradient magnitude.
+- **What is the stability limit for SGD on a quadratic?** `lr < 2 / lambda_max`. For `H = diag(1, 100)` the measured threshold is `0.02005` against a theoretical `0.02`. Heavy ball with `mu = 0.9` extends it to `0.038`, matching `2 * (1 + mu) / lambda_max`.
+- **Why can PyTorch's Nesterov diverge at a rate plain SGD handles?** The implementation applies `p <- p - lr * (g + mu * buf)`, counting the current gradient twice and giving an effective `(1 + mu)` multiplier. The measured threshold is `0.01359`, below plain SGD's `0.02005`.
+- **When does momentum hurt?** On a well-conditioned problem. On the isotropic quadratic, heavy ball at `lr = 0.1` ends at `4.23e-2` where plain SGD reaches `3.01e-4`, because there is no oscillation to cancel and the buffer only adds overshoot.
+- **How much memory does Adam cost for a 7B model?** 8 bytes per parameter for `m` and `v`, so 56 GB in float32, on top of 28 GB of parameters and 28 GB of gradients.
+- **What does Lion change?** One buffer instead of two and a `sign` on the interpolated momentum, so 4 bytes per parameter. The step size is exactly `lr` per coordinate, and it needs a smaller learning rate and larger weight decay than AdamW.
+- **How does Adafactor save memory?** It factors the second moment for 2D weights into a row and a column vector and reconstructs their outer product, turning `16,777,216` values into `8,192` for a `(4096, 4096)` matrix.

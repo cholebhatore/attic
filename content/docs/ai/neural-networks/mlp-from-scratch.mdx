@@ -1,0 +1,380 @@
+---
+title: MLP from Scratch
+description: 'Cached forward pass, the seven analytical backward gradients, gradient checking against central differences, and where each shape comes from.'
+---
+
+[Backprop from Scratch](/ai/math-foundations/backprop-from-scratch) built reverse-mode differentiation over a scalar graph. This page does the same thing over matrices, where every gradient has a shape that has to line up with the parameter it updates, and where getting the shape right is most of the work.
+
+The network is two linear layers with a ReLU between them and a softmax cross-entropy loss on top. Seven gradients come out of the backward pass. All seven are derived here, implemented in NumPy, and checked against central differences to a relative error of `1e-10`.
+
+---
+
+## The network
+
+```text
+x    (N, D)   inputs, N samples of D features
+z1 = x @ W1 + b1        (N, H)   pre-activation
+a1 = relu(z1)           (N, H)   hidden activations
+z2 = a1 @ W2 + b2       (N, C)   logits
+p  = softmax(z2)        (N, C)   class probabilities
+L  = -mean( log p[i, y[i]] )     scalar cross-entropy
+```
+
+`W1` is `(D, H)`, `b1` is `(H,)`, `W2` is `(H, C)`, `b2` is `(C,)`. Note that these are the transposes of what `nn.Linear` stores, because here the weights multiply on the right.
+
+The dataset is three Gaussian blobs in four dimensions:
+
+```python title="data.py"
+import numpy as np
+
+def make_data(seed=0, N=300, D=4, C=3):
+    rng = np.random.default_rng(seed)
+    centroids = rng.standard_normal((C, D)) * 2.0
+    y = rng.integers(0, C, N)
+    x = centroids[y] + rng.standard_normal((N, D)) * 0.7
+    return x, y
+
+x, y = make_data()
+print(x.shape, y.shape)      # (300, 4) (300,)
+print(y[:12].tolist())       # [1, 2, 1, 0, 2, 2, 2, 0, 0, 2, 0, 1]
+print(np.bincount(y))        # [92 96 112]
+```
+
+Weights start at He normal, `std = sqrt(2 / fan_in)`, which [Layers and Initialization](/ai/neural-networks/layers-and-initialization) showed is the right scale for ReLU:
+
+```python title="init.py"
+def init_params(D, H, C, seed=1):
+    rng = np.random.default_rng(seed)
+    return (
+        rng.standard_normal((D, H)) * np.sqrt(2 / D),
+        np.zeros(H),
+        rng.standard_normal((H, C)) * np.sqrt(2 / H),
+        np.zeros(C),
+    )
+```
+
+---
+
+## The forward pass, cached
+
+Backpropagation needs the intermediate values from the forward pass. Every gradient below is a function of something computed on the way in, so the forward pass has to keep those values around. That is what the cache is, and it is also why training uses more memory than inference: inference can throw each intermediate away as soon as the next one is computed.
+
+```python title="forward.py"
+import numpy as np
+
+def softmax(z):
+    z = z - z.max(axis=1, keepdims=True)      # the log-sum-exp trick
+    e = np.exp(z)
+    return e / e.sum(axis=1, keepdims=True)
+
+def forward(x, y, W1, b1, W2, b2):
+    z1 = x @ W1 + b1
+    a1 = np.maximum(0.0, z1)
+    z2 = a1 @ W2 + b2
+    p = softmax(z2)
+    N = x.shape[0]
+    loss = -np.log(p[np.arange(N), y]).mean()
+    return loss, (x, y, z1, a1, p, N)
+```
+
+Six things go into the cache. `x` is needed for `dW1`. `z1` is needed for the ReLU mask. `a1` is needed for `dW2`. `p` and `y` are needed for `dz2`. `N` is the divisor.
+
+Subtracting the row maximum inside `softmax` does not change the result, since softmax is shift-invariant, and it prevents `exp` from overflowing on large logits. [Softmax and Logits](/ai/math-foundations/softmax-and-logits) covers why.
+
+The loss starts at `2.194449` on this dataset with `H = 16`. Guessing uniformly among three classes would give `ln(3) = 1.0986`, so the random network is worse than guessing: it makes confident wrong predictions. That is normal and it is the reason warmup exists.
+
+---
+
+## The backward pass
+
+Work backwards from the loss. The chain rule applies at every step, and at every step the shape of the incoming gradient determines the shape of the outgoing one.
+
+### 1. Gradient at the logits
+
+This is the one worth deriving in full, because it collapses beautifully. For a single sample, `L = -log p_y` and `p = softmax(z)`:
+
+```text
+dp_y/dz_k = p_y * (delta_ky - p_k)
+
+dL/dz_k   = -(1/p_y) * dp_y/dz_k
+          = -(1/p_y) * p_y * (delta_ky - p_k)
+          = p_k - delta_ky
+```
+
+Averaging over the batch divides by `N`:
+
+```text
+dz2 = (p - onehot(y)) / N          shape (N, C)
+```
+
+The gradient of softmax cross-entropy with respect to its logits is the predicted distribution minus the target distribution. No Jacobian, no matrix. This is the single most useful identity in deep learning, and it is why `nn.CrossEntropyLoss` takes logits rather than probabilities: the combination of `log_softmax` and `nll_loss` produces this exact expression in one numerically stable step.
+
+### 2. Gradients of the second layer
+
+`z2 = a1 @ W2 + b2`. Treating `a1` as fixed:
+
+```text
+dW2 = a1.T @ dz2          (H, N) @ (N, C) -> (H, C)     matches W2
+db2 = dz2.sum(axis=0)     (N, C) -> (C,)                matches b2
+```
+
+`db2` is a column sum because the bias is broadcast across all `N` rows, so its gradient is the sum of the contributions from each row. The same reasoning gives `db1` below.
+
+### 3. Pushing through to the hidden layer
+
+```text
+da1 = dz2 @ W2.T          (N, C) @ (C, H) -> (N, H)     matches a1
+```
+
+### 4. Through the ReLU
+
+ReLU's derivative is `1` where the pre-activation was positive and `0` elsewhere, so the gradient is masked element-wise:
+
+```text
+dz1 = da1 * (z1 > 0)      (N, H)                        matches z1
+```
+
+This is where a dead unit shows up. If `z1[i, j] <= 0` for every sample `i`, then column `j` of `dz1` is entirely zero, so `dW1[:, j]` and `db1[j]` are zero, so that unit never updates and stays dead.
+
+### 5. Gradients of the first layer
+
+```text
+dW1 = x.T @ dz1           (D, N) @ (N, H) -> (D, H)     matches W1
+db1 = dz1.sum(axis=0)     (N, H) -> (H,)                matches b1
+```
+
+Every parameter gradient has the same shape as its parameter. That is not a coincidence and it is the fastest sanity check available: if `dW1` does not have shape `(D, H)`, the derivation is wrong.
+
+---
+
+## Implementing it
+
+```python title="backward.py"
+def backward(cache, W2):
+    x, y, z1, a1, p, N = cache
+    dz2 = (p - np.eye(p.shape[1])[y]) / N
+    dW2 = a1.T @ dz2
+    db2 = dz2.sum(axis=0)
+    da1 = dz2 @ W2.T
+    dz1 = da1 * (z1 > 0)
+    dW1 = x.T @ dz1
+    db1 = dz1.sum(axis=0)
+    return dW1, db1, dW2, db2
+```
+
+`np.eye(C)[y]` is the one-hot encoding: indexing an identity matrix by the label vector picks out one row per sample. Eleven lines, seven gradients, no framework.
+
+And the training loop, which is the five steps from [Training Loop](/ai/pytorch/training-loop) with autograd replaced by the function above:
+
+```python title="mlp.py"
+import numpy as np
+
+# make_data, init_params, softmax, forward, backward as defined above
+
+def accuracy(x, y, W1, b1, W2, b2):
+    logits = np.maximum(0.0, x @ W1 + b1) @ W2 + b2
+    return (logits.argmax(axis=1) == y).mean()
+
+def train(x, y, H=16, lr=0.5, epochs=200):
+    D, C = x.shape[1], int(y.max()) + 1
+    W1, b1, W2, b2 = init_params(D, H, C)
+
+    for epoch in range(epochs):
+        loss, cache = forward(x, y, W1, b1, W2, b2)
+        dW1, db1, dW2, db2 = backward(cache, W2)
+
+        W1 -= lr * dW1
+        b1 -= lr * db1
+        W2 -= lr * dW2
+        b2 -= lr * db2
+
+        if epoch % 25 == 0 or epoch == epochs - 1:
+            print(f"  epoch {epoch:>3}  loss {loss:.6f}  "
+                  f"acc {accuracy(x, y, W1, b1, W2, b2) * 100:5.1f}%")
+
+    return W1, b1, W2, b2
+
+x, y = make_data()
+train(x, y)
+```
+
+```text
+  epoch   0  loss 2.194449  acc  84.7%
+  epoch  25  loss 0.098911  acc  97.7%
+  epoch  50  loss 0.068335  acc  97.7%
+  epoch  75  loss 0.053909  acc  97.3%
+  epoch 100  loss 0.045966  acc  97.7%
+  epoch 125  loss 0.041065  acc  98.0%
+  epoch 150  loss 0.037954  acc  98.0%
+  epoch 175  loss 0.035718  acc  98.3%
+  epoch 199  loss 0.034094  acc  99.0%
+```
+
+Accuracy is already 84.7% at epoch 0 because the blobs are well separated and He initialization points the network in a usable direction before any training. Loss falls two orders of magnitude in the first 25 epochs and then grinds. The non-monotonic accuracy at epoch 75, dipping to 97.3% while the loss keeps falling, is the network becoming more confident about the samples it already gets right rather than fixing the ones it gets wrong. Full-batch SGD on a separable problem does that; it has no stochasticity left to escape with.
+
+---
+
+## Gradient checking
+
+Never trust a hand-derived backward pass. The check is brute force: perturb each parameter by a small `h`, measure how much the loss moves, and compare that against the analytical gradient.
+
+```text
+dL/dtheta ~= ( L(theta + h) - L(theta - h) ) / 2h
+```
+
+Central difference rather than forward difference, because the error is `O(h^2)` instead of `O(h)`. At `h = 1e-5` that is a truncation error around `1e-10`.
+
+```python title="gradcheck.py"
+import numpy as np
+
+def gradcheck(x, y, D, H, C, h=1e-5):
+    W1, b1, W2, b2 = init_params(D, H, C)
+    loss, cache = forward(x, y, W1, b1, W2, b2)
+    analytic = dict(zip(("W1", "b1", "W2", "b2"), backward(cache, W2)))
+    params = {"W1": W1, "b1": b1, "W2": W2, "b2": b2}
+
+    print(f"  loss at init = {loss:.6f}")
+    for name, arr in params.items():
+        numeric = np.zeros_like(arr)
+        it = np.nditer(arr, flags=["multi_index"])
+        while not it.finished:
+            i = it.multi_index
+            old = arr[i]
+
+            arr[i] = old + h
+            plus, _ = forward(x, y, W1, b1, W2, b2)
+            arr[i] = old - h
+            minus, _ = forward(x, y, W1, b1, W2, b2)
+            arr[i] = old
+
+            numeric[i] = (plus - minus) / (2 * h)
+            it.iternext()
+
+        a = analytic[name]
+        abs_err = np.abs(a - numeric).max()
+        rel_err = abs_err / max(np.abs(a).max(), 1e-12)
+        print(f"  {name:<4} {str(arr.shape):<10} abs {abs_err:.3e}  rel {rel_err:.3e}")
+
+x, y = make_data()
+gradcheck(x, y, D=x.shape[1], H=16, C=3)
+```
+
+```text
+  loss at init = 2.194449
+  W1   (4, 16)     abs 4.297e-11  rel 7.728e-11
+  b1   (16,)       abs 2.457e-11  rel 1.019e-10
+  W2   (16, 3)     abs 1.056e-10  rel 8.115e-11
+  b2   (3,)        abs 1.073e-11  rel 4.045e-11
+```
+
+All four relative errors sit at `1e-10`, which is the floor set by the `h^2` truncation term. The derivation is correct.
+
+Two rules for reading this number:
+
+| Relative error   | Meaning                                                                             |
+| :--------------- | :---------------------------------------------------------------------------------- |
+| `< 1e-7`         | Correct. This is float32 noise plus truncation                                      |
+| `1e-5` to `1e-3` | Probably correct in `float32`. Recheck in `float64`                                 |
+| `> 1e-2`         | A bug. Almost always a missing transpose, a wrong reduction axis, or a missing `/N` |
+
+Do the check in `float64`. In `float32` the difference `L(theta + h) - L(theta - h)` loses significant digits to cancellation, and a correct gradient can look wrong. NumPy defaults to `float64` for `standard_normal`, which is why the numbers above are so clean.
+
+<Callout type="info">### `torch.autograd.gradcheck` is this function</Callout>
+
+PyTorch ships the same check as `torch.autograd.gradcheck(fn, inputs, eps=1e-6)`. It exists because custom `autograd.Function` implementations get backward passes wrong constantly, and because the check is cheap relative to the debugging it saves. Use it whenever you write one.
+
+---
+
+## The shape contract
+
+Every shape in the run above, with `N = 300`, `D = 4`, `H = 16`, `C = 3`:
+
+| Tensor | Shape       | Role                                     |
+| :----- | :---------- | :--------------------------------------- |
+| `x`    | `(300, 4)`  | input batch                              |
+| `W1`   | `(4, 16)`   | parameter                                |
+| `z1`   | `(300, 16)` | pre-activation, cached for the ReLU mask |
+| `a1`   | `(300, 16)` | hidden activation, cached for `dW2`      |
+| `W2`   | `(16, 3)`   | parameter                                |
+| `z2`   | `(300, 3)`  | logits                                   |
+| `p`    | `(300, 3)`  | probabilities, cached for `dz2`          |
+| `dz2`  | `(300, 3)`  | gradient at the logits                   |
+| `dW2`  | `(16, 3)`   | matches `W2`                             |
+| `db2`  | `(3,)`      | matches `b2`                             |
+| `da1`  | `(300, 16)` | matches `a1`                             |
+| `dz1`  | `(300, 16)` | matches `z1`                             |
+| `dW1`  | `(4, 16)`   | matches `W1`                             |
+| `db1`  | `(16,)`     | matches `b1`                             |
+
+Activation gradients keep the batch dimension. Parameter gradients lose it, summed away by the `x.T @` and `a1.T @` products. That sum is the entire content of mini-batching: a batch of 300 samples contributes one averaged gradient, not 300 of them.
+
+---
+
+## The one bug everyone writes
+
+Drop the `/N` from `dz2`:
+
+```text
+max|dW2| with /N     = 1.301190e+00
+max|dW2| without /N  = 3.903569e+02
+ratio                = 300.0 = N
+```
+
+The gradient is exactly `N` times too large, so the effective learning rate is `N` times what you set. At `N = 300` and `lr = 0.5` the network diverges immediately. The failure is quiet in a specific way: if you lower `lr` to compensate, the network trains normally and you never learn the bug is there. It only surfaces when you change the batch size, because then the effective learning rate changes with it and your tuned `lr` stops working.
+
+The same class of bug appears with gradient accumulation, covered in [Training Loop](/ai/pytorch/training-loop): `loss.backward()` adds to `.grad`, so four micro-batches summed without dividing by four give four times the gradient a true large batch would.
+
+---
+
+## What autograd is doing for you
+
+Compare the code above with the same network in PyTorch:
+
+```python title="same_in_torch.py"
+import numpy as np
+import torch
+from torch import nn
+
+x_np, y_np = make_data()
+x = torch.from_numpy(x_np).float()
+y = torch.from_numpy(y_np).long()
+
+model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 3))
+loss_fn = nn.CrossEntropyLoss()
+opt = torch.optim.SGD(model.parameters(), lr=0.5)
+
+for epoch in range(200):
+    opt.zero_grad()
+    loss = loss_fn(model(x), y)
+    loss.backward()
+    opt.step()
+```
+
+`loss.backward()` computes all seven gradients by walking the graph that the forward pass built. [Autograd Engine](/ai/pytorch/autograd-engine) covers how the graph is recorded. The value of writing the NumPy version first is that you know what those seven gradients are, so when a shape error appears in a real model you can tell which of the seven is wrong.
+
+What the PyTorch version handles that the NumPy version does by hand:
+
+| Feature              | NumPy version          | PyTorch version                              |
+| :------------------- | :--------------------- | :------------------------------------------- |
+| Batch reduction      | manual `/N`            | `reduction="mean"` is the default            |
+| Numerical stability  | manual max-subtraction | fused inside `log_softmax`                   |
+| Memory               | cache everything       | frees each node once its backward runs       |
+| Weight storage order | `(in, out)`            | `(out, in)`, so `F.linear` uses `@ W.T`      |
+| Speed                | CPU BLAS               | GPU, and fused kernels under `torch.compile` |
+
+The weight storage order row is the one that bites people converting checkpoints. See [Checkpointing](/ai/pytorch/checkpointing) for the conversion.
+
+---
+
+## Interview questions
+
+- **What is the gradient of softmax cross-entropy with respect to the logits?** `p - onehot(y)`, averaged over the batch. The softmax Jacobian and the log cancel exactly, which is why the expression contains no matrix.
+- **Why does `nn.CrossEntropyLoss` take logits instead of probabilities?** Applying `log_softmax` and `nll_loss` together produces `p - onehot(y)` in one pass and subtracts the row maximum internally, so it is stable for large logits. Passing softmax output double-applies the nonlinearity and loses that stability.
+- **Why does the backward pass need a cache?** Every parameter gradient is a product of an incoming gradient and a forward-pass intermediate. `dW2 = a1.T @ dz2` needs `a1`, and the ReLU mask needs `z1`. Nothing in the backward pass can recompute them from the parameters alone.
+- **Why is training more memory-hungry than inference?** Training holds every cached intermediate until its backward node runs. Inference computes and discards, which is why `torch.no_grad()` and `inference_mode` cut memory so sharply.
+- **How do you verify a hand-written backward pass?** Central differences, `(L(theta + h) - L(theta - h)) / 2h`, with `h = 1e-5` in `float64`. A correct implementation matches to a relative error around `1e-10`. Above `1e-2` there is a bug.
+- **Why central difference rather than forward difference?** Forward difference has `O(h)` truncation error, central difference `O(h^2)`. At `h = 1e-5` that is the difference between an error floor of `1e-5` and `1e-10`.
+- **What shape does a parameter gradient have, and why?** The same shape as the parameter. Activation gradients carry the batch dimension; parameter gradients do not, because the batch is summed away by the transpose-multiply.
+- **What happens if you forget to divide by the batch size?** The gradient is `N` times too large, so the effective learning rate is `N` times what you set. Lowering `lr` hides it until you change the batch size.
+- **Where does a dead ReLU unit show up in the backward pass?** Its column in `dz1` is zero for every sample, so the corresponding column of `dW1` and the matching entry of `db1` are zero. The unit cannot recover within that run.
+- **Why store `W` as `(in, out)` here and `(out, in)` in `nn.Linear`?** The NumPy version multiplies on the right, so `W` has to be `(in, out)`. PyTorch stores one neuron's weights per row for readability and applies the transpose inside `F.linear`.

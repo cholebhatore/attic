@@ -1,0 +1,350 @@
+---
+title: Neurons and Activations
+description: 'The affine transform, ReLU and dead units, GELU and its tanh approximation, SiLU, and how SwiGLU becomes a transformer feed-forward block.'
+---
+
+A neuron is two operations. A weighted sum, which is linear, and a squashing function, which is not. Everything interesting about neural networks comes from the second one, and everything interesting about the second one comes from its derivative.
+
+This page works through the four activations you will meet in practice: ReLU, GELU, SiLU, and the gated SwiGLU. Each has a specific shape, a specific derivative, and a specific failure mode.
+
+---
+
+## What one neuron computes
+
+Take an input vector `x` of length `n`, a weight vector `w` of the same length, and a scalar bias `b`. The neuron computes a pre-activation `z` and passes it through an activation `a`:
+
+```text
+z = w . x + b        pre-activation, a scalar
+a = f(z)             activation, a scalar
+```
+
+The dot product is a projection. It measures how much of `x` points along `w`, which is why [Similarity and Norms](/ai/math-foundations/similarity-and-norms) matters here: a neuron with unit-norm weights is computing cosine similarity to `w` scaled by the magnitude of `x`. The bias `b` slides the decision boundary off the origin, so the neuron fires at `w . x = -b` rather than at `w . x = 0`.
+
+A layer is `m` of these sharing the same input. Stack the weight vectors into a matrix `W` of shape `(m, n)` and the biases into a vector of shape `(m,)`, and the whole layer is one matrix product:
+
+```python title="neuron.py"
+import numpy as np
+
+def relu(z):
+    return np.maximum(0.0, z)
+
+W = np.array([[1.0, 2.0], [0.5, -0.5], [-1.0, 0.0]])   # (3, 2)
+b = np.array([0.0, 1.0, -1.0])                          # (3,)
+x = np.array([1.0, 1.0])                                # (2,)
+
+z = x @ W.T + b
+print(z.tolist())          # [3.0, 1.0, -2.0]
+print(relu(z).tolist())    # [3.0, 1.0, 0.0]
+```
+
+Three neurons, one matmul. The `W.T` is there because PyTorch stores a linear layer's weight as `(out_features, in_features)` and multiplies on the right, so a batch of inputs `(batch, in_features)` needs the transpose to line up. [Checkpointing](/ai/pytorch/checkpointing) covers the same convention when converting weights from Keras.
+
+<Callout type="info">
+  ### Why the loop disappears
+
+Writing this as a loop over the 3 neurons gives identical results and is measurably slower. At
+`batch=256`, `n=512`, `m=512`, looping 512 separate dot products takes 8.18 ms against 1.81 ms for
+one `x @ W.T`, a factor of 4.5. The matmul hands the whole batch to BLAS, which tiles it into
+cache and uses fused multiply-add instructions. This is the single transformation that makes deep
+learning fast, and it is why tensor shape bugs are the most common bugs you will write.
+
+</Callout>
+
+---
+
+## Why the nonlinearity is the whole point
+
+Drop `f` and stack two linear layers:
+
+```text
+y = W2 (W1 x + b1) + b2
+  = (W2 W1) x + (W2 b1 + b2)
+  = W' x + b'
+```
+
+Two layers become one, with a combined weight matrix `W' = W2 W1` and a combined bias. This holds for any depth: a hundred linear layers are algebraically one linear layer, and the network can only ever represent affine functions.
+
+```python title="collapse.py"
+import numpy as np
+
+rng = np.random.default_rng(3)
+W1, b1 = rng.standard_normal((6, 4)), rng.standard_normal(6)
+W2, b2 = rng.standard_normal((3, 6)), rng.standard_normal(3)
+x = rng.standard_normal((5, 4))
+
+two = (x @ W1.T + b1) @ W2.T + b2
+one = x @ (W2 @ W1).T + (W2 @ b1 + b2)
+
+print(two.shape, one.shape)                     # (5, 3) (5, 3)
+print(np.abs(two - one).max())                  # 3.553e-15
+print(np.linalg.matrix_rank(W2 @ W1))           # 3
+```
+
+The residual is floating-point noise. And note the rank: `W2 @ W1` is `(3, 4)` with rank 3, capped by the narrowest layer in the stack. Depth without nonlinearity buys nothing and costs a bottleneck.
+
+The activation is what breaks the collapse. `f(W1 x + b1)` cannot be rewritten as `W' x + b'` for any `W'`, so each layer adds a genuinely new function. A two-layer MLP with a nonlinearity can approximate any continuous function on a compact set, which is the universal approximation theorem, and it does so with a width that grows polynomially rather than exponentially in the depth you would otherwise need.
+
+<Callout type="warn">
+  ### A wide linear layer is still a linear layer
+
+If a model is underfitting, adding width to a network with weak nonlinearities rarely helps.
+Adding depth does, because each nonlinear layer adds expressiveness. Adding width only adds rank,
+and rank is already capped by your narrowest layer.
+
+</Callout>
+
+---
+
+## ReLU
+
+```text
+ReLU(z) = max(0, z)
+ReLU'(z) = 1 if z > 0, else 0
+```
+
+The rectified linear unit is the default for a reason. It is one comparison and one multiply, it saturates nowhere on the positive side, and its derivative is exactly `1` wherever it is active, so gradients pass through a deep stack without shrinking.
+
+That last property is the whole point. Compare it to `tanh`, whose derivative peaks at `1.0` at `z = 0` and falls to `0.0099` at `z = 3`. Every layer of `tanh` multiplies the gradient by something less than one, so forty layers shrink it by a factor that compounds into nothing. This is the vanishing gradient problem, and ReLU fixes it by not squashing.
+
+### The dead unit problem
+
+ReLU's derivative is `0` for `z <= 0`. A unit whose pre-activation is negative for every input in the dataset gets zero gradient, so its weights never update, so its pre-activation stays negative. The unit is dead and stays dead for the rest of training.
+
+How likely this is depends entirely on where the pre-activations sit. If `z` is standard normal, symmetry gives exactly half the units outputting zero on any given input, which is fine because a different half fires for a different input. Trouble starts when the pre-activations drift negative:
+
+| Pre-activation distribution | Fraction with `z <= 0` |
+| :-------------------------- | :--------------------- |
+| `N(0, 1)`                   | 50.0%                  |
+| `N(-1, 1)`                  | 84.1%                  |
+| `N(-2, 1)`                  | 97.7%                  |
+| `N(-3, 1)`                  | 99.9%                  |
+
+A mean shift of `-2` in the pre-activations kills almost the entire layer, and it can happen from one bad gradient step early in training with a learning rate that is too high. This is why [Layers and Initialization](/ai/neural-networks/layers-and-initialization) spends so much time on where the weights start, and why normalization layers exist.
+
+Three fixes exist, and you will see all of them:
+
+```text
+LeakyReLU(z) = z          if z > 0
+             = alpha * z  if z <= 0     alpha = 0.01 by default
+```
+
+Leaky ReLU gives the negative side a small slope so the gradient is never exactly zero. `PReLU` makes `alpha` learnable per channel. `ELU` uses `alpha * (exp(z) - 1)` instead, which is smooth at zero and saturates at `-alpha` rather than diverging, at the cost of an exponential.
+
+---
+
+## GELU
+
+```text
+GELU(z) = z * Phi(z)
+```
+
+where `Phi` is the standard normal cumulative distribution function. The Gaussian Error Linear Unit scales each input by the probability that a standard normal draw falls below it. Large positive inputs pass through nearly unchanged because `Phi(z)` approaches `1`. Large negative inputs are zeroed because `Phi(z)` approaches `0`. Inputs near zero are scaled by about `0.5`.
+
+It is a smooth ReLU, and the smoothness is the reason it displaced ReLU in transformers. BERT, GPT-2 and GPT-3 use it, as do most vision transformers.
+
+`Phi` involves an `erf`, which is slow, so nearly every implementation uses the tanh approximation instead:
+
+```text
+GELU(z) ~= 0.5 * z * (1 + tanh( sqrt(2/pi) * (z + 0.044715 * z^3) ))
+```
+
+```python title="gelu_error.py"
+import numpy as np
+from math import erf, pi, sqrt
+
+def gelu_exact(z):
+    return 0.5 * z * (1.0 + np.vectorize(erf)(z / sqrt(2.0)))
+
+def gelu_tanh(z):
+    return 0.5 * z * (1.0 + np.tanh(sqrt(2 / pi) * (z + 0.044715 * z**3)))
+
+xs = np.linspace(-6, 6, 240001)
+err = np.abs(gelu_exact(xs) - gelu_tanh(xs))
+i = int(np.argmax(err))
+
+print(f"{err[i]:.3e} at x = {xs[i]:.4f}")     # 4.732e-04 at x = -2.6989
+print(f"{abs(gelu_exact(1.0) - gelu_tanh(1.0)):.3e}")   # 1.528e-04
+```
+
+The worst disagreement is `4.7e-4`, about a twentieth of a percent of the activation value, near `|z| = 2.7`. Nothing downstream can resolve that. `nn.GELU(approximate="tanh")` and `nn.GELU(approximate="none")` are interchangeable in practice, and the tanh form is faster because it avoids `erf`.
+
+GELU also dips below zero. Its minimum is `-0.16997` at `z = -0.75179`, so unlike ReLU it can express a small negative output, which is what keeps gradients flowing through units that would otherwise be dead.
+
+---
+
+## SiLU
+
+```text
+SiLU(z) = z * sigmoid(z)
+```
+
+The Sigmoid Linear Unit, published independently as Swish, is GELU's close cousin: replace the normal CDF with a logistic. Same qualitative shape, same small negative dip, same smoothness.
+
+```python title="silu_minimum.py"
+import numpy as np
+
+def sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
+def silu(z):
+    return z * sigmoid(z)
+
+xs = np.linspace(-5, 0, 5000001)
+ys = silu(xs)
+j = int(np.argmin(ys))
+
+print(f"{ys[j]:.6f} at x = {xs[j]:.6f}")   # -0.278465 at x = -1.278465
+```
+
+The minimum is `-0.278465` at `z = -1.278465`, which solves `sigmoid(z) * (1 + z * (1 - sigmoid(z))) = 0`. SiLU's negative dip is about 64% deeper than GELU's, and that is a real difference in behaviour, not a rounding error. It gives the unit more room to push activations negative, which helps on tasks where the sign carries information.
+
+SiLU is the activation inside SwiGLU, which is why LLaMA, PaLM, Mistral, and Qwen all use it.
+
+---
+
+## All four, side by side
+
+Evaluated at the same nine points:
+
+| `z`         | -3.0000 | -2.0000 | -1.0000 | -0.5000 | 0.0000 | 0.5000 | 1.0000 | 2.0000 | 3.0000 |
+| :---------- | :------ | :------ | :------ | :------ | :----- | :----- | :----- | :----- | :----- |
+| `ReLU`      | 0.0000  | 0.0000  | 0.0000  | 0.0000  | 0.0000 | 0.5000 | 1.0000 | 2.0000 | 3.0000 |
+| `LeakyReLU` | -0.0300 | -0.0200 | -0.0100 | -0.0050 | 0.0000 | 0.5000 | 1.0000 | 2.0000 | 3.0000 |
+| `ELU`       | -0.9502 | -0.8647 | -0.6321 | -0.3935 | 0.0000 | 0.5000 | 1.0000 | 2.0000 | 3.0000 |
+| `tanh`      | -0.9951 | -0.9640 | -0.7616 | -0.4621 | 0.0000 | 0.4621 | 0.7616 | 0.9640 | 0.9951 |
+| `GELU`      | -0.0040 | -0.0455 | -0.1587 | -0.1543 | 0.0000 | 0.3457 | 0.8413 | 1.9545 | 2.9960 |
+| `SiLU`      | -0.1423 | -0.2384 | -0.2689 | -0.1888 | 0.0000 | 0.3112 | 0.7311 | 1.7616 | 2.8577 |
+
+Three things to read off this table.
+
+`ReLU` and `LeakyReLU` and `GELU` and `SiLU` are all unbounded above. At `z = 3` they output `3.0`, `3.0`, `2.996`, `2.858`. `tanh` outputs `0.9951` and would output `0.9999` at `z = 5`. The bounded activations destroy information about magnitude once the input is large, and their gradients vanish there. That is the practical reason the field moved off `tanh` and `sigmoid` for hidden layers.
+
+`GELU` and `SiLU` are not monotonic. Both turn around in the negative region, which is what creates their dips. This means a single GELU or SiLU unit can, on its own, distinguish "strongly negative" from "slightly negative" in a way ReLU cannot: ReLU maps both to zero.
+
+At `z = 1`, GELU passes `0.8413` and SiLU passes `0.7311`. SiLU is consistently the smaller of the two for positive inputs and the more negative for negative ones. If you swap one for the other without retuning, the activation scale of every layer shifts, and the downstream normalization has to absorb it.
+
+---
+
+## Derivatives
+
+Computed by central difference with `h = 1e-6`:
+
+| `z`     | -3.0000 | -2.0000 | -1.0000 | -0.5000 | 0.0000 | 0.5000 | 1.0000 | 2.0000 | 3.0000 |
+| :------ | :------ | :------ | :------ | :------ | :----- | :----- | :----- | :----- | :----- |
+| `ReLU'` | 0.0000  | 0.0000  | 0.0000  | 0.0000  | 0.0000 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+| `GELU'` | -0.0119 | -0.0852 | -0.0833 | 0.1325  | 0.5000 | 0.8675 | 1.0833 | 1.0852 | 1.0119 |
+| `SiLU'` | -0.0881 | -0.0908 | 0.0723  | 0.2600  | 0.5000 | 0.7400 | 0.9277 | 1.0908 | 1.0881 |
+| `tanh'` | 0.0099  | 0.0707  | 0.4200  | 0.7864  | 1.0000 | 0.7864 | 0.4200 | 0.0707 | 0.0099 |
+
+The `tanh'` row is the one to compare against. Its maximum is `1.0` at the origin and it collapses to `0.0099` at `|z| = 3`, so a `tanh` network whose pre-activations are spread out has a gradient that shrinks by a factor of 100 per layer. ReLU's derivative is `0` or `1` with nothing in between, so the surviving half of the units pass gradient through untouched. GELU and SiLU peak slightly above `1.0`, around `1.085` and `1.091`, and go mildly negative in the dip region, so they behave like ReLU for large positive `z` while keeping a nonzero gradient everywhere else.
+
+The negative derivatives are what makes GELU and SiLU non-monotonic, and they are useful: a unit can learn to _reduce_ its output as the input becomes more negative, instead of just flattening out.
+
+At `z = 0` ReLU's derivative is undefined. PyTorch picks `0`. The choice never matters in floating point because the probability of landing exactly on zero is nil, but it does matter if you are gradient-checking a hand-written implementation against autograd, which [MLP from Scratch](/ai/neural-networks/mlp-from-scratch) does.
+
+---
+
+## Gated units and SwiGLU
+
+A gated linear unit splits the input into two paths, applies a linear map to each, passes one through an activation, and multiplies them together element-wise:
+
+```text
+GLU(x, W, V) = (x W) * sigmoid(x V)
+```
+
+The gate `sigmoid(x V)` decides how much of the value path `x W` gets through, per element. This is strictly more expressive than a plain activation because the gate is computed from the input rather than from the value itself, so the network can learn to suppress specific features conditionally.
+
+SwiGLU replaces the sigmoid gate with SiLU:
+
+```text
+SwiGLU(x, W, V, W2) = ( SiLU(x W) * (x V) ) W2
+```
+
+Two projections in, one element-wise product, one projection out. That is three weight matrices where a standard feed-forward block has two.
+
+<Mermaid
+  chart={`
+flowchart LR
+    X["x  (batch, d)"] --> Wg["W_gate  (d, h)"]
+    X --> Wu["W_up  (d, h)"]
+    Wg --> S["SiLU"]
+    S --> M["element-wise *"]
+    Wu --> M
+    M --> Wd["W_down  (h, d)"]
+    Wd --> Y["y  (batch, d)"]
+`}
+/>
+
+```python title="swiglu.py"
+import numpy as np
+
+def sigmoid(z):
+    return 1.0 / (1.0 + np.exp(-z))
+
+def silu(z):
+    return z * sigmoid(z)
+
+def swiglu(x, W_gate, W_up, W_down):
+    return (silu(x @ W_gate) * (x @ W_up)) @ W_down
+
+rng = np.random.default_rng(0)
+d, h, batch = 64, 128, 2
+x = rng.standard_normal((batch, d))
+W_gate = rng.standard_normal((d, h)) / np.sqrt(d)
+W_up = rng.standard_normal((d, h)) / np.sqrt(d)
+W_down = rng.standard_normal((h, d)) / np.sqrt(h)
+
+y = swiglu(x, W_gate, W_up, W_down)
+print(y.shape)                        # (2, 64)
+
+d, h = 4096, 11008                    # LLaMA-7B feed-forward dimensions
+print(3 * d * h)                      # 135266304  SwiGLU, three matrices
+print(2 * d * (4 * d))                # 134217728  standard FFN, two matrices at h = 4d
+```
+
+Three matrices cost more than two, so implementations shrink `h` to keep the parameter count roughly even. The standard transformer feed-forward uses `h = 4d` and two matrices, giving `8d^2` parameters. SwiGLU uses three, so parameter-neutral means `h = 8d/3`. Real models round that up to a multiple of 256 so the matmul dimensions divide evenly into tensor cores:
+
+| `d`  | Standard `h = 4d` | `8d/3` exact | SwiGLU `h` (rounded) | Standard params | SwiGLU params | Ratio  |
+| :--- | :---------------- | :----------- | :------------------- | :-------------- | :------------ | :----- |
+| 2048 | 8192              | 5461.33      | 5632                 | 33.55M          | 34.60M        | 1.0312 |
+| 3072 | 12288             | 8192.00      | 8192                 | 75.50M          | 75.50M        | 1.0000 |
+| 4096 | 16384             | 10922.67     | 11008                | 134.22M         | 135.27M       | 1.0078 |
+| 5120 | 20480             | 13653.33     | 13824                | 209.72M         | 212.34M       | 1.0125 |
+| 8192 | 32768             | 21845.33     | 22016                | 536.87M         | 541.07M       | 1.0078 |
+
+This is where LLaMA's `11008` comes from. `d = 4096`, `4d = 16384`, `int(2/3 * 16384) = 10922`, rounded up to a multiple of 256 gives `11008`. The ratio `1.0078` says the gated block costs under one percent more parameters than the standard one.
+
+At `d = 3072` the rounding lands exactly on `8192` and the ratio is `1.0000`, which is a coincidence of `d` being divisible by 3 rather than a designed property.
+
+---
+
+## Choosing one
+
+| Use            | When                                                                                                        |
+| :------------- | :---------------------------------------------------------------------------------------------------------- |
+| `nn.ReLU`      | CNNs, MLPs, anything where speed matters more than the last fraction of a percent                           |
+| `nn.GELU`      | Transformers, especially BERT-style encoders and vision transformers                                        |
+| `nn.SiLU`      | Inside a gated block, which means SwiGLU feed-forward layers in decoder LLMs                                |
+| `nn.LeakyReLU` | GANs and autoencoders, where dead units are common and the negative slope preserves information             |
+| `nn.PReLU`     | When you have the budget to learn `alpha` per channel and suspect dead units                                |
+| `nn.ELU`       | Rare now. Self-normalizing networks with `SELU` are the remaining niche                                     |
+| `nn.Tanh`      | Output layers that must be bounded to `(-1, 1)`, and inside LSTM gates where the bounded range is the point |
+| `nn.Sigmoid`   | Output layers for binary classification and multi-label heads. Never a hidden layer                         |
+
+The last row is worth stating plainly. `sigmoid` in a hidden layer caps the output at `1` and the gradient at `0.25`, so a forty-layer sigmoid network attenuates its gradient by `0.25^40`. That is why the 2010s moved to ReLU and why sigmoid survives only where you need a probability or a gate.
+
+For a new model today: ReLU for a CNN or an MLP, GELU for a transformer encoder, SiLU inside SwiGLU for a decoder. Do not spend search budget on the choice; it is worth less than the learning rate.
+
+---
+
+## Interview questions
+
+- **Why does a network need a nonlinearity?** Two stacked linear layers are algebraically one linear layer, `W2(W1 x + b1) + b2 = (W2 W1)x + (W2 b1 + b2)`, and the combined matrix has rank capped by the narrowest layer. Depth without nonlinearity adds parameters without adding expressiveness.
+- **What is a dead ReLU unit and how does it happen?** A unit whose pre-activation is negative for every input receives zero gradient, so its weights never move, so it stays negative. It is permanent for that run. It happens when a large gradient step pushes the pre-activation mean negative, or when the learning rate is high early in training.
+- **Why did transformers move from ReLU to GELU?** GELU is smooth everywhere and has a nonzero derivative across the whole negative region, so no unit can die and the gradient is a continuous function of the input. It also has a small negative dip, letting a unit reduce its output rather than only flatten it.
+- **What is the tanh approximation to GELU and how accurate is it?** `0.5 z (1 + tanh(sqrt(2/pi)(z + 0.044715 z^3)))` replaces the normal CDF with a logistic form to avoid `erf`. The worst absolute error is `4.7e-4` near `|z| = 2.7`, which no downstream layer can resolve.
+- **How does SiLU differ from GELU?** SiLU gates with a logistic instead of a normal CDF. Its negative dip is deeper, `-0.278465` at `z = -1.278465` against GELU's `-0.16997` at `z = -0.75179`, and it passes less of the positive range.
+- **What is SwiGLU and why does it need three weight matrices?** A gate path and a value path, both linear projections of the input, multiplied element-wise after the gate passes through SiLU, then projected back down. Three matrices against a standard feed-forward's two.
+- **Why is LLaMA's feed-forward width 11008 and not 16384?** Three matrices cost 50% more than two, so the hidden width is shrunk to keep the parameter count even. Parameter-neutral is `h = 8d/3 = 10922.67` for `d = 4096`, rounded up to a multiple of 256 for tensor-core alignment, giving `11008`.
+- **Why is `sigmoid` unsuitable as a hidden-layer activation?** Its output saturates at `1` and its derivative peaks at `0.25`, so gradients shrink by at least a factor of four per layer. Its surviving uses are output layers that must produce a probability and LSTM gates, where saturation is the intended behaviour.
+- **What does the bias term contribute?** It shifts the activation threshold off the origin, so the unit fires at `w . x = -b`. Without it every layer's decision boundary is forced through zero and the network cannot represent a shifted threshold at all.
