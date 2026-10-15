@@ -1,0 +1,198 @@
+---
+title: Scaling and Parallelism
+description: Kaplan versus Chinchilla scaling laws, tokens-per-parameter ratios in real releases, and data, tensor, pipeline, sequence, and expert parallelism.
+---
+
+Two questions sit behind every training run: how big should the model be for a given compute budget, and how do you spread it across devices. The first is a scaling law. The second is a parallelism strategy, and the answer depends on what is too large to fit.
+
+---
+
+## Kaplan's laws
+
+Kaplan et al. (arXiv:2001.08361) fit power laws to training loss against parameters `N`, data `D`, and compute `C`:
+
+```
+L(N) = (N_c / N)^alpha_N        alpha_N = 0.076
+L(D) = (D_c / D)^alpha_D        alpha_D = 0.095
+L(C) = (C_c / C)^alpha_C        alpha_C = 0.050
+```
+
+Three claims from the paper:
+
+1. Loss depends strongly on scale and weakly on architecture details like depth versus width.
+2. Smooth power laws hold over seven orders of magnitude, with no visible plateau.
+3. Large models are more sample-efficient, so for a fixed compute budget you should train a bigger model on less data.
+
+Claim 3 gives the optimal split `N ∝ C^0.73` and `D ∝ C^0.27`. Compute goes mostly to parameters. GPT-3 followed it: 175B parameters on 300B tokens, a ratio of about 1.7 tokens per parameter.
+
+---
+
+## Chinchilla
+
+Hoffmann et al. (arXiv:2203.15556) rederived the same relationship three independent ways and got a different answer. Their conclusion: `N_opt ∝ C^0.50` and `D_opt ∝ C^0.50`. Parameters and tokens should scale together, which gives the rule of thumb **20 training tokens per parameter**.
+
+They trained Chinchilla, 70B parameters on 1.4 trillion tokens, and compared it to Gopher, 280B parameters on 300 billion tokens, at matched compute. Chinchilla reached 67.5% average accuracy on MMLU against Gopher's 60.0%, and cost roughly 7.5x less to serve.
+
+Gopher's ratio was 1.07 tokens per parameter. By Chinchilla's law it was undertrained by a factor of nearly 20 in data.
+
+The paper's fitted loss surface:
+
+```
+L(N, D) = E + A / N^alpha + B / D^beta
+E = 1.69    A = 406.4    alpha = 0.34    B = 410.7    beta = 0.28
+```
+
+The `E` term is the irreducible entropy of the data. No amount of scale removes it, and it is why loss curves flatten rather than reaching zero.
+
+---
+
+## Why frontier models ignore Chinchilla
+
+Chinchilla optimizes training compute. It says nothing about inference compute, and for a deployed model inference dominates total cost. A smaller model trained on far more data costs more to train and much less to serve, and the serving cost is paid every day forever.
+
+| Model       | Params | Training tokens | Tokens per param | Note                         |
+| :---------- | :----- | :-------------- | :--------------- | :--------------------------- |
+| GPT-3       | 175B   | 300B            | 1.7              | Kaplan-optimal               |
+| Gopher      | 280B   | 300B            | 1.1              | Severely undertrained        |
+| Chinchilla  | 70B    | 1.4T            | 20               | The reference point          |
+| Llama 1 65B | 65B    | 1.4T            | 21.5             | Chinchilla-optimal           |
+| Llama 2 70B | 70B    | 2T              | 28.6             | Slightly overtrained         |
+| DeepSeek-V3 | 671B   | 14.8T           | 22               | Near-optimal on total params |
+| Llama 3 8B  | 8B     | 15T             | 1,875            | Deliberately overtrained     |
+
+Llama 3 8B's ratio is not a mistake. The Llama 3 paper (arXiv:2407.21783) argues that a small model trained on a very large dataset performs comparably at inference to a much larger one, and that the inference saving outweighs the extra training cost by a wide margin. DeepSeek-V3's 671B is closer to Chinchilla because MoE lets it pay for 37B of active compute per token while holding 671B of capacity.
+
+<Callout type="info">
+  ### Compute accounting
+
+The standard approximation is `C ≈ 6 N D` FLOPs: 2 per parameter for the forward pass, 4 for the backward. It ignores attention's `O(N^2)` term, which is why it underestimates long-context training. DeepSeek-V3's published budget was 2.788M H800 GPU hours on 2,048 GPUs, at a stated cost under $5.6M.
+
+</Callout>
+
+---
+
+## What does not fit
+
+Before choosing a strategy, identify the constraint. Memory per parameter during training:
+
+| Component               | Bytes per param |
+| :---------------------- | :-------------- |
+| bf16 parameters         | 2               |
+| bf16 gradients          | 2               |
+| fp32 master copy (Adam) | 4               |
+| fp32 momentum           | 4               |
+| fp32 variance           | 4               |
+| **Total**               | **16**          |
+
+A 7.5B model needs 120 GB before a single activation is allocated. That is ZeRO's headline figure (Rajbhandari et al., arXiv:1910.02054), and it explains why optimizer state, not weights, is the first thing you shard.
+
+---
+
+## The five parallelism strategies
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph DP["Data Parallel — shard the batch"]
+        direction LR
+        D1["GPU 0<br/>full model"] --- D2["GPU 1<br/>full model"]
+    end
+    subgraph TP["Tensor Parallel — shard the weights"]
+        direction LR
+        T1["GPU 0<br/>heads 0-15"] --- T2["GPU 1<br/>heads 16-31"]
+    end
+    subgraph PP["Pipeline Parallel — shard the layers"]
+        direction LR
+        P1["GPU 0<br/>layers 0-15"] --> P2["GPU 1<br/>layers 16-31"]
+    end
+    subgraph EP["Expert Parallel — shard the experts"]
+        direction LR
+        E1["GPU 0<br/>experts 0-127"] --- E2["GPU 1<br/>experts 128-255"]
+    end
+    subgraph SP["Sequence Parallel — shard the tokens"]
+        direction LR
+        S1["GPU 0<br/>positions 0-4095"] --- S2["GPU 1<br/>positions 4096-8191"]
+    end
+`}
+/>
+
+### Data parallelism
+
+Replicate the full model, split the batch, all-reduce the gradients. Communication volume per step is `2 * model_size` (reduce-scatter plus all-gather, equivalent to one all-reduce).
+
+It does not help when the model itself does not fit. That is what ZeRO and FSDP fix, by sharding the redundant state instead of replicating it:
+
+| Stage  | What is sharded  | Memory per GPU at 7.5B, 8 GPUs |
+| :----- | :--------------- | :----------------------------- |
+| ZeRO-0 | Nothing (DDP)    | 120 GB                         |
+| ZeRO-1 | Optimizer states | 15 + 15 + 90/8 = 41 GB         |
+| ZeRO-2 | Plus gradients   | 15 + 15/8 + 90/8 = 28 GB       |
+| ZeRO-3 | Plus parameters  | 120/8 = 15 GB                  |
+
+ZeRO-3 and PyTorch FSDP are the same idea. The cost is that ZeRO-3 needs an all-gather of parameters before every layer's forward and backward, so communication grows as memory shrinks.
+
+### Tensor parallelism
+
+Shard individual weight matrices. Megatron-LM (Shoeybi et al., arXiv:1909.08053) showed the pattern that makes it work with one all-reduce per block:
+
+- The MLP's first Linear is **column-parallel**: each GPU holds `[d, d_ff/t]` and computes an independent slice of the hidden activation. No communication.
+- The second Linear is **row-parallel**: each GPU holds `[d_ff/t, d]` and produces a partial sum. One all-reduce combines them.
+- Attention shards by head, which is naturally parallel, then the output projection is row-parallel.
+
+Result: two all-reduces per transformer layer in the forward pass, two more in the backward. That is heavy, so tensor parallelism degree is capped at the number of GPUs in one node, where NVLink bandwidth is an order of magnitude above the inter-node fabric.
+
+### Pipeline parallelism
+
+Shard by layer. GPU 0 holds layers 0 to 15, GPU 1 holds 16 to 31, and activations flow forward while gradients flow back.
+
+The problem is the bubble: with `p` stages, stage `k` is idle until stage `k-1` has produced something. Splitting the batch into `m` microbatches interleaves the stages and shrinks the idle fraction to
+
+```
+bubble_fraction = (p - 1) / (m + p - 1)
+```
+
+With 4 stages and 32 microbatches that is 8.6%. GPipe (Huang et al., arXiv:1811.06965) runs all forward microbatches then all backward ones and needs to store every activation. PipeDream's 1F1B schedule interleaves them so peak activation memory is bounded by `p` microbatches instead of `m`.
+
+### Sequence parallelism
+
+Two distinct things share the name.
+
+**Megatron-SP** (Korthikanti et al., arXiv:2205.05198) shards the parts tensor parallelism leaves replicated: LayerNorm, dropout, and the residual stream, split along the sequence dimension. It replaces one all-reduce with an all-gather plus a reduce-scatter, same volume, but it cuts activation memory by the TP degree.
+
+**Ring Attention / DeepSpeed-Ulysses** (Liu et al., arXiv:2310.01486; Jacobs et al., arXiv:2309.14509) shard the sequence itself so a context longer than one GPU's memory can be trained. Each device holds a contiguous block of positions and passes its KV block around a ring, or exchanges heads via all-to-all, so every block eventually attends to every other.
+
+### Expert parallelism
+
+Shard the `E` experts of an MoE layer across devices. Each token must be dispatched to whichever GPU holds its selected expert and the result combined back, which is an all-to-all in both directions. The communication volume scales with tokens times `k` times `d_model`, and it is the reason MoE training needs a fast interconnect even when the per-token compute is small.
+
+---
+
+## Choosing
+
+| Constraint                       | Strategy                    | Where it runs           |
+| :------------------------------- | :-------------------------- | :---------------------- |
+| Model fits, want more throughput | Data parallel / FSDP        | Anywhere                |
+| Optimizer state does not fit     | ZeRO-1 through ZeRO-3       | Anywhere                |
+| One layer's weights do not fit   | Tensor parallel             | Within a node only      |
+| Layer count is too deep          | Pipeline parallel           | Across nodes            |
+| Context does not fit             | Sequence / context parallel | Across nodes            |
+| Expert count is large            | Expert parallel             | Within a node preferred |
+
+Production runs combine all of them. A typical DeepSeek-V3-scale configuration puts tensor parallel within a node, pipeline parallel across nodes, data parallel across the whole cluster, and expert parallel orthogonal to pipeline. The degrees multiply to the total device count.
+
+---
+
+## Interview questions
+
+1. State Kaplan's optimal compute split and Chinchilla's, and explain why they disagree.
+2. How many training tokens per parameter does the Chinchilla rule of thumb specify, and what two numbers from the paper support it?
+3. What does the `E` term in the Chinchilla loss fit represent?
+4. Llama 3 8B was trained on 15T tokens. Compute its tokens-per-parameter ratio and explain why a lab would choose that.
+5. Account for the 16 bytes per parameter in mixed-precision Adam training.
+6. What does each ZeRO stage shard, and what does ZeRO-3 cost you in communication?
+7. Explain the column-parallel then row-parallel pattern and why it needs only one all-reduce per MLP.
+8. Why is tensor parallelism degree limited to a single node?
+9. Derive the pipeline bubble fraction for 4 stages and 32 microbatches.
+10. What does 1F1B change relative to GPipe?
+11. Name the two different things called sequence parallelism and say what each one shards.
+12. Why does expert parallelism require all-to-all rather than all-reduce?

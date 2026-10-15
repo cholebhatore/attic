@@ -1,0 +1,218 @@
+---
+title: Reading Model Code
+description: How to dissect a Hugging Face modeling_*.py file, map every config.json field to code, inspect weights without loading them, and run a clean architectural ablation.
+---
+
+Every architecture in this phase is a few hundred lines someone already wrote. Reading the real implementation is faster than reading three blog posts about it, and it is the only way to be sure a config field means what you think it means.
+
+---
+
+## Where the code lives
+
+Two places, and knowing which one you are reading matters.
+
+| Location                                                      | When                                                  |
+| :------------------------------------------------------------ | :---------------------------------------------------- |
+| `site-packages/transformers/models/<name>/modeling_<name>.py` | The model is supported upstream                       |
+| `~/.cache/huggingface/modules/transformers_modules/<repo>/`   | Downloaded from the Hub with `trust_remote_code=True` |
+
+A model directory holds four or five files:
+
+- `configuration_<name>.py` — the dataclass holding every field from `config.json`
+- `modeling_<name>.py` — the modules
+- `tokenization_<name>.py` / `tokenization_<name>_fast.py` — the tokenizer
+- `modular_<name>.py` — a newer convention: a compact file that declares only what differs from a parent model, from which the others are generated
+
+`modular_*.py` is the fastest read when it exists, because it shows the delta instead of the whole model.
+
+`trust_remote_code=True` executes Python from a model repository at load time. It is how most Chinese-lab releases ship custom architectures. Treat it the way you treat `curl | sh`: read the file, or pin a revision, before enabling it on a machine that matters.
+
+---
+
+## Reading order
+
+Do not read top to bottom. Follow the forward pass inward.
+
+<Mermaid
+  chart={`
+flowchart TD
+    A["Qwen3ForCausalLM.forward<br/>loss, logits, lm_head"] --> B["Qwen3Model.forward<br/>embed, loop layers, final norm"]
+    B --> C["Qwen3DecoderLayer.forward<br/>two residuals, two norms"]
+    C --> D["Qwen3Attention.forward<br/>QK-norm, RoPE, GQA, cache"]
+    C --> E["Qwen3MLP or Qwen3MoeSparseMoeBlock"]
+    B --> F["Qwen3RotaryEmbedding<br/>cos/sin built once per forward"]
+`}
+/>
+
+Start at `*ForCausalLM.forward`. It is short: embed, run the model, project to `vocab_size`, optionally compute cross-entropy. Everything interesting is one level down. Skip the generation utilities, the `PreTrainedModel` boilerplate, and the `_supports_*` class flags on a first pass.
+
+---
+
+## Mapping config to code
+
+The table below is the field set that appears across Llama 4, DeepSeek-V3, and Qwen 3. Learn what each one controls and you can read any new `config.json` in a minute.
+
+| Field                                             | Controls                                                                          |
+| :------------------------------------------------ | :-------------------------------------------------------------------------------- |
+| `hidden_size`                                     | `d_model`, the residual stream width                                              |
+| `num_hidden_layers`                               | Number of decoder blocks                                                          |
+| `num_attention_heads`                             | Query heads                                                                       |
+| `num_key_value_heads`                             | KV heads. Equal to query heads means MHA, 1 means MQA, anything between means GQA |
+| `head_dim`                                        | Per-head width, sometimes not `hidden_size / num_attention_heads`                 |
+| `intermediate_size`                               | Feed-forward width (or expert width in an MoE)                                    |
+| `intermediate_size_mlp`                           | Dense feed-forward width where both exist                                         |
+| `moe_intermediate_size`                           | Per-expert feed-forward width                                                     |
+| `num_experts` / `n_routed_experts`                | Expert count                                                                      |
+| `num_experts_per_tok`                             | Top-k                                                                             |
+| `shared_expert_intermediate_size`                 | Present means a shared expert exists; absent means it does not                    |
+| `first_k_dense_replace`                           | How many leading layers skip the MoE                                              |
+| `mlp_only_layers`                                 | Explicit list of dense layer indices                                              |
+| `decoder_sparse_step`                             | Every nth layer is MoE                                                            |
+| `use_qk_norm`                                     | Normalize queries and keys per head                                               |
+| `attention_bias`                                  | Bias on the attention projections                                                 |
+| `rope_theta`                                      | RoPE base frequency                                                               |
+| `rope_scaling`                                    | Long-context extension config, `null` means native                                |
+| `max_position_embeddings`                         | Trained or extended context                                                       |
+| `rms_norm_eps`                                    | RMSNorm epsilon                                                                   |
+| `tie_word_embeddings`                             | Whether the input embedding and output head share weights                         |
+| `vocab_size`                                      | Embedding rows. `len(tokenizer)` may be larger                                    |
+| `quantization_config`                             | Post-training quantization recipe                                                 |
+| `layer_types` / `attention_chunk_size`            | Per-layer attention span                                                          |
+| `topk_method` / `scoring_func` / `norm_topk_prob` | Router behaviour                                                                  |
+| `router_aux_loss_coef`                            | Load-balancing penalty weight, `0` means none                                     |
+| `num_nextn_predict_layers`                        | Multi-token prediction module depth                                               |
+
+---
+
+## Inspecting without downloading
+
+The parameter list is in the safetensors index, which is a small JSON file:
+
+```python
+import json
+import urllib.request
+
+url = "https://huggingface.co/Qwen/Qwen3-8B/resolve/main/model.safetensors.index.json"
+index = json.load(urllib.request.urlopen(url))
+
+names = sorted(index["weight_map"])
+print(len(names))                             # one entry per tensor
+print([n for n in names if "layers.0." in n]) # every tensor in block 0
+print(index["metadata"]["total_size"])        # bytes on disk
+```
+
+Tensor names encode the architecture. `model.layers.0.self_attn.k_proj.weight` existing while `self_attn.k_proj.bias` does not tells you `attention_bias = false` without reading the config. `mlp.experts.127.down_proj.weight` tells you there are 128 routed experts. `model.layers.0.mlp.gate_proj.weight` with no `experts` key tells you the layer is dense.
+
+With the weights local:
+
+```python
+from safetensors import safe_open
+
+with safe_open("model-00001-of-00004.safetensors", framework="pt") as f:
+    for name in f.keys():
+        print(name, f.get_slice(name).get_shape(), f.get_slice(name).get_dtype())
+```
+
+`get_slice` reads the header only, so this works on a file far larger than RAM.
+
+---
+
+## Loading and counting
+
+```python
+import torch
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+cfg = AutoConfig.from_pretrained("Qwen/Qwen3-8B")
+print(cfg.num_key_value_heads, cfg.head_dim, cfg.intermediate_size)
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-8B",
+    dtype=torch.bfloat16,          # named torch_dtype before transformers 4.56
+    attn_implementation="sdpa",    # or "flash_attention_2", "eager"
+)
+
+total = sum(p.numel() for p in model.parameters())
+trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"{total:,} total, {trainable:,} trainable")
+
+print(model)                                # the module tree
+for name, p in model.named_parameters():
+    if name.startswith("model.layers.0."):
+        print(name, tuple(p.shape))
+```
+
+`attn_implementation="eager"` gives you the unoptimized path with explicit `matmul` and `softmax`, which is far easier to read and hook than the fused `sdpa` kernel. Use it for inspection, not for serving.
+
+To capture intermediates:
+
+```python
+acts = {}
+
+
+def hook(name):
+    def fn(module, inputs, output):
+        acts[name] = output.detach().float().cpu()
+    return fn
+
+
+model.model.layers[0].self_attn.register_forward_hook(hook("attn0"))
+with torch.no_grad():
+    model(**tok("hello", return_tensors="pt"))
+print(acts["attn0"].shape)                  # (1, 3, 4096) for Qwen3-8B: attn, v, weights
+```
+
+Attention modules return a tuple, so the hook receives all of it. Index into the tuple when you want only the projected output.
+
+---
+
+## Reproducing an ablation
+
+An ablation is a controlled comparison: change one architectural choice, hold everything else fixed, and measure. The discipline matters more than the result.
+
+| Claim to test                       | Change                                            | Measure                                               |
+| :---------------------------------- | :------------------------------------------------ | :---------------------------------------------------- |
+| QK-Norm stabilizes deep stacks      | Set `use_qk_norm = False`, remove the two norms   | Loss spikes over 2000 steps at 24, 36, 48 layers      |
+| GQA trades little quality           | Set `num_key_value_heads = num_attention_heads`   | Loss at matched steps, plus KV cache bytes            |
+| `rope_theta` sets the usable window | Try `10000`, `500000`, `1000000`                  | Perplexity at 4K, 16K, 32K                            |
+| The shared expert matters           | Add one always-active expert to a routed-only MoE | Loss and expert load histogram                        |
+| Dense first layers help             | Vary `first_k_dense_replace` over 0, 1, 3, 6      | Loss at matched FLOPs                                 |
+| Aux-loss-free beats aux loss        | Swap the Switch loss for the bias update          | Loss plus the fraction of experts receiving any token |
+
+Method rules that decide whether the result means anything:
+
+1. **Match compute, not steps.** A wider model sees more FLOPs per step. Compare at equal `6 N D`, not equal iterations.
+2. **Use a proxy model.** 100M to 1B parameters on a few GPUs. The conclusions transfer imperfectly to 671B, but the direction usually holds.
+3. **Fix the tokenizer.** Changing the vocabulary changes the tokens per sample, which changes the effective data budget.
+4. **Log the router.** For any MoE ablation, record a histogram of expert selections every 100 steps. Collapse shows up there long before it shows up in the loss.
+5. **Report the seed spread.** Two seeds at the same config can differ by more than the effect you are measuring. Run three.
+
+```python
+import torch
+
+
+def expert_load_histogram(idx, n_experts):
+    # idx: (batch * seq_len, top_k) from the router
+    counts = torch.bincount(idx.flatten(), minlength=n_experts).float()
+    return (counts / counts.sum()).tolist()
+```
+
+A uniform histogram sits at `1 / n_experts` for every entry. A collapsed one has a handful of large values and a long tail of exact zeros, and the zeros are the dead experts the correction bias exists to revive.
+
+---
+
+## Interview questions
+
+1. What are the four files in a Hugging Face model directory, and which one is the fastest to read?
+2. What does `trust_remote_code=True` do, and what is the risk?
+3. Which class do you start from when reading a new `modeling_*.py`, and why not the top of the file?
+4. Given only a tensor name list from a safetensors index, how would you determine the number of routed experts, whether the model uses attention bias, and whether a layer is dense?
+5. What does `num_key_value_heads` tell you when it equals `num_attention_heads`, when it is 1, and when it is between?
+6. Why does the absence of `shared_expert_intermediate_size` in Qwen3-30B-A3B's config matter?
+7. How do you read the parameter shapes of a 30B model on a laptop?
+8. What does `attn_implementation="eager"` give you that `"sdpa"` does not, and why would you not serve with it?
+9. A forward hook on an attention module receives a tuple. What is in it?
+10. Why must an ablation match compute rather than training steps?
+11. What would you log to detect expert collapse before it appears in the loss curve?
+12. Name three things you must hold fixed for an architectural ablation to be interpretable.

@@ -1,0 +1,136 @@
+---
+title: Foundation Models
+description: How pre-training replaced task-specific training, the adaptation ladder from prompting to continued pre-training, and open-weights versus closed-source trade-offs.
+---
+
+Before 2018 the workflow was one model per task. Sentiment analysis needed a trained classifier, translation needed a separate sequence-to-sequence model, question answering needed a third. Each one was trained from scratch on its own labelled dataset, and none of the work transferred.
+
+A **foundation model** is a model trained on broad data at scale such that it can be adapted to a wide range of downstream tasks (Bommasani et al., arXiv:2108.07258). The definition has two load-bearing parts: the training data is broad rather than task-specific, and the same weights serve many tasks after adaptation.
+
+---
+
+## The three eras of AI engineering
+
+| Era                      | What you train                    | What you need                                     | Iteration time | Example                         |
+| :----------------------- | :-------------------------------- | :------------------------------------------------ | :------------- | :------------------------------ |
+| **Task-specific**        | A whole model                     | Thousands of labelled examples                    | Days to weeks  | A CNN per image class           |
+| **Pretrain + fine-tune** | A classifier head, or all weights | A pretrained checkpoint plus hundreds of examples | Hours          | BERT with a linear layer on top |
+| **Prompt + adapt**       | Nothing, or a small adapter       | A prompt template and a few examples              | Minutes        | GPT-4 with a system prompt      |
+
+The economic consequence is that model capability became a purchasable input. Instead of budgeting a training run, you budget an inference call.
+
+<Callout type="info">
+  ### Emergent abilities, and the argument against them
+
+Wei et al. (arXiv:2206.07682) reported that some capabilities appear only above a scale threshold: multi-step arithmetic and instruction following are at zero for small models and nonzero for large ones, with no smooth improvement in between. Schaeffer et al. (arXiv:2304.15004) argued the effect is an artifact of the metric. Exact-match scoring is discontinuous, so a model whose underlying per-digit accuracy improves smoothly still looks like it jumps from 0% to 100% on a five-digit problem. Switching to a token-level or Brier score makes the same curves smooth. Both papers are worth knowing; interviewers like asking which one you believe.
+
+</Callout>
+
+---
+
+## Generative AI
+
+A **discriminative** model learns `p(label | input)`. A **generative** model learns `p(input)` or `p(output | input)` and can sample new data from it.
+
+Autoregressive language models are generative in the conditional sense: they model `p(x_t | x_1 ... x_t-1)` and produce text by sampling one token at a time. That single objective turns out to be a universal interface, because any task can be written as text completion.
+
+| Task            | Discriminative formulation       | Generative formulation                |
+| :-------------- | :------------------------------- | :------------------------------------ |
+| Classification  | `softmax(W h)` over N classes    | Complete the string `"The label is:"` |
+| Translation     | Encoder-decoder with beam search | Complete `"English: ... French: ..."` |
+| Summarization   | Not naturally expressible        | Complete `"Article: ... Summary:"`    |
+| Code generation | Not naturally expressible        | Complete the docstring and signature  |
+
+Other generative families exist and use different mechanisms: diffusion models denoise latents for images, and autoregressive codecs generate audio tokens. The transformer backbone is shared.
+
+---
+
+## The adaptation ladder
+
+Ordered from cheapest and least capable to most expensive and most capable.
+
+| Rung                      | Weights change? | Data needed           | Cost per attempt    | Fixes                              |
+| :------------------------ | :-------------- | :-------------------- | :------------------ | :--------------------------------- |
+| **Prompt engineering**    | No              | Zero                  | Cents               | Format, tone, simple reasoning     |
+| **Few-shot in context**   | No              | A handful of examples | Cents               | Style, output schema               |
+| **RAG**                   | No              | A retrieval corpus    | Moderate            | Fresh or private facts             |
+| **LoRA fine-tune**        | Adapter only    | Hundreds to thousands | Hours on one GPU    | Behaviour, domain style, formats   |
+| **Full fine-tune**        | Yes             | Tens of thousands     | Days on a cluster   | Deep behaviour change              |
+| **Continued pretraining** | Yes             | Billions of tokens    | Weeks               | New language, new domain knowledge |
+| **Pretraining**           | From scratch    | Trillions of tokens   | Millions of dollars | A new foundation model             |
+
+The rule that decides which rung to use: RAG for knowledge that changes, fine-tuning for behaviour that must be consistent. Retrieval cannot teach a model to emit a strict JSON schema on every call, and fine-tuning cannot keep a product catalogue current.
+
+---
+
+## Open-weights versus closed-source
+
+**Closed-source** models are accessed only through an API. The weights, and usually the architecture and training data, are not released. **Open-weights** models publish the checkpoint so you can download it, run it, and modify it.
+
+Open-weights is not the same as open source. Almost no frontier model releases its training data or the full training pipeline. The OSI's open-source AI definition asks for the data, so it classifies Llama and Gemma releases as not open source even though the weights are downloadable.
+
+| License family               | Examples                             | Restrictions worth reading                                                                                                                       |
+| :--------------------------- | :----------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Apache 2.0 / MIT**         | Qwen 3, DeepSeek-V3, OLMo 2, Mixtral | None beyond attribution and patent grant                                                                                                         |
+| **Custom community license** | Llama 4, Gemma                       | Use thresholds (Llama's clause triggers at 700 million monthly active users), naming requirements, no training competing models in Gemma's terms |
+| **Proprietary API**          | GPT, Claude, Gemini                  | No weights. Rate limits, data retention terms, no self-hosting                                                                                   |
+
+### The four trade-offs
+
+**Cost.** An API charges per token with no fixed cost, so low traffic is cheap and high traffic is expensive. Self-hosting inverts that: the GPUs cost the same whether they are idle or saturated. The break-even point depends on your sustained token throughput, and it is usually reached sooner than people expect for high-volume workloads.
+
+**Privacy.** API calls send your data to a third party. Self-hosting keeps it inside your network. This is the deciding factor for healthcare, legal, and any workload governed by data residency rules. Enterprise API tiers with zero-retention clauses narrow the gap but do not eliminate the transfer.
+
+**Latency.** An API adds network round-trip time and queueing behind other tenants. A local model on dedicated hardware has neither, and you control the batch size. A local model on a single consumer GPU is usually slower than a well-provisioned API, because the API provider runs optimized kernels across many accelerators.
+
+**Control.** Self-hosting gives you the logits, the sampling loop, the ability to quantize, the ability to edit weights, and the ability to pin a version forever. An API can change the underlying model under a stable alias, deprecate a version, or raise prices.
+
+| Requirement                      | Choose             |
+| :------------------------------- | :----------------- |
+| Lowest time to production        | Closed API         |
+| Data cannot leave the network    | Open weights       |
+| Need logit-level access          | Open weights       |
+| Spiky, low-volume traffic        | Closed API         |
+| Sustained high volume            | Open weights       |
+| Need the absolute best benchmark | Usually closed API |
+
+---
+
+## Where a model runs
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Client<br/>browser or SDK"] --> B["API Gateway<br/>auth, rate limit, routing"]
+    B --> C["Tokenizer"]
+    C --> D["Scheduler<br/>continuous batching"]
+    D --> E["GPU Pool<br/>tensor-parallel replicas"]
+    E --> D
+    D --> F["Sampler<br/>stop tokens, penalties"]
+    F --> G["Streaming Response<br/>SSE chunks"]
+    G --> A
+`}
+/>
+
+Two properties of this pipeline matter for cost and latency.
+
+**Prefill and decode are different workloads.** Prefill processes the whole prompt in one parallel forward pass and is compute-bound. Decode generates one token per forward pass and is memory-bandwidth-bound, because every step must read the entire weight matrix and the KV cache to produce a single token. That asymmetry is why output tokens are billed at a higher rate than input tokens, commonly several times higher, and why providers cache repeated prompt prefixes.
+
+**Batching is where throughput comes from.** A single request underuses a GPU badly. Continuous batching admits new requests into a running batch as soon as a slot frees, rather than waiting for the whole batch to finish. It changes the scheduler's unit of work from a request to a decode step.
+
+---
+
+## Interview questions
+
+1. What is the definition of a foundation model, and which two properties distinguish it from a task-specific model?
+2. Name the three eras of AI engineering and what changed economically at each transition.
+3. What is the difference between a discriminative and a generative model, and which one is an autoregressive LLM?
+4. When does RAG beat fine-tuning, and when is fine-tuning the only option?
+5. Why is "open weights" not the same as "open source"?
+6. Name two restrictions in a custom community license that an Apache 2.0 release does not have.
+7. Give the cost, privacy, latency, and control arguments for self-hosting an open-weights model.
+8. Why do API providers charge more per output token than per input token?
+9. What is the difference between prefill and decode in terms of what the GPU is bottlenecked on?
+10. What does continuous batching change about how a scheduler admits work?
+11. Summarize the Wei et al. and Schaeffer et al. disagreement about emergent abilities.
+12. A startup needs strict JSON output on every call and must not send patient data to a third party. Which rungs of the adaptation ladder are available to it?

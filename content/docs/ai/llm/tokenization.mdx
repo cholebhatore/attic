@@ -1,0 +1,207 @@
+---
+title: Tokenization
+description: BPE, WordPiece, and SentencePiece unigram; byte-level encoding, the pre-tokenization regex, vocabulary sizing, and why rare words fragment.
+---
+
+A model can only do arithmetic on integers. Tokenization is the function that turns a string into a list of integers, and its inverse. Everything about cost, context length, and multilingual fairness flows from how that function is built.
+
+The tokenizer is trained separately from the model, on a sample of the training corpus, and is frozen before the model ever runs. Its output vocabulary is a fixed lookup table.
+
+---
+
+## The three algorithms
+
+| Algorithm      | Merge criterion                                           | Trained on          | Used by                       |
+| :------------- | :-------------------------------------------------------- | :------------------ | :---------------------------- |
+| **BPE**        | Highest raw pair frequency                                | Bytes or characters | GPT-2/3/4, Llama 3/4, Qwen    |
+| **WordPiece**  | Highest pair likelihood `count(ab) / (count(a) count(b))` | Characters          | BERT, DistilBERT              |
+| **Unigram LM** | Iterative pruning from an over-large candidate set        | Characters or bytes | T5, Llama 1/2, Mistral, mBART |
+
+BPE and WordPiece are bottom-up: they start with individual characters and merge. Unigram is top-down: it starts with every substring in the corpus and deletes the ones whose removal costs the least likelihood, using EM to re-estimate the remaining probabilities (Kudo, arXiv:1804.10959).
+
+WordPiece's criterion is the difference that matters. Raw frequency merges `the` into one token because `th` is common. The likelihood ratio also merges pairs that are _surprising together_, so a rare pair that almost always appears together still gets merged.
+
+### SentencePiece is a library, not an algorithm
+
+A common interview trap. **SentencePiece** (Kudo and Richardson, arXiv:1808.06226) implements both BPE and unigram, and its distinguishing feature is that it treats the input as a raw character stream with no pre-tokenization. Whitespace is encoded as a printable character (`▁`) rather than used as a delimiter, so the tokenizer is reversible and language-independent.
+
+Tiktoken and Hugging Face `tokenizers` implement BPE with an explicit pre-tokenization step instead.
+
+---
+
+## Byte-pair encoding, trained
+
+The base vocabulary is the 256 possible bytes. Every merge adds one new entry. This is why a byte-level tokenizer can never produce an unknown token.
+
+```python
+import re
+
+GPT2_PATTERN = (
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+|"""
+    r""" ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+)
+
+
+def get_stats(ids):
+    counts = {}
+    for seq in ids:
+        for pair in zip(seq, seq[1:]):
+            counts[pair] = counts.get(pair, 0) + 1
+    return counts
+
+
+def merge(seq, pair, idx):
+    out, i = [], 0
+    while i < len(seq):
+        if i < len(seq) - 1 and seq[i] == pair[0] and seq[i + 1] == pair[1]:
+            out.append(idx)
+            i += 2
+        else:
+            out.append(seq[i])
+            i += 1
+    return out
+
+
+def train_bpe(text, vocab_size):
+    num_merges = vocab_size - 256
+    pretokens = re.findall(GPT2_PATTERN, text)          # needs the `regex` module for \p{L}
+    ids = [list(t.encode("utf-8")) for t in pretokens]  # list[list[int]]
+    merges = {}                                          # (int, int) -> int
+    vocab = {idx: bytes([idx]) for idx in range(256)}    # int -> bytes
+
+    for i in range(num_merges):
+        stats = get_stats(ids)
+        top_pair = max(stats, key=stats.get)
+        idx = 256 + i
+        ids = [merge(seq, top_pair, idx) for seq in ids]
+        merges[top_pair] = idx
+        vocab[idx] = vocab[top_pair[0]] + vocab[top_pair[1]]
+
+    return merges, vocab
+```
+
+The loop is greedy and order-dependent. Once `("t", "h")` merges into `256`, the next round counts pairs over the new symbol table, so `("256", "e")` can merge into `the`. Nothing is ever reconsidered.
+
+### Pre-tokenization
+
+Merges are only allowed _within_ a pre-token. `"the dog"` will never merge across the space, so the tokenizer cannot produce a token spanning two words. The GPT-2 regex splits on contractions, letter runs, digit runs, punctuation runs, and whitespace, and it is why `" dog"` and `"dog"` are different tokens: the leading space is part of the pre-token.
+
+Byte-level BPE runs over UTF-8 bytes rather than Unicode characters, which was GPT-2's contribution and removes the unknown-token case entirely. The trade-off, analyzed in Gorman et al. (2019), is that a CJK character occupies three bytes and may be split mid-character, producing invalid UTF-8 fragments that must be reassembled at decode time.
+
+---
+
+## Vocabulary size
+
+Real published vocabularies:
+
+| Tokenizer             | Vocab   | Base  | Params in embedding at `d_model = 4096` |
+| :-------------------- | :------ | :---- | :-------------------------------------- |
+| GPT-2                 | 50,257  | bytes | 205,852,672                             |
+| Llama 2               | 32,000  | chars | 131,072,000                             |
+| Mistral 7B            | 32,768  | chars | 134,217,728                             |
+| DeepSeek-V3           | 129,280 | bytes | 529,530,880                             |
+| Llama 3               | 128,256 | bytes | 525,336,576                             |
+| Qwen 3                | 151,936 | bytes | 622,329,856                             |
+| GPT-4o (`o200k_base`) | 200,019 | bytes | 819,277,824                             |
+
+The embedding table is `vocab * d_model` and the output head is the same shape unless weights are tied. Doubling the vocabulary adds `vocab * d_model * 2 bytes` of weights at bf16 and doubles the width of the logits tensor, which is `batch * seq_len * vocab` and often the single largest activation in the model.
+
+What a larger vocabulary buys is **compression**, usually measured as tokens per byte or subwords per word. More merges means fewer tokens for the same text, and fewer tokens means three things at once: lower cost per document, more text inside the same context window, and faster generation, since each decode step emits one token.
+
+The benefit is not distributed evenly. Enlarging the vocabulary mostly helps scripts and domains that the smaller table covered badly, which is why moving from a 32K character-level table to a 128K byte-level one changes non-Latin text far more than it changes English.
+
+---
+
+## Using a tokenizer
+
+```python
+import tiktoken
+
+enc = tiktoken.get_encoding("cl100k_base")   # GPT-4 / GPT-3.5
+ids = enc.encode("hello world")          # [15339, 1917]
+enc.decode(ids)                          # 'hello world'
+len(enc.encode("antidisestablishmentarianism"))   # several times longer than the word count suggests
+enc.decode([15339, 195])                 # partial UTF-8 bytes decode to U+FFFD
+
+enc2 = tiktoken.get_encoding("o200k_base") # GPT-4o
+len(enc2.encode("你好世界")) < len(enc.encode("你好世界"))   # True — better CJK coverage
+```
+
+Hugging Face exposes the same surface with more control:
+
+```python
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+out = tok("hello world", return_tensors="pt")
+out["input_ids"]                          # shape (1, seq_len)
+tok.vocab_size                            # 151,936 learned merges
+tok.decode(out["input_ids"][0])           # 'hello world'
+```
+
+`vocab_size` counts only the learned merges. Special tokens live above that range, so `len(tok)` is larger than `tok.vocab_size`, and the model's embedding matrix is sized to `len(tok)`.
+
+---
+
+## Fragmentation and why it matters
+
+A rare or domain-specific word is not in the merge table, so it splits into whatever byte runs survived training.
+
+| Input                            | Typical token count | Why                                                   |
+| :------------------------------- | :------------------ | :---------------------------------------------------- |
+| `"the"`                          | 1                   | Highest-frequency word in English                     |
+| `"tokenization"`                 | 2 to 3              | Common enough to merge partly                         |
+| `"antidisestablishmentarianism"` | 8 or more           | Rare; splits into Latin roots and sub-roots           |
+| `"Kubernetes"`                   | 2 to 3              | Proper noun, capitalized form is rarer than lowercase |
+| `"1987-04-23"`                   | 4 or more           | Digit runs split into chunks                          |
+
+Four concrete consequences.
+
+**Cost.** Providers bill per token. The same semantic content costs more when it fragments, so a legal or medical corpus bills higher per page than conversational text.
+
+**Effective context.** A 128K-token window holds roughly 100K words of well-tokenized English, but far fewer words of a language the vocabulary was not built for.
+
+**Character-level reasoning.** If `"strawberry"` is one or two tokens, the model never sees its letters. Tasks that require counting, reversing, or spelling a word degrade, because the information is not in the representation. This is a tokenizer limitation, not an attention limitation.
+
+**Multilingual unfairness.** Tokenizers trained mostly on English give low-resource languages high fertility, so the same sentence consumes several times more tokens and more money, and the model has less practice on it.
+
+<Callout type="warn">
+  ### Numbers are the worst case
+
+BPE merges digit runs in chunks, so `1234567` may become `123`, `456`, `7`. There is no positional-value structure in those tokens. This is why arithmetic on large numbers is unreliable in models with naive digit tokenization, and why GPT-4o's `o200k_base` splits digits one per token as a deliberate fix.
+
+</Callout>
+
+---
+
+## Special tokens and chat templates
+
+Control tokens are outside the merge table and are never produced by pre-tokenization. They are inserted by the chat template.
+
+| Token | Model family    | Purpose |
+| :---- | :-------------- | :------ | ------------------- | ------------------------------------ |
+| `<    | endoftext       | >`      | GPT-2, GPT-3        | Document boundary during pretraining |
+| `<    | im_start        | >`      | ChatML, Qwen        | Start of a chat turn                 |
+| `<    | im_end          | >`      | ChatML, Qwen        | End of a chat turn                   |
+| `<    | eot_id          | >`      | Llama 3             | End of turn                          |
+| `<    | start_header_id | >`      | Llama 3             | Start of a role header               |
+| `<    | think           | >`      | Qwen 3, DeepSeek-R1 | Reasoning trace delimiter            |
+
+`tok.apply_chat_template(messages, tokenize=False)` renders the template string. Getting it wrong is a common failure: a model fine-tuned on `<|im_start|>user` will behave badly if you send it bare text.
+
+---
+
+## Interview questions
+
+1. What is the difference between BPE's merge criterion and WordPiece's, and why does the difference matter for rare pairs?
+2. Is SentencePiece an algorithm? What does it provide that tiktoken does not?
+3. Why can a byte-level BPE tokenizer never emit an unknown token, and what does it emit instead when it splits a multi-byte character?
+4. What does the pre-tokenization regex prevent, and why are `" dog"` and `"dog"` different tokens?
+5. Walk through three merge rounds of BPE on the string `"low lower"`.
+6. A model has `d_model = 4096` and a 128,256-entry vocabulary. How many parameters are in the embedding table, and what is the shape of the logits tensor for a batch of 8 sequences of length 2048?
+7. Name three consequences of rare-word fragmentation beyond token count.
+8. Why does the tokenizer affect a model's ability to count the letters in `"strawberry"`?
+9. Why does `len(tokenizer)` differ from `tokenizer.vocab_size`?
+10. What is a chat template, and what breaks if you send raw text to a model trained with one?
+11. Where are special tokens inserted, and can the pre-tokenizer produce them?
+12. Unigram tokenization starts with too many tokens and prunes. Why is that direction better for multilingual corpora than merging?

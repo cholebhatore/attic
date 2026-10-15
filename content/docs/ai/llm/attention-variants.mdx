@@ -1,0 +1,175 @@
+---
+title: Attention Variants
+description: MQA, GQA, and MLA — why the KV cache is a memory-bandwidth problem, the shapes each variant produces, and how latent compression cuts the cache by 57x.
+---
+
+During decode, the model emits one token per forward pass and must read the entire KV cache to do it. The cache grows with every token and every concurrent request, and the read is not overlapped with useful compute. That makes attention memory-bandwidth bound rather than FLOP bound, and it is the reason three variants of attention exist.
+
+All three change one thing: how many key and value vectors are stored per token per layer. The queries stay full rank.
+
+---
+
+## The three variants
+
+| Variant | KV heads | Source                           | Cached per token per layer   |
+| :------ | :------- | :------------------------------- | :--------------------------- |
+| **MHA** | `h`      | Vaswani et al., arXiv:1706.03762 | `2 * h * d_head`             |
+| **MQA** | 1        | Shazeer, arXiv:1911.02150        | `2 * d_head`                 |
+| **GQA** | `g`      | Ainslie et al., arXiv:2305.13245 | `2 * g * d_head`             |
+| **MLA** | latent   | DeepSeek-V2, arXiv:2405.04434    | `d_c + d_r` (512 + 64 in V3) |
+
+MQA shares one K and one V head across all query heads. It gives the maximum cache reduction, but a single head has to serve every query subspace, and quality drops measurably on larger models.
+
+GQA is the compromise that won. Split the `h` query heads into `g` groups; each group shares one K/V head. `g = h` recovers MHA, `g = 1` recovers MQA.
+
+| Model          | Query heads | KV heads | Ratio | Variant |
+| :------------- | :---------- | :------- | :---- | :------ |
+| GPT-3 175B     | 96          | 96       | 1x    | MHA     |
+| PaLM 540B      | 48          | 1        | 48x   | MQA     |
+| Llama 2 70B    | 64          | 8        | 8x    | GQA     |
+| Llama 3 8B     | 32          | 8        | 4x    | GQA     |
+| Qwen 3 8B      | 32          | 8        | 4x    | GQA     |
+| Qwen 3 30B-A3B | 32          | 4        | 8x    | GQA     |
+| DeepSeek-V3    | 128         | latent   | —     | MLA     |
+
+Ainslie et al. show that GQA-8 matches MHA quality on GLUE while decoding substantially faster, and that you do not need to train from scratch: mean-pool the KV heads of a pretrained multi-head model into `g` groups, then continue training for a few thousand steps. This "uptraining" recipe is why so many 2023 releases adopted GQA without a full retrain.
+
+---
+
+## GQA shapes
+
+From Qwen3-8B's published config: `hidden_size = 4096`, `num_attention_heads = 32`, `num_key_value_heads = 8`, `head_dim = 128`.
+
+```python
+import torch
+import torch.nn as nn
+
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, d_model=4096, n_heads=32, n_kv_heads=8, head_dim=128):
+        super().__init__()
+        self.n_heads, self.n_kv_heads, self.head_dim = n_heads, n_kv_heads, head_dim
+        self.groups = n_heads // n_kv_heads              # 4 query heads per KV head
+        self.q_proj = nn.Linear(d_model, n_heads * head_dim, bias=False)     # 4096 -> 4096
+        self.k_proj = nn.Linear(d_model, n_kv_heads * head_dim, bias=False)  # 4096 -> 1024
+        self.v_proj = nn.Linear(d_model, n_kv_heads * head_dim, bias=False)  # 4096 -> 1024
+        self.o_proj = nn.Linear(n_heads * head_dim, d_model, bias=False)     # 4096 -> 4096
+
+    def forward(self, x, cos, sin):
+        B, T, _ = x.shape
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        # q: (B, 32, T, 128)   k, v: (B, 8, T, 128)
+
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+
+        # repeat_interleave on the head dim expands 8 KV heads to 32
+        k = k.repeat_interleave(self.groups, dim=1)      # (B, 32, T, 128)
+        v = v.repeat_interleave(self.groups, dim=1)      # (B, 32, T, 128)
+
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.o_proj(out.transpose(1, 2).reshape(B, T, -1))   # (B, T, 4096)
+```
+
+`repeat_interleave` is only needed for a manual implementation. `scaled_dot_product_attention` and every serious inference engine support grouped KV natively through `enable_gqa=True` or an explicit group argument, and materializing the repeated tensors would defeat the memory saving.
+
+KV cache arithmetic for this layer:
+
+| Variant           | Elements per token per layer | Bytes at bf16 | 32K context, batch 1, 36 layers |
+| :---------------- | :--------------------------- | :------------ | :------------------------------ |
+| MHA (32 KV heads) | 8,192                        | 16,384        | 18 GiB                          |
+| GQA (8 KV heads)  | 2,048                        | 4,096         | 4.5 GiB                         |
+
+---
+
+## Multi-head Latent Attention
+
+GQA reduces the _number_ of heads. MLA reduces the _rank_ of what each head stores, and it goes much further.
+
+The observation is that the K and V matrices across all heads are highly redundant. Instead of caching `h * d_head` values, cache a single low-rank latent vector and reconstruct K and V from it on the fly.
+
+From DeepSeek-V3's config: `kv_lora_rank = 512`, `q_lora_rank = 1536`, `qk_nope_head_dim = 128`, `qk_rope_head_dim = 64`, `v_head_dim = 128`, `num_attention_heads = 128`, `hidden_size = 7168`.
+
+```
+c_KV  = W_DKV x                # (T, 512)        cached
+k_R   = W_KR  x                # (T, 64)         cached, shared across all heads
+
+k_i^C = W_UK c_KV              # (T, 128, 128)   reconstructed, not cached
+v_i   = W_UV c_KV              # (T, 128, 128)   reconstructed, not cached
+
+c_Q   = W_DQ  x                # (T, 1536)
+q_i^C = W_UQ  c_Q              # (T, 128, 128)
+q_i^R = W_UQR c_Q + W_QR c_Q   # (T, 128, 64)
+
+score_i = q_i^C . k_i^C + q_i^R . k_R
+```
+
+The cache holds `512 + 64 = 576` elements per token per layer. The equivalent MHA configuration at 128 heads and 128 dimensions holds `2 * 128 * 128 = 32,768`. That is a 57x reduction.
+
+DeepSeek-V2 (arXiv:2405.04434) reports a 93.3% KV cache reduction and up to 5.76x generation throughput against DeepSeek 67B.
+
+### Why RoPE is decoupled
+
+The low-rank trick only works if the compression is position-independent. RoPE rotates vectors by an angle that depends on the token's position, so a rotary-transformed key cannot be recovered from a shared latent without also knowing the position. Keeping the rotary part as a separate, full-rank, shared-across-heads vector `k_R` preserves the compression on the 512-dimensional content part while leaving positional information exact.
+
+This is also why MLA has two score terms. The content term uses the nope dimensions, and the positional term uses the rope dimensions.
+
+### Absorbing the up-projections
+
+Reconstructing `k_i^C` and `v_i` at inference would materialize `128 heads * 192 dims` per token, which is larger than the MHA cache and defeats the purpose. So the up-projections are folded into the query and output weights ahead of time:
+
+```
+q_i^C . k_i^C = (W_UQ_i c_Q) . (W_UK_i c_KV) = c_Q^T (W_UQ_i^T W_UK_i) c_KV
+```
+
+Define `W'_i = W_UQ_i^T W_UK_i`, shape `(1536, 512)`, and the score is computed directly from the cached latents. The same fold applies to `W_UV` and `W_O` on the output side. This is the single most important implementation detail in MLA, and the one most write-ups skip.
+
+<Mermaid
+  chart={`
+flowchart LR
+    X["x<br/>(T, 7168)"] --> DKV["W_DKV"]
+    DKV --> CKV["c_KV<br/>(T, 512) CACHED"]
+    X --> KR["W_KR"]
+    KR --> KPE["k_R<br/>(T, 64) CACHED"]
+    CKV --> UK["W_UK / W_UV<br/>absorbed into Q and O"]
+    X --> DQ["W_DQ"]
+    DQ --> CQ["c_Q<br/>(T, 1536)"]
+    CQ --> UQ["W_UQ / W_UQR"]
+    UK --> ATT["Attention over latents"]
+    UQ --> ATT
+    KPE --> ATT
+    ATT --> O["W_O<br/>(T, 7168)"]
+`}
+/>
+
+---
+
+## Sliding window and chunked attention
+
+An orthogonal axis. Instead of compressing what is stored, restrict what is attended to.
+
+| Approach                    | Mechanism                                                                                                                                    | Source                                 |
+| :-------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------- |
+| **Sliding window**          | Each token attends to the previous `w` tokens. Older information propagates through stacked layers, so the receptive field is `w * n_layers` | Mistral 7B, arXiv:2310.06825           |
+| **Chunked local attention** | Interleave layers that attend within an 8,192-token chunk with layers that attend globally                                                   | Llama 4, `attention_chunk_size = 8192` |
+| **Sparse global tokens**    | A small set of landmark tokens is visible everywhere                                                                                         | Longformer, BigBird                    |
+
+Qwen3's config carries `sliding_window: null` and `use_sliding_window: false`, so the released dense models do not use it even though the code path exists.
+
+---
+
+## Interview questions
+
+1. Why is autoregressive decode memory-bandwidth bound rather than compute bound?
+2. What does MQA change about the KV cache, and what quality does it cost?
+3. Explain GQA as a generalization, and state what `g = h` and `g = 1` recover.
+4. How do you convert a pretrained multi-head checkpoint to GQA without retraining from scratch?
+5. Compute the KV cache bytes per token per layer for Qwen3-8B at bf16, and the same number if it used MHA.
+6. Why does `repeat_interleave` on the KV heads defeat the point of GQA in an inference engine?
+7. What is the low-rank observation behind MLA?
+8. Why must the RoPE component be decoupled from the compressed latent in MLA?
+9. MLA caches 576 elements per token per layer. What would it cost to reconstruct the per-head keys at inference instead of absorbing the up-projections?
+10. Write the absorbed form of the MLA score in terms of `c_Q` and `c_KV`.
+11. What receptive field does a sliding window of `w` give in an `L`-layer model, and what does it lose?
+12. DeepSeek-V3's config sets `num_key_value_heads = 128`, the same as `num_attention_heads`. Why does that field not mean what it means in a GQA model?

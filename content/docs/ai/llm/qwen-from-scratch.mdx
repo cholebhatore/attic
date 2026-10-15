@@ -1,0 +1,249 @@
+---
+title: Qwen 3 from Scratch
+description: QK-Norm in place of QKV bias, grouped-query attention, hybrid thinking and non-thinking modes, and both the dense and MoE blocks with parameter counts that match.
+---
+
+Qwen 3 ships in two families: dense models from 0.6B to 32B, and MoE models at 30B-A3B and 235B-A22B. The technical report is arXiv:2505.09388.
+
+Two things distinguish it architecturally. QK-Norm replaces the QKV bias Qwen 2 used, and the same weights serve both a reasoning mode and a direct-answer mode through a chat-template switch.
+
+---
+
+## The configs
+
+Qwen3-8B, dense:
+
+| Field                     | Value   |
+| :------------------------ | :------ |
+| `hidden_size`             | 4096    |
+| `num_hidden_layers`       | 36      |
+| `num_attention_heads`     | 32      |
+| `num_key_value_heads`     | 8       |
+| `head_dim`                | 128     |
+| `intermediate_size`       | 12288   |
+| `vocab_size`              | 151936  |
+| `max_position_embeddings` | 40960   |
+| `rope_theta`              | 1000000 |
+| `rms_norm_eps`            | 1e-06   |
+| `attention_bias`          | false   |
+| `tie_word_embeddings`     | false   |
+| `sliding_window`          | null    |
+| `rope_scaling`            | null    |
+
+Qwen3-30B-A3B, MoE:
+
+| Field                   | Value |
+| :---------------------- | :---- |
+| `hidden_size`           | 2048  |
+| `num_hidden_layers`     | 48    |
+| `num_attention_heads`   | 32    |
+| `num_key_value_heads`   | 4     |
+| `head_dim`              | 128   |
+| `num_experts`           | 128   |
+| `num_experts_per_tok`   | 8     |
+| `moe_intermediate_size` | 768   |
+| `intermediate_size`     | 6144  |
+| `mlp_only_layers`       | []    |
+| `decoder_sparse_step`   | 1     |
+| `norm_topk_prob`        | true  |
+| `router_aux_loss_coef`  | 0.001 |
+| `output_router_logits`  | false |
+
+`mlp_only_layers` is empty and `decoder_sparse_step` is 1, so every layer is MoE. There is no `shared_expert_intermediate_size` field, which is the visible break from Qwen2-MoE: Qwen 3 dropped the shared expert entirely and relies on 128 fine-grained routed experts.
+
+`rope_theta = 1000000` is two orders of magnitude above DeepSeek-V3's 10000. A larger base spreads the rotary frequencies out, which is what allows a longer trained context without interpolation. The config's native window is 40,960; extending to 128K means setting `rope_scaling` to `{"type": "yarn", "factor": 4.0}` and continuing training on long sequences.
+
+---
+
+## QK-Norm
+
+Qwen 2 put a bias on `q_proj`, `k_proj`, and `v_proj`. Qwen 3 sets `attention_bias = false` and normalizes the queries and keys instead. The code below assumes `import torch`, `import torch.nn as nn`, `import torch.nn.functional as F`, and reuses `RMSNorm` and `apply_rope` from [Blocks and Positions](/ai/transformers/blocks-and-positions).
+
+```python
+class Qwen3Attention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.n_heads = cfg.num_attention_heads          # 32
+        self.n_kv = cfg.num_key_value_heads             # 8
+        self.groups = self.n_heads // self.n_kv         # 4
+        self.head_dim = cfg.head_dim                    # 128
+        self.scaling = self.head_dim ** -0.5
+
+        self.q_proj = nn.Linear(cfg.hidden_size, self.n_heads * self.head_dim, bias=False)  # 4096 -> 4096
+        self.k_proj = nn.Linear(cfg.hidden_size, self.n_kv * self.head_dim, bias=False)     # 4096 -> 1024
+        self.v_proj = nn.Linear(cfg.hidden_size, self.n_kv * self.head_dim, bias=False)     # 4096 -> 1024
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, cfg.hidden_size, bias=False)  # 4096 -> 4096
+        self.q_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
+        self.k_norm = RMSNorm(self.head_dim, cfg.rms_norm_eps)
+
+    def forward(self, x, cos, sin):
+        B, T, _ = x.shape
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv, self.head_dim).transpose(1, 2)
+        # q: (B, 32, T, 128)    k, v: (B, 8, T, 128)
+
+        q = apply_rope(self.q_norm(q), cos, sin)
+        k = apply_rope(self.k_norm(k), cos, sin)
+
+        k = k.repeat_interleave(self.groups, dim=1)     # (B, 32, T, 128)
+        v = v.repeat_interleave(self.groups, dim=1)
+
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scaling)
+        return self.o_proj(out.transpose(1, 2).reshape(B, T, -1))
+```
+
+The norm is over `head_dim`, not over `hidden_size`, and it is applied per head. That bounds every attention logit at `sqrt(head_dim) = 11.3` after scaling, which is what makes 36- and 48-layer stacks trainable in bf16 without loss spikes. Dropping the bias at the same time removes a degree of freedom that was mostly compensating for unnormalized activation growth.
+
+`RMSNorm` here is the same class as everywhere else in the model. Applying it over the last dimension means a `(B, heads, T, 128)` tensor gets 128-element normalization independently at every position and every head.
+
+---
+
+## Dense and MoE blocks
+
+```python
+class Qwen3MLP(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
+
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class Qwen3MoeSparseMoeBlock(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.top_k = cfg.num_experts_per_tok            # 8
+        self.n_experts = cfg.num_experts                # 128
+        self.norm_topk_prob = cfg.norm_topk_prob        # True
+        self.gate = nn.Linear(cfg.hidden_size, self.n_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [Qwen3MLP(cfg.hidden_size, cfg.moe_intermediate_size) for _ in range(self.n_experts)]
+        )
+
+    def forward(self, x):
+        B, T, D = x.shape
+        flat = x.reshape(B * T, D)
+        logits = self.gate(flat)                        # (BT, 128)
+        weights = F.softmax(logits, dim=-1)             # (BT, 128)
+        vals, idx = torch.topk(weights, self.top_k, dim=-1)   # (BT, 8)
+        if self.norm_topk_prob:
+            vals = vals / vals.sum(-1, keepdim=True)
+
+        out = torch.zeros_like(flat)
+        for slot in range(self.top_k):
+            for e in range(self.n_experts):
+                mask = idx[:, slot] == e
+                if mask.any():
+                    out[mask] += vals[mask, slot].unsqueeze(-1) * self.experts[e](flat[mask])
+        return out.reshape(B, T, D)
+
+
+class Qwen3DecoderLayer(nn.Module):
+    def __init__(self, cfg, layer_idx, sparse):
+        super().__init__()
+        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.self_attn = Qwen3Attention(cfg)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.mlp = Qwen3MoeSparseMoeBlock(cfg) if sparse else \
+            Qwen3MLP(cfg.hidden_size, cfg.intermediate_size)
+
+    def forward(self, x, cos, sin):
+        h = x + self.self_attn(self.input_layernorm(x), cos, sin)
+        return h + self.mlp(self.post_attention_layernorm(h))
+```
+
+`sparse` is decided per layer index from `mlp_only_layers` and `decoder_sparse_step`. For 30B-A3B it is always `True`.
+
+Qwen 3's routing uses softmax scoring with an auxiliary loss at `router_aux_loss_coef = 0.001`, the Switch Transformer approach rather than DeepSeek's aux-loss-free bias. The one deviation is that the load statistics are accumulated across the **global batch** rather than per micro-batch, which gives a much more stable estimate of each expert's share when the micro-batch is small.
+
+---
+
+## Hybrid thinking mode
+
+The same weights produce two behaviours. A reasoning block is delimited by tags and can be switched on or off per turn.
+
+```python
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-8B")
+messages = [{"role": "user", "content": "How many primes below 50?"}]
+
+prompt = tok.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True,
+    enable_thinking=False,        # global switch
+)
+```
+
+With thinking enabled the rendered template ends in a header that invites a `<think>` block; with it disabled the model answers directly. There is also a **soft switch** that works mid-conversation without changing the template: append `/think` or `/no_think` to the user content. The model was trained on both markers, so it obeys whichever came last.
+
+| Mode         | Output shape                     | Cost   | Use for                          |
+| :----------- | :------------------------------- | :----- | :------------------------------- |
+| **Thinking** | Reasoning block, then the answer | Higher | Math, code, multi-step logic     |
+| **No-think** | Answer only                      | Lower  | Chat, extraction, classification |
+
+In vLLM the switch is passed as `chat_template_kwargs={"enable_thinking": False}`, and a `thinking_budget` caps the reasoning block's length so a runaway chain cannot consume the whole context window.
+
+<Callout type="warn">
+  ### Thinking mode is a decoding concern, not an architecture concern
+
+Nothing in `config.json` distinguishes the two modes. There is no second head and no adapter. The difference is entirely in the prompt the tokenizer renders, which is why a model served without the correct chat template silently loses its reasoning ability. If a Qwen3 deployment suddenly answers shallowly, check the template before checking the weights.
+
+</Callout>
+
+---
+
+## Parameter count
+
+Qwen3-8B, dense, no biases:
+
+| Component                 | Formula             | Parameters        |
+| :------------------------ | :------------------ | :---------------- |
+| `q_proj`                  | `4096 * 32 * 128`   | 16,777,216        |
+| `k_proj`                  | `4096 * 8 * 128`    | 4,194,304         |
+| `v_proj`                  | `4096 * 8 * 128`    | 4,194,304         |
+| `o_proj`                  | `32 * 128 * 4096`   | 16,777,216        |
+| `q_norm`, `k_norm`        | `2 * 128`           | 256               |
+| MLP                       | `3 * 4096 * 12288`  | 150,994,944       |
+| Two block norms           | `2 * 4096`          | 8,192             |
+| **Per layer**             |                     | **192,946,432**   |
+| 36 layers                 |                     | 6,946,071,552     |
+| Untied embedding and head | `2 * 151936 * 4096` | 1,244,659,712     |
+| **Total**                 |                     | **8,190,735,360** |
+
+Qwen3-30B-A3B:
+
+| Component                 | Formula                                    | Parameters         |
+| :------------------------ | :----------------------------------------- | :----------------- |
+| Attention                 | `2048*4096 + 2*2048*512 + 4096*2048 + 256` | 18,874,624         |
+| One expert                | `3 * 2048 * 768`                           | 4,718,592          |
+| 128 experts               | `128 * 4718592`                            | 603,979,776        |
+| Router                    | `2048 * 128`                               | 262,144            |
+| **Per layer**             |                                            | **623,120,640**    |
+| 48 layers                 |                                            | 29,909,790,720     |
+| Untied embedding and head | `2 * 151936 * 2048`                        | 622,329,856        |
+| **Total**                 |                                            | **30,532,122,624** |
+
+Counting only the 8 experts each token activates gives 3,353,032,704, which is the published 3.3B active figure. Note the asymmetry with DeepSeek-V3: Qwen 3's experts are tiny (`moe_intermediate_size = 768`) and numerous, so its active-to-total ratio is 11% against DeepSeek's 5.5%.
+
+---
+
+## Interview questions
+
+1. What did Qwen 3 replace QKV bias with, and what bound does the replacement place on an attention logit?
+2. Why is `q_norm` an RMSNorm over `head_dim` rather than over `hidden_size`?
+3. What does `num_key_value_heads = 8` with `num_attention_heads = 32` mean for the KV cache, and what is it for Qwen3-30B-A3B?
+4. Which field in Qwen3-30B-A3B's config tells you the shared expert is gone, and what does Qwen 3 rely on instead?
+5. How does Qwen 3's load balancing differ from DeepSeek-V3's?
+6. What is `rope_theta = 1000000` doing, and what would you change to reach a 128K window?
+7. Show that Qwen3-8B has 8.19B parameters given its config.
+8. Compute the active parameters per token for Qwen3-30B-A3B and compare the active-to-total ratio with DeepSeek-V3's.
+9. Is hybrid thinking mode an architectural feature? Where does the mode get selected?
+10. What is the difference between the global `enable_thinking` switch and the `/think` soft switch?
+11. What is a thinking budget, and what problem does it solve?
+12. `mlp_only_layers` is empty and `decoder_sparse_step` is 1. What does that combination tell you about the model?

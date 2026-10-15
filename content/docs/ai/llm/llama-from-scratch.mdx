@@ -1,0 +1,292 @@
+---
+title: Llama 4 from Scratch
+description: A complete Llama 4 text stack — GQA, SwiGLU, RoPE, RMSNorm, QK-Norm, chunked local attention, attention temperature tuning, and top-1 MoE.
+---
+
+Phase 5 built a GPT. This page turns it into a Llama 4 text model. Five things change: grouped-query attention, QK-Norm, chunked local attention with a per-layer type list, attention temperature tuning for long context, and a top-1 mixture of experts in place of some feed-forward blocks.
+
+Everything else — RMSNorm, SwiGLU, RoPE, pre-norm residuals, untied embeddings — is already there.
+
+---
+
+## The config
+
+`Llama4TextConfig` defaults as published in Hugging Face `transformers`:
+
+| Field                     | Default | Meaning                                       |
+| :------------------------ | :------ | :-------------------------------------------- |
+| `vocab_size`              | 202048  | Embedding rows                                |
+| `hidden_size`             | 5120    | `d_model`                                     |
+| `num_hidden_layers`       | 48      | Transformer blocks                            |
+| `num_attention_heads`     | 40      | Query heads                                   |
+| `num_key_value_heads`     | 8       | KV heads; 5 query heads share each            |
+| `head_dim`                | 128     | Not `hidden_size / num_heads`, set explicitly |
+| `intermediate_size`       | 8192    | Expert feed-forward width                     |
+| `intermediate_size_mlp`   | 16384   | Dense feed-forward width                      |
+| `num_local_experts`       | 16      | Experts per MoE layer                         |
+| `num_experts_per_tok`     | 1       | Top-1 routing                                 |
+| `use_qk_norm`             | True    | Normalize queries and keys per head           |
+| `attention_chunk_size`    | 8192    | Chunk width for local layers                  |
+| `attn_temperature_tuning` | True    | Position-dependent attention temperature      |
+| `floor_scale`             | 8192    | Denominator for the temperature ramp          |
+| `attn_scale`              | 0.1     | Slope of the temperature ramp                 |
+| `max_position_embeddings` | 131072  | Trained context                               |
+| `rms_norm_eps`            | 1e-05   | RMSNorm epsilon                               |
+| `attention_bias`          | False   | No bias in any projection                     |
+| `tie_word_embeddings`     | False   | Separate input and output matrices            |
+
+`head_dim = 128` with `num_attention_heads = 40` gives a query projection of `40 * 128 = 5120`, which happens to equal `hidden_size`. That is a coincidence of these defaults; Llama 3 8B uses `head_dim = 128` with `hidden_size = 4096` and 32 heads, also equal. Llama 4 decouples the two so it stops being one.
+
+The released models are much larger than these defaults. Meta's release notes give Scout at 17B active and roughly 109B total across 16 experts, Maverick at 17B active and roughly 400B total across 128 experts, and Behemoth at 288B active and roughly 2T total. Both released models use early fusion for native multimodality, so the text stack sits behind a vision encoder rather than being adapted to it later.
+
+---
+
+## What changes from the Phase 5 GPT
+
+| Component         | Phase 5 GPT               | Llama 4                                                                          |
+| :---------------- | :------------------------ | :------------------------------------------------------------------------------- |
+| KV heads          | Equal to query heads      | 8 shared across 40 query heads                                                   |
+| Q/K normalization | None                      | RMSNorm over `head_dim`, applied before RoPE                                     |
+| Attention mask    | Lower-triangular causal   | Causal, plus chunk alignment on local layers                                     |
+| Attention scale   | Constant `1/sqrt(d_head)` | Constant times a position-dependent factor                                       |
+| Feed-forward      | SwiGLU everywhere         | SwiGLU dense on some layers, top-1 MoE on others                                 |
+| Layer types       | Uniform                   | `layer_types` list mapping each index to `full_attention` or `chunked_attention` |
+
+---
+
+## Block anatomy
+
+<Mermaid
+  chart={`
+flowchart TD
+    X["x  (B, T, 5120)"] --> N1["RMSNorm"]
+    N1 --> QP["q_proj -> (B, T, 40, 128)"]
+    N1 --> KP["k_proj -> (B, T, 8, 128)"]
+    N1 --> VP["v_proj -> (B, T, 8, 128)"]
+    QP --> QN["q_norm over head_dim"]
+    KP --> KN["k_norm over head_dim"]
+    QN --> R1["RoPE"]
+    KN --> R2["RoPE"]
+    R1 --> ATT["Scaled dot-product attention<br/>chunked or full mask"]
+    R2 --> ATT
+    VP --> ATT
+    ATT --> OP["o_proj -> (B, T, 5120)"]
+    X --> ADD1["+"]
+    OP --> ADD1
+    ADD1 --> N2["RMSNorm"]
+    N2 --> ROUTE{"Layer type?"}
+    ROUTE -->|dense| MLP["SwiGLU<br/>intermediate 16384"]
+    ROUTE -->|MoE| MOE["Router + 16 experts<br/>intermediate 8192, top-1"]
+    ADD1 --> ADD2["+"]
+    MLP --> ADD2
+    MOE --> ADD2
+    ADD2 --> OUT["(B, T, 5120)"]
+`}
+/>
+
+---
+
+## The implementation
+
+`apply_rope`, `build_rope_cache`, and `rotate_half` are the ones from [Blocks and Positions](/ai/transformers/blocks-and-positions). Llama 4 uses them unchanged; `rope_theta` differs per release but the mechanics are identical.
+
+```python
+import math
+from dataclasses import dataclass, field
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+@dataclass
+class Llama4TextConfig:
+    vocab_size: int = 202048
+    hidden_size: int = 5120
+    num_hidden_layers: int = 48
+    num_attention_heads: int = 40
+    num_key_value_heads: int = 8
+    head_dim: int = 128
+    intermediate_size: int = 8192          # per expert
+    intermediate_size_mlp: int = 16384     # dense layers
+    num_local_experts: int = 16
+    num_experts_per_tok: int = 1
+    use_qk_norm: bool = True
+    attention_chunk_size: int = 8192
+    attn_temperature_tuning: bool = True
+    floor_scale: int = 8192
+    attn_scale: float = 0.1
+    max_position_embeddings: int = 131072
+    rms_norm_eps: float = 1e-5
+    router_aux_loss_coef: float = 0.001
+    layer_types: list = field(default_factory=list)      # "full_attention" | "chunked_attention"
+    mlp_only_layers: list = field(default_factory=list)  # indices using the dense MLP
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return normed * self.weight
+
+
+def chunked_causal_mask(T, chunk, device):
+    i = torch.arange(T, device=device).unsqueeze(1)     # (T, 1) query positions
+    j = torch.arange(T, device=device).unsqueeze(0)     # (1, T) key positions
+    causal = j <= i
+    aligned = (i // chunk) == (j // chunk)
+    return causal & aligned                             # (T, T)
+```
+
+The chunks are **aligned**, not sliding. Position 8,191 sees positions 0 through 8,191. Position 8,192 starts a fresh chunk and sees only itself until the chunk fills. Information crosses a chunk boundary only through a full-attention layer, which is why `layer_types` alternates rather than making every layer local.
+
+```python
+class Llama4Attention(nn.Module):
+    def __init__(self, cfg, layer_idx):
+        super().__init__()
+        self.cfg = cfg
+        self.n_heads = cfg.num_attention_heads
+        self.n_kv = cfg.num_key_value_heads
+        self.groups = self.n_heads // self.n_kv
+        self.scaling = cfg.head_dim ** -0.5
+        self.chunked = cfg.layer_types[layer_idx] == "chunked_attention"
+
+        self.q_proj = nn.Linear(cfg.hidden_size, self.n_heads * cfg.head_dim, bias=False)
+        self.k_proj = nn.Linear(cfg.hidden_size, self.n_kv * cfg.head_dim, bias=False)
+        self.v_proj = nn.Linear(cfg.hidden_size, self.n_kv * cfg.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * cfg.head_dim, cfg.hidden_size, bias=False)
+        if cfg.use_qk_norm:
+            self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
+            self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
+
+    def forward(self, x, cos, sin, position_ids):
+        B, T, _ = x.shape
+        q = self.q_proj(x).view(B, T, self.n_heads, self.cfg.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv, self.cfg.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv, self.cfg.head_dim).transpose(1, 2)
+        # q: (B, 40, T, 128)    k, v: (B, 8, T, 128)
+
+        if self.cfg.use_qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)       # normalize before RoPE
+
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
+
+        mask = chunked_causal_mask(T, self.cfg.attention_chunk_size, x.device) if self.chunked \
+            else torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
+
+        attn = torch.matmul(q, k.transpose(-1, -2)) * self.scaling     # (B, 40, T, T)
+
+        if self.cfg.attn_temperature_tuning:
+            ramp = torch.floor(position_ids / self.cfg.floor_scale)     # (B, T)
+            denom = ramp.clamp(max=self.cfg.max_position_embeddings // self.cfg.floor_scale) + 1
+            temp = torch.log(denom) * self.cfg.attn_scale + 1.0         # (B, T)
+            attn = attn * temp[:, None, :, None]
+
+        attn = attn.masked_fill(~mask, float("-inf"))
+        attn = F.softmax(attn, dim=-1, dtype=torch.float32).to(q.dtype)
+
+        k = k.repeat_interleave(self.groups, dim=1)                     # (B, 40, T, 128)
+        v = v.repeat_interleave(self.groups, dim=1)
+        out = torch.matmul(attn, v).transpose(1, 2).reshape(B, T, -1)   # (B, T, 5120)
+        return self.o_proj(out)
+```
+
+Two things QK-Norm buys. It bounds every attention logit, because normalized vectors of dimension `d_head` have a dot product at most `d_head` before the `1/sqrt(d_head)` scale, so the post-scale logit is at most `sqrt(d_head) = 11.3` instead of growing with activation magnitude. And it removes the depth-dependent blowup that shows up in very deep models, which is the failure mode `use_qk_norm` exists to prevent.
+
+The temperature ramp is a log function of position: at `T = 8192` the factor is `log(2) * 0.1 + 1 = 1.069`, and at `T = 131072` it is `log(17) * 0.1 + 1 = 1.284`. Longer contexts produce flatter attention distributions, so multiplying the logits by a growing factor sharpens them back. It is the same correction YaRN calls `mscale`.
+
+```python
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff):
+        super().__init__()
+        self.gate = nn.Linear(d_model, d_ff, bias=False)
+        self.up = nn.Linear(d_model, d_ff, bias=False)
+        self.down = nn.Linear(d_ff, d_model, bias=False)
+
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+
+
+class Llama4MoE(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.top_k = cfg.num_experts_per_tok
+        self.gate = nn.Linear(cfg.hidden_size, cfg.num_local_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [SwiGLU(cfg.hidden_size, cfg.intermediate_size) for _ in range(cfg.num_local_experts)]
+        )
+
+    def forward(self, x):
+        B, T, D = x.shape
+        flat = x.reshape(B * T, D)
+        scores = F.softmax(self.gate(flat), dim=-1)              # (BT, 16)
+        vals, idx = torch.topk(scores, self.top_k, dim=-1)       # (BT, 1)
+        vals = vals / vals.sum(-1, keepdim=True)
+        out = torch.zeros_like(flat)
+        for slot in range(self.top_k):
+            for e in range(len(self.experts)):
+                mask = idx[:, slot] == e
+                if mask.any():
+                    out[mask] += vals[mask, slot].unsqueeze(-1) * self.experts[e](flat[mask])
+        return out.reshape(B, T, D)
+
+
+class Llama4DecoderLayer(nn.Module):
+    def __init__(self, cfg, layer_idx):
+        super().__init__()
+        self.input_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.self_attn = Llama4Attention(cfg, layer_idx)
+        self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
+        self.mlp = SwiGLU(cfg.hidden_size, cfg.intermediate_size_mlp) \
+            if layer_idx in cfg.mlp_only_layers else Llama4MoE(cfg)
+
+    def forward(self, x, cos, sin, position_ids):
+        h = x + self.self_attn(self.input_layernorm(x), cos, sin, position_ids)
+        return h + self.mlp(self.post_attention_layernorm(h))
+```
+
+`router_jitter_noise` adds Gaussian noise to the router logits during training only, which prevents the router from locking into an early assignment. `router_aux_loss_coef = 0.001` is the load-balancing penalty from [Mixture of Experts](/ai/llm/mixture-of-experts).
+
+---
+
+## Parameter arithmetic
+
+Per layer, at the config defaults, with no biases anywhere:
+
+| Component                           | Formula                      | Parameters     |
+| :---------------------------------- | :--------------------------- | :------------- |
+| `q_proj`                            | `5120 * 40 * 128`            | 26,214,400     |
+| `k_proj`                            | `5120 * 8 * 128`             | 5,242,880      |
+| `v_proj`                            | `5120 * 8 * 128`             | 5,242,880      |
+| `o_proj`                            | `40 * 128 * 5120`            | 26,214,400     |
+| `q_norm` + `k_norm`                 | `2 * 128`                    | 256            |
+| **Attention total**                 |                              | **62,914,816** |
+| Dense MLP (`intermediate_size_mlp`) | `3 * 5120 * 16384`           | 251,658,240    |
+| One expert (`intermediate_size`)    | `3 * 5120 * 8192`            | 125,829,120    |
+| 16 experts + router                 | `16 * 125829120 + 5120 * 16` | 2,013,347,840  |
+| Two RMSNorms                        | `2 * 5120`                   | 10,240         |
+
+Embeddings: `202048 * 5120 = 1,034,485,760`, and because `tie_word_embeddings = False` the output head costs the same again.
+
+The MoE layer holds 16 times the parameters of one expert but runs one expert per token, so its active cost is 125,829,120, which is _half_ the dense MLP's 251,658,240. That is the arithmetic behind 109B total and 17B active: total parameters are set by how many experts exist, active parameters by how wide one expert is.
+
+---
+
+## Interview questions
+
+1. Why does Llama 4 set `head_dim` explicitly instead of deriving it from `hidden_size / num_attention_heads`?
+2. Where in the attention block is QK-Norm applied, and why before RoPE rather than after?
+3. What bound does QK-Norm place on an attention logit, and what failure does that prevent?
+4. What is the difference between aligned chunked attention and a sliding window?
+5. Position 8,192 in a chunked layer sees how many previous tokens?
+6. Why must `layer_types` include full-attention layers rather than making every layer chunked?
+7. Compute the attention temperature factor at `T = 8192` and at `T = 131072` with `floor_scale = 8192` and `attn_scale = 0.1`.
+8. What problem does attention temperature tuning solve at long context?
+9. How many parameters does one expert hold, and how many does the dense MLP hold, at these defaults?
+10. Why is an MoE layer's active cost lower than the dense MLP's even though its total cost is 16 times higher?
+11. What does `router_jitter_noise` do, and at what point in training does it apply?
+12. Llama 4 Scout has 16 experts and Maverick has 128, both at 17B active. What does that difference change about inference memory and about router behaviour?

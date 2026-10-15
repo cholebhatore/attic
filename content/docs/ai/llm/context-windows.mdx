@@ -1,0 +1,187 @@
+---
+title: Context Windows
+description: The quadratic attention compute and linear KV-cache growth that bound a context window, real per-token memory numbers, and how RoPE scaling extends them.
+---
+
+A context window is not a free design choice. Four separate limits push back on it, and an interviewer who asks "why can't we just make the context bigger?" wants all four.
+
+1. **Attention compute** grows as `O(N^2)` in sequence length.
+2. **KV-cache memory** grows as `O(N)` per request, per layer.
+3. **Positional encodings** are trained on a finite range and degrade outside it.
+4. **Attention quality** falls off well before the hard limit, so the effective window is smaller than the advertised one.
+
+---
+
+## Quadratic attention compute
+
+Self-attention builds an `N x N` score matrix per head. Two matmuls produce it and consume it: `Q K^T` and `A V`.
+
+Per layer, per token, forward FLOPs:
+
+| Component                                 | FLOPs    |
+| :---------------------------------------- | :------- |
+| Q, K, V, O projections (multi-head)       | `8 d^2`  |
+| SwiGLU feed-forward with `d_ff = (8/3) d` | `16 d^2` |
+| Attention score matmuls                   | `4 N d`  |
+
+The dense parts are constant in `N`. The score matmuls grow linearly per token, so the total grows as `N^2` across the sequence. Setting them equal gives the crossover:
+
+```
+4 N d = 24 d^2
+N = 6 d
+```
+
+At `d_model = 4096` that is roughly 24,576 tokens. Past that point the score matmuls cost more than every weight matrix in the layer combined. Grouped-query attention shrinks the K and V projections and a wider feed-forward raises the dense constant, so the exact crossover moves, but the shape of the curve does not.
+
+<Callout type="info">
+  ### Materializing the score matrix is not an option at long context
+
+A single 128,256-token prompt with 32 heads at bf16 needs `32 * 128256^2 * 2 bytes = 1,052,774,498,304 bytes`, about 980 GiB, for one attention matrix. FlashAttention (Dao et al., arXiv:2205.14135) never builds it. It tiles the computation so only `O(N)` of intermediate state is ever resident, using the online-softmax trick to accumulate the weighted values block by block. The `O(N^2)` FLOP cost remains; the `O(N^2)` memory cost does not.
+
+</Callout>
+
+---
+
+## Linear KV-cache growth
+
+During decoding, every generated token attends to every previous one. Recomputing K and V for the whole prefix each step would be quadratic, so they are cached.
+
+```
+kv_bytes = 2 * n_layers * n_kv_heads * d_head * seq_len * batch * bytes_per_param
+```
+
+The leading `2` is K and V. Per token, per layer, the cache holds `2 * n_kv_heads * d_head` values.
+
+| Model             | Layers | KV heads      | `d_head` | Bytes per token (bf16) | At 8,192 tokens | At 128K tokens |
+| :---------------- | :----- | :------------ | :------- | :--------------------- | :-------------- | :------------- |
+| GPT-3 175B (MHA)  | 96     | 96            | 128      | 4,718,592 (4.5 MiB)    | 36 GiB          | 576 GiB        |
+| Llama 3 70B (GQA) | 80     | 8             | 128      | 327,680 (320 KiB)      | 2.5 GiB         | 40 GiB         |
+| Llama 3 8B (GQA)  | 32     | 8             | 128      | 131,072 (128 KiB)      | 1.0 GiB         | 16 GiB         |
+| DeepSeek-V3 (MLA) | 61     | shared latent | —        | 70,272 (68.6 KiB)      | 0.55 GiB        | 8.6 GiB        |
+
+GPT-3's row is the whole motivation for multi-query and grouped-query attention. Nine GiB of cache for a 2,048-token batch of one is unworkable; dropping the KV head count by 12x removes it almost entirely. DeepSeek-V3's MLA compresses further, to 576 elements per layer per token instead of 32,768. See [Attention Variants](/ai/llm/attention-variants).
+
+The cache is what makes long context expensive at serving time rather than at build time. Weights are fixed; the cache multiplies by concurrent requests.
+
+### Decode is memory-bandwidth bound
+
+Each decode step reads every weight to emit one token. For an 8B model at bf16 that is 16 GB of reads per token. On a GPU with 1 TB/s of bandwidth the floor is about 16 ms per token, roughly 60 tokens per second, before any compute. Batching amortizes those reads across requests, which is why continuous batching raises throughput without raising per-request latency much.
+
+---
+
+## Positional encodings outside the trained range
+
+RoPE rotates query and key vectors by an angle proportional to position:
+
+```
+theta_i = base^(-2i / d_head)
+```
+
+A model trained on 4,096 positions has never seen rotation angles beyond that range. Feed it position 8,000 and the dot products land in a region the attention weights were never optimized for. Output degrades before it collapses, and perplexity spikes sharply past the boundary.
+
+Three families of fixes, all cheap relative to retraining.
+
+### Position Interpolation
+
+Chen et al., arXiv:2306.15595. Scale every position by `L / L'` so a 32K prompt occupies the same angle range as the original 4K training range:
+
+```
+m' = m * (L / L')
+```
+
+Downside: adjacent tokens that used to differ by a full angular step now differ by `1/8` of one, so high-frequency dimensions lose resolution. The paper shows 1,000 fine-tuning steps recover most of the loss.
+
+### NTK-aware scaling
+
+Instead of scaling positions, scale the base so different frequency bands stretch by different amounts:
+
+```
+base' = base * s^(d_head / (d_head - 2))
+```
+
+High-frequency dimensions, which encode local order, are barely changed. Low-frequency dimensions, which encode long-range position, absorb the extension. No fine-tuning needed for moderate factors.
+
+### YaRN
+
+Peng et al., arXiv:2309.00071. NTK-by-parts plus an attention temperature correction `1/t = 0.1 ln(s) + 1`, which compensates for the fact that longer contexts produce flatter attention distributions.
+
+DeepSeek-V3's published config uses it directly:
+
+```json
+{
+  "rope_theta": 10000,
+  "rope_scaling": {
+    "type": "yarn",
+    "factor": 40,
+    "original_max_position_embeddings": 4096,
+    "beta_fast": 32,
+    "beta_slow": 1,
+    "mscale": 1.0,
+    "mscale_all_dim": 1.0
+  },
+  "max_position_embeddings": 163840
+}
+```
+
+`4096 * 40 = 163,840`, which is the advertised window. `beta_fast` and `beta_slow` are the ramp boundaries that decide which frequency dimensions get NTK treatment and which get interpolation.
+
+### Other approaches
+
+| Method                      | Idea                                                                                                    | Source                                 |
+| :-------------------------- | :------------------------------------------------------------------------------------------------------ | :------------------------------------- |
+| **Sliding window**          | Each token attends to the previous `w` tokens only; older information reaches it through stacked layers | Mistral 7B, arXiv:2310.06825           |
+| **Chunked local attention** | Interleave local chunked attention with a few global layers                                             | Llama 4, `attention_chunk_size = 8192` |
+| **LongRoPE**                | Search per-dimension rescale factors non-uniformly                                                      | Ding et al., arXiv:2402.13753          |
+| **Dual Chunk Attention**    | Separate intra-chunk, inter-chunk, and successive-chunk offsets                                         | DeepSeek-V2                            |
+| **Sparse patterns**         | Dilated and strided attention over the full sequence                                                    | Longformer, BigBird                    |
+
+---
+
+## Advertised versus effective context
+
+Extending the window is necessary but not sufficient. RULER (Hsieh et al., arXiv:2404.06654) tests retrieval, multi-hop tracing, aggregation, and question answering at increasing lengths and finds most models degrade well before their stated limit. "Lost in the Middle" (Liu et al., arXiv:2307.03172) shows a U-shaped accuracy curve: information at the very start and very end of the context is found reliably, and information in the middle is missed.
+
+Two causes. The positional distribution during training is skewed toward shorter sequences, so long positions are under-trained. And softmax over more candidates flattens the distribution, reducing the peak weight any single relevant token receives.
+
+<Callout type="warn">
+  ### What an interviewer is testing
+
+"This model has a 1M token context" and "this model works at 1M tokens" are different claims. If you state a context length in an interview, say what benchmark it was measured on and at what length the accuracy started falling. Naming RULER or NoLiMa signals you have deployed long-context workloads rather than read a spec sheet.
+
+</Callout>
+
+---
+
+## Sizing a context window
+
+The practical constraint is usually VRAM, not FLOPs.
+
+```
+total_vram = weights + (kv_bytes_per_token * context_length * concurrent_requests) + activations
+```
+
+For Llama 3 8B at bf16 serving 32 concurrent requests with a 32K window:
+
+```
+weights   =  8B * 2 bytes               = 16 GiB
+kv_cache  =  131,072 * 32,768 * 32      = 128 GiB
+```
+
+The cache is eight times the model. Quantizing the KV cache to fp8 or int4 halves or quarters that term and is usually the first optimization applied in production. PagedAttention, from vLLM (Kwon et al., arXiv:2309.06180), removes the second problem: without it, memory is preallocated per request in contiguous blocks, and internal fragmentation wastes a large fraction of it. Paging allocates in small non-contiguous blocks instead.
+
+---
+
+## Interview questions
+
+1. Name the four limits that bound a context window.
+2. Derive the crossover length at which attention score matmuls cost more FLOPs than the weight matrices in a layer, for `d_model = 4096` with a SwiGLU feed-forward.
+3. Why is the score matrix `O(N^2)` in memory but FlashAttention makes it `O(N)`, and which of the two costs does it remove?
+4. Write the KV-cache size formula and compute bytes per token for a 32-layer model with 8 KV heads and `d_head = 128` at bf16.
+5. Why does GPT-3 need 4.5 MiB of KV cache per token while Llama 3 8B needs 128 KiB?
+6. Why is decoding memory-bandwidth bound rather than compute bound, and what does batching do about it?
+7. Explain position interpolation and its failure mode at high frequencies.
+8. Why does NTK-aware scaling modify the RoPE base instead of the positions?
+9. Read DeepSeek-V3's `rope_scaling` block and explain what `factor` and `original_max_position_embeddings` do together.
+10. What is the difference between advertised and effective context length, and which benchmarks measure the second one?
+11. Why does "lost in the middle" happen?
+12. A 70B model at bf16 has to serve 64 concurrent 16K-token requests. Which term dominates the VRAM budget, and name two ways to shrink it.

@@ -1,0 +1,256 @@
+---
+title: Decoding Strategies
+description: Greedy, beam search, temperature, top-k, top-p, min-p, and penalties, with the exact distribution each one fails on, plus stop tokens versus stop sequences.
+---
+
+The model's forward pass ends at a logits vector of length `vocab_size`. Turning that into one token is the sampler's job, and it is a separate design decision from the architecture. The same weights produce a rigid transcript at `temperature = 0` and incoherent noise at `temperature = 2`.
+
+Every strategy below is a transformation of the logits followed by `argmax` or a categorical draw.
+
+---
+
+## Greedy decoding
+
+Take the highest-probability token at every step.
+
+```python
+next_id = logits[-1].argmax()
+```
+
+Greedy is deterministic and cheap, but it does **not** find the highest-probability sequence. Maximizing `sum log p(x_t | x_<t)` step by step is a local optimum; a sequence starting with a slightly less likely token can end up far more probable overall.
+
+Its practical failure is degeneration. Holtzman et al. (arXiv:1904.09751) showed that greedy text becomes repetitive quickly: once a phrase appears, it raises the probability of appearing again, and the model enters a loop it cannot escape. The distribution has no mechanism for escaping a shallow local maximum.
+
+Use greedy when you want reproducibility, extraction, classification, or code where variation is a bug. Set `temperature = 0` in an API call and you get greedy behaviour, modulo tie-breaking.
+
+---
+
+## Beam search
+
+Keep `B` partial sequences instead of one, expand each by every vocabulary entry, and prune back to the top `B` by cumulative log-probability.
+
+```python
+def beam_step(beam, logprobs, B):
+    # beam: list of (score, ids);  logprobs: (vocab,) for the last position
+    cands = []
+    for score, ids in beam:
+        for j in range(logprobs.shape[0]):
+            cands.append((score + logprobs[j], ids + [j]))
+    cands.sort(key=lambda t: t[0], reverse=True)
+    return cands[:B]
+```
+
+Real implementations never loop over the vocabulary in Python; they use `torch.topk` on the flattened `(B * vocab)` score matrix.
+
+Beam search fixes greedy's myopia but not its degeneration, and for open-ended generation it makes it worse. High-probability sequences in natural language are short, generic, and safe, so beam search converges on bland text. It remains the right choice for translation, summarization, and structured output, where there is one correct answer and a length penalty is well defined:
+
+```
+score = (1 / L^alpha) * sum(log p_t)
+```
+
+with `alpha` around 0.6 to 0.7, from Wu et al. (arXiv:1609.08144).
+
+---
+
+## Temperature
+
+Divide the logits before the softmax:
+
+```
+p_i = exp(z_i / T) / sum_j exp(z_j / T)
+```
+
+| `T`      | Effect                                       | Limit              |
+| :------- | :------------------------------------------- | :----------------- |
+| `T -> 0` | Ratios blow up; the top logit takes all mass | Becomes greedy     |
+| `T = 1`  | The trained distribution, unchanged          | Baseline           |
+| `T > 1`  | Ratios compress; the distribution flattens   | Approaches uniform |
+| `T < 1`  | Ratios widen; the distribution sharpens      | Approaches greedy  |
+
+Worked example on logits `[2.0, 1.5, 0.5, -1.0]`:
+
+| `T`   | p(A)  | p(B)  | p(C)  | p(D)  |
+| :---- | :---- | :---- | :---- | :---- |
+| 0.5   | 0.704 | 0.259 | 0.035 | 0.002 |
+| 1.0   | 0.532 | 0.323 | 0.119 | 0.026 |
+| 2.0   | 0.404 | 0.315 | 0.191 | 0.090 |
+| 100.0 | 0.253 | 0.252 | 0.249 | 0.246 |
+
+Temperature never changes the _ranking_, only the spread. It cannot rescue a model that ranks the wrong token first, and it cannot protect against a tail of individually tiny probabilities that sum to something large. That is what truncation is for.
+
+Above `T = 1.5` on most models, grammar and factual consistency break down first, then syntax. Below `T = 0.3`, output stops varying across seeds and starts looping.
+
+---
+
+## Top-k
+
+Sort by probability, keep the `k` highest, zero the rest, renormalize.
+
+The failure is that `k` is fixed while distributions are not. Take two extremes from a 4-token and an 11-token example.
+
+**Peaked**, logits `[3.0, 0.2, 0.1, 0.05]`, probabilities `[0.856, 0.052, 0.047, 0.045]`:
+
+| Strategy  | Tokens kept | Comment                                                                                |
+| :-------- | :---------- | :------------------------------------------------------------------------------------- |
+| top-k=3   | A, B, C     | Renormalized to `[0.896, 0.055, 0.049]`. B and C are noise the model assigned under 6% |
+| top-p=0.9 | A, B        | Cumulative reaches 0.908                                                               |
+| min-p=0.1 | A           | Threshold is `0.1 * 0.856 = 0.086`; only A clears it                                   |
+
+**Flat**, eleven logits from 1.0 down to 0.5 in steps of 0.05, probabilities from 0.115 to 0.070:
+
+| Strategy  | Tokens kept | Comment                                                                   |
+| :-------- | :---------- | :------------------------------------------------------------------------ |
+| top-k=3   | 3           | Keeps only 33% of the probability mass, so the same three openings repeat |
+| top-p=0.9 | 10          | Cumulative reaches 0.930 at the tenth token                               |
+| min-p=0.1 | 11          | Threshold is `0.1 * 0.115 = 0.0115`; all clear it                         |
+
+One fixed `k` is simultaneously too permissive and too restrictive.
+
+---
+
+## Top-p (nucleus sampling)
+
+Keep the smallest set whose cumulative probability reaches `p`, then renormalize. The set size adapts to the shape of the distribution.
+
+Holtzman et al. (arXiv:1904.09751) introduced it and showed it beats both beam search and top-k on perplexity _and_ human judgment for open-ended generation, which is unusual: normally the two metrics disagree.
+
+Typical settings are `p = 0.9` to `0.95`. It fails when the distribution is flat _and_ long-tailed: at `p = 0.95` over a 128K vocabulary the nucleus can contain thousands of tokens, and sampling from the bottom of it produces wrong-but-fluent text. That is why production samplers combine top-k with top-p rather than choosing one.
+
+---
+
+## Min-p
+
+A newer rule that scales the cutoff by the model's own confidence:
+
+```
+threshold = base_p * max(p)
+```
+
+When the model is confident, `max(p)` is high, so the threshold is high and almost nothing else is admitted. When the model is unsure, `max(p)` is low, the threshold drops, and a wide range stays available. It is one hyperparameter that behaves correctly in both regimes, which is why it has displaced top-k in several inference engines.
+
+Other truncation rules worth naming: **typical sampling** (Meister et al., arXiv:2202.00666) keeps tokens whose surprisal is close to the distribution's entropy, and **epsilon / eta cutoffs** drop everything below an absolute or entropy-scaled probability floor.
+
+---
+
+## Repetition controls
+
+| Control                | Formula                                           | What it does                                                                    |
+| :--------------------- | :------------------------------------------------ | :------------------------------------------------------------------------------ |
+| **Repetition penalty** | `z_i = z_i / penalty` if `i` appeared, else `z_i` | Multiplicative; penalizes negative logits in the wrong direction unless handled |
+| **Frequency penalty**  | `z_i -= alpha * count(i)`                         | Scales with how often the token appeared                                        |
+| **Presence penalty**   | `z_i -= beta * 1[count(i) > 0]`                   | Flat penalty once a token has appeared                                          |
+| **No-repeat n-gram**   | mask any token that would complete a seen n-gram  | Hard constraint; prevents verbatim loops                                        |
+
+The repetition penalty's sign issue is a real bug class: dividing a negative logit by 1.2 makes it _less_ negative, so penalizing a token the model dislikes promotes it instead. Hugging Face's implementation handles this; hand-written samplers often do not.
+
+---
+
+## A full sampler
+
+The order matters. Apply penalties first, then temperature, then truncation, then sample.
+
+```python
+import torch
+import torch.nn.functional as F
+
+
+def sample_next(logits, temperature=0.8, top_k=50, top_p=0.95, min_p=0.0):
+    z = logits[-1].float()                              # (vocab,)
+
+    if temperature <= 0:
+        return int(z.argmax())
+    z = z / temperature
+
+    if top_k > 0:
+        kth = torch.topk(z, min(top_k, z.shape[-1]))[-1][-1]
+        z = z.masked_fill(z < kth, float("-inf"))
+
+    if min_p > 0:
+        p = F.softmax(z, dim=-1)
+        z = z.masked_fill(p < min_p * p.max(), float("-inf"))
+
+    if 0 < top_p < 1:
+        sorted_z, sorted_idx = torch.sort(z, descending=True)
+        cum = torch.softmax(sorted_z, dim=-1).cumsum(dim=-1)
+        drop = cum > top_p
+        drop[..., 1:] = drop[..., :-1].clone()           # keep the token that crossed p
+        drop[..., 0] = False
+        sorted_z = sorted_z.masked_fill(drop, float("-inf"))
+        z = torch.full_like(z, float("-inf")).scatter(-1, sorted_idx, sorted_z)
+
+    probs = F.softmax(z, dim=-1)
+    return int(torch.multinomial(probs, num_samples=1))
+```
+
+Three details that trip people up. The `drop[..., 1:]` shift is what keeps the first token that crosses `p`; without it the nucleus is empty whenever the top token alone exceeds `p`. Sorting then scattering restores the original vocabulary order before `multinomial`. And `float("-inf")` before a softmax gives exact zeros, whereas a finite sentinel like `-1e9` leaves a small residue that a flat distribution can still sample from.
+
+---
+
+## Stopping mechanics
+
+Generation ends for one of four reasons: a stop token, a stop sequence, a maximum length, or an explicit stop from the serving layer.
+
+### Stop token
+
+A single vocabulary ID the model is trained to emit at the end of a turn. It is part of the sampling loop, so the check is one integer comparison per step.
+
+| Model   | Token | ID        |
+| :------ | :---- | :-------- | --- | ------ |
+| GPT-2   | `<    | endoftext | >`  | 50256  |
+| Qwen 3  | `<    | im_end    | >`  | 151645 |
+| Llama 3 | `<    | eot_id    | >`  | 128009 |
+
+Llama 3 also keeps `<|end_of_text|>` (128001) for the base-model pretraining boundary and `<|eom_id|>` for end-of-message in some templates. Instruct models stop on `<|eot_id|>` because it marks the end of a _turn_, not the end of a document, and a chat response must end at the turn.
+
+### Stop sequence
+
+An arbitrary string matched against the decoded output during generation. It is not in the sampler; it is a post-hoc string check on the growing text buffer.
+
+| Property                | Stop token                       | Stop sequence                              |
+| :---------------------- | :------------------------------- | :----------------------------------------- |
+| Where it lives          | Inside the sampling loop         | Outside, in the serving layer              |
+| Matched on              | One integer ID                   | A string, possibly spanning tokens         |
+| Training required       | Yes, the model learns to emit it | No                                         |
+| Latency cost            | None                             | A decode and a substring search per step   |
+| Can be emitted mid-word | No                               | Yes, which causes partial-token truncation |
+
+The tokenization problem is why stop sequences are fiddly. If the stop string is `"User:"` and the model emits `"User"` then `":"` as separate tokens, a naive check works. If it emits `" User:"` with a leading space as one token, the buffer check has to match a substring of a decoded token, and the tokenizer must decode incrementally without dropping incomplete UTF-8.
+
+<Callout type="warn">
+  ### Should the stop string be returned?
+
+Most APIs expose `include_stop_str_in_output` (OpenAI) or `return_tokens_in_response` (vLLM) because the answer differs by use case. When you are splitting a prompt-completion pair, you want the stop string stripped. When you are streaming to a UI, you usually want it kept so the transcript stays readable. Getting this wrong produces off-by-one truncation that only shows up on multi-turn conversations.
+
+</Callout>
+
+A model that never emits its stop token runs to `max_tokens` and stops mid-sentence. That is the most common symptom of a wrong chat template: the model was trained to stop on `<|eot_id|>` but the prompt never contained `<|start_header_id|>assistant<|end_header_id|>`, so it does not recognize that it is in a turn.
+
+---
+
+## Choosing a configuration
+
+| Task                       | temperature | top_p | Penalties | Notes                            |
+| :------------------------- | :---------- | :---- | :-------- | :------------------------------- |
+| Extraction, classification | 0           | —     | none      | Deterministic; greedy            |
+| Code generation            | 0 to 0.2    | 0.95  | none      | Syntax breaks above 0.5          |
+| Factual QA                 | 0.3         | 0.9   | light     | Diversity helps self-consistency |
+| Chat                       | 0.7 to 1.0  | 0.9   | moderate  | Below 0.5 sounds robotic         |
+| Creative writing           | 1.0 to 1.3  | 0.95  | moderate  | Grammar starts slipping          |
+| Brainstorming              | 1.3+        | 0.98  | heavy     | Expect incoherence               |
+
+---
+
+## Interview questions
+
+1. Why does greedy decoding not produce the highest-probability sequence?
+2. What is neural text degeneration, and why does beam search make it worse for open-ended generation?
+3. Write the length-normalized beam score and say where the exponent `alpha` comes from.
+4. What does temperature change about a distribution, and what can it never change?
+5. Given logits `[2.0, 1.5, 0.5, -1.0]`, what happens to the top token's probability as `T` goes from 0.5 to 2.0?
+6. Construct one distribution where top-k=3 is too permissive and one where it is too restrictive.
+7. Why did Holtzman et al. argue that top-p beats top-k on both perplexity and human judgment?
+8. How does min-p decide its threshold, and why is that better than a fixed k?
+9. What is the sign bug in a naive repetition penalty?
+10. In what order should penalties, temperature, top-k, top-p, and sampling be applied, and why?
+11. What is the difference between a stop token and a stop sequence in terms of where each one is checked?
+12. A model runs to `max_tokens` every time and stops mid-sentence. What is the most likely cause?
