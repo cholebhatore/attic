@@ -1,0 +1,309 @@
+---
+title: Vision Architectures
+description: 'A CIFAR-10 training pipeline with transforms.v2, ResNet residual connections, Inception 1x1 convolutions, and navigating the timm library.'
+---
+
+Three problems had to be solved before deep vision worked: getting enough training signal out of a small dataset, getting gradients through fifty layers, and spending compute where it matters instead of uniformly. Data augmentation solves the first, residual connections solve the second, and multi-scale blocks solve the third.
+
+---
+
+## A CIFAR-10 pipeline
+
+CIFAR-10 is `60000` colour images at `32 x 32` in ten classes: `50000` train, `10000` test. Small enough to fit on one GPU and small enough that you have to augment.
+
+```python title="cifar.py"
+import torch
+from torch.utils.data import DataLoader
+from torchvision.datasets import CIFAR10
+from torchvision.transforms import v2
+
+MEAN = (0.4914, 0.4822, 0.4465)
+STD = (0.2470, 0.2435, 0.2616)
+
+train_tf = v2.Compose([
+    v2.ToImage(),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.RandomCrop(32, padding=4),
+    v2.RandomHorizontalFlip(),
+    v2.RandAugment(num_ops=2, magnitude=9),
+    v2.Normalize(MEAN, STD),
+    v2.RandomErasing(p=0.25),
+])
+
+test_tf = v2.Compose([
+    v2.ToImage(),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(MEAN, STD),
+])
+
+train = CIFAR10("./data", train=True, download=True, transform=train_tf)
+test = CIFAR10("./data", train=False, transform=test_tf)
+
+train_dl = DataLoader(train, batch_size=128, shuffle=True, num_workers=4, pin_memory=True)
+test_dl = DataLoader(test, batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
+```
+
+`transforms.v2` is the current API. It operates on tensors and on `tv_tensors` that carry boxes and masks, so the same transform pipeline works for detection and segmentation. The legacy `transforms` namespace only handles PIL images and tensors, and `ToTensor()` in it does the scaling that `v2.ToDtype(torch.float32, scale=True)` does here.
+
+<Callout type="warn">
+  ### Normalize last, erase later
+
+`Normalize` must come after every pixel-space augmentation, because `RandAugment` expects values in `[0, 1]` and not zero-mean channel statistics. `RandomErasing` must come after `Normalize` so the erased patch is filled with the dataset mean rather than with `0`, which would read as a black square.
+
+</Callout>
+
+### Augmentation choices
+
+| Transform                   | Effect                                    | Typical CIFAR-10 setting |
+| :-------------------------- | :---------------------------------------- | :----------------------- |
+| `RandomCrop(32, padding=4)` | Translation invariance                    | Always on                |
+| `RandomHorizontalFlip()`    | Mirror invariance                         | Always on                |
+| `RandAugment(2, 9)`         | Bundle of colour and geometry distortions | Two ops, magnitude 9     |
+| `RandomErasing(p=0.25)`     | Occlusion robustness                      | 25% of samples           |
+| `ColorJitter`               | Brightness, contrast, saturation, hue     | Subsumed by RandAugment  |
+| `GaussianBlur`              | Blur robustness                           | Subsumed by RandAugment  |
+| `AutoAugment`               | Policy searched on the target dataset     | Slower to set up         |
+| `MixUp` / `CutMix`          | Blends pairs of samples and their labels  | In the training loop     |
+
+`MixUp` and `CutMix` are not transforms because they combine two samples, so they need the labels too. `timm` exposes them as collate functions:
+
+```python
+from timm.data import Mixup
+
+mixup = Mixup(mixup_alpha=1.0, cutmix_alpha=1.0, prob=1.0, switch_prob=0.5, num_classes=10)
+```
+
+With mixup the target becomes soft, so `CrossEntropyLoss` needs `label_smoothing` or the `SoftTargetCrossEntropy` loss from `timm`.
+
+### The training loop
+
+Nothing new here beyond [Training Loop](/ai/pytorch/training-loop), except that CNNs on CIFAR-10 want a warmup and a cosine decay over roughly 200 epochs at SGD with momentum `0.9` and weight decay `5e-4`.
+
+```python title="train.py"
+model = SmallCNN().to(device)          # or timm.create_model("resnet18", num_classes=10)
+opt = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=5e-4, nesterov=True)
+sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=0.1, steps_per_epoch=len(train_dl), epochs=100)
+scaler = torch.amp.GradScaler("cuda")
+
+for epoch in range(100):
+    model.train()
+    for x, y in train_dl:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = F.cross_entropy(model(x), y)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+        sched.step()
+```
+
+A ResNet-18 trained this way lands around 95% test accuracy. Without augmentation it lands around 91%, and without weight decay around 89%.
+
+---
+
+## Residual connections
+
+Plain deep CNNs stopped improving past roughly twenty layers. Not because of vanishing gradients, which BatchNorm had largely fixed, but because a deeper network had strictly more capacity and still got worse training loss. That is an optimization failure, not a generalization one.
+
+ResNet's fix is to make each block learn a correction to its input rather than the input's replacement:
+
+```text
+Plain block:       y = F(x)
+Residual block:    y = F(x) + x
+```
+
+`F(x)` is the two or three conv layers, and `x` is the identity shortcut. The addition is why the network can always do no worse than a shallower one: setting `F` to zero recovers the identity.
+
+The gradient consequence is what makes it trainable. Differentiating `y = F(x) + x` gives:
+
+```text
+dy/dx = dF/dx + 1
+```
+
+That `+1` is a path from any layer straight back to any earlier layer that never passes through a weight matrix. A hundred-layer residual network has a hundred-layer-deep multiplicative chain _plus_ an unbroken additive highway, and the highway dominates.
+
+### The bottleneck block
+
+ResNet-18 and ResNet-34 use a basic block with two `3 x 3` convolutions. ResNet-50 and deeper use a bottleneck with three:
+
+```python
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, planes: int, stride: int = 1, downsample=None) -> None:
+        super().__init__()
+        mid = planes  # planes is the bottleneck width, output is planes * 4
+        self.conv1 = nn.Conv2d(planes * 4, mid, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid)
+        self.conv2 = nn.Conv2d(mid, mid, 3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid)
+        self.conv3 = nn.Conv2d(mid, planes * 4, 1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * 4)
+        self.downsample = downsample
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        identity = x if self.downsample is None else self.downsample(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        return self.relu(out + identity)
+```
+
+The `1 x 1` convolutions squeeze the channel count down before the expensive `3 x 3` and expand it back after. At `planes = 64` the block runs `256 -> 64 -> 64 -> 256`, and the `3 x 3` costs `64 * 64 * 9 = 36864` weights per position instead of `256 * 256 * 9 = 589824`.
+
+The shortcut needs a projection when the block changes resolution or channel count:
+
+```python
+downsample = nn.Sequential(
+    nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=2, bias=False),
+    nn.BatchNorm2d(out_ch),
+)
+```
+
+### Pre-activation
+
+ResNet v1 puts the ReLU after the final BatchNorm and after the addition, so the shortcut signal passes through a nonlinearity before the next block. ResNet v2 moves the norms and activations to the front:
+
+```text
+v1:  x -> conv -> bn -> relu -> conv -> bn -> (+x) -> relu
+v2:  x -> bn -> relu -> conv -> bn -> relu -> conv -> (+x)
+```
+
+v2 gives a completely clean additive path from the last block to the first, and it trains a 1001-layer network where v1 diverges. Every transformer since uses pre-norm for the same reason, covered in [Normalization](/ai/neural-networks/normalization).
+
+<Callout type="info">
+  ### Skip connections everywhere after ResNet
+
+U-Net concatenates encoder features into the decoder for segmentation. DenseNet concatenates every previous layer's output rather than adding it. Transformers add the block input to both the attention and the feed-forward output. All of them are the same `+ x` trick with a different aggregation.
+
+</Callout>
+
+---
+
+## Inception and multi-scale blocks
+
+A convolution commits to one kernel size. An object might be `5` pixels wide in one image and `80` in another, so GoogLeNet runs several kernel sizes in parallel and concatenates the results, letting later layers decide which scale was informative.
+
+The Inception v1 module has four branches over the same input:
+
+| Branch | Operation                     | Output channels |
+| :----- | :---------------------------- | --------------: |
+| 1      | `1 x 1` conv                  |              64 |
+| 2      | `1 x 1` then `3 x 3`          |             128 |
+| 3      | `1 x 1` then `5 x 5`          |              32 |
+| 4      | `3 x 3` max pool then `1 x 1` |              32 |
+
+All four run at the same stride and padding, so their spatial dimensions match and `torch.cat` along the channel axis works. The module outputs `64 + 128 + 32 + 32 = 256` channels.
+
+### Why the 1x1 convolutions are there
+
+Run the `5 x 5` branch directly on `256` input channels and it costs `32 * 256 * 25 = 204800` multiply-adds per spatial position for its `32` outputs. Inception puts a `1 x 1` conv in front that reduces `256` channels down to `16`, so the `5 x 5` now costs `32 * 16 * 25 = 12800`. The `1 x 1` itself costs `256 * 16 = 4096`, and the branch total drops to `16896`, roughly twelve times cheaper.
+
+```python
+nn.Sequential(
+    nn.Conv2d(256, 16, 1), nn.ReLU(),
+    nn.Conv2d(16, 32, 5, padding=2), nn.ReLU(),
+)
+```
+
+A `1 x 1` convolution is a dense layer applied independently at every spatial position. It has no receptive field and no translation across the image; it only mixes channels. That makes it the cheapest way to change channel count, and it appears in three roles:
+
+| Role                      | Example                                      | Effect                                    |
+| :------------------------ | :------------------------------------------- | :---------------------------------------- |
+| Channel reduction         | Inception `1 x 1` before a `5 x 5`           | Cuts FLOPs by `10x` or more               |
+| Channel expansion         | ResNet bottleneck `1 x 1` after a `3 x 3`    | Restores width cheaply                    |
+| Nonlinearity without cost | `1 x 1 -> ReLU` stacks in Network-in-Network | Adds depth with no receptive field growth |
+
+Inception v3 replaces every `5 x 5` with two stacked `3 x 3` convolutions, following the VGG argument, and factorizes asymmetric convolutions like `1 x 7` followed by `7 x 1` to cut parameters again.
+
+---
+
+## Navigating timm
+
+[`pytorch-image-models`](https://github.com/huggingface/pytorch-image-models) ships most published vision architectures with pretrained weights, plus the training and augmentation code that produced them. It is the standard way to get a backbone.
+
+```python title="timm_basics.py"
+import timm
+
+print(len(timm.list_pretrained()))            # several thousand checkpoints
+print(timm.list_pretrained("convnext*"))      # wildcard match on model family
+
+model = timm.create_model("convnext_tiny", pretrained=True, num_classes=10)
+```
+
+The four things you will do most often:
+
+```python
+# 1. A feature extractor with the classification head removed
+backbone = timm.create_model("resnet50", pretrained=True, num_classes=0)
+feats = backbone(torch.randn(2, 3, 224, 224))   # (2, 2048) after global pooling
+
+# 2. Multi-scale features from several stages
+fpn = timm.create_model("resnet50", pretrained=True, features_only=True, out_indices=(1, 2, 3, 4))
+for f in fpn(torch.randn(2, 3, 224, 224)):
+    print(f.shape)                              # (2,256,56,56) ... (2,2048,7,7)
+
+# 3. The transforms a checkpoint was trained with
+cfg = timm.data.resolve_model_data_config(model)
+train_tf, eval_tf = timm.data.create_transform(**cfg, is_training=True), timm.data.create_transform(**cfg)
+
+# 4. Inspecting the architecture before you modify it
+print(model.default_cfg)                        # input size, crop pct, mean, std
+print(model.feature_info.channels())            # channel count per stage
+```
+
+Model names in `timm` follow `family_variant.pretrained_cfg`, for example `convnext_tiny.fb_in22k_ft_in1k` means ConvNeXt-Tiny with weights finetuned on ImageNet-1k from an ImageNet-22k pretraining run published by Facebook AI Research. `timm.list_pretrained()` is the authoritative list; the docs table lags behind.
+
+Useful subpackages:
+
+| Module           | Contents                                                        |
+| :--------------- | :-------------------------------------------------------------- |
+| `timm.models`    | Architectures, `create_model`, `list_pretrained`                |
+| `timm.data`      | Transforms, `Mixup`, `FastCollateMixup`, dataset adapters       |
+| `timm.layers`    | DropPath, `SEModule`, `PatchEmbed`, `Mlp`, `ClassifierHead`     |
+| `timm.losses`    | `SoftTargetCrossEntropy`, `BinaryCrossEntropy`, label smoothing |
+| `timm.optim`     | Optimizer factories and the `timm` LR schedule wrappers         |
+| `timm.scheduler` | Cosine, step, plateau, and tanh schedules in `timm`'s own API   |
+
+`timm.layers` is worth reading even if you never use the pretrained weights, because `Mlp`, `DropPath`, and `PatchEmbed` are the same blocks the transformer implementations in Phase 5 are built from.
+
+---
+
+## A short architecture timeline
+
+| Year | Model        | Params | Top-5 error | The idea                                       |
+| ---: | :----------- | -----: | ----------: | :--------------------------------------------- |
+| 1998 | LeNet-5      |   60 K |       `n/a` | Convolutions and pooling on handwritten digits |
+| 2012 | AlexNet      |   61 M |      15.3 % | ReLU, dropout, two GPUs, heavy augmentation    |
+| 2014 | VGG-16       |  138 M |       7.3 % | Uniform `3 x 3` stacks, depth                  |
+| 2014 | GoogLeNet    |    7 M |       6.7 % | Inception, global average pooling              |
+| 2015 | ResNet-152   |   60 M |      3.57 % | Residual connections                           |
+| 2017 | MobileNet v1 |  4.2 M |       `n/a` | Depthwise separable convolutions               |
+| 2017 | DenseNet-201 |    8 M |       `n/a` | Dense concatenation instead of addition        |
+| 2018 | SENet-154    |   28 M |      2.25 % | Squeeze-and-excitation channel attention       |
+| 2019 | EfficientNet |  5.3 M |       `n/a` | Compound scaling of depth, width, resolution   |
+| 2020 | ViT-B/16     |   86 M |       `n/a` | Patch embeddings, no convolutions              |
+| 2022 | ConvNeXt-T   |   29 M |       `n/a` | Transformer design choices applied to a CNN    |
+
+The error column is ILSVRC validation top-5. Note how far parameter counts fall once residual connections and pointwise convolutions arrive: GoogLeNet beats VGG by a wide margin with a twentieth of the parameters.
+
+ConvNeXt is the interesting entry. It takes a ResNet-50 and applies transformer-era choices one at a time: changing the training recipe, moving to a `7 x 7` depthwise convolution, swapping ReLU for GELU, replacing BatchNorm with LayerNorm, and using fewer activation and normalization layers. Each change is worth roughly a point, and the result matches a Swin transformer at the same FLOPs. Convolutions did not lose to attention because they were the wrong operator.
+
+---
+
+## Interview questions
+
+1. Why does a residual block train better than a plain block of the same depth, in terms of the gradient?
+2. What is a bottleneck block, and what does the `1 x 1` convolution in it accomplish?
+3. When does a ResNet shortcut need a projection instead of an identity?
+4. What is the difference between ResNet v1 and v2 block ordering, and why does v2 train deeper?
+5. Why does an Inception module put a `1 x 1` conv before its `5 x 5` conv?
+6. Give three distinct roles a `1 x 1` convolution plays in modern architectures.
+7. Which CIFAR-10 augmentations must run before normalization, and why?
+8. What does `Mixup` do to the loss function, and why can you not use plain `CrossEntropyLoss` with it?
+9. What does `timm.create_model(..., num_classes=0)` return, and what shape?
+10. How would you extract features from four stages of a backbone for a feature pyramid, using `timm`?
+11. Why did VGG-16 have 138 M parameters while GoogLeNet had 7 M at comparable accuracy?
+12. What did ConvNeXt change relative to ResNet, and what does that tell you about CNNs versus transformers?

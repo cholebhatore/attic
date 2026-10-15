@@ -1,0 +1,294 @@
+---
+title: Recurrent Networks
+description: 'Recurrent hidden states, backpropagation through time, vanishing and exploding gradients, clipping, LSTM and GRU gating, and sliding-window forecasting.'
+---
+
+A convolution shares weights across space. A recurrent network shares weights across time. That single change lets a model carry information forward over a variable-length sequence, and it creates the gradient problem that dominated sequence modelling for a decade.
+
+---
+
+## The recurrent cell
+
+One hidden state `h_t` is updated at every timestep from the current input `x_t` and the previous state:
+
+```text
+h_t = tanh(W_ih x_t + b_ih + W_hh h_(t-1) + b_hh)
+y_t = W_hy h_t + b_hy
+```
+
+`W_hh` is applied at every step, so it is the same matrix multiplied by itself as many times as the sequence is long. That fact explains both what RNNs can do and why they fail.
+
+```python
+import torch
+import torch.nn as nn
+
+rnn = nn.RNN(input_size=128, hidden_size=256, num_layers=1, batch_first=True)
+x = torch.randn(8, 40, 128)              # batch 8, sequence length 40
+out, h_n = rnn(x)
+print(out.shape)   # (8, 40, 256)  hidden state at every timestep
+print(h_n.shape)   # (1, 8, 256)   hidden state at the last timestep only
+```
+
+Without `batch_first=True` the input layout is `(T, B, H)`, which is what `nn.LSTM` and `nn.GRU` also default to. This is the most common shape bug in sequence code.
+
+PyTorch keeps two separate biases, `b_ih` and `b_hh`, for CUDA kernel reasons. They are redundant; their sum is what matters.
+
+---
+
+## Backpropagation through time
+
+Unroll the recurrence over `T` steps and you have a `T`-layer network where every layer shares the same weights. BPTT is ordinary backprop on that unrolled graph.
+
+The gradient of the final state with respect to an earlier state is a product of `T - k` Jacobians:
+
+```text
+dh_T / dh_k = product over t=k+1..T of  diag(tanh'(z_t)) W_hh
+```
+
+Bounding the norm, with `gamma = max tanh' = 1` and `rho = ||W_hh||_2`:
+
+```text
+||dh_T / dh_k|| <= (gamma * rho)^(T-k)
+```
+
+That exponent is the whole story.
+
+| `rho`     | Behaviour over 40 steps                      | Symptom                                    |
+| :-------- | :------------------------------------------- | :----------------------------------------- |
+| `rho > 1` | Grows exponentially                          | `NaN` loss, gradient explosion             |
+| `rho = 1` | Stays bounded only if the tanh terms are `1` | Unstable in practice                       |
+| `rho < 1` | Decays exponentially                         | Vanishing gradient, no long range learning |
+
+Because the same matrix is reused at every step, there is no value of `rho` that keeps gradients stable for both very long and very short dependencies. A vanilla RNN learns dependencies over roughly ten to twenty steps and not much beyond.
+
+`gamma` makes it worse. `tanh'` is `1` only at zero and falls towards zero as the pre-activation saturates, so a network with large weights has both a large `rho` and small `gamma` terms that fluctuate wildly. This is why ReLU is sometimes used in recurrent cells for the exploding case: `gamma` becomes exactly `1`.
+
+---
+
+## Clipping exploding gradients
+
+Clipping is a bound, not a fix. It stops `NaN` and lets training continue; it does nothing about the vanishing direction.
+
+```python
+loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+opt.step()
+```
+
+`clip_grad_norm_` rescales the whole gradient vector if its global norm exceeds the threshold, which preserves direction:
+
+```text
+g <- g * min(1, max_norm / ||g||)
+```
+
+`clip_grad_value_` clamps each element independently and distorts direction. Norm clipping is the default choice for RNNs and LSTMs.
+
+<Callout type="warn">
+  ### Clipping and mixed precision
+
+With `torch.amp.GradScaler`, gradients are scaled up during `backward()` to avoid FP16 underflow. Clipping the scaled values gives you a meaningless threshold. Call `scaler.unscale_(opt)` first, then clip, then `scaler.step(opt)`.
+
+</Callout>
+
+A typical `max_norm` for an LSTM language model is `5.0`, and for most other recurrent work `1.0`. Monitor the pre-clip norm during training; if it is routinely an order of magnitude above the threshold, the threshold is doing the optimization for you and the learning rate is too high.
+
+### Truncated BPTT
+
+For very long sequences, process the input in chunks of length `L`, detach the hidden state at each chunk boundary, and backpropagate only within a chunk.
+
+```python
+h = None
+for chunk in sequence.split(L, dim=1):
+    out, h = rnn(chunk, h)
+    loss = criterion(out, target)
+    loss.backward()
+    h = tuple(t.detach() for t in h)     # cut the graph between chunks
+```
+
+This bounds memory to `O(L)` instead of `O(T)` and caps the gradient chain length. The cost is that dependencies longer than `L` are never learned, which is fine when `L` is chosen above the dependency length you care about.
+
+---
+
+## LSTM
+
+The Long Short-Term Memory cell adds a second state `c_t`, the cell state, which is updated additively rather than by overwriting:
+
+```text
+i_t = sigmoid(W_ii x_t + b_ii + W_hi h_(t-1) + b_hi)     input gate
+f_t = sigmoid(W_if x_t + b_if + W_hf h_(t-1) + b_hf)     forget gate
+g_t = tanh(W_ig x_t + b_ig + W_hg h_(t-1) + b_hg)        candidate
+o_t = sigmoid(W_io x_t + b_io + W_ho h_(t-1) + b_ho)     output gate
+
+c_t = f_t * c_(t-1) + i_t * g_t                          additive cell update
+h_t = o_t * tanh(c_t)                                    exposed hidden state
+```
+
+| Gate   | Range    | Controls                               |
+| :----- | :------- | :------------------------------------- |
+| Forget | `(0, 1)` | How much of the old cell state to keep |
+| Input  | `(0, 1)` | How much of the candidate to write     |
+| Output | `(0, 1)` | How much of the cell state to expose   |
+
+The key line is `c_t = f_t * c_(t-1) + i_t * g_t`. Differentiating gives:
+
+```text
+dc_t / dc_(t-1) = f_t   (plus terms through the gate pre-activations)
+```
+
+If the forget gate learns to stay near `1`, the gradient passes through almost unchanged for arbitrarily many steps. That is the constant error carousel, and it is why LSTMs learn dependencies over hundreds of timesteps where vanilla RNNs fail at twenty. It replaces the multiplicative `W_hh` chain with an elementwise gate chain.
+
+Two implementation details that matter:
+
+- **Forget gate bias.** Initialize `b_if` to `1` or `2` so the gate starts open. With the default initialization it starts near `sigmoid(0) = 0.5`, and the cell forgets half its state every step before it has learned anything.
+- **Peephole connections** let the gates read `c_(t-1)` directly. They help on tasks needing precise timing and are rarely used otherwise. PyTorch's `nn.LSTM` does not implement them.
+
+```python
+lstm = nn.LSTM(128, 256, num_layers=2, batch_first=True, bidirectional=True, dropout=0.1)
+out, (h_n, c_n) = lstm(torch.randn(8, 40, 128))
+print(out.shape)   # (8, 40, 512)      2 directions x 256
+print(h_n.shape)   # (4, 8, 256)       2 layers x 2 directions
+```
+
+`dropout` between LSTM layers applies to the hidden state passed upward, not to the recurrent connection within a layer. With `num_layers=1` it does nothing.
+
+---
+
+## GRU
+
+The Gated Recurrent Unit merges the cell and hidden state into one vector and uses two gates instead of three:
+
+```text
+r_t = sigmoid(W_ir x_t + b_ir + W_hr h_(t-1) + b_hr)     reset gate
+z_t = sigmoid(W_iz x_t + b_iz + W_hz h_(t-1) + b_hz)     update gate
+n_t = tanh(W_in x_t + b_in + r_t * (W_hn h_(t-1) + b_hn))
+h_t = (1 - z_t) * n_t + z_t * h_(t-1)
+```
+
+`z_t` interpolates between the previous state and the new candidate, so it plays the role of both forget and input gates with the constraint `i_t = 1 - f_t`. That constraint is what GRU gives up relative to LSTM: it cannot forget and not write at the same time.
+
+| Property          | RNN                           | GRU                         | LSTM                           |
+| :---------------- | :---------------------------- | :-------------------------- | :----------------------------- |
+| States            | 1                             | 1                           | 2 (`h` and `c`)                |
+| Gates             | 0                             | 2                           | 3                              |
+| Weight matrices   | `H_in*H + H*H`                | `3` times that              | `4` times that                 |
+| Additive path     | None                          | Via `z_t`                   | Via `c_t`                      |
+| Long dependencies | ~20 steps                     | Hundreds                    | Hundreds                       |
+| Typical use       | Short sequences, tiny budgets | Default when data is scarce | Default when data is plentiful |
+
+At equal hidden size, an LSTM has roughly `4/3` the parameters of a GRU. Published comparisons are close enough to a tie that the choice is usually made on parameter budget and library support rather than accuracy.
+
+---
+
+## Bidirectional, stacked, and variable length
+
+A bidirectional layer runs two independent recurrences, one forward and one backward, and concatenates the outputs. It sees the whole sequence at every position, which is what you want for classification and tagging and what you cannot have for autoregressive generation.
+
+```python
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+lengths = torch.tensor([40, 31, 27, 19, 12, 8, 5, 2])
+packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+out_packed, (h_n, c_n) = lstm(packed)
+out, out_lengths = pad_packed_sequence(out_packed, batch_first=True)
+```
+
+Packing removes the padded positions from the computation entirely, so short sequences in a batch cost nothing and the final hidden state `h_n` is the state at each sample's true last timestep rather than at the padding. Without packing, `h_n` is garbage for every sequence shorter than the longest.
+
+`enforce_sorted=False` lets PyTorch sort internally. Older versions required the batch to be pre-sorted by length, and a lot of existing code still does that.
+
+---
+
+## Time series prediction
+
+The setup is sliding-window autoregression: predict the next `H` values from the previous `W` values, and slide the window along the series.
+
+```python title="window.py"
+import torch
+from torch.utils.data import Dataset
+
+class WindowDataset(Dataset):
+    def __init__(self, series: torch.Tensor, window: int = 48, horizon: int = 1):
+        n = len(series) - window - horizon + 1
+        self.x = torch.stack([series[i : i + window] for i in range(n)])
+        self.y = torch.stack([series[i + window : i + window + horizon] for i in range(n)])
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, i):
+        return self.x[i], self.y[i]
+
+series = torch.randn(5000, 1)
+train = WindowDataset(series[:4000], window=48, horizon=1)
+test = WindowDataset(series[4000:], window=48, horizon=1)
+print(train[0][0].shape, train[0][1].shape)   # (48, 1) (1, 1)
+```
+
+### Multi-horizon strategies
+
+| Strategy  | How it works                                   | Failure mode                        |
+| :-------- | :--------------------------------------------- | :---------------------------------- |
+| One-step  | Predict `t+1` only                             | Cannot forecast                     |
+| Recursive | Feed predictions back as inputs                | Errors compound over the horizon    |
+| Direct    | One output head per future step                | No cross-step consistency           |
+| Seq2seq   | Encoder over history, decoder over the horizon | More parameters, best long horizons |
+
+Recursive multi-step is what "autoregression" usually means in practice, and it is where the error growth shows up: a small bias at step one gets fed back in and amplified. Direct multi-horizon avoids that at the cost of independent predictions per step.
+
+### Things that matter more than the architecture
+
+- **Normalize per feature, fitted on training data only.** A standardization computed over the whole series leaks the future into the training split.
+- **Difference non-stationary series.** An LSTM cannot extrapolate a trend it has never seen leave its training range.
+- **Split by time, never shuffle.** Random splits on a series produce optimistic numbers that do not survive deployment.
+- **Beat a naive baseline first.** Predicting `y_hat = x_t` (persistence) or a seasonal mean is a strong baseline on many real series, and a recurrent model that does not beat it is not learning.
+
+```python title="model.py"
+class Forecaster(nn.Module):
+    def __init__(self, n_features=1, hidden=128, layers=2, horizon=1):
+        super().__init__()
+        self.rnn = nn.LSTM(n_features, hidden, layers, batch_first=True)
+        self.head = nn.Linear(hidden, horizon)
+
+    def forward(self, x):
+        out, _ = self.rnn(x)          # x: (B, W, n_features)
+        return self.head(out[:, -1])  # use the final timestep only
+```
+
+Using `out[:, -1]` gives the state after the whole window. For multi-step direct forecasting, widen the head to `horizon` outputs. For seq2seq, run a second decoder RNN whose input at each step is the previous prediction.
+
+---
+
+## When recurrent networks still make sense
+
+Transformers replaced RNNs for language, but the replacement is not universal.
+
+| Situation                                      | Better choice                    |
+| :--------------------------------------------- | :------------------------------- |
+| Long sequences, plenty of data, parallelizable | Transformer                      |
+| Streaming inference, one sample at a time      | RNN or LSTM, constant memory     |
+| Very small dataset, short sequences            | GRU or LSTM                      |
+| Strictly causal online prediction              | Any recurrent model              |
+| Irregularly sampled time series                | RNN with a time-aware decay gate |
+| Edge deployment with a tiny memory budget      | GRU                              |
+
+A recurrent model processes a stream in `O(1)` memory per step. A transformer needs the full KV cache, which grows linearly with sequence length. That is why [Phase 10](/ai/inference) spends so much time on KV-cache management: it is the cost of giving up recurrence.
+
+Modern recurrent variants (Mamba, RWKV, RetNet, xLSTM) revisit these trade-offs with linear-time attention-like mechanisms, and as of 2026 they are competitive with transformers on long-context language modelling at lower inference cost.
+
+---
+
+## Interview questions
+
+1. Write the LSTM update equations and label each gate.
+2. Why does an LSTM avoid the vanishing gradient that a vanilla RNN suffers? Point at the specific term.
+3. What is the constant error carousel?
+4. Derive the bound on `||dh_T / dh_k||` for a vanilla RNN and explain what `rho` does.
+5. Why does gradient clipping preserve direction with `clip_grad_norm_` but not with `clip_grad_value_`?
+6. Where does clipping go in an AMP training step, and why does the order matter?
+7. What is truncated BPTT, and what does it cost you?
+8. Why initialize the LSTM forget gate bias to a positive value?
+9. What does GRU give up relative to LSTM, and how many parameters does each have at equal hidden size?
+10. What goes wrong if you feed a padded batch to `nn.LSTM` without packing, and read `h_n`?
+11. Why must time series splits be chronological rather than random?
+12. Compare recursive and direct multi-step forecasting, and say when each fails.
+13. What does a recurrent model give you at inference time that a transformer does not?

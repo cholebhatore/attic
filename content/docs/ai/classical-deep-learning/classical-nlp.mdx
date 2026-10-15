@@ -1,0 +1,329 @@
+---
+title: Classical NLP and Seq2Seq
+description: 'Word2Vec and GloVe embeddings, encoder-decoder translation, teacher forcing, CNN-to-RNN image captioning, and the fixed-vector bottleneck that motivated attention.'
+---
+
+Before transformers, NLP was a pipeline of separate pieces: an embedding table learned on unlabeled text, a recurrent encoder, a recurrent decoder, and a search procedure at inference time. The pieces are worth knowing because the vocabulary is still in use, because the embedding idea survives intact inside every modern tokenizer, and because the failure of this pipeline is exactly what attention was invented to fix.
+
+---
+
+## From one-hot to embeddings
+
+A vocabulary of `V` words represented as one-hot vectors has `V` dimensions, and every pair of words is exactly orthogonal. The dot product of `cat` and `dog` is `0`, the same as the dot product of `cat` and `aircraft`. There is no similarity to learn from and the input dimension grows with the vocabulary.
+
+An embedding is a learned lookup table: a matrix `E` of shape `(V, d)` where row `i` is the vector for token `i`.
+
+```python
+import torch
+import torch.nn as nn
+
+emb = nn.Embedding(num_embeddings=50000, embedding_dim=300, padding_idx=0)
+ids = torch.tensor([[5, 12, 809, 0, 0]])
+print(emb(ids).shape)          # (1, 5, 300)
+print(emb.weight.shape)        # (50000, 300)
+```
+
+The lookup is a row select, not a matrix multiply, so it costs nothing compared to a dense projection. `padding_idx` fixes that row at zero and excludes it from gradient updates. Setting `sparse=True` on the embedding produces sparse gradients, which only some optimizers support.
+
+Everything downstream works in this `d`-dimensional space instead of the `V`-dimensional one.
+
+---
+
+## Word2Vec
+
+Two architectures from Mikolov et al. (arXiv:1301.3781, arXiv:1310.4546), both trained on the co-occurrence statistics of a plain corpus.
+
+| Model     | Input             | Predicts          | Better at              |
+| :-------- | :---------------- | :---------------- | :--------------------- |
+| Skip-gram | One center word   | Its context words | Rare words             |
+| CBOW      | The context words | The center word   | Frequent words, faster |
+
+Skip-gram is the one that produces the useful embeddings. For a center word `w_t` and a window of size `C`, it maximizes:
+
+```text
+sum over t, sum over -C <= j <= C, j != 0 of   log p(w_(t+j) | w_t)
+```
+
+with `p` modelled as a softmax over the whole vocabulary. That softmax is the problem: normalizing over `V = 100000` words for every window position is intractable.
+
+### Negative sampling
+
+Replace the softmax with a binary classification: distinguish the true context word from `K` noise samples.
+
+```text
+log sigmoid(u_o . v_c) + sum over k=1..K of  E[ log sigmoid(-u_k . v_c) ]
+```
+
+`v_c` is the center word's vector, `u_o` is the context word's vector from a second table. `K` is typically `5` to `20` for small corpora and `2` to `5` for large ones. Noise words are drawn from the unigram distribution raised to the `3/4` power, which slightly boosts rare words relative to their true frequency.
+
+```python title="skipgram.py"
+import torch
+import torch.nn.functional as F
+
+def nce_loss(center, context, negatives):
+    # center: (B, d), context: (B, d), negatives: (B, K, d)
+    pos = (center * context).sum(-1)                          # (B,)
+    neg = torch.bmm(negatives, center.unsqueeze(-1)).squeeze(-1)  # (B, K)
+    return -(F.logsigmoid(pos) + F.logsigmoid(-neg).sum(-1)).mean()
+```
+
+Two more tricks matter in practice:
+
+- **Subsampling frequent words.** Drop token `w` with probability `1 - sqrt(t / f(w))` where `f(w)` is its corpus frequency and `t` is around `1e-5`. This removes most occurrences of `the` and `of`, which carry no distributional signal and otherwise dominate the gradient.
+- **Window sampling.** Instead of a fixed window, draw the actual window size uniformly each time so nearby words are seen more often than distant ones.
+
+### What the vectors encode
+
+The trained vectors support linear analogy arithmetic. The famous case is:
+
+```text
+vec("king") - vec("man") + vec("woman")  ≈  vec("queen")
+```
+
+Cosine similarity between the result and every vocabulary vector ranks `queen` near the top. Similar structure appears for capital-country pairs, comparative adjectives, and verb tenses. It is the strongest evidence that a simple co-occurrence objective learns something like semantic composition, and it is the reason static embeddings were the standard NLP input layer for five years.
+
+---
+
+## GloVe
+
+Global Vectors (Pennington et al., 2014) skips the windowing and factorizes the whole co-occurrence matrix directly.
+
+Build `X`, where `X_ij` counts how often word `j` appears in the context of word `i` over the entire corpus. Then fit vectors so their dot product predicts the log of that count:
+
+```text
+J = sum over i,j of  f(X_ij) * (w_i . v_j + b_i + c_j - log X_ij)^2
+```
+
+The weighting function caps the influence of very frequent pairs:
+
+```text
+f(X) = (X / X_max)^0.75   if X < X_max
+f(X) = 1                  otherwise
+```
+
+with `X_max = 100` in the original paper. Without it, a handful of pairs like `the` with `of` would dominate the loss.
+
+```python title="glove.py"
+import torch
+
+def glove_loss(W, V, b, c, X, X_max=100.0, alpha=0.75):
+    # W, V: (V_size, d);  X: dense or sparse co-occurrence counts
+    pred = W @ V.T + b[:, None] + c[None, :]
+    weight = torch.clamp(X / X_max, max=1.0).pow(alpha)
+    return (weight * (pred - torch.log(X.clamp(min=1e-12))) ** 2).sum()
+```
+
+In practice nobody builds the dense `X`. The reference implementation streams the corpus, counts co-occurrences into a sparse table, shuffles it, and runs AdaGrad for a fixed number of passes.
+
+### Word2Vec against GloVe
+
+| Property           | Word2Vec                    | GloVe                                    |
+| :----------------- | :-------------------------- | :--------------------------------------- |
+| Data structure     | Sliding windows over text   | Global co-occurrence matrix              |
+| Objective          | Binary classification (NCE) | Weighted least squares on log counts     |
+| Local vs global    | Local context only          | Uses global statistics                   |
+| Memory             | Low, streams the corpus     | Must store the co-occurrence table       |
+| Analogy accuracy   | Comparable                  | Comparable, slightly better on some sets |
+| Pretrained vectors | Google News 300d            | Wikipedia and Gigaword, 50 to 300d       |
+
+In most head-to-head evaluations the two are within a point of each other downstream. GloVe's advantage is that it makes explicit use of corpus-wide statistics, which helps on small corpora where any individual window is uninformative.
+
+---
+
+## The limits of static embeddings
+
+One vector per word type, fixed at inference time. Three consequences:
+
+- **Polysemy collapses.** `bank` gets a single vector averaging the river sense and the financial sense. Context cannot disambiguate it because there is no mechanism to change the vector.
+- **Out-of-vocabulary words have nothing.** Any token not in the training vocabulary maps to an unknown vector.
+- **Morphology is ignored.** `run`, `runs`, `running`, and `ran` are four unrelated vectors unless the corpus happens to make them similar.
+
+Subword methods fix the third one. FastText represents a word as a bag of character n-grams and sums their vectors, so `running` and `run` share most of their representation and novel words still get a vector. Byte-pair encoding, covered in [Phase 6](/ai/llm), solves the second by building the vocabulary out of frequent byte sequences rather than whole words.
+
+Contextual embeddings (ELMo, then BERT) solve the first by computing a different vector for each word occurrence from a bidirectional language model. That is the transition point between this page and Phase 5.
+
+---
+
+## Seq2Seq
+
+Sutskever et al. (arXiv:1409.3215) mapped a variable-length input sequence to a variable-length output sequence with two RNNs and nothing in between but a single vector.
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph ENC["Encoder LSTM"]
+        X1["le"] --> X2["chat"] --> X3["est"] --> X4["EOS"]
+    end
+    X4 --> C["context vector c"]
+    C --> D1["decoder step 1"]
+    D1 --> D2["decoder step 2"]
+    D2 --> D3["decoder step 3"]
+    D3 --> D4["EOS"]
+    D1 --> Y1["the"]
+    D2 --> Y2["cat"]
+    D3 --> Y3["is"]
+`}
+/>
+
+The encoder reads the whole source sentence and ends in some hidden state. That state, and only that state, is passed to the decoder, which then generates the target one token at a time from its own previous output.
+
+```python title="seq2seq.py"
+import torch
+import torch.nn as nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+class Encoder(nn.Module):
+    def __init__(self, vocab: int, dim: int = 300, hidden: int = 512, layers: int = 2):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, dim, padding_idx=0)
+        self.rnn = nn.LSTM(dim, hidden, layers, bidirectional=True, batch_first=True)
+        self.proj = nn.Linear(hidden * 2, hidden)
+
+    def forward(self, x, lengths):
+        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        out, (h, c) = self.rnn(packed)
+        out, _ = pad_packed_sequence(out, batch_first=True)      # (B, T, 2*hidden)
+        h = self.proj(torch.cat([h[-2], h[-1]], dim=-1))         # (B, hidden)
+        c = self.proj(torch.cat([c[-2], c[-1]], dim=-1))
+        return out, (h.unsqueeze(0), c.unsqueeze(0))
+
+class Decoder(nn.Module):
+    def __init__(self, vocab: int, dim: int = 300, hidden: int = 512, layers: int = 2):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, dim, padding_idx=0)
+        self.rnn = nn.LSTM(dim, hidden, layers, batch_first=True)
+        self.out = nn.Linear(hidden, vocab)
+
+    def forward(self, y, state):
+        out, state = self.rnn(y, state)      # y: (B, 1)
+        return self.out(out), state
+```
+
+`h[-2]` and `h[-1]` are the forward and backward final states of the top bidirectional layer. Concatenating and projecting them gives a single context vector, which is the `c` in the diagram.
+
+### Teacher forcing
+
+During training, feed the ground-truth previous token to the decoder rather than the token it predicted. Training parallelizes across all target positions and converges much faster.
+
+```python
+target_in = torch.cat([bos.expand(B, 1), y_true[:, :-1]], dim=1)   # shifted right
+logits, _ = decoder(target_in, state)
+loss = F.cross_entropy(logits.reshape(-1, V), y_true.reshape(-1), ignore_index=0)
+```
+
+At inference there is no ground truth, so the decoder consumes its own predictions. The mismatch between the two regimes is **exposure bias**: the model never saw its own mistakes during training, so one wrong token can push it off-distribution for the rest of the sequence. Scheduled sampling interpolates between the two, feeding predictions with increasing probability as training progresses.
+
+### Decoding
+
+Greedy search takes the `argmax` at every step and produces repetitive, degenerate output on translation. Beam search keeps the top `k` partial hypotheses and is the standard for deterministic tasks, with `k` between `4` and `10`. Sampling with temperature is used when diversity matters more than likelihood. Both are covered in detail in [Phase 6](/ai/llm).
+
+Two small tricks from the original paper still hold:
+
+- **Reverse the input sentence.** Feeding `a b c` as `c b a` puts the first source words closer to the start of decoding, where gradients are strongest. It bought several BLEU points in 2014.
+- **Use a deep encoder and share nothing.** Four LSTM layers with no weight sharing beat two layers with sharing.
+
+---
+
+## The fixed-vector bottleneck
+
+Everything the decoder knows about the source passes through one vector of size `hidden`, regardless of whether the source is four words or four hundred.
+
+Bahdanau et al. (arXiv:1409.0473) measured this directly. BLEU for a plain encoder-decoder stays flat on short sentences and then falls off sharply past roughly twenty words, while their attention-based variant holds its score out to sixty words. The degradation is not a training failure; it is an information capacity failure. Compressing a long sentence into `512` floats loses content, and the loss grows with length.
+
+The fix is to stop compressing. Keep every encoder hidden state `h_1 ... h_T`, and at each decoder step compute a weighted sum where the weights come from a learned alignment between the decoder state and each encoder state:
+
+```text
+e_tj = a(s_(t-1), h_j)                alignment score, a small feed-forward net
+alpha_tj = softmax_j(e_tj)            attention weights
+c_t = sum over j of alpha_tj * h_j    per-step context vector
+```
+
+Now the context vector `c_t` is recomputed at every decoding step and can point at whichever source positions matter for the token being generated. On translation, those weights align to the source word being translated, which is why attention maps on `en`-`fr` look like a soft diagonal.
+
+That single change, a per-step weighted sum over stored encoder states, is the mechanism that becomes self-attention in [Phase 5](/ai/transformers). Once the context vector no longer needs a recurrence to be updated, the recurrence itself stops being necessary.
+
+---
+
+## Image captioning
+
+Swap the RNN encoder for a CNN and the same architecture describes images.
+
+| Model                                                        | Encoder                    | Decoder                           | The contribution                                     |
+| :----------------------------------------------------------- | :------------------------- | :-------------------------------- | :--------------------------------------------------- |
+| Show and Tell (Vinyals, 2014)                                | CNN, final vector          | LSTM                              | Treat the image as the first word                    |
+| Deep Visual-Semantic Alignments (Karpathy and Fei-Fei, 2014) | CNN region features        | RNN with a soft-alignment decoder | Aligns words to image regions                        |
+| Show, Attend and Tell (Xu, 2015)                             | CNN, `14 x 14` feature map | LSTM with spatial attention       | Attention over image locations, with a visualization |
+
+Show and Tell is the Seq2Seq structure with one substitution:
+
+```python title="caption.py"
+import timm
+import torch
+import torch.nn as nn
+
+class Captioner(nn.Module):
+    def __init__(self, vocab: int, feat_dim: int = 2048, hidden: int = 512):
+        super().__init__()
+        self.backbone = timm.create_model("resnet50", pretrained=True, num_classes=0)
+        self.project = nn.Linear(feat_dim, hidden)
+        self.emb = nn.Embedding(vocab, hidden, padding_idx=0)
+        self.cell = nn.LSTMCell(hidden, hidden)
+        self.out = nn.Linear(hidden, vocab)
+
+    def forward(self, image, tokens):
+        B = image.shape[0]
+        zeros = torch.zeros(B, self.cell.hidden_size, device=image.device)
+        h, c = self.cell(self.project(self.backbone(image)), (zeros, zeros))
+
+        logits = []
+        for t in range(tokens.shape[1]):
+            h, c = self.cell(self.emb(tokens[:, t]), (h, c))
+            logits.append(self.out(h))
+        return torch.stack(logits, dim=1)      # (B, T, vocab)
+```
+
+The image feature is projected to the embedding dimension and used as the input at `t = 0`, exactly as a start-of-sequence token would be. Everything after that is the language model from the previous section.
+
+Show, Attend and Tell keeps the CNN's `14 x 14 x 2048` feature map instead of pooling it, flattens it to `196` spatial locations, and computes attention weights over those locations at each decoding step. The resulting heatmaps show the model looking at the dog when it writes "dog" and at the grass when it writes "grass", which was the first widely shared visualization of attention doing something interpretable.
+
+<Callout type="info">
+  ### The same bottleneck, different modality
+
+A pooled `2048`-dimensional image vector has to hold the whole scene for a caption of arbitrary length. Spatial attention relieves it in exactly the way source-word attention relieves the translation encoder. Any architecture that compresses variable-size input into a fixed vector has this problem, and the fix is always the same: keep the pre-pool representations and let the consumer select from them.
+
+</Callout>
+
+---
+
+## Evaluation
+
+| Metric     | Measures                                                             | Weakness                                                                   |
+| :--------- | :------------------------------------------------------------------- | :------------------------------------------------------------------------- |
+| Perplexity | Exponentiated mean negative log-likelihood of the corpus             | Says nothing about output quality                                          |
+| BLEU       | N-gram precision against one or more references                      | Ignores recall beyond brevity penalty, insensitive to word order at high n |
+| METEOR     | Unigram match with stemming and synonymy, plus fragmentation penalty | Needs WordNet for full effect                                              |
+| ROUGE      | N-gram recall, for summarization                                     | Rewards copying                                                            |
+| CIDEr      | TF-IDF weighted n-gram similarity, for captioning                    | Sensitive to reference count                                               |
+| SPICE      | Scene-graph tuple matching                                           | Expensive parser                                                           |
+| Human      | Adequacy and fluency ratings                                         | Slow, expensive, not reproducible                                          |
+
+All the automatic metrics correlate only loosely with human judgment, and all of them can be gamed by producing frequent n-grams. They are useful for tracking progress during development and meaningless for comparing two systems that are close. Modern evaluation uses learned judges and human preference data, covered in [Phase 11](/ai/agents).
+
+---
+
+## Interview questions
+
+1. Why is a one-hot vocabulary representation unusable as a model input?
+2. What does `nn.Embedding` compute, and why is a lookup cheaper than a projection?
+3. Contrast skip-gram and CBOW, and say which produces better embeddings for rare words.
+4. Write the negative sampling objective and explain what the `3/4` power on the noise distribution does.
+5. Why does Word2Vec subsample frequent words, and with what probability?
+6. What is the GloVe weighting function for, and what breaks without it?
+7. Give two failure modes of static word embeddings and name the technique that fixes each.
+8. What is teacher forcing, and what is exposure bias?
+9. Why did the original Seq2Seq paper reverse the input sentence?
+10. Describe the fixed-vector bottleneck precisely, and what evidence Bahdanau et al. used to demonstrate it.
+11. Write the attention equations for a Seq2Seq decoder and explain what `alpha_tj` represents.
+12. In Show and Tell, how is the image injected into the LSTM?
+13. What does spatial attention in Show, Attend and Tell give you that global average pooling does not?
+14. Why is BLEU a poor metric for comparing two good captioning systems?

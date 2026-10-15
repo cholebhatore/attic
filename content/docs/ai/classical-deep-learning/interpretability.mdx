@@ -1,0 +1,303 @@
+---
+title: Interpretability
+description: 'Forward and backward hooks, capturing and visualizing feature maps, saliency maps from input gradients, and Grad-CAM heatmaps built by hand.'
+---
+
+A trained CNN is a differentiable function from pixels to class scores, and you can query it in two directions. Push an image forward and read what each layer computes. Push a class score backward and read which pixels and which units were responsible for it. Both directions use the same mechanism: hooks.
+
+---
+
+## Hooks
+
+A hook is a callback PyTorch invokes during a module's forward or backward pass. You register it on a module and it fires every time that module runs, with no change to the model's source.
+
+| Registration                   | Signature                                    | Fires                 |
+| :----------------------------- | :------------------------------------------- | :-------------------- |
+| `register_forward_pre_hook`    | `(module, args) -> None or modified args`    | Before `forward`      |
+| `register_forward_hook`        | `(module, args, output) -> None or new out`  | After `forward`       |
+| `register_full_backward_hook`  | `(module, grad_input, grad_output) -> tuple` | During `backward`     |
+| `register_module_forward_hook` | Global, every module                         | After every `forward` |
+
+```python
+handles = []
+acts = {}
+
+def fwd(module, args, output):
+    acts[module] = output.detach()
+
+handles.append(model.layer4.register_forward_hook(fwd))
+model(x)
+print(acts[model.layer4].shape)   # (B, 2048, 7, 7)
+
+for h in handles:
+    h.remove()
+```
+
+Four things worth knowing:
+
+- Returning a value from a forward hook replaces the module's output. This is how you patch a layer without editing the model.
+- Returning a tuple from a backward hook replaces `grad_input`. This is how guided backprop works.
+- `register_full_backward_hook` is the current API. `register_backward_hook` is deprecated and mishandles modules with multiple outputs.
+- Hooks hold references to what they capture. Remove the handles, or your activations stay on the GPU for the lifetime of the process.
+
+If you need the gradient of a tensor that is not a module output, `retain_grad()` is simpler than a hook:
+
+```python
+mid = model.features[:6](x)
+mid.retain_grad()
+logits = model.features[6:](mid)
+logits.sum().backward()
+print(mid.grad.shape)
+```
+
+---
+
+## Inspecting feature maps
+
+The cheapest useful audit is a forward hook that records activation statistics per layer. It catches dead units, saturation, and scale drift in a few lines.
+
+```python title="activation_stats.py"
+stats = {}
+
+def record(name):
+    def hook(module, args, output):
+        o = output.detach().float()
+        stats[name] = {
+            "mean": o.mean().item(),
+            "std": o.std().item(),
+            "frac_zero": (o == 0).float().mean().item(),
+            "max": o.amax().item(),
+        }
+    return hook
+
+for name, module in model.named_modules():
+    if isinstance(module, nn.ReLU):
+        module.register_forward_hook(record(name))
+```
+
+`frac_zero` after a ReLU is the dead-unit rate. A layer where it exceeds about 0.8 has collapsed and is contributing nothing; see [Neurons and Activations](/ai/neural-networks/neurons-and-activations).
+
+### Finding what a unit responds to
+
+For a given channel `k` in a feature map, score every image in the dataset by its maximum activation and look at the top ten. This is the standard manual version of feature visualization, and on ImageNet-pretrained models the results are interpretable: early channels fire on colours and edges, mid channels on textures like fur and grille, late channels on object parts.
+
+```python title="max_activating.py"
+best = []
+
+def hook(module, args, output):
+    score = output[:, channel].flatten(1).amax(1)     # (B,)
+    for i, s in enumerate(score.tolist()):
+        best.append((s, i))
+
+model.layer4[2].register_forward_hook(hook)
+with torch.no_grad():
+    for batch, _ in loader:
+        model(batch.to(device))
+best.sort(reverse=True)
+```
+
+Activating a single channel maximally by gradient ascent on the input, starting from noise or a blurred image, is Deep Dream and activation maximization. That is on the next page.
+
+---
+
+## Saliency maps
+
+Saliency answers: which pixels most influence this class score? Take the gradient of the score with respect to the input image.
+
+```python title="saliency.py"
+import torch
+
+def saliency(model, x, class_idx=None):
+    model.eval()
+    x = x.unsqueeze(0).requires_grad_(True)
+    logits = model(x)
+    idx = logits.argmax(-1).item() if class_idx is None else class_idx
+
+    model.zero_grad()
+    logits[0, idx].backward()
+
+    grad = x.grad[0].abs()              # (3, H, W)
+    return grad.amax(0)                 # (H, W), max over colour channels
+```
+
+Setting `requires_grad_(True)` on the input rather than the weights is the whole trick, and it is the same mechanism as every attack and visualization method on the next page. `model.zero_grad()` stops weight gradients from accumulating across calls, but the parameters still allocate gradient buffers. Free them first if memory is tight:
+
+```python
+for p in model.parameters():
+    p.requires_grad_(False)
+```
+
+The result is noisy. Three common cleanups:
+
+| Variant              | Modification                                | Effect                        |
+| :------------------- | :------------------------------------------ | :---------------------------- |
+| Vanilla gradient     | `abs(grad)`                                 | Noisy, shows local edges      |
+| Gradient times input | `grad * x`                                  | Suppresses low-value pixels   |
+| SmoothGrad           | Average `grad` over `n` noisy copies of `x` | Much smoother, `n` times cost |
+| Guided backprop      | Block negative gradients at every ReLU      | Sharp, high-contrast          |
+
+Guided backprop needs a backward hook on each ReLU that zeroes the negative part of the incoming gradient:
+
+```python
+def guided_relu(module, grad_input, grad_output):
+    return (grad_output[0].clamp(min=0),)
+
+for m in model.modules():
+    if isinstance(m, nn.ReLU):
+        m.register_full_backward_hook(guided_relu)
+```
+
+Returning a one-element tuple replaces `grad_input`. The result is visually far cleaner than vanilla saliency, and it is also less faithful, since it drops the negative evidence that pushed the score down.
+
+---
+
+## Grad-CAM
+
+Saliency gives pixel-level detail and no semantic locality. Grad-CAM gives a coarse heatmap over the last convolutional feature map that says which region of the image the class score came from.
+
+For class `c` and the last conv layer's activation `A` with channels `A^1 ... A^K`:
+
+```text
+alpha_k = (1/Z) * sum over i,j of  dY^c / dA^k_ij
+L_Grad-CAM = ReLU( sum_k  alpha_k * A^k )
+```
+
+`alpha_k` is the global-average-pooled gradient of the class score with respect to channel `k`. It measures how much channel `k` matters for class `c`. The weighted sum of channels is then passed through a ReLU so only positive evidence shows, and upsampled to the input resolution.
+
+```python title="gradcam.py"
+import torch
+import torch.nn.functional as F
+
+def grad_cam(model, target_layer, x, class_idx=None):
+    acts, grads = {}, {}
+
+    def fwd(module, args, output):
+        acts["a"] = output
+
+    def bwd(module, grad_input, grad_output):
+        grads["g"] = grad_output[0]
+
+    hf = target_layer.register_forward_hook(fwd)
+    hb = target_layer.register_full_backward_hook(bwd)
+
+    x = x.unsqueeze(0)
+    logits = model(x)
+    idx = logits.argmax(-1).item() if class_idx is None else class_idx
+
+    model.zero_grad()
+    logits[0, idx].backward()
+    hf.remove()
+    hb.remove()
+
+    A, G = acts["a"][0], grads["g"][0]         # both (K, h, w)
+    alpha = G.mean(dim=(1, 2), keepdim=True)   # (K, 1, 1)
+    cam = torch.relu((alpha * A).sum(0))       # (h, w)
+    cam = cam / cam.amax().clamp(min=1e-8)
+    return F.interpolate(
+        cam[None, None], size=x.shape[-2:], mode="bilinear", align_corners=False
+    )[0, 0]
+```
+
+Target the last convolutional layer before global pooling. For a `timm` ResNet-50 that is `model.layer4[-1].conv3`, or more reliably the module whose output feeds `model.avgpool`:
+
+```python
+target = [m for m in model.modules() if isinstance(m, nn.Conv2d)][-1]
+```
+
+The heatmap will be `7 x 7` for a `224 x 224` input, upsampled by bilinear interpolation. That coarseness is expected and is the reason Grad-CAM is often combined with guided backprop.
+
+### Guided Grad-CAM
+
+Multiply the upsampled Grad-CAM by the guided-backprop saliency map elementwise. Grad-CAM supplies the localization, guided backprop supplies the fine detail.
+
+```python
+guided = guided_backprop(model, x, idx)            # (3, H, W)
+cam = F.interpolate(grad_cam_out[None, None], guided.shape[-2:])[0, 0]
+result = guided * cam
+```
+
+<Callout type="warn">
+  ### In-place operations break backward hooks
+
+`nn.ReLU(inplace=True)` overwrites its input tensor, and a backward hook registered on the preceding convolution then sees a tensor that has already been freed. PyTorch raises a version-counter error, or the hook silently receives the wrong gradient. When you need Grad-CAM, rebuild the model with `inplace=False`, or register the hook on the ReLU module itself rather than the convolution before it.
+
+</Callout>
+
+---
+
+## Attribution methods and captum
+
+Grad-CAM and saliency are two points in a large space. [`captum`](https://github.com/pytorch/captum) implements most of them with a common API: each attributor takes a forward function, an input, and a target index, and returns a tensor shaped like the input.
+
+| Method                          | What it computes                                          | Cost                 |
+| :------------------------------ | :-------------------------------------------------------- | :------------------- |
+| `Saliency`                      | Gradient of the score wrt the input                       | One backward         |
+| `InputXGradient`                | Gradient times input                                      | One backward         |
+| `GuidedBackprop`                | Gradient with positive-only ReLU paths                    | One backward         |
+| `IntegratedGradients`           | Path integral of gradients from a baseline to the input   | `m` backward passes  |
+| `DeepLift`                      | Single-pass approximation of integrated gradients         | Roughly one backward |
+| `GradCam`                       | Gradient-weighted activation of a chosen layer            | One backward         |
+| `LayerIntegratedGradients`      | Integrated gradients attributed to a chosen layer         | `m` backward passes  |
+| `Occlusion` / `FeatureAblation` | Score change when a patch is masked or replaced           | Many forward passes  |
+| `NoiseTunnel`                   | SmoothGrad-style variance reduction over any of the above | Multiplier on top    |
+| `ShapleyValueSampling`          | Game-theoretic contribution per feature                   | Very expensive       |
+
+```python
+from captum.attr import IntegratedGradients, LayerIntegratedGradients, visualization
+
+ig = IntegratedGradients(model)
+attr = ig.attribute(x, target=idx, baselines=torch.zeros_like(x), n_steps=50)
+```
+
+Integrated gradients is the one to reach for when you need a defensible answer rather than a pretty picture. It satisfies two axioms that plain gradients violate: a feature that never changes between the baseline and the input gets zero attribution, and attributions sum to the difference between the input's score and the baseline's score. It costs `m` backward passes, usually `m = 50`.
+
+Occlusion methods are model-agnostic and slow, but they measure the quantity you asked about directly: how much does the score change when this patch is gone.
+
+---
+
+## Hooks for everything else
+
+The same two registration calls cover most model surgery you will ever need without touching a `forward` method.
+
+| Use                                | Hook type       | Notes                                      |
+| :--------------------------------- | :-------------- | :----------------------------------------- |
+| Shape debugging                    | Forward pre     | Print `args[0].shape` for every module     |
+| Embedding extraction for retrieval | Forward         | Capture the pooled feature vector          |
+| FLOP and MAC counting              | Forward         | Multiply output elements by kernel weights |
+| Quantization calibration           | Forward         | Record min/max or histogram per activation |
+| Attention weight extraction        | Forward         | Alternative to `output_attentions=True`    |
+| Feature distillation losses        | Both            | Match teacher and student activations      |
+| Gradient norm monitoring per layer | Backward        | Detect one layer dominating or dying       |
+| Patching a layer's behaviour       | Forward, return | Returned value replaces the module output  |
+
+A global forward pre-hook that prints shapes is the fastest way to debug a new architecture:
+
+```python
+import torch.nn.modules.module as nn_module
+
+def shape_probe(module, args):
+    t = args[0]
+    if torch.is_tensor(t):
+        print(f"{module.__class__.__name__:20s} in={tuple(t.shape)}")
+
+handle = nn_module.register_module_forward_pre_hook(shape_probe)
+model(torch.randn(1, 3, 224, 224))
+handle.remove()
+```
+
+---
+
+## Interview questions
+
+1. What is the signature of a forward hook, and what happens if it returns a value?
+2. Why is `register_full_backward_hook` preferred over `register_backward_hook`?
+3. How do you get the gradient of an intermediate tensor that is not a module's output?
+4. Write the Grad-CAM formula and explain what `alpha_k` measures.
+5. Which layer should Grad-CAM target, and why not an earlier one?
+6. What breaks when a backward hook is registered on a module followed by an in-place ReLU?
+7. How does guided backprop modify the backward pass, and what does that cost in faithfulness?
+8. What two axioms do integrated gradients satisfy that vanilla gradients do not?
+9. When would you use occlusion over a gradient method?
+10. How do you extract embeddings from a pretrained backbone without editing its `forward`?
+11. What does a high dead-unit fraction in a layer's activations tell you?
+12. Why do hooks cause memory leaks, and how do you avoid it?

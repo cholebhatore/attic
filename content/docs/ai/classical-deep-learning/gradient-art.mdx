@@ -1,0 +1,345 @@
+---
+title: Gradient Manipulation
+description: 'Optimizing the input instead of the weights: FGSM and PGD adversarial attacks on MNIST, Deep Dream activation ascent, and neural style transfer with L-BFGS.'
+---
+
+Every page so far has computed `d loss / d weights` and used it to change the model. Nothing in the autograd engine requires that. Set `requires_grad = True` on the input tensor and the same backward pass gives you `d loss / d pixels`, which you can use to change the image instead.
+
+That one change produces three useful and one dangerous thing: adversarial examples, Deep Dream, and style transfer. All three freeze the model completely.
+
+```python
+import torch
+
+model.eval()
+for p in model.parameters():
+    p.requires_grad_(False)
+
+x = image.clone().requires_grad_(True)
+loss = objective(model(x))
+(grad,) = torch.autograd.grad(loss, x)
+```
+
+| Application         | Objective                           | Direction | Iterations   |
+| :------------------ | :---------------------------------- | :-------- | :----------- |
+| Adversarial attack  | Class loss, wrong label             | Ascend    | 1 to 40      |
+| Deep Dream          | Layer activation norm               | Ascend    | Hundreds     |
+| Style transfer      | Content plus Gram-matrix style loss | Descend   | 300 to 1000  |
+| Feature attribution | Class score                         | Read only | One backward |
+
+---
+
+## Adversarial examples
+
+A perturbation too small for a human to notice that flips the model's prediction. On MNIST, adding `L_inf` noise of magnitude `0.25` to a network with `0.94%` test error raises that error to `89.42%` (Goodfellow, Shlens, Szegedy, arXiv:1412.6572). The perturbation changes each pixel by at most a quarter of the full range, which on a grayscale image is imperceptible.
+
+### Why it happens
+
+The standard explanation is dimensionality, not curvature. A classifier in `d` input dimensions is locally approximately linear, and moving distance `eps` along a direction aligned with the weight vector changes the logit by `eps * norm(w)`. In `784` dimensions, a small per-pixel change in the right direction is a large change in the logit direction.
+
+Two consequences follow. First, the attack needs only the sign of the gradient, because it wants to move as far as possible along each coordinate within the `L_inf` budget. Second, the perturbation transfers between models, since different networks trained on the same data learn roughly parallel decision boundaries.
+
+---
+
+## FGSM
+
+The Fast Gradient Sign Method is one backward pass:
+
+```text
+x_adv = clip(x + eps * sign(grad_x loss(f(x), y)), 0, 1)
+```
+
+```python title="fgsm.py"
+import torch
+import torch.nn.functional as F
+
+def fgsm(model, x, y, eps=0.3):
+    x = x.clone().requires_grad_(True)
+    loss = F.cross_entropy(model(x), y)
+    (grad,) = torch.autograd.grad(loss, x)
+    return (x.detach() + eps * grad.sign()).clamp(0, 1)
+
+def fgsm_targeted(model, x, y_target, eps=0.3):
+    x = x.clone().requires_grad_(True)
+    loss = F.cross_entropy(model(x), y_target)
+    (grad,) = torch.autograd.grad(loss, x)
+    return (x.detach() - eps * grad.sign()).clamp(0, 1)
+```
+
+The untargeted version ascends the loss for the true label. The targeted version descends the loss for the attacker's chosen label, so the sign flips.
+
+### Choosing eps
+
+`eps` is measured in the input's own units, so it depends on the range and the dataset.
+
+| Dataset    | Input range | Typical `L_inf` eps               | Notes                                   |
+| :--------- | :---------- | :-------------------------------- | :-------------------------------------- |
+| MNIST      | `[0, 1]`    | `0.3`                             | The published benchmark                 |
+| CIFAR-10   | `[0, 1]`    | `8 / 255 = 0.031`                 | Standard robust-accuracy eps            |
+| ImageNet   | `[0, 1]`    | `4 / 255 = 0.016`                 | Tighter, images are busier              |
+| Normalized | zero-mean   | State the pre-normalization value | Eps after `Normalize` is not comparable |
+
+Always clip to the valid input range after adding the perturbation. Skipping that step gives you an attack on a distribution the model never saw, and the accuracy drop means nothing.
+
+---
+
+## PGD
+
+Projected Gradient Descent iterates FGSM with a smaller step, a random start, and a projection back into the `eps` ball after every step:
+
+```text
+x_0 = x + Uniform(-eps, eps)
+x_(t+1) = Proj_eps( clip(x_t + alpha * sign(grad_x loss(x_t, y))) )
+```
+
+```python title="pgd.py"
+import torch
+import torch.nn.functional as F
+
+def pgd(model, x, y, eps=0.3, alpha=0.01, steps=40, random_start=True):
+    adv = x.clone()
+    if random_start:
+        adv = adv + torch.empty_like(adv).uniform_(-eps, eps)
+        adv = adv.clamp(0, 1)
+
+    for _ in range(steps):
+        adv.requires_grad_(True)
+        loss = F.cross_entropy(model(adv), y)
+        (grad,) = torch.autograd.grad(loss, adv)
+        adv = adv.detach() + alpha * grad.sign()
+        adv = torch.clamp(adv, x - eps, x + eps)   # project back into the ball
+        adv = adv.clamp(0, 1)                       # valid pixel range
+    return adv
+```
+
+`torch.clamp(adv, x - eps, x + eps)` broadcasts the per-sample ball. The random start matters: without it, PGD can get stuck in a poor local region of the loss surface, and reported robustness is overstated.
+
+PGD is the reference attack. If a defense holds against PGD with enough steps and restarts, it holds against most of what came before it.
+
+### Attack taxonomy
+
+| Attack       | Steps    | Objective                    | Random start | Use                     |
+| :----------- | :------- | :--------------------------- | :----------- | :---------------------- |
+| FGSM         | 1        | Class loss                   | No           | Fast smoke test         |
+| BIM / I-FGSM | k        | Class loss                   | No           | PGD without the start   |
+| PGD          | k        | Class loss                   | Yes          | The standard evaluation |
+| CW           | many     | Margin, minimized `L2`       | Optional     | Minimal perturbation    |
+| DeepFool     | few      | Linearized boundary distance | No           | Minimal perturbation    |
+| AutoAttack   | ensemble | PGD plus APGD, FAB, Square   | Yes          | The number to publish   |
+
+[`AutoAttack`](https://github.com/fra31/auto-attack) runs four attacks and takes the best per sample, with no hyperparameters to tune. It exists because papers kept reporting robust accuracy against weak hand-tuned attacks.
+
+---
+
+## Adversarial training
+
+Train on the perturbed examples. This is the only defense that has held up.
+
+```python title="adv_train.py"
+import torch.nn.functional as F
+
+for x, y in train_dl:
+    x, y = x.to(device), y.to(device)
+    x_adv = pgd(model, x, y, eps=0.3, alpha=0.01, steps=40)
+
+    opt.zero_grad(set_to_none=True)
+    loss = 0.5 * F.cross_entropy(model(x), y) + 0.5 * F.cross_entropy(model(x_adv), y)
+    loss.backward()
+    opt.step()
+```
+
+The cost is roughly the number of PGD steps, so a 40-step run trains about thirty times slower than standard training. The accuracy trade is real: adversarially trained MNIST models give up a couple of clean points to reach around 95% robust accuracy at `eps = 0.3`, and CIFAR-10 robust accuracy sits near 60% at `eps = 8/255` against roughly 95% clean.
+
+<Callout type="warn">
+  ### Gradient masking is not robustness
+
+Many published defenses worked by breaking the gradient rather than the perturbation, so FGSM and weak PGD found nothing while a stronger attack found everything. The symptoms are specific: PGD much weaker than expected relative to FGSM, near-zero gradient norms on adversarial examples, accuracy that goes up as you increase the number of steps, and attacks that fail on a reparameterized copy of the same model. Athalye et al. broke thirteen of the eighteen defenses published at ICML 2018 this way. Always evaluate with AutoAttack, and check the model under a different random seed and input transform before believing a robustness number.
+
+</Callout>
+
+---
+
+## Deep Dream
+
+Maximize the activation of an intermediate convolutional layer with respect to the input. Whatever pattern that layer detects gets amplified into the image until it is visible.
+
+```python title="dream.py"
+import torch
+import torch.nn.functional as F
+from torchvision.models import inception_v3, Inception_V3_Weights
+
+deepdream = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1).features.to(device).eval()
+for p in deepdream.parameters():
+    p.requires_grad_(False)
+
+MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+
+def forward_to(x, layer_idx):
+    x = (x - MEAN) / STD
+    for i, layer in enumerate(deepdream):
+        x = layer(x)
+        if i == layer_idx:
+            break
+    return x
+
+def ascend(img, layer_idx, iters=100, lr=0.01, jitter=32, channel=None):
+    for _ in range(iters):
+        shift = torch.randint(-jitter, jitter + 1, (2,)).tolist()
+        img = torch.roll(img, shifts=shift, dims=(2, 3))
+
+        img.requires_grad_(True)
+        out = forward_to(img, layer_idx)
+        loss = out[:, channel].mean() if channel is not None else out.pow(2).mean()
+        (grad,) = torch.autograd.grad(loss, img)
+
+        with torch.no_grad():
+            img = img + lr * grad / grad.abs().mean().clamp(min=1e-8)
+            img = torch.roll(img, shifts=[-s for s in shift], dims=(2, 3))
+    return img.detach()
+
+def dream_octaves(img, layer_idx, num_octaves=4, octave_scale=1.4, **kwargs):
+    detail = torch.zeros_like(img)
+    for octave in range(num_octaves):
+        if octave > 0:
+            size = [int(d / octave_scale) for d in img.shape[-2:]]
+            img = F.interpolate(img, size=size, mode="bilinear", align_corners=False)
+            detail = F.interpolate(detail, size=size, mode="bilinear", align_corners=False)
+        img = ascend(img + detail, layer_idx, **kwargs) - detail
+    return img
+```
+
+The two tricks that make the output look like the well-known images:
+
+- **Jitter.** Randomly translate the image by up to `jitter` pixels before each step and translate it back after. Without this, the ascent locks onto high-frequency pixel noise aligned to the sensor grid.
+- **Octaves.** Downscale, ascend, upscale, repeat. Running the ascent at several scales and compositing the results produces large coherent motifs instead of one blob.
+
+The objective choice controls the result. `out.pow(2).mean()` amplifies everything the layer sees. `out[:, c].mean()` amplifies one channel, which for a mid-level Inception layer produces a specific repeating motif. Deeper layers give object parts, shallower layers give textures.
+
+Chris Olah's [_Feature Visualization_](https://distill.pub/2017/feature-visualization) is the careful version of this, and it documents why naive activation maximization produces adversarial-looking high-frequency noise rather than clean concepts, and what regularization fixes it.
+
+---
+
+## Style transfer
+
+Gatys et al. (arXiv:1508.06576) showed that a frozen VGG can separate what an image depicts from how it is painted. Content lives in the activations of a deep layer. Style lives in the correlations between channels, which a Gram matrix measures.
+
+### Feature extraction
+
+Use `vgg19().features` and capture at fixed indices:
+
+| Index | Name      | Used for                     |
+| ----: | :-------- | :--------------------------- |
+|     1 | `relu1_1` | Style, fine texture          |
+|     6 | `relu2_1` | Style, small shapes          |
+|    11 | `relu3_1` | Style, object-scale patterns |
+|    20 | `relu4_1` | Style, larger structure      |
+|    22 | `relu4_2` | Content                      |
+|    29 | `relu5_1` | Style, coarse layout         |
+
+```python title="style.py"
+import torch
+import torch.nn.functional as F
+from torchvision.models import vgg19, VGG19_Weights
+
+STYLE_IDX = [1, 6, 11, 20, 29]
+CONTENT_IDX = 22
+STYLE_WEIGHTS = [1.0, 1.0, 1.0, 1.0, 1.0]
+
+features = vgg19(weights=VGG19_Weights.IMAGENET1K_V1).features.to(device).eval()
+for p in features.parameters():
+    p.requires_grad_(False)
+
+def gram(x):
+    b, c, h, w = x.shape
+    f = x.view(b, c, h * w)
+    return f @ f.transpose(1, 2) / (c * h * w)
+
+def forward_to(x, up_to):
+    for i, layer in enumerate(features):
+        x = layer(x)
+        if i == up_to:
+            return x
+    return x
+
+def collect(x, max_idx):
+    out, i = {}, 0
+    for i, layer in enumerate(features):
+        x = layer(x)
+        if i in STYLE_IDX or i == CONTENT_IDX:
+            out[i] = x
+        if i == max_idx:
+            break
+    return out
+```
+
+### The three losses
+
+```python
+content_feat = collect(normalize(content_img), CONTENT_IDX)[CONTENT_IDX].detach()
+style_feats = {i: gram(v).detach() for i, v in collect(normalize(style_img), max(STYLE_IDX)).items()
+               if i in STYLE_IDX}
+
+def content_loss(gen_feats):
+    return F.mse_loss(gen_feats[CONTENT_IDX], content_feat)
+
+def style_loss(gen_feats):
+    total = 0.0
+    for i, target in style_feats.items():
+        total = total + STYLE_WEIGHTS[STYLE_IDX.index(i)] * F.mse_loss(gram(gen_feats[i]), target)
+    return total / len(style_feats)
+
+def tv_loss(x):
+    return (x[:, :, 1:, :] - x[:, :, :-1, :]).pow(2).mean() + \
+           (x[:, :, :, 1:] - x[:, :, :, :-1]).pow(2).mean()
+```
+
+Content loss is a plain squared error between two activation maps, so it preserves where things are. Style loss compares Gram matrices, which discard position entirely and keep only which features co-occur, so it preserves texture and palette. Total variation penalizes neighbouring-pixel differences and removes the speckle that pure ascent produces.
+
+### L-BFGS on the image
+
+The image is the only parameter. There is no dataset and no epoch, so a batch optimizer is a poor fit.
+
+```python title="optimize.py"
+image = content_img.clone().requires_grad_(True)
+opt = torch.optim.LBFGS([image], max_iter=500, line_search_fn="strong_wolfe")
+
+CONTENT_W, STYLE_W, TV_W = 1.0, 1e6, 1e-2
+
+def closure():
+    with torch.no_grad():
+        image.clamp_(0, 1)
+    opt.zero_grad()
+    feats = collect(normalize(image), max(STYLE_IDX))
+    loss = CONTENT_W * content_loss(feats) + STYLE_W * style_loss(feats) + TV_W * tv_loss(image)
+    loss.backward()
+    return loss
+
+opt.step(closure)
+```
+
+Three reasons L-BFGS is the standard here rather than Adam:
+
+- It approximates second-order curvature from recent gradient differences, so it takes far fewer function evaluations to converge. Each evaluation is a full VGG-19 forward pass.
+- `line_search_fn="strong_wolfe"` picks the step length properly instead of relying on a tuned learning rate.
+- The `clamp_` inside the closure keeps pixels in range without adding it to the loss.
+
+`STYLE_W = 1e6` against `CONTENT_W = 1.0` is the ratio from the original paper. Style loss values are much smaller than content loss values because Gram matrices are normalized by `c * h * w`, so the weights are a rescaling, not a statement about importance. Moving the ratio toward content gives a faithful recoloring; moving it toward style gives a loose impression of the original layout.
+
+Starting from the content image converges faster and keeps the layout. Starting from white noise produces more faithful style but drifts away from the content structure. Starting from the style image is a middle option that is rarely used.
+
+---
+
+## Interview questions
+
+1. What single change to a training loop turns it into an attack?
+2. Write the FGSM update and explain why it uses `sign` rather than the raw gradient.
+3. Why are adversarial examples a consequence of high dimensionality rather than of extreme nonlinearity?
+4. What three things does PGD add to FGSM, and what does each one fix?
+5. Why does the `eps` value used on CIFAR-10 differ from the one used on MNIST?
+6. What is gradient masking, and how do you detect it in a defense you are evaluating?
+7. Why is adversarial training expensive, and roughly by what factor at 40 PGD steps?
+8. Do adversarial perturbations transfer between independently trained models, and why?
+9. What objective does Deep Dream ascend, and what do the jitter and octave tricks fix?
+10. What does a Gram matrix capture that an activation map does not?
+11. Why is L-BFGS used for style transfer instead of Adam?
+12. What happens to a style transfer result if you raise the content weight relative to the style weight?

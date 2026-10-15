@@ -1,0 +1,240 @@
+---
+title: Convolutions
+description: 'Kernels and filters, stride, padding, pooling, the output size formula, dilated convolutions, and how receptive fields grow with depth.'
+---
+
+A dense layer on a `224 x 224 x 3` image has `150528` inputs. Projecting those to `64` outputs costs `9633792` weights, and every one of them is position-specific, so a detector for a vertical edge has to be relearned separately at each of `50176` locations.
+
+A convolution instead slides one small kernel over the image and reuses the same weights at every position. The same `64` edge detectors cost `64 x 3 x 3 x 3 + 64 = 1792` parameters, about five thousand times fewer, and an edge learned in the top-left corner transfers to the bottom-right.
+
+---
+
+## Kernels, filters, and channels
+
+Three words get used interchangeably and are not the same thing.
+
+| Term           | Means                                                           |
+| :------------- | :-------------------------------------------------------------- |
+| Kernel         | The `kH x kW` window that slides over one input channel         |
+| Filter         | One full `C_in x kH x kW` slice, summed over all input channels |
+| Output channel | One filter's response map, i.e. one feature map                 |
+
+So a `Conv2d(3, 64, kernel_size=3)` has `64` filters, each reading all `3` input channels, producing `64` output feature maps. Its weight tensor has shape `(C_out, C_in, kH, kW) = (64, 3, 3, 3)`.
+
+```python
+import torch.nn as nn
+
+conv = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3, padding=1)
+print(conv.weight.shape)  # (64, 3, 3, 3)
+print(conv.bias.shape)    # (64,)
+```
+
+PyTorch uses `NCHW` ordering: a batch of images is `(B, C, H, W)`, and `nn.Conv2d` expects that. TensorFlow's default `NHWC` is the main source of shape bugs when porting models.
+
+The operation on a single output position is a dot product over the whole patch:
+
+```text
+out[n, co, i, j] = bias[co] + sum over ci, ki, kj of
+                   x[n, ci, i*s + ki*d, j*s + kj*d] * w[co, ci, ki, kj]
+```
+
+That is a `sum`, not a correlation with a flipped kernel, which makes PyTorch's `Conv2d` a cross-correlation. Nobody flips in practice and nothing breaks.
+
+---
+
+## The output size formula
+
+Everything about conv shapes comes from one line:
+
+```text
+H_out = floor((H_in + 2*padding - dilation*(kernel - 1) - 1) / stride) + 1
+```
+
+Worked cases on a `32 x 32` input:
+
+| Kernel | Stride | Padding | Dilation | Output | Notes                          |
+| -----: | -----: | ------: | -------: | -----: | :----------------------------- |
+|      3 |      1 |       0 |        1 |     30 | Valid, shrinks                 |
+|      3 |      1 |       1 |        1 |     32 | Same size, the common choice   |
+|      3 |      2 |       1 |        1 |     16 | Halves resolution              |
+|      5 |      1 |       2 |        1 |     32 | Same size with a bigger kernel |
+|      1 |      1 |       0 |        1 |     32 | Pointwise, mixes channels only |
+|      3 |      1 |       2 |        2 |     32 | Dilated, same size, wider view |
+|      7 |      2 |       3 |        1 |     16 | ResNet stem                    |
+
+Two rules of thumb fall out. With an odd kernel, `padding = (kernel - 1) / 2` at `stride = 1` preserves spatial size. With any kernel, `padding = floor(kernel / 2)` at `stride = 2` halves it.
+
+<Callout type="info">
+  ### Dilation buys receptive field for free
+
+A `3 x 3` kernel at `dilation = 2` touches pixels two apart, covering a `5 x 5` footprint while still using nine weights. Stacking dilations `1, 2, 4, 8` grows the receptive field exponentially with no parameter cost, which is why DeepLab and WaveNet use it instead of more pooling.
+
+</Callout>
+
+---
+
+## Stride
+
+Stride is how far the kernel moves between positions. Stride `2` discards every other output, halving each spatial dimension and cutting compute fourfold.
+
+Modern architectures mostly replaced strided pooling with strided convolution, because a strided conv learns which samples to keep rather than hard-coding a max. ResNet does this at the start of every block that changes resolution.
+
+---
+
+## Padding
+
+`padding = 0` is called **valid** convolution and shrinks the feature map. `padding` chosen to preserve size is called **same**.
+
+Zero padding has one known artefact: the border pixels of every feature map are computed from a patch that is mostly zeros, so activations near the edge carry less information. It compounds over depth, which is why very deep networks sometimes use replicate or circular padding.
+
+```python
+nn.ZeroPad2d(1)      # constant 0
+nn.ReplicationPad2d(1)  # repeats the edge pixel
+nn.ReflectionPad2d(1)   # mirrors around the edge
+```
+
+---
+
+## Pooling
+
+Pooling summarizes a local window, usually with a max or a mean.
+
+| Layer                                    | What it does                                       | Parameters |
+| :--------------------------------------- | :------------------------------------------------- | ---------: |
+| `nn.MaxPool2d(2, 2)`                     | Max over each `2 x 2` window, halves resolution    |          0 |
+| `nn.AvgPool2d(2, 2)`                     | Mean over each `2 x 2` window                      |          0 |
+| `nn.AdaptiveAvgPool2d(1)`                | Mean over the whole feature map, output is `1 x 1` |          0 |
+| `nn.Conv2d(C, C, 2, stride=2, groups=C)` | Learned per-channel downsample                     |         2C |
+
+Max pooling is the standard choice between conv blocks: it is translation-tolerant and has no parameters. Its downside is that it discards exact position, which matters for segmentation.
+
+`AdaptiveAvgPool2d(1)` is the global average pool that ends a modern classifier. It flattens a `C x H x W` feature map to `C` numbers regardless of the input resolution, which is what lets one backbone accept both `224 x 224` and `384 x 384` images.
+
+```python
+backbone = nn.Sequential(conv_stem, nn.AdaptiveAvgPool2d(1), nn.Flatten())
+head = nn.Linear(512, 10)
+```
+
+---
+
+## Receptive field progression
+
+The receptive field of a unit is how much of the original input it can see. It grows with every layer, and it grows faster than the kernel size suggests because each layer's window is measured in the _previous_ layer's coordinates.
+
+Track two quantities per layer: `RF`, the receptive field, and `j`, the jump, which is the stride of everything above it.
+
+```text
+RF_n = RF_(n-1) + (k_n - 1) * j_(n-1)
+j_n  = j_(n-1) * s_n
+RF_0 = 1, j_0 = 1
+```
+
+Applied to the first three blocks of VGG16 on a `224 x 224` image:
+
+| Layer     | `k, s` | Spatial out | `RF` | `j` |
+| :-------- | :----: | ----------: | ---: | --: |
+| Input     | `n/a`  | `224 x 224` |    1 |   1 |
+| `conv1_1` | `3, 1` | `224 x 224` |    3 |   1 |
+| `conv1_2` | `3, 1` | `224 x 224` |    5 |   1 |
+| `pool1`   | `2, 2` | `112 x 112` |    6 |   2 |
+| `conv2_1` | `3, 1` | `112 x 112` |   10 |   2 |
+| `conv2_2` | `3, 1` | `112 x 112` |   14 |   2 |
+| `pool2`   | `2, 2` |   `56 x 56` |   16 |   4 |
+| `conv3_1` | `3, 1` |   `56 x 56` |   24 |   4 |
+| `conv3_2` | `3, 1` |   `56 x 56` |   32 |   4 |
+| `conv3_3` | `3, 1` |   `56 x 56` |   40 |   4 |
+| `pool3`   | `2, 2` |   `28 x 28` |   44 |   8 |
+
+By `pool3` a single unit sees a `44 x 44` patch of the input. Three more blocks and it sees the whole image. This is the mechanism behind the hierarchy of features: early units see pixels and edges, deep units see object parts, and the units feeding the classifier see the entire scene.
+
+It also explains a design constraint. If your object is `64` pixels across, no unit shallower than `RF = 64` can classify it, and stacking `3 x 3` convolutions at `stride = 1` with no pooling grows `RF` by only `2` per layer.
+
+<Callout type="warn">
+  ### Two 3x3 convolutions beat one 5x5
+
+A stack of two `3 x 3` convolutions has `RF = 5`, the same as a single `5 x 5`. It uses `2 * 3 * 3 = 18` weights per channel pair instead of `25`, and it inserts a ReLU in the middle, so it is both cheaper and more nonlinear. Every architecture after VGG uses `3 x 3` almost exclusively.
+
+</Callout>
+
+---
+
+## Convolutions are matrix multiplies
+
+Frameworks implement a convolution by rearranging the input into a matrix where each column is one flattened patch, then calling a GEMM. The rearrangement is called `im2col`.
+
+```python
+import torch
+
+x = torch.randn(1, 3, 5, 5)
+patches = torch.nn.functional.unfold(x, kernel_size=3, padding=1)
+print(patches.shape)  # (1, 27, 25) -> 27 = 3*3*3, 25 = 5*5 output positions
+
+w = torch.randn(8, 27)
+out = (w @ patches).view(1, 8, 5, 5)
+```
+
+`unfold` is `im2col` and `fold` is its inverse. This is why convolution throughput tracks matmul throughput, and why it costs memory: `im2col` expands the input by a factor of `k * k`.
+
+---
+
+## Grouped and depthwise convolutions
+
+`groups = g` splits the input channels into `g` independent sets, convolves each separately, and concatenates. `groups = 1` is a normal conv, `groups = C_in` is a **depthwise** conv where each channel is filtered on its own.
+
+| Variant                                 | `groups`      | Weights for `C -> C`, `3 x 3` |
+| :-------------------------------------- | :------------ | ----------------------------: |
+| Standard                                | `1`           |                   `9 * C * C` |
+| Grouped, `g = 4`                        | `4`           |               `9 * C * C / 4` |
+| Depthwise                               | `C`           |                       `9 * C` |
+| Depthwise separable (depthwise + `1x1`) | `C`, then `1` |               `9 * C + C * C` |
+
+Depthwise separable convolutions are the MobileNet trick: for `C = 256` that is `2304 + 65536 = 67840` weights against `589824` for a standard conv, roughly an eighth. Grouped convolutions of other sizes power ResNeXt and AlexNet, the latter out of memory necessity on two 2012 GPUs.
+
+---
+
+## A minimal CNN
+
+```python
+import torch
+import torch.nn as nn
+
+class SmallCNN(nn.Module):
+    def __init__(self, num_classes: int = 10) -> None:
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
+            nn.MaxPool2d(2),                                     # 32 -> 16
+            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
+            nn.MaxPool2d(2),                                     # 16 -> 8
+            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
+        self.head = nn.Linear(128, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.features(x))
+
+model = SmallCNN()
+x = torch.randn(8, 3, 32, 32)
+print(model(x).shape)  # (8, 10)
+```
+
+The `conv -> norm -> relu` triple is the standard block. Norm placement is covered in [Normalization](/ai/neural-networks/normalization); pre-activation ordering is covered on the next page.
+
+---
+
+## Interview questions
+
+1. Why does a convolution use fewer parameters than a dense layer on the same input, and what assumption does that encoding buy you?
+2. Compute the output size of `Conv2d(64, 128, kernel_size=3, stride=2, padding=1, dilation=2)` on a `56 x 56` input.
+3. What is the difference between a kernel, a filter, and an output channel?
+4. What shape is `nn.Conv2d(3, 16, 3).weight`, and why is `C_in` the second dimension rather than the first?
+5. Derive the receptive field of a stack of four `3 x 3` convolutions at `stride = 1`, then of the same stack with a `2 x 2` max pool inserted after the second.
+6. Why did VGG use two `3 x 3` convolutions instead of one `5 x 5`?
+7. What does a dilated convolution do, and when would you choose it over pooling?
+8. What does `AdaptiveAvgPool2d(1)` give you that `AvgPool2d(H, W)` does not?
+9. Explain grouped convolution. What is a depthwise convolution, and what does it lose relative to a standard one?
+10. Why do most modern architectures use a stride-2 convolution instead of max pooling to halve resolution?
