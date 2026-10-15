@@ -1,0 +1,341 @@
+---
+title: GPT from Scratch
+description: 'A complete autoregressive transformer in PyTorch: char-level and BPE tokenizers, RMSNorm blocks, sampling with temperature and top-k, and the training loop.'
+---
+
+Everything on the previous four pages goes into one file. This is a runnable character-level GPT of about 14M parameters, close to the model in Karpathy's _Let's build GPT_ video and small enough to train on a single consumer GPU in an hour. The last section covers what changes when you swap in a BPE tokenizer and what nanoGPT adds on top.
+
+---
+
+## Config and data
+
+Character-level means the vocabulary is the set of distinct characters in the corpus, usually 50 to 100 for English text. Every character is one token, so sequences are long and cheap per token.
+
+```python title="data.py"
+import torch
+
+text = open("input.txt", encoding="utf-8").read()
+chars = sorted(set(text))
+vocab_size = len(chars)
+
+stoi = {ch: i for i, ch in enumerate(chars)}
+itos = {i: ch for i, ch in enumerate(chars)}
+
+def encode(s: str) -> list[int]:
+    return [stoi[c] for c in s]
+
+def decode(ids: list[int]) -> str:
+    return "".join(itos[i] for i in ids)
+
+data = torch.tensor(encode(text), dtype=torch.long)
+split = int(0.9 * len(data))
+train_data, val_data = data[:split], data[split:]
+```
+
+Batching samples random windows. Targets are the input shifted by one, which is what makes the loss causal.
+
+```python
+def get_batch(split_name, cfg, device="cpu"):
+    d = train_data if split_name == "train" else val_data
+    ix = torch.randint(len(d) - cfg.block_size, (cfg.batch_size,))
+    x = torch.stack([d[i : i + cfg.block_size] for i in ix])              # (B, T)
+    y = torch.stack([d[i + 1 : i + 1 + cfg.block_size] for i in ix])      # (B, T)
+    return x.to(device), y.to(device)
+```
+
+`torch.randint(len(d) - cfg.block_size, ...)` leaves room for the one-token shift on the last window.
+
+---
+
+## The model
+
+```python title="gpt.py"
+import math
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+@dataclass
+class Config:
+    block_size: int = 256
+    vocab_size: int = 65
+    n_layer: int = 6
+    n_head: int = 6
+    d_model: int = 384
+    dropout: float = 0.1
+    batch_size: int = 64
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))                          # (d,)
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, cfg: Config) -> None:
+        super().__init__()
+        self.d = cfg.d_model
+        self.h = cfg.n_head
+        self.d_head = cfg.d_model // cfg.n_head
+        self.wqkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=False)
+        self.wo = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.attn_drop = nn.Dropout(cfg.dropout)
+        self.resid_drop = nn.Dropout(cfg.dropout)
+        mask = torch.tril(torch.ones(cfg.block_size, cfg.block_size))
+        self.register_buffer("causal", mask.view(1, 1, cfg.block_size, cfg.block_size), persistent=False)
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        q, k, v = self.wqkv(x).split(self.d, dim=-1)                       # 3 x (B, T, d)
+        q = q.view(B, T, self.h, self.d_head).transpose(1, 2)              # (B, h, T, d_head)
+        k = k.view(B, T, self.h, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.h, self.d_head).transpose(1, 2)
+
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)           # (B, h, T, T)
+        att = att.masked_fill(self.causal[:, :, :T, :T] == 0, float("-inf"))
+        att = self.attn_drop(att.softmax(dim=-1))
+        out = (att @ v).transpose(1, 2).contiguous().view(B, T, self.d)    # (B, T, d)
+        return self.resid_drop(self.wo(out))
+
+
+class MLP(nn.Module):
+    def __init__(self, cfg: Config) -> None:
+        super().__init__()
+        d_ff = 4 * cfg.d_model
+        self.gate = nn.Linear(cfg.d_model, d_ff, bias=False)
+        self.up = nn.Linear(cfg.d_model, d_ff, bias=False)
+        self.down = nn.Linear(d_ff, cfg.d_model, bias=False)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def forward(self, x):
+        return self.drop(self.down(F.silu(self.gate(x)) * self.up(x)))
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config) -> None:
+        super().__init__()
+        self.ln1 = RMSNorm(cfg.d_model)
+        self.attn = CausalSelfAttention(cfg)
+        self.ln2 = RMSNorm(cfg.d_model)
+        self.mlp = MLP(cfg)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class GPT(nn.Module):
+    def __init__(self, cfg: Config) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.tok = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.pos = nn.Embedding(cfg.block_size, cfg.d_model)
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        self.ln_f = RMSNorm(cfg.d_model)
+        self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.head.weight = self.tok.weight                                 # weight tying
+
+        self.apply(self._init_weights)
+        for name, p in self.named_parameters():
+            if name.endswith("wo.weight") or name.endswith("down.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(self, input_ids):
+        B, T = input_ids.shape
+        pos = torch.arange(T, device=input_ids.device)                     # (T,)
+        x = self.tok(input_ids) + self.pos(pos)                            # (B, T, d)
+        for block in self.blocks:
+            x = block(x)                                                   # (B, T, d)
+        return self.head(self.ln_f(x))                                     # (B, T, V)
+```
+
+Three details worth naming. `register_buffer(..., persistent=False)` keeps the causal mask on the right device without writing it into checkpoints. `wqkv` fuses the three projections into one `d x 3d` matmul, which is what every production implementation does. The scaled initialization on `wo` and `down` divides by `sqrt(2 * n_layer)` because those are the two matrices whose output is added to the residual stream each block, so without scaling the residual grows with depth. GPT-2 used the same rule.
+
+Parameter count for the config above:
+
+| Component         | Formula          |     Parameters |
+| :---------------- | :--------------- | -------------: |
+| `tok`             | `65 * 384`       |         24,960 |
+| `pos`             | `256 * 384`      |         98,304 |
+| `wqkv`, per block | `384 * 1152`     |        442,368 |
+| `wo`, per block   | `384 * 384`      |        147,456 |
+| `gate` + `up`     | `2 * 384 * 1536` |      1,179,648 |
+| `down`            | `1536 * 384`     |        589,824 |
+| Two `RMSNorm`     | `2 * 384`        |            768 |
+| 6 blocks          | `6 * 2,360,064`  |     14,160,384 |
+| `ln_f`            | `384`            |            384 |
+| `head`            | tied to `tok`    |              0 |
+| **Total**         |                  | **14,284,032** |
+
+---
+
+## Generation
+
+```python
+@torch.no_grad()
+def generate(model, idx, max_new_tokens, temperature=1.0, top_k=None):
+    model.eval()
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -model.cfg.block_size :]                         # crop to the context window
+        logits = model(idx_cond)[:, -1, :]                                 # (B, V)
+        logits = logits / temperature
+        if top_k is not None:
+            kth, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < kth[:, [-1]]] = float("-inf")
+        probs = F.softmax(logits, dim=-1)
+        idx = torch.cat([idx, torch.multinomial(probs, num_samples=1)], dim=1)
+    model.train()
+    return idx
+```
+
+`model.eval()` turns off dropout, which matters here because the attention and residual drops are active during training. The crop `idx[:, -block_size:]` is required: the position embedding table has `block_size` rows, so a longer input indexes out of bounds.
+
+Temperature and top-k trade off against each other. Temperature `1.0` samples from the model's own distribution; below `1.0` it sharpens toward the argmax and above `1.0` it flattens. Top-k truncates to the `k` highest logits and renormalizes, which removes the long tail of near-impossible tokens that temperature alone cannot suppress.
+
+---
+
+## Training
+
+```python title="train.py"
+import math
+
+import torch
+import torch.nn.functional as F
+
+def configure_optimizer(model, lr, weight_decay, betas=(0.9, 0.95)):
+    decay, no_decay = [], []
+    for p in model.parameters():
+        (decay if p.dim() >= 2 else no_decay).append(p)
+    groups = [
+        {"params": decay, "weight_decay": weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ]
+    return torch.optim.AdamW(groups, lr=lr, betas=betas)
+
+def get_lr(step, warmup, max_steps, max_lr, min_lr):
+    if step < warmup:
+        return max_lr * (step + 1) / warmup
+    if step >= max_steps:
+        return min_lr
+    t = (step - warmup) / (max_steps - warmup)
+    return min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * t))
+```
+
+Weight decay applies to matrices and embeddings, not to norms and biases. Those are one-dimensional parameters whose job is scale, and decaying them toward zero destabilizes the norm. `betas=(0.9, 0.95)` is GPT-2's setting; the lower `beta_2` makes the second-moment estimate forget faster, which helps on the spiky loss curves of language modeling. See [Optimizers](/ai/neural-networks/optimizers).
+
+```python
+model = GPT(cfg).to(device)
+opt = configure_optimizer(model, lr=6e-4, weight_decay=0.1)
+
+for step in range(max_steps):
+    for g in opt.param_groups:
+        g["lr"] = get_lr(step, warmup=100, max_steps=max_steps, max_lr=6e-4, min_lr=6e-5)
+
+    x, y = get_batch("train", cfg, device)
+    logits = model(x)                                                      # (B, T, V)
+    loss = F.cross_entropy(logits.view(-1, cfg.vocab_size), y.view(-1))
+
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+```
+
+`logits.view(-1, V)` against `y.view(-1)` is the standard flattening for language modeling, and it does not need the shift because `get_batch` already returned `y` offset by one.
+
+An untrained model outputs a uniform distribution, so cross-entropy starts near `ln(V)`. For `V = 65` that is `4.17`; for GPT-2's `V = 50257` it is `10.83`. That number is the baseline every loss curve should begin at, and seeing anything else means the initialization is off.
+
+---
+
+## BPE instead of characters
+
+Character-level models spend their capacity on spelling. A 256-token window is 256 characters, roughly fifty words, so the model never sees enough context to learn long-range structure, and it must spend steps reproducing common letter sequences it could have stored as one symbol.
+
+Byte-pair encoding fixes both by making frequent strings single tokens.
+
+| Tokenizer           |  Vocab | Chars per token | Context in 256 tokens | Loss floor `ln(V)` |
+| :------------------ | -----: | :-------------: | :-------------------- | -----------------: |
+| Char-level          |     65 |        1        | About 50 words        |               4.17 |
+| GPT-2 BPE           | 50,257 |     3 to 4      | About 200 words       |              10.83 |
+| LLaMA SentencePiece | 32,000 |     3 to 4      | About 200 words       |              10.37 |
+
+GPT-2's `50,257` is exact: 256 base byte tokens, plus 50,000 learned merges, plus one end-of-text token. The higher loss floor is not a regression, because the two models are not predicting the same thing. Cross-entropy per token converts to bits per byte by multiplying by tokens per byte, and BPE wins that comparison on real text.
+
+```python title="bpe.py"
+import tiktoken
+
+enc = tiktoken.get_encoding("gpt2")
+ids = enc.encode("hello world")
+print(ids, enc.decode(ids))
+# [31373, 995] hello world
+```
+
+The only code change is `Config.vocab_size`, which comes from the tokenizer instead of the corpus, and the `encode`/`decode` pair. Everything downstream is identical.
+
+If you want to train your own, `tokenizers` from Hugging Face runs byte-level BPE with GPT-2's pre-tokenization regex:
+
+```text
+'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+```
+
+That pattern splits contractions and keeps leading spaces attached to words, which is why BPE tokens for common words start with a space byte.
+
+<Callout type="warn">
+  ### The vocabulary size sets the memory ceiling
+
+The logits tensor is `(B, T, V)`. At `B = 64`, `T = 256`, `V = 50257` in fp32 that is `3.3 GB` for one activation, before any block runs. Character-level models fit in a corner of that. If you move to a BPE tokenizer without reducing the batch, the final projection and the cross-entropy backward pass become the first thing to run out of memory. Liger Kernel and other fused cross-entropy implementations exist specifically to avoid materializing that tensor.
+
+</Callout>
+
+---
+
+## What nanoGPT adds
+
+[karpathy/nanoGPT](https://github.com/karpathy/nanoGPT) is the reference minimal implementation and reproduces GPT-2 124M on OpenWebText. Its README reports about four days on 8 A100s for that run. On top of the code above it adds:
+
+| Addition                         | Why                                                             |
+| :------------------------------- | :-------------------------------------------------------------- |
+| `F.scaled_dot_product_attention` | FlashAttention path, no `T x T` matrix in memory                |
+| `torch.compile`                  | Fuses the elementwise ops, roughly 20 to 30 percent faster      |
+| bf16 `autocast` + `GradScaler`   | Half the activation memory at the same loss                     |
+| Gradient accumulation            | Large effective batch on one GPU                                |
+| `DistributedDataParallel`        | Multi-GPU, launched with `torchrun`                             |
+| Pre-tokenized `uint16` memmap    | Datasets stay on disk; a `uint16` covers any vocab under 65,536 |
+| `crop_block_size`                | Runs a trained long-context model on shorter inputs             |
+| Checkpoint resume, `init_from`   | Restarts from a checkpoint or from OpenAI's GPT-2 weights       |
+
+The `uint16` memmap is the one that surprises people. nanoGPT's `prepare.py` tokenizes the whole dataset once into `train.bin` and `val.bin` as memory-mapped `uint16` arrays, so training reads a slice of disk instead of holding tokens in RAM. Char-level models qualify too, since their vocabularies are tiny.
+
+If you build one thing from this phase, build the character-level model above and train it on a corpus small enough to finish in an hour. Eldan and Li's TinyStories work (arXiv:2305.07759) found that models around 10M parameters trained on synthetic children's stories generate fluent, coherent English, which makes a 14M character-level model a reasonable place to see real capability appear.
+
+---
+
+## Interview questions
+
+1. Why are the targets in `get_batch` shifted by one rather than computed from the logits?
+2. What does `register_buffer(..., persistent=False)` do for the causal mask?
+3. Why fuse `W_Q`, `W_K`, `W_V` into one `wqkv` matmul?
+4. Why are `wo` and `down` initialized with `std / sqrt(2 * n_layer)`?
+5. What breaks if you generate past `block_size` without cropping?
+6. What do temperature and top-k each control, and when would you use both?
+7. Why is weight decay excluded from norm and bias parameters?
+8. What loss should an untrained model report, and what does a different number mean?
+9. Compute GPT-2's `50,257` from its tokenizer components.
+10. Why does a BPE model have a higher cross-entropy per token but a lower one per byte?
+11. Which tensor runs out of memory first when you switch from characters to BPE?
+12. Name four things nanoGPT adds over a single-GPU reference implementation.

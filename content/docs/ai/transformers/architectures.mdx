@@ -1,0 +1,243 @@
+---
+title: Architectures and the Forward Pass
+description: 'BERT against GPT against T5, masked and causal language modeling, why decoder-only won, and a token-by-token trace of a decoder forward pass with shapes.'
+---
+
+The transformer block is the same everywhere. What differs between BERT, GPT, and T5 is the mask on the attention, the training objective, and whether there is one stack or two. This page compares the three families and then traces a single forward pass through a decoder, with the shape at every step.
+
+---
+
+## The three families
+
+<Mermaid
+  chart={`
+flowchart TB
+    subgraph EncOnly["Encoder-only: BERT"]
+      direction TB
+      E1["Bidirectional self-attention"] --> E2["Pooled hidden states"] --> E3["Task head"]
+    end
+    subgraph DecOnly["Decoder-only: GPT"]
+      direction TB
+      D1["Causal self-attention"] --> D2["Last hidden state"] --> D3["LM head over vocab"]
+    end
+    subgraph EncDec["Encoder-decoder: T5"]
+      direction TB
+      C1["Bidirectional encoder"] --> C3["Cross-attention"]
+      C2["Causal decoder"] --> C3
+      C3 --> C4["LM head over vocab"]
+    end
+`}
+/>
+
+| Property          | Encoder-only (BERT)                   | Decoder-only (GPT)          | Encoder-decoder (T5)                            |
+| :---------------- | :------------------------------------ | :-------------------------- | :---------------------------------------------- |
+| Attention mask    | None, full bidirectional              | Upper-triangular causal     | Encoder none, decoder causal, plus cross        |
+| Objective         | Masked language modeling              | Causal language modeling    | Span corruption, seq2seq                        |
+| Supervised tokens | The 15% masked                        | Every position              | Every decoder position                          |
+| Generates text    | No                                    | Yes                         | Yes                                             |
+| Params per layer  | `4d^2` attention + `8d^2` FFN         | Same                        | Adds `4d^2` cross-attention                     |
+| Examples          | BERT, RoBERTa, BGE, E5                | GPT-3, LLaMA, Mistral, Qwen | T5, BART, FLAN-T5, mT5                          |
+| Best for          | Classification, retrieval, embeddings | General-purpose LLMs        | Translation, summarization, small-model seq2seq |
+
+Encoder-only models cannot generate, because a bidirectional model that sees the answer cannot be asked to produce it one token at a time. Decoder-only models can do everything an encoder can, at some cost in efficiency on pure classification. That asymmetry is most of the story.
+
+---
+
+## Masked language modeling
+
+BERT trains by hiding tokens and predicting them from both sides.
+
+- Pick 15% of tokens at random.
+- Of those, replace 80% with `[MASK]`, 10% with a random vocabulary token, and leave 10% unchanged.
+- Compute cross-entropy only on the selected 15%.
+
+```python title="mlm.py"
+import torch
+
+MLM_PROB, MASK_ID = 0.15, 103
+
+def mask_tokens(input_ids: torch.Tensor, vocab_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+    labels = input_ids.clone()
+    selected = torch.rand(input_ids.shape, device=input_ids.device) < MLM_PROB
+    labels[~selected] = -100                                   # ignored by CrossEntropyLoss
+
+    roll = torch.rand(input_ids.shape, device=input_ids.device)
+    inputs = torch.where(selected, torch.full_like(input_ids, MASK_ID), input_ids)
+    random_tok = torch.randint(vocab_size, input_ids.shape, device=input_ids.device)
+    inputs = torch.where(selected & (roll >= 0.8) & (roll < 0.9), random_tok, inputs)
+    inputs = torch.where(selected & (roll >= 0.9), input_ids, inputs)
+    return inputs, labels
+```
+
+The 10/10 split exists because `[MASK]` never appears at inference time. If every selected token became `[MASK]`, the encoder would only ever see inputs containing a token it never sees in deployment, and representations would drift. The random-token and unchanged branches keep the encoder honest on clean input.
+
+Each pass supervises 15% of tokens. On a 512-token sequence that is about 77 predictions.
+
+Use it for classification, token labeling, sentence-pair scoring, and embeddings. `sentence-transformers`, BGE, and E5 are all BERT-shaped and still the right choice when the task is retrieval rather than generation.
+
+---
+
+## Causal language modeling
+
+GPT trains by predicting the next token from the prefix. Every position is a training signal.
+
+```python title="clm.py"
+import torch
+import torch.nn.functional as F
+
+def causal_lm_loss(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    # logits (B, T, V) hold the prediction for the *next* token at each position
+    shift_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))     # (B*(T-1), V)
+    shift_labels = input_ids[:, 1:].reshape(-1)                       # (B*(T-1),)
+    return F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+```
+
+The one-position shift is the whole trick. Position `t` predicts token `t+1`, so the logits for the last position have no label and are dropped. On a 4096-token sequence that is 4095 predictions from one forward pass, against roughly 614 for MLM on the same length. The data-efficiency gap is about `1 / 0.15`, a factor of 6.7.
+
+There is no train/inference mismatch. The model sees exactly the same kind of input during training and generation, because generation is just running the same forward pass repeatedly and feeding the output back.
+
+---
+
+## Encoder-decoder
+
+T5 reformulates every task as text to text. `translate English to German: That is good` in, `Das ist gut` out. The encoder reads the whole input bidirectionally, and the decoder generates autoregressively while attending back through cross-attention.
+
+Training uses span corruption rather than single-token masking: 15% of tokens are dropped in contiguous spans with a mean length of 3, each replaced by a single sentinel (`<extra_id_0>`, `<extra_id_1>`, ...), and the target is the sentinel-delimited list of dropped spans.
+
+The decoder layer costs `20d^2` against `12d^2` for a decoder-only layer of the same width, because cross-attention adds a fourth projection set. It buys the encoder's bidirectional view of the input, which is worth something when the input is short and structured, as in translation.
+
+<Callout type="info">
+  ### When encoder-decoder still wins
+
+At fixed parameter counts in the 100M to 3B range, T5 and FLAN-T5 beat comparably sized decoder-only models on translation and summarization, because the encoder gives every generated token a full bidirectional read of the source. Above roughly 10B parameters, decoder-only models trained on enough data close the gap and then pass it, and the KV-cache and batching advantages of a single stack take over. If you are fine-tuning a small model for a translation or extraction task today, an encoder-decoder is still a reasonable first choice.
+
+</Callout>
+
+---
+
+## Why decoder-only dominates
+
+Six reasons, in rough order of importance.
+
+| Reason                              | Explanation                                                                                                                                                                                                     |
+| :---------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Supervision density                 | Every token is a label. MLM uses 15%. Same data, about 6.7x more gradient signal.                                                                                                                               |
+| One interface                       | Everything is continuation. No task heads, no `[CLS]`, no separate classifier fine-tuning.                                                                                                                      |
+| In-context learning                 | Few-shot prompting is a property of autoregressive models and appears with scale. The training objective is already "continue this text", which subsumes "continue this text that happens to contain examples". |
+| No objective mismatch               | `[MASK]` never occurs at inference. Causal training has no such artifact.                                                                                                                                       |
+| Simpler serving                     | One stack, one KV cache, half the attention parameters of an encoder-decoder.                                                                                                                                   |
+| The scaling laws were measured here | Kaplan et al. (arXiv:2001.08361) and Hoffmann et al. (arXiv:2203.15556) both studied decoder-only models, so the recipes transferred.                                                                           |
+
+The honest counterpoint: decoder-only models pay for the causal mask. A unidirectional representation of a sentence is weaker than a bidirectional one for tasks that need the whole input at once, which is why embedding leaderboards are still topped by BERT-shaped models. Decoder-only dominance is about general capability per unit of scale, not about winning every task.
+
+---
+
+## Step-by-step decoder forward pass
+
+The chain the interview asks for. Shapes are for GPT-2 small (`d_model = 768`, 12 layers, 12 heads, vocab 50,257) with `B = 2` and `T = 8`.
+
+|   # | Operation                              | Output shape          | Params touched |
+| --: | :------------------------------------- | :-------------------- | -------------: |
+|   1 | Token IDs from the tokenizer           | `(2, 8)` int64        |              0 |
+|   2 | `wte` embedding lookup                 | `(2, 8, 768)`         |     38,597,376 |
+|   3 | `wpe` position lookup, added to step 2 | `(2, 8, 768)`         |        786,432 |
+|   4 | Pre-LayerNorm                          | `(2, 8, 768)`         |          1,536 |
+|   5 | `W_Q`, `W_K`, `W_V` projections        | `(2, 8, 768)` each    |      1,771,776 |
+|   6 | Reshape to heads                       | `(2, 12, 8, 64)` each |              0 |
+|   7 | `Q K^T / sqrt(64)` plus causal mask    | `(2, 12, 8, 8)`       |              0 |
+|   8 | Softmax, times `V`                     | `(2, 12, 8, 64)`      |              0 |
+|   9 | Merge heads, output projection `W_O`   | `(2, 8, 768)`         |        590,592 |
+|  10 | Residual add with step 3 output        | `(2, 8, 768)`         |              0 |
+|  11 | Pre-LayerNorm                          | `(2, 8, 768)`         |          1,536 |
+|  12 | FFN up-projection                      | `(2, 8, 3072)`        |      2,362,368 |
+|  13 | Activation, down-projection            | `(2, 8, 768)`         |      2,360,064 |
+|  14 | Residual add with step 10 output       | `(2, 8, 768)`         |              0 |
+|  15 | Steps 4 to 14, repeated 12 times       | `(2, 8, 768)`         |     85,054,464 |
+|  16 | Final LayerNorm                        | `(2, 8, 768)`         |          1,536 |
+|  17 | LM head, `(768, 50257)`                | `(2, 8, 50257)`       |        0, tied |
+|  18 | Sample from `logits[:, -1, :]`         | `(2,)` token IDs      |              0 |
+
+Steps 1 through 3 and 16 through 18 happen once. Steps 4 through 15 are the `N` blocks. Adding the four distinct rows gives `38,597,376 + 786,432 + 85,054,464 + 1,536 = 124,439,808`, the published GPT-2 small count.
+
+The parameter column is GPT-2's, which uses biases on every projection and affine LayerNorms. The code below follows LLaMA and uses neither, so its norms and projections are slightly cheaper.
+
+```python title="forward.py"
+import torch
+import torch.nn as nn
+
+class GPT(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int, n_layers: int, n_heads: int, block_size: int) -> None:
+        super().__init__()
+        self.wte = nn.Embedding(vocab_size, d_model)
+        self.wpe = nn.Embedding(block_size, d_model)
+        self.blocks = nn.ModuleList([Block(d_model, n_heads, 4 * d_model) for _ in range(n_layers)])
+        self.ln_f = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight          # weight tying
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        B, T = input_ids.shape
+        pos = torch.arange(T, device=input_ids.device)                       # (T,)
+        x = self.wte(input_ids) + self.wpe(pos)                              # (B, T, d)
+        for block in self.blocks:
+            x = block(x)                                                     # (B, T, d)
+        return self.lm_head(self.ln_f(x))                                    # (B, T, V)
+```
+
+`Block` is the class from [Blocks and Positions](/ai/transformers/blocks-and-positions).
+
+### Weight tying
+
+Setting `lm_head.weight = wte.weight` means the input embedding and the output projection share one matrix. The LM head computes a dot product between the final hidden state and every token's embedding vector, so the logit for token `i` is the similarity between the hidden state and the direction that token occupies in embedding space. It saves 38.6M parameters in GPT-2 small, about 31% of the model, and it regularizes: Press and Wolf (arXiv:1608.05859) showed tying improves perplexity on PTB and WikiText-2.
+
+Modern models tie less often. LLaMA does not, because at 7B the embedding is a small fraction of the total and the two matrices want different scales.
+
+### Where the memory goes
+
+The activation that dominates is the logits tensor, not the hidden states.
+
+| Batch |   `T` | Logits elements | fp32 bytes |
+| ----: | ----: | --------------: | ---------: |
+|     2 |     8 |         804,112 |     3.2 MB |
+|     8 | 2,048 |     823,410,688 |     3.3 GB |
+|    16 | 8,192 |   6,587,285,504 |    26.3 GB |
+
+A 50,257-way vocabulary is 65 times wider than `d_model = 768`. At long context and large batch, the final projection alone exceeds the memory of every block combined. This is why inference engines compute logits only for the last position, why training uses chunked or fused cross-entropy kernels such as Liger, and why [Devices and Precision](/ai/pytorch/devices-and-precision) matters more for language models than for CNNs.
+
+---
+
+## Parameter accounting
+
+GPT-2 small, published as 124M. Every number below is exact.
+
+| Component                | Formula                       |      Parameters |
+| :----------------------- | :---------------------------- | --------------: |
+| Token embedding `wte`    | `50257 * 768`                 |      38,597,376 |
+| Position embedding `wpe` | `1024 * 768`                  |         786,432 |
+| Attention, per block     | `4 * 768 * 768 + 4 * 768`     |       2,362,368 |
+| Attention, 12 blocks     | `12 * 2,362,368`              |      28,348,416 |
+| FFN, per block           | `2 * 768 * 3072 + 3072 + 768` |       4,722,432 |
+| FFN, 12 blocks           | `12 * 4,722,432`              |      56,669,184 |
+| LayerNorms, 12 blocks    | `12 * 2 * 2 * 768`            |          36,864 |
+| Final LayerNorm          | `2 * 768`                     |           1,536 |
+| LM head                  | tied to `wte`                 |               0 |
+| **Total**                |                               | **124,439,808** |
+
+Two thirds of the non-embedding weight is in the FFN, and the embedding itself is 31% of the model. Both facts reverse as models grow: LLaMA-7B has a 32,000-token vocabulary against GPT-2's 50,257 and 4,096 dimensions against 768, so its embedding is 131,072,000 parameters out of 6.7B, under 2%.
+
+---
+
+## Interview questions
+
+1. What are the three differences between BERT, GPT, and T5, given the same block?
+2. Why does MLM replace 10% of selected tokens with random vocabulary items?
+3. What is the train/inference mismatch in BERT, and how does PET address it?
+4. How many supervised predictions does one pass over a 4096-token sequence give under MLM and under CLM?
+5. Why can an encoder-only model not generate text?
+6. What does T5's span corruption change relative to single-token masking?
+7. Give four reasons decoder-only models dominate production LLMs.
+8. What task class does an encoder-only model still win, and why?
+9. Recite the decoder forward pass from token IDs to logits, naming the shape at each stage.
+10. What is weight tying, what does it save in GPT-2 small, and why do modern models skip it?
+11. Which activation tensor dominates memory at long context, and what do inference engines do about it?
+12. Compute the parameter count of GPT-2 small from its config and explain why the embedding share shrinks with scale.

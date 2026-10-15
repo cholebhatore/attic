@@ -1,0 +1,207 @@
+---
+title: Attention Internals
+description: 'Query, key, and value projections, the scaled dot-product formula, self-attention from scratch, the sqrt(d_k) variance proof, and cross-attention.'
+---
+
+A Seq2Seq model compresses its whole input into one vector. Attention removes the compression: the decoder keeps every encoder state and decides, at each step, how much of each one to read. Once that decision is a differentiable weighted average rather than something a recurrent state has to carry, the recurrence stops being necessary.
+
+---
+
+## Query, key, and value
+
+Attention is a soft dictionary lookup. A hard lookup hashes a key and returns exactly one value. Attention scores a query against every key and returns a weighted blend of all the values.
+
+| Projection | Role in the analogy                      | Question it answers                    |
+| :--------- | :--------------------------------------- | :------------------------------------- |
+| Query `Q`  | What I am looking for                    | What does position `i` need right now? |
+| Key `K`    | What each entry advertises itself as     | What does position `j` offer?          |
+| Value `V`  | What each entry hands over once selected | If I read position `j`, what do I get? |
+
+All three come from the same input, through three separate learned matrices:
+
+```text
+Q = X W_Q      K = X W_K      V = X W_V
+```
+
+The geometric reading: `W_Q` and `W_K` map tokens into a space where the dot product measures relevance. That dot product is a cosine similarity scaled by both magnitudes, which is why [Similarity and Norms](/ai/math-foundations/similarity-and-norms) matters here. `W_V` maps into a different space, because what makes two tokens relevant to each other is not the same as what information should be passed between them.
+
+Separating key from value is what makes attention more expressive than a plain similarity lookup. In a one-hot bag-of-words model, `K` and `V` would be the same object and attention would reduce to averaging similar tokens.
+
+---
+
+## The scaled dot-product formula
+
+```text
+Attention(Q, K, V) = softmax( Q K^T / sqrt(d_k) ) V
+```
+
+Shapes, for a batch of `B` sequences of length `T` with model width `d_model` and head width `d_k`:
+
+| Tensor         | Shape             | Comes from                           |
+| :------------- | :---------------- | :----------------------------------- |
+| `X`            | `(B, T, d_model)` | Token embeddings plus positions      |
+| `W_Q`          | `(d_model, d_k)`  | Learned                              |
+| `Q`            | `(B, T, d_k)`     | `X @ W_Q`                            |
+| `Q K^T`        | `(B, T, T)`       | Every query scored against every key |
+| `softmax(...)` | `(B, T, T)`       | Attention weights, rows sum to 1     |
+| Output         | `(B, T, d_k)`     | Weighted sum of values               |
+
+The `T x T` matrix is the cost. Compute is `O(B T^2 d_k)` and the weight matrix alone is `B T^2` floats per head.
+
+### Self-attention from scratch
+
+```python title="attention.py"
+import math
+
+import torch
+import torch.nn as nn
+
+def attention(q, k, v, mask=None):
+    # q, k: (B, T, d_k)   v: (B, T, d_v)
+    scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])   # (B, T, T)
+    if mask is not None:
+        scores = scores.masked_fill(mask == 0, float("-inf"))
+    return scores.softmax(dim=-1) @ v                            # (B, T, d_v)
+
+
+class SelfAttention(nn.Module):
+    def __init__(self, d_model: int, d_k: int) -> None:
+        super().__init__()
+        self.wq = nn.Linear(d_model, d_k, bias=False)
+        self.wk = nn.Linear(d_model, d_k, bias=False)
+        self.wv = nn.Linear(d_model, d_k, bias=False)
+
+    def forward(self, x, mask=None):
+        q, k, v = self.wq(x), self.wk(x), self.wv(x)
+        return attention(q, k, v, mask)
+```
+
+`k.transpose(-2, -1)` swaps the last two axes only, so a `(B, T, d_k)` tensor becomes `(B, d_k, T)` and the batched matmul produces `(B, T, T)`. Using `.T` here would fail, because it reverses all dimensions.
+
+The same computation in `einsum`, which names the axes instead of relying on position:
+
+```python
+import math
+
+import torch
+
+scale = 1.0 / math.sqrt(q.shape[-1])                        # q, k, v as passed to attention()
+scores = torch.einsum("bqd,bkd->bqk", q, k) * scale         # (B, T_q, T_k)
+out = torch.einsum("bqk,bkd->bqd", scores.softmax(-1), v)   # (B, T_q, d_v)
+```
+
+---
+
+## Why divide by sqrt(d_k)
+
+Assume the components of `q` and `k` are independent with mean `0` and variance `1`. The dot product is a sum of `d_k` products:
+
+```text
+q . k = sum over i=1..d_k of q_i * k_i
+
+E[q_i * k_i]     = E[q_i] * E[k_i] = 0
+Var[q_i * k_i]   = Var[q_i] * Var[k_i] = 1
+Var[q . k]       = d_k          (sum of d_k independent unit-variance terms)
+std[q . k]       = sqrt(d_k)
+```
+
+So the logits entering softmax have standard deviation `sqrt(d_k)`, which grows with the head width. Dividing by `sqrt(d_k)` puts them back at unit variance. The scale factor is a variance normalizer, not a tuning knob.
+
+At `d_k = 64` the unscaled logits have standard deviation `8`; at `d_k = 512`, `22.6`. Scaling by `1 / sqrt(d_k)` brings both back to `1`.
+
+| Head width `d_k` | std of `q . k`, unscaled | std after scaling |
+| ---------------: | -----------------------: | ----------------: |
+|               64 |                    `8.0` |             `1.0` |
+|              256 |                   `16.0` |             `1.0` |
+|              512 |                   `22.6` |             `1.0` |
+
+What matters is the ratio this creates inside the softmax. A logit gap of `g` becomes a weight ratio of `exp(g)`. With unit-variance logits, a one-standard-deviation gap between the top logit and a competitor is a factor of `e^1 = 2.7`. With `d_k = 64` unscaled, the same one-standard-deviation gap is `8` logits, a factor of `e^8 = 2981`. The row collapses onto its maximum and every other position stops contributing.
+
+### Why saturation kills learning
+
+The Jacobian of softmax is `dp_i / dz_j = p_i (delta_ij - p_j)`. Its diagonal terms are `p_i (1 - p_i)`, which peak at `0.25` when `p_i = 0.5` and go to zero at both ends.
+
+| Top weight `p` | `p (1 - p)` | Gradient scale relative to `p = 0.5` |
+| -------------: | ----------: | -----------------------------------: |
+|         `0.50` |     `0.250` |                                 `1x` |
+|         `0.90` |     `0.090` |                              `0.36x` |
+|         `0.99` |    `0.0099` |                              `0.04x` |
+|        `0.999` |  `0.000999` |                             `0.004x` |
+
+At `p = 0.999` the gradient is 250 times smaller than at `p = 0.5`. In float16, where the smallest normal value is around `6e-5`, gradients that small underflow to zero. The attention weights stop being learnable and the layer becomes a fixed lookup.
+
+<Callout type="info">
+  ### Why `sqrt(d_k)` and not `d_k`
+
+Dividing by `d_k` would make the logit variance `1 / d_k`, shrinking towards zero as the head widens. All logits would become nearly equal, softmax would approach a uniform average, and the layer would lose the ability to select. Dividing by the standard deviation is the unique choice that holds logit variance at `1` regardless of `d_k`.
+
+</Callout>
+
+The variance assumption is not exactly true of a trained network, which is why some architectures add a learned temperature on top of the fixed `1 / sqrt(d_k)`. QK-Norm, used in Qwen 3 and covered in [Phase 6](/ai/llm), normalizes `q` and `k` with RMSNorm before the dot product so the variance holds by construction rather than by assumption.
+
+---
+
+## Cross-attention versus self-attention
+
+The computation is identical. The only difference is where `Q`, `K`, and `V` come from.
+
+| Variant               | `Q` from          | `K`, `V` from                | Where it appears                         |
+| :-------------------- | :---------------- | :--------------------------- | :--------------------------------------- |
+| Self-attention        | The same sequence | The same sequence            | Every encoder layer, every decoder layer |
+| Cross-attention       | The decoder       | The encoder output           | The middle sublayer of a decoder block   |
+| Masked self-attention | The decoder       | The decoder, causally masked | Decoder self-attention                   |
+
+```python title="cross_attention.py"
+import torch.nn as nn
+
+class CrossAttention(nn.Module):
+    def __init__(self, d_model: int, d_k: int) -> None:
+        super().__init__()
+        self.wq = nn.Linear(d_model, d_k, bias=False)   # reads the decoder
+        self.wk = nn.Linear(d_model, d_k, bias=False)   # reads the encoder
+        self.wv = nn.Linear(d_model, d_k, bias=False)   # reads the encoder
+
+    def forward(self, decoder_x, encoder_out):
+        q = self.wq(decoder_x)          # (B, T_dec, d_k)
+        k = self.wk(encoder_out)        # (B, T_enc, d_k)
+        v = self.wv(encoder_out)        # (B, T_enc, d_k)
+        return attention(q, k, v)       # (B, T_dec, d_k); attention() is from above
+```
+
+Note the output shape. Cross-attention produces one vector per `decoder` position, but the attention matrix is `(T_dec, T_enc)`, so the two sequence lengths need not match. That is what makes translation between languages of different lengths work.
+
+A decoder block therefore has three weight sets: self-attention, cross-attention, and the feed-forward network. With `d_ff = 4 d_model`, an encoder block is `4 d^2` of attention plus `8 d^2` of feed-forward, and a decoder block adds another `4 d^2` for cross-attention. Dropping cross-attention removes about a fifth of the parameters per block, which is one reason encoder-only and decoder-only models are cheaper per layer than a full encoder-decoder.
+
+Cross-attention is also the mechanism behind text-to-image diffusion models, where image latent features query a text encoder's output. The `T_dec` positions are pixel patches and the `T_enc` positions are prompt tokens.
+
+---
+
+## Cost and where it goes
+
+| Quantity                       | Scaling                  | At `B=1, T=8192, heads=32, d_head=128` |
+| :----------------------------- | :----------------------- | :------------------------------------- |
+| Projections `Q`, `K`, `V`, `O` | `O(T d_model^2)`         | 4 matmuls of `8192 x 4096 x 4096`      |
+| Score matrix `Q K^T`           | `O(T^2 d_head)` per head | `32 x 8192 x 8192 x 128` MACs          |
+| Attention weights in memory    | `O(B heads T^2)`         | `32 * 8192^2 * 4 bytes = 8 GB` in fp32 |
+| Feed-forward network           | `O(T d_model d_ff)`      | 3 matmuls through `11008` (SwiGLU)     |
+
+The quadratic term is what bounds context length. At `T = 8192` the score matrix alone needs 8 GB in float32 for a single sequence, and it grows fourfold at `T = 16384`.
+
+FlashAttention gets rid of the memory cost by never materializing the full matrix, recomputing attention block by block against the running softmax statistics. That is a [Phase 10](/ai/inference) topic. The `O(T^2)` compute stays.
+
+---
+
+## Interview questions
+
+1. Write the attention formula and give the shape of every tensor in it for a batch of `B` sequences of length `T`.
+2. What is the difference between a key and a value, and why does attention need both?
+3. Derive the variance of `q . k` under the standard assumptions, and show why the scale factor is `1 / sqrt(d_k)`.
+4. What happens to the softmax gradient when the logits are unscaled at `d_k = 512`?
+5. Why is dividing by `d_k` instead of `sqrt(d_k)` wrong in the other direction?
+6. Write the softmax Jacobian and say where its diagonal terms are maximized.
+7. In cross-attention, which sequence length determines the output shape and which determines the width of the attention matrix?
+8. Why does a decoder block have more parameters than an encoder block?
+9. What does attention cost in compute and in memory as a function of `T`, and which one does FlashAttention fix?
+10. Why does `k.transpose(-2, -1)` work on a batched tensor where `k.T` does not?
+11. What does QK-Norm change about the scaling argument?
+12. If `q` and `k` were drawn from a distribution with variance `4` instead of `1`, what scale factor would you need?

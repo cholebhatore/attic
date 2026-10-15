@@ -1,0 +1,284 @@
+---
+title: Blocks and Positions
+description: 'The pre-norm transformer block, feed-forward layers as key-value memories, residual connections as gradient highways, and sinusoidal, learned, and RoPE positions.'
+---
+
+Attention moves information between positions. Everything else in the block computes on each position independently. This page covers the two remaining pieces of a transformer block, the feed-forward network and the residual connection, and then the positional signal that attention cannot produce on its own.
+
+---
+
+## Block anatomy
+
+Every modern decoder layer is the same five operations.
+
+<Mermaid
+  chart={`
+flowchart TD
+    X["x: (B, T, d)"] --> N1["RMSNorm"]
+    N1 --> A["Causal multi-head attention"]
+    A --> ADD1(("+"))
+    X --> ADD1
+    ADD1 --> N2["RMSNorm"]
+    N2 --> F["Feed-forward: SwiGLU"]
+    F --> ADD2(("+"))
+    ADD1 --> ADD2
+    ADD2 --> Y["out: (B, T, d)"]
+`}
+/>
+
+```python title="block.py"
+import torch
+import torch.nn as nn
+
+class Block(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, d_ff: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.attn = MultiHeadAttention(d_model, n_heads)
+        self.ln2 = nn.LayerNorm(d_model, elementwise_affine=False)
+        self.ffn = FeedForward(d_model, d_ff)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        h = self.ln1(x)
+        x = x + self.drop(self.attn(h, h, h, mask))
+        x = x + self.drop(self.ffn(self.ln2(x)))
+        return x
+```
+
+The norm is applied to a copy, and the un-normalized tensor is what flows through the residual. `LayerNorm(elementwise_affine=False)` matches LLaMA's RMSNorm, which has a weight but no bias and no mean subtraction. See [Normalization](/ai/neural-networks/normalization).
+
+---
+
+## Feed-forward networks
+
+The FFN is two linear layers with a nonlinearity between them, applied to each position separately:
+
+```text
+FFN(x) = W_2 f(W_1 x + b_1) + b_2      W_1: (d_ff, d)   W_2: (d, d_ff)
+```
+
+"Position-wise" means the same `W_1` and `W_2` are used at every position, and no position talks to any other. Attention is the only operation in the block that mixes information across the sequence.
+
+```python title="ffn.py"
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model: int, d_ff: int) -> None:
+        super().__init__()
+        self.up = nn.Linear(d_model, d_ff, bias=False)
+        self.gate = nn.Linear(d_model, d_ff, bias=False)
+        self.down = nn.Linear(d_ff, d_model, bias=False)
+
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+```
+
+### Width and parameter share
+
+The original paper used `d_ff = 4 * d_model`. GPT-2 kept that. Gated variants need three matrices instead of two, so they shrink the width to keep the parameter count comparable.
+
+| Model       | `d_model` | `d_ff` | Matrices | FFN params per block |
+| :---------- | --------: | -----: | -------: | -------------------: |
+| GPT-2 small |       768 |  3,072 |        2 |            4,718,592 |
+| BERT base   |       768 |  3,072 |        2 |            4,718,592 |
+| LLaMA-7B    |     4,096 | 11,008 |        3 |          135,266,304 |
+| LLaMA-70B   |     8,192 | 28,672 |        3 |          704,643,072 |
+
+LLaMA sets `d_ff` to the nearest multiple of 256 above `(8/3) * d_model`. For `d_model = 4096` that is `10922.7` rounded up to `11008`. Three matrices at `8/3 d` cost about the same as two at `4 d`.
+
+The consequence is that the FFN dominates the weights. In GPT-2 small, attention is `4 d^2 = 2,359,296` per block and the FFN is `4,718,592`, so two thirds of every block sits in the feed-forward layer.
+
+### Key-value memories
+
+Geva et al., _Transformer Feed-Forward Layers Are Key-Value Memories_ (arXiv:2012.14913), read the FFN as an associative memory. Each row of `W_1` is a key that detects an input pattern, and the corresponding column of `W_2` is a value written into the output when that key fires.
+
+Their evidence: lower layers respond to shallow patterns like n-grams and syntactic constructions, upper layers respond to semantic patterns, and the value vectors in the upper layers push specific vocabulary items up in the next-token distribution. Dai et al., _Knowledge Neurons in Pretrained Transformers_ (arXiv:2104.08696), extended this by locating individual neurons whose activation corresponds to a factual relation, and showed that suppressing or amplifying them changes the model's answers.
+
+This is why editing a fact in a trained model is easier than editing a behaviour. Facts live in identifiable FFN neurons; behaviours are spread across attention patterns too.
+
+---
+
+## Skip connections
+
+Each sublayer computes `x + Sublayer(Norm(x))`. The identity path is what makes the depth trainable.
+
+Differentiating `y = x + F(x)` gives
+
+```text
+dy/dx = I + dF/dx
+```
+
+The `I` term means a gradient always has a route back to the input that does not pass through any learned weights. Stack `L` blocks and the gradient of the output with respect to block 1 contains a term that is the product of `L` identity maps, which is still `I`. Without that term the product would be `L` Jacobians multiplied together and would shrink or explode, which is exactly the failure mode covered in [Recurrent Networks](/ai/classical-deep-learning/recurrent-networks).
+
+### The residual stream
+
+A useful mental model: the residual is not a shortcut around the computation, it is the main channel. Each block reads from it, computes something, and writes the result back by addition. Attention heads write the information they gathered; FFNs write the associations they recalled. Layer `L` sees the sum of everything layers `1..L-1` wrote.
+
+That sum grows with depth, which is why the norm sits on the read path rather than the write path.
+
+### Pre-norm versus post-norm
+
+| Placement     | Formula                       | Behaviour                                                            |
+| :------------ | :---------------------------- | :------------------------------------------------------------------- |
+| Post-norm     | `Norm(x + Sublayer(x))`       | Original paper. Better final quality at small depth, needs LR warmup |
+| Pre-norm      | `x + Sublayer(Norm(x))`       | Stable without warmup. Every large model uses it                     |
+| Sandwich-norm | `x + Norm(Sublayer(Norm(x)))` | Both. Costs one extra norm per sublayer                              |
+
+Xiong et al., _On Layer Normalization in the Transformer Architecture_ (arXiv:2002.04745), showed the gradient norm at initialization is `O(sqrt(d ln d))` for post-norm and `O(sqrt(ln d / d))` for pre-norm. Post-norm's gradient blows up with width, which is why it needs warmup to survive the first few hundred steps. DeepNet (arXiv:2203.00555) recovers post-norm's quality by scaling the residual and the initialization, and trains 1000-layer transformers without warmup.
+
+<Callout type="info">
+  ### Two things the residual does not do
+
+It does not make the network compute an identity function. The sublayer output is added, so the block always changes the representation. And it does not remove the need for normalization; it removes the need for normalization _on the main path_. Pre-norm networks still have unbounded residual growth, and models above roughly 100 layers need a final norm plus careful initialization to keep logits in range.
+
+</Callout>
+
+---
+
+## Why attention needs positions
+
+Attention is permutation equivariant. Shuffle the rows of `X` and the rows of the output shuffle the same way, because the softmax over `Q K^T` depends only on which vectors are present, not on where they sit.
+
+```text
+Attention(P X) = P Attention(X)      for any permutation matrix P
+```
+
+"the cat sat on the mat" and "mat the on sat cat the" produce the same multiset of output vectors. A stack of FFNs is also position-independent, so the entire block is blind to order. Language is not. The positional signal has to be injected before the first block, either added to the embeddings or applied inside every attention computation.
+
+---
+
+## Sinusoidal encoding
+
+The original scheme assigns position `pos` a fixed vector built from sines and cosines at geometrically spaced frequencies:
+
+```text
+PE(pos, 2i)     = sin(pos / 10000^(2i/d_model))
+PE(pos, 2i + 1) = cos(pos / 10000^(2i/d_model))
+```
+
+Dimension pair `i` has wavelength `2 * pi * 10000^(2i/d_model)`. For `d_model = 512`:
+
+| `i` | Divisor `10000^(2i/d_model)` | Wavelength          |
+| --: | ---------------------------: | :------------------ |
+|   0 |                            1 | `2 pi`, about 6     |
+|  64 |                           10 | `20 pi`, about 63   |
+| 128 |                          100 | `200 pi`, about 628 |
+| 192 |                        1,000 | about 6,283         |
+| 255 |                        9,645 | about 60,600        |
+
+The fast dimensions distinguish adjacent tokens. The slow ones distinguish tokens thousands of positions apart. Together they form a binary-counter-like code where no two positions collide.
+
+```python title="positional.py"
+import torch
+
+def sinusoidal_pe(n_positions: int, d_model: int) -> torch.Tensor:
+    pos = torch.arange(n_positions, dtype=torch.float32).unsqueeze(1)   # (n, 1)
+    i = torch.arange(0, d_model, 2, dtype=torch.float32)                # (d/2,)
+    angle = pos / (10000.0 ** (i / d_model))                            # (n, d/2)
+    pe = torch.zeros(n_positions, d_model)                              # (n, d)
+    pe[:, 0::2] = angle.sin()
+    pe[:, 1::2] = angle.cos()
+    return pe
+
+print(sinusoidal_pe(4, 4).round(decimals=4).tolist())
+# [[0.0, 1.0, 0.0, 1.0],
+#  [0.8415, 0.5403, 0.01, 1.0],
+#  [0.9093, -0.4161, 0.02, 0.9998],
+#  [0.1411, -0.99, 0.03, 0.9996]]
+```
+
+The claimed advantage is that `PE(pos + k)` is a linear function of `PE(pos)`. For dimension pair `i`, shifting by `k` rotates the two components by the fixed angle `k / 10000^(2i/d_model)`, and a rotation is a matrix multiply with constant coefficients. A linear layer can therefore learn to attend to relative offsets. The original paper uses this encoding, and it still appears in speech and vision transformers, but current language models replaced it with learned or rotary positions.
+
+---
+
+## Learned absolute positions
+
+GPT-2 and BERT replace the formula with a trained embedding table indexed by position.
+
+```python
+self.wte = nn.Embedding(vocab_size, d_model)      # token
+self.wpe = nn.Embedding(block_size, d_model)      # position
+x = self.wte(input_ids) + self.wpe(torch.arange(T, device=input_ids.device))
+```
+
+GPT-2 small spends `1024 * 768 = 786,432` parameters on `wpe`. The table learns whatever spacing the data wants instead of a fixed geometric one, and it trains well at the lengths seen in pretraining.
+
+Two limits follow from it being a lookup table. The model cannot run past `block_size` without interpolating or extending the table, and it has no mechanism for generalizing an offset it has never seen. Both are why length extrapolation is hard for absolute-position models.
+
+---
+
+## Rotary position embedding
+
+RoPE (Su et al., arXiv:2104.09864) does not add anything to the embeddings. It rotates the query and key vectors inside every attention layer, by an angle proportional to the position.
+
+Pair up the `d_head` dimensions. For pair `i`, rotate by `m * theta_i` where
+
+```text
+theta_i = base^(-2i/d_head)        base = 10000
+```
+
+After rotation, the dot product between a query at position `m` and a key at position `n` depends only on `m - n`:
+
+```text
+<R(m) q, R(n) k> = <R(m - n) q, k>
+```
+
+Relative position falls out of the absolute encoding, at every layer, with no extra parameters. Values are left unrotated, since only the scores need the offset.
+
+```python title="rope.py"
+import torch
+
+def build_rope_cache(T: int, d_head: int, base: float = 10000.0):
+    inv_freq = 1.0 / (base ** (torch.arange(0, d_head, 2, dtype=torch.float32) / d_head))  # (d/2,)
+    pos = torch.arange(T, dtype=torch.float32)                                             # (T,)
+    freqs = torch.outer(pos, inv_freq)                                                     # (T, d/2)
+    emb = torch.cat((freqs, freqs), dim=-1)                                                # (T, d)
+    return emb.cos(), emb.sin()
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rope(q, k, cos, sin):
+    cos = cos[None, None]        # (1, 1, T, d) broadcasts over batch and heads
+    sin = sin[None, None]
+    return q * cos + rotate_half(q) * sin, k * cos + rotate_half(k) * sin
+```
+
+`rotate_half` splits the vector into two halves instead of interleaving pairs. The two conventions are equivalent as long as `cos` and `sin` are built by concatenating `freqs` with itself, which is what the code above does. Mixing the conventions silently halves the effective rotation.
+
+RoPE is used by LLaMA, Mistral, Qwen, Gemma, and GPT-NeoX. Length extrapolation still degrades, which is why base-frequency tuning and interpolation schemes exist; those are [Phase 6](/ai/llm) material.
+
+---
+
+## Choosing an encoding
+
+| Scheme             | Parameters | Where applied      | Relative? | Extrapolates past train length |
+| :----------------- | ---------: | :----------------- | :-------- | :----------------------------- |
+| Sinusoidal         |          0 | Added to embedding | No        | Poorly                         |
+| Learned absolute   |    `T * d` | Added to embedding | No        | No                             |
+| Relative bias (T5) |    buckets | Added to scores    | Yes       | Moderately                     |
+| ALiBi              |          0 | Added to scores    | Yes       | Well                           |
+| RoPE               |          0 | Rotates `q`, `k`   | Yes       | Poorly, tunable                |
+
+ALiBi (Press et al., arXiv:2108.12409) adds a fixed per-head penalty `-m * |i - j|` to the attention scores, with slopes `2^(-8i/h)`. It has no parameters and was the first scheme to train short and test much longer without collapse. T5's relative bias (Raffel et al., arXiv:1910.10683) learns one scalar per head per distance bucket, with buckets spaced logarithmically so distant positions share a bias.
+
+---
+
+## Interview questions
+
+1. What does "position-wise" mean for the FFN, and which operation mixes across positions?
+2. Why is `d_ff = (8/3) * d_model` used with SwiGLU instead of `4 * d_model`?
+3. What fraction of a transformer block's parameters is in the FFN, and why does that matter?
+4. Explain the key-value memory reading of the FFN and the evidence behind it.
+5. Derive `dy/dx` for a residual connection and explain why the `I` term matters.
+6. What is the residual stream, and why is the norm placed on the read path?
+7. Why does post-norm need learning-rate warmup and pre-norm not?
+8. Show that attention is permutation equivariant and state the consequence for language.
+9. Write the sinusoidal encoding formula and explain the wavelength progression.
+10. Why is `PE(pos + k)` a linear function of `PE(pos)`, and who uses this in practice?
+11. What are the two limits of learned absolute positions?
+12. Derive why RoPE makes the score depend only on `m - n`, and what `rotate_half` assumes.

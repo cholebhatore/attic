@@ -1,0 +1,195 @@
+---
+title: Masking and Multi-Head
+description: 'Upper-triangular causal masks, padding masks, why masking is what allows parallel training, and splitting attention into multiple representation subspaces.'
+---
+
+Two modifications turn plain attention into something you can train on language. A causal mask stops a position from reading the future, which is what makes autoregressive training possible in one pass. Multiple heads let one position attend to more than one thing at a time.
+
+---
+
+## Causal masking
+
+A language model predicts token `t+1` from tokens `1..t`. During training you have the whole sequence, so position `t` must be prevented from looking at `t+1` and beyond, or the model learns to copy the answer.
+
+The mask is an upper-triangular matrix of negative infinity:
+
+```python title="mask.py"
+import torch
+
+T = 5
+causal = torch.tril(torch.ones(T, T))
+print(causal.tolist())
+# [[1, 0, 0, 0, 0],
+#  [1, 1, 0, 0, 0],
+#  [1, 1, 1, 0, 0],
+#  [1, 1, 1, 1, 0],
+#  [1, 1, 1, 1, 1]]
+```
+
+Row `i` has ones in columns `0..i` and zeros after. Applying it before the softmax:
+
+```python
+import math
+
+scores = (q @ k.transpose(-2, -1)) / math.sqrt(q.shape[-1])    # (B, h, T, T)
+scores = scores.masked_fill(causal == 0, float("-inf"))
+weights = scores.softmax(dim=-1)
+```
+
+### Why negative infinity and not zero
+
+Softmax exponentiates. A masked logit of `0` becomes `exp(0) = 1`, which is a large weight relative to typical logits and leaks future information. A masked logit of `-inf` becomes `exp(-inf) = 0`, exactly removing that position from the weighted sum while leaving the remaining weights properly normalized.
+
+```text
+softmax([2.0, 1.0, -inf]) = [0.73, 0.27, 0.00]
+softmax([2.0, 1.0,  0.0]) = [0.67, 0.24, 0.09]   # the future token keeps 9% of the mass
+```
+
+Use `float("-inf")`, not a large finite number like `-1e9`. In float16 `-1e9` overflows to `-inf` anyway, and in bfloat16 a finite sentinel can survive into the softmax and produce a small but nonzero leak.
+
+<Callout type="info">
+  ### Masking is what makes training parallel
+
+An RNN needs `T` sequential steps to produce `T` training signals. A causal transformer produces all of them in a single forward pass, because every position computes its own prediction while restricted to its own prefix. One pass over a 4096-token sequence yields 4095 supervised next-token examples instead of one. That throughput difference, not the attention mechanism itself, is why transformers scale.
+
+The mask is still needed at inference during prompt prefill, where the whole prompt is processed in one pass. It is not needed for the single-token decode steps that follow, since there is nothing after the current position to mask.
+
+</Callout>
+
+---
+
+## Padding masks
+
+Batches need uniform length, so short sequences are padded. Padded positions must not be attended to as keys, or they contribute a spurious weight to every row.
+
+```python
+causal = torch.tril(torch.ones(T, T)).bool()                # (T, T), True where allowed
+pad_mask = (input_ids != PAD_TOKEN_ID)                      # (B, T), True where real
+pad_mask = pad_mask[:, None, None, :]                       # (B, 1, 1, T), broadcasts over heads and query rows
+mask = causal[None, None] & pad_mask                        # (B, 1, T, T)
+```
+
+`&` needs boolean operands, so convert the causal mask with `.bool()` before combining. The result broadcasts over the head axis when passed as `attn_mask`.
+
+The two masks answer different questions. Causal asks "is key position `j` in the future of query position `i`?" and is the same for every sequence. Padding asks "does key position `j` exist in this sequence?" and differs per sample. Combine them with a logical AND.
+
+A fully masked row produces `softmax([-inf, ..., -inf])`, which is `NaN`. Pad tokens as queries do produce such a row. The loss ignores those positions through `ignore_index`, but the `NaN` still propagates through the residual stream if you are not careful. Pad on the right and slice predictions to real positions, or clamp the mask so at least one column survives.
+
+---
+
+## Multi-head attention
+
+One softmax produces one probability distribution per query position, so one attention head computes one weighted average. If a token needs to attend to its syntactic subject and to the previous word and to a coreference target, a single head has to compromise between them.
+
+Multi-head attention splits the representation into `h` subspaces, runs attention independently in each, and concatenates the results:
+
+```text
+head_i = Attention(X W_Q_i, X W_K_i, X W_V_i)
+MultiHead(X) = Concat(head_1, ..., head_h) W_O
+```
+
+With `d_head = d_model / h`, the projections are still `d_model x d_model` in total, so the parameter count does not change with the number of heads. More heads means narrower heads, not more weights.
+
+```python title="mha.py"
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int) -> None:
+        super().__init__()
+        if d_model % n_heads:
+            raise ValueError("d_model must be divisible by n_heads")
+        self.h = n_heads
+        self.d_head = d_model // n_heads
+        self.wq = nn.Linear(d_model, d_model, bias=False)
+        self.wk = nn.Linear(d_model, d_model, bias=False)
+        self.wv = nn.Linear(d_model, d_model, bias=False)
+        self.wo = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, q_in, k_in, v_in, mask=None):
+        B, T, _ = q_in.shape
+        q = self.wq(q_in).view(B, T, self.h, self.d_head).transpose(1, 2)   # (B, h, T, d_head)
+        k = self.wk(k_in).view(B, T, self.h, self.d_head).transpose(1, 2)
+        v = self.wv(v_in).view(B, T, self.h, self.d_head).transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)       # (B, h, T, d_head)
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)               # (B, T, d_model)
+        return self.wo(out)
+```
+
+Two things go wrong here often enough to memorize. `transpose(1, 2)` moves the head axis forward so each head becomes an independent batch entry, and `view` requires contiguity, so the transpose back needs `.contiguous()` before the reshape or it raises. See [Indexing and Shapes](/ai/pytorch/indexing-and-shapes).
+
+### The fused path
+
+`F.scaled_dot_product_attention` is the PyTorch 2.x implementation of the whole formula. It applies the `1 / sqrt(d_head)` scale itself and dispatches to FlashAttention, memory-efficient attention, or a math fallback depending on the input dtype and mask.
+
+```python
+out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, dropout_p=0.0)
+```
+
+Three traps:
+
+- Do not scale by `1 / sqrt(d_head)` before calling it. The scale is applied inside, so you would apply it twice.
+- `is_causal=True` and `attn_mask=...` are mutually exclusive. Passing both raises.
+- `nn.MultiheadAttention` uses the opposite mask polarity to the convention above. A boolean `attn_mask` there means `True` is _not allowed_, and a float mask is _added_ to the scores. Inverting this silently destroys the model.
+
+For a hand-rolled version without the fused kernel, `attention(q, k, v, mask)` from the previous page is equivalent.
+
+---
+
+## What heads specialize in
+
+Interpretability work on trained models finds heads with consistent, nameable jobs.
+
+| Head type   | Behaviour                                             | Source                         |
+| :---------- | :---------------------------------------------------- | :----------------------------- |
+| Positional  | Attends almost entirely to the previous or next token | Voita et al., arXiv:1905.10650 |
+| Syntactic   | Attends to a direct object, determiner, or verb       | Clark et al., arXiv:1906.04341 |
+| Rare-word   | Fires on low-frequency tokens                         | Voita et al.                   |
+| Coreference | Attends from a pronoun to its antecedent              | Clark et al.                   |
+| Induction   | Copies the token that followed a previous occurrence  | Olsson et al., 2022            |
+
+Voita et al. also found that most heads are prunable: on an English-to-German translation model, 33 of 48 heads in a decoder layer could be dropped with a BLEU loss under `0.15`. The specialization is real but concentrated in a small number of heads.
+
+The counterpoint matters for interviews. Jain and Wallace (arXiv:1902.10186) showed that very different attention distributions can produce identical predictions, and Wiegreffe and Pinter (arXiv:1908.04626) showed that this does not make attention useless as an explanation, only that a single high-weight position is not evidence of causal importance. Attention weights are a hypothesis about what the model used, not a proof.
+
+---
+
+## Choosing head count and width
+
+`d_head` is surprisingly stable across published models.
+
+| Model            | `d_model` | Heads | `d_head` |
+| :--------------- | --------: | ----: | -------: |
+| Transformer base |       512 |     8 |       64 |
+| Transformer big  |      1024 |    16 |       64 |
+| BERT base        |       768 |    12 |       64 |
+| BERT large       |      1024 |    16 |       64 |
+| GPT-2 small      |       768 |    12 |       64 |
+| GPT-3 175B       |     12288 |    96 |      128 |
+| LLaMA-7B         |      4096 |    32 |      128 |
+| LLaMA-70B        |      8192 |    64 |      128 |
+
+Sixty-four works well up to about `d_model = 1024`. Beyond that, models moved to `d_head = 128` rather than adding heads indefinitely. A head narrower than about `32` does not have enough room to represent a useful subspace, and the score-matrix memory grows with head count even when the parameter count does not.
+
+The head count is also the unit that later optimizations compress. Multi-Query Attention uses one head for all queries, and Grouped-Query Attention uses a small number of groups shared across query heads. Both cut KV-cache memory without changing `d_model`. That is [Phase 6](/ai/llm).
+
+---
+
+## Interview questions
+
+1. Why is a causal mask applied with `-inf` rather than `0`?
+2. What does the causal mask enable during training that an RNN cannot do?
+3. How do causal and padding masks differ, and how do you combine them?
+4. What produces `NaN` in a masked attention row, and how do you avoid it?
+5. Write the multi-head attention equations and state the parameter count as a function of `h`.
+6. Why does `.view()` fail after `.transpose()`, and what fixes it?
+7. What are the three traps in `F.scaled_dot_product_attention`?
+8. How does `nn.MultiheadAttention`'s mask polarity differ from a hand-written implementation?
+9. Name three specialized head types found in trained models and the evidence for them.
+10. Why is attention weight magnitude weak evidence for causal importance?
+11. Why did large models move from `d_head = 64` to `d_head = 128` instead of adding more heads?
+12. Which axis does `transpose(1, 2)` move, and why does that make each head an independent batch entry?
