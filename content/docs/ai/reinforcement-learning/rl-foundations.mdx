@@ -1,0 +1,211 @@
+---
+title: RL Foundations
+description: 'Markov decision processes, the return and discount factor, value and Q functions, both Bellman equations, the advantage, and how all of it maps onto a language model.'
+---
+
+Reinforcement learning for LLMs borrows its vocabulary from a field built for Atari and robotics. The words carry over exactly: state, action, reward, policy, advantage. The setting does not, and knowing where the analogy holds and where it strains is most of what this page is for.
+
+---
+
+## The agent-environment loop
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Agent (policy)"] -->|"action a_t"| E["Environment"]
+    E -->|"state s_t+1, reward r_t+1"| A
+    A -.->|"objective: maximise discounted return"| A
+`}
+/>
+
+The agent picks an action, the environment returns a new state and a scalar reward, and the loop repeats until the episode ends. Nothing else in RL exists outside this loop. Every algorithm is a different answer to one question: how should the agent choose, given only the rewards it has seen?
+
+---
+
+## The Markov decision process
+
+An MDP is the formal name for that loop.
+
+| Component       | Symbol       | Meaning                                           |
+| :-------------- | :----------- | :------------------------------------------------ |
+| State space     | `S`          | Everything the environment can be                 |
+| Action space    | `A`          | Everything the agent can do                       |
+| Transition      | `P(s'\|s,a)` | Probability of landing in `s'` from `s` after `a` |
+| Reward          | `R(s,a)`     | Scalar feedback, possibly delayed                 |
+| Discount factor | `gamma`      | How much future reward is worth against present   |
+
+"Markov" means the next state depends only on the current state and action, not on the history that got you there. `P(s_t+1 | s_t, a_t) = P(s_t+1 | s_1, a_1, ..., s_t, a_t)`. Real environments violate this constantly, and the standard fix is to make the state bigger until it holds enough history to satisfy it. A partially observable environment, where the agent sees less than the true state, is a POMDP.
+
+### The discount factor
+
+`gamma` lives in `[0, 1]` and sets the effective planning horizon at roughly `1 / (1 - gamma)` steps.
+
+| `gamma` | Effective horizon | Behaviour                                    |
+| :------ | :---------------- | :------------------------------------------- |
+| `0`     | 1 step            | Pure greed, no planning                      |
+| `0.9`   | ~10 steps         | Short-sighted                                |
+| `0.99`  | ~100 steps        | Common default for games and control         |
+| `1.0`   | Unlimited         | Only valid for episodic tasks that terminate |
+
+LLM RL uses `gamma = 1`. A response is finite, so there is no infinite sum to diverge, and discounting intermediate tokens would arbitrarily devalue the end of a long reasoning chain.
+
+---
+
+## Return, value, and Q
+
+The return is the total discounted reward from a point onward:
+
+```text
+G_t = r_t+1 + gamma * r_t+2 + gamma^2 * r_t+3 + ...
+```
+
+Two functions summarise expected return, and the distinction between them runs through every algorithm in this phase.
+
+| Function | Definition                   | Question it answers                       |
+| :------- | :--------------------------- | :---------------------------------------- |
+| `V(s)`   | `E[G_t \| S_t = s]`          | How good is this state under policy `pi`? |
+| `Q(s,a)` | `E[G_t \| S_t = s, A_t = a]` | How good is this action here?             |
+
+They relate by `V(s) = sum_a pi(a|s) Q(s,a)`, and `Q(s,a) = R(s,a) + gamma * sum_s' P(s'|s,a) V(s')`.
+
+---
+
+## The Bellman equations
+
+### Expectation form
+
+Value at a state equals the immediate reward plus the discounted value of where you end up:
+
+```text
+V^pi(s) = sum_a pi(a|s) sum_s' P(s'|s,a) [ R(s,a) + gamma * V^pi(s') ]
+```
+
+This is a recursive definition, and recursion is what makes RL tractable. Instead of enumerating every trajectory, you solve a fixed-point problem over states. Dynamic programming methods iterate this equation to convergence when `P` is known. When it is not, you sample, which is what temporal-difference learning does.
+
+### Optimality form
+
+Replace the policy-weighted average with a max:
+
+```text
+V*(s) = max_a sum_s' P(s'|s,a) [ R(s,a) + gamma * V*(s') ]
+Q*(s,a) = R(s,a) + gamma * sum_s' P(s'|s,a) max_a' Q*(s',a')
+```
+
+The second line is exactly what Q-learning approximates. Every value-based method in this phase is a sampling-based attack on that equation.
+
+---
+
+## The advantage
+
+```text
+A^pi(s,a) = Q^pi(s,a) - V^pi(s)
+```
+
+How much better this action is than what the policy would do on average from this state. Under expectation over actions it is zero: `sum_a pi(a|s) A^pi(s,a) = 0`.
+
+The advantage is the quantity every modern policy-gradient method multiplies by the log-probability gradient, and the reason is variance rather than bias. Using the raw return `G_t` works but is noisy, because most of `G_t` reflects how good the state was, which the action had no influence over. Subtracting `V(s)` removes that shared component. PPO, GAE and GRPO are all variations on estimating this one term.
+
+---
+
+## Taxonomy
+
+| Axis               | Options                         | Examples                        |
+| :----------------- | :------------------------------ | :------------------------------ |
+| What is learned    | Value function, policy, or both | DQN, REINFORCE, PPO             |
+| Whose data is used | On-policy, off-policy           | PPO is on, DQN is off           |
+| Is the model known | Model-free, model-based         | Almost all LLM RL is model-free |
+| Horizon            | Episodic, continuing            | LLM generation is episodic      |
+
+**On-policy** means the update uses data generated by the current policy. Once you update, the old data is stale, so on-policy methods are sample-hungry. **Off-policy** means you can learn from data collected by any policy, including a replay buffer of past experience, which is sample-efficient but harder to stabilise.
+
+LLM RL sits awkwardly here. PPO and GRPO are formally on-policy, but in practice one rollout batch is reused for several gradient steps, which requires an importance-sampling correction to stay valid. That correction is the ratio in PPO's objective and the reason the clipping exists.
+
+---
+
+## Mapping the MDP onto a language model
+
+| RL concept     | LLM equivalent                                         |
+| :------------- | :----------------------------------------------------- |
+| State `s_t`    | The prompt plus every token generated so far           |
+| Action `a_t`   | The next token                                         |
+| Action space   | The vocabulary, typically 32,000 to 152,000 entries    |
+| Policy `pi`    | The language model itself, `softmax` over logits       |
+| Episode        | One complete response                                  |
+| Reward         | From a reward model, a verifier, or a human preference |
+| Transition `P` | Deterministic: appending a token to the sequence       |
+| `gamma`        | `1`, because episodes are finite                       |
+
+Two entries in that table deserve attention.
+
+The transition is deterministic. Given a state and an action, the next state is fixed, since it is just string concatenation. All the stochasticity lives in the policy. This removes a large part of what makes classical RL hard, and it is why nobody trains a dynamics model for LLM RL.
+
+The reward is almost always terminal. A verifier checks the final answer, or a reward model scores the completed response. Intermediate tokens receive no direct signal, so the same scalar is broadcast back to every token in the sequence through the return. That is the credit assignment problem in its sharpest form, and process reward models are one attempt to fix it.
+
+<Callout type="info">
+  ### What is genuinely different here
+
+Classical RL assumes a small action space and many short episodes collected over millions of environment steps. LLM RL has a 100,000-way action space, episodes measured in thousands of tokens, and a rollout cost measured in GPU-seconds rather than microseconds.
+
+The consequence is that generation, not gradient descent, dominates the wall-clock time of an LLM RL run. This is why every framework in this phase ships a fast inference engine for rollouts and why weight synchronisation between the training process and the generation engine is the central engineering problem.
+
+</Callout>
+
+---
+
+## A worked episode
+
+Prompt: "What is 17 \* 24? Put the answer in `\boxed`."
+
+```text
+t=0  s_0 = [prompt]                    a_0 = "1"      pi(a_0|s_0) = 0.31
+t=1  s_1 = [prompt, "1"]               a_1 = "7"      pi(a_1|s_1) = 0.88
+...
+t=k  s_k = [prompt, "17 * 24 = 408 \boxed{"]  a_k = "408}"   ...
+terminal: verifier extracts 408, compares to the gold answer, r = +1
+```
+
+Every token gets advantage derived from that single `+1`. GRPO computes it by sampling eight responses to the same prompt and normalising their rewards against each other, which is how a scalar terminal reward produces a per-token learning signal without a critic.
+
+---
+
+## Interview questions
+
+1. Define a Markov decision process.
+
+   A tuple of a state space, an action space, a transition probability `P(s'|s,a)`, a reward function, and a discount factor. "Markov" means the next state depends only on the current state and action, not on the history that preceded them. When a real environment violates this, you enlarge the state until it holds enough history to satisfy it.
+
+2. What does the discount factor control, and why is it `1` for LLM training?
+
+   It weights future reward against immediate reward, setting an effective horizon of about `1 / (1 - gamma)` steps. LLM generation is episodic and finite, so the infinite sum that makes discounting necessary never arises, and setting `gamma < 1` would arbitrarily devalue tokens near the end of a long reasoning chain.
+
+3. What is the difference between `V(s)` and `Q(s,a)`?
+
+   `V` is the expected return from a state when following the policy thereafter, averaging over the actions the policy would take. `Q` is the expected return from a state after taking one specific action, then following the policy. They connect through `V(s) = sum_a pi(a|s) Q(s,a)`.
+
+4. State the Bellman optimality equation for `Q` and name what approximates it.
+
+   `Q*(s,a) = R(s,a) + gamma * sum_s' P(s'|s,a) max_a' Q*(s',a')`. Q-learning approximates it by sampling transitions and replacing the expectation with observed rewards, using `max_a' Q(s',a')` as the bootstrap target. DQN is the same equation with a neural network standing in for the Q table.
+
+5. What is the advantage function and why do policy-gradient methods use it instead of the raw return?
+
+   `A(s,a) = Q(s,a) - V(s)`, how much better an action is than the policy's average from that state. The raw return is dominated by how good the state was, which the action did not cause, and that shared component is pure variance. Subtracting the baseline removes it without biasing the gradient.
+
+6. On-policy against off-policy, and where does LLM RL sit?
+
+   On-policy methods update using data from the current policy and must discard it after each update. Off-policy methods learn from any data, including a replay buffer, which is sample-efficient but needs corrections for the distribution mismatch. PPO and GRPO are nominally on-policy but reuse one rollout batch for several gradient steps, which is only valid because of an importance-sampling ratio and a clip on it.
+
+7. Map the MDP components onto a language model generating a response.
+
+   The state is the prompt plus tokens generated so far, the action is the next token, the action space is the vocabulary, the policy is the model's softmax, an episode is one response, and the reward comes from a reward model or verifier at the end. The transition is deterministic string concatenation, so all stochasticity lives in the policy.
+
+8. Why is credit assignment unusually hard in LLM RL?
+
+   The reward is terminal. A single scalar for a 4,000-token response has to be attributed to every token that produced it, and the standard mechanism broadcasts the same advantage to all of them. Process reward models, which score individual reasoning steps, are one response to this, and they need step-level labels that are expensive to obtain.
+
+9. Why does generation dominate the cost of an LLM RL run rather than the gradient update?
+
+   Each training step needs a batch of complete responses sampled token by token from the current policy, and autoregressive decoding cannot be parallelised across positions. The forward and backward pass over those tokens is a single dense compute burst by comparison. This is why RL frameworks embed a fast inference engine for rollouts and treat weight synchronisation into it as the core engineering problem.
+
+10. What is a POMDP and does it apply to language models?
+
+    A partially observable MDP, where the agent sees an observation that is less than the true environment state. In multi-turn tool use the model cannot see the tool's internals or other users' actions, so the setting is genuinely partially observable. In single-turn generation it is not, since the state is exactly the visible token sequence.

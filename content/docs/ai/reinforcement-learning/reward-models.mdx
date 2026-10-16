@@ -1,0 +1,242 @@
+---
+title: Reward Models and RLHF
+description: 'The three-stage RLHF pipeline, preference data as pairwise comparisons, the Bradley-Terry loss, reward model architecture, and the overoptimization scaling law.'
+---
+
+A language model has no intrinsic notion of a good answer. RLHF installs one: collect human comparisons, fit a scalar function to them, then optimise the policy against that function with PPO. The scalar function is the reward model, and it is the weakest link in the chain.
+
+---
+
+## The three stages
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Pretrained base"] --> B["Stage 1: SFT on demonstrations"]
+    B --> C["Stage 2: Reward model on comparisons"]
+    B --> D["Reference model (frozen copy)"]
+    C --> E["Stage 3: PPO"]
+    D --> E
+    E --> F["Aligned policy"]
+`}
+/>
+
+| Stage | Data                                        | Output                         | Method                |
+| :---- | :------------------------------------------ | :----------------------------- | :-------------------- |
+| 1     | Thousands of prompt-response demonstrations | An instruction-following model | SFT                   |
+| 2     | Tens of thousands of ranked response pairs  | A scalar reward function       | Binary classification |
+| 3     | Prompts, sampled on policy                  | The aligned model              | PPO with a KL penalty |
+
+InstructGPT (Ouyang et al., arXiv:2203.02155) is the canonical writeup: 13,000 SFT prompts, 33,000 comparison prompts, and a 1.3B aligned model that human labelers preferred over the 175B GPT-3 it was built from. That last result is the reason the field exists.
+
+Stage 1 matters more than it looks. PPO can only reinforce behaviour the policy already produces sometimes. If the SFT model never emits a well-formatted answer, no reward signal will teach it one, because the sampler never proposes it.
+
+---
+
+## Why comparisons and not scores
+
+Asking a human to rate a response from 1 to 10 produces noisy, miscalibrated numbers. Different labelers use different ranges, the same labeler drifts over a shift, and the absolute value carries no consistent meaning.
+
+Asking which of two responses is better is far more reliable. The task is easier, the answers agree across labelers, and the output is exactly what a ranking model needs. The cost is that you must generate multiple candidates per prompt.
+
+InstructGPT sampled `K` between 4 and 9 completions per prompt and had labelers rank them, producing `K(K-1)/2` comparison pairs from each ranking. Sampling several completions from the same prompt is important: pairs drawn from different prompts confound response quality with prompt difficulty.
+
+---
+
+## The Bradley-Terry model
+
+Bradley and Terry's 1952 model turns a scalar score into a pairwise probability:
+
+```text
+P(y_w preferred to y_l | x) = sigmoid( r(x, y_w) - r(x, y_l) )
+```
+
+Only the difference matters, so `r` is identified up to an additive constant. Maximising the likelihood of observed comparisons gives the loss:
+
+```text
+L = -E_(x, y_w, y_l) [ log sigmoid( r(x, y_w) - r(x, y_l) ) ]
+```
+
+That is binary cross-entropy on a logit that happens to be a difference of two model outputs.
+
+<Callout type="info">
+  ### The same expression reappears as DPO
+
+Replace `r(x, y)` with `beta * log( pi_theta(y|x) / pi_ref(y|x) )` and you have the Direct Preference Optimization loss exactly. DPO's derivation runs the substitution the other way: it solves the Bradley-Terry objective for the optimal policy in closed form, then observes that the reward can be written as a function of the policy. Nothing new is learned, which is why the two losses look alike.
+
+</Callout>
+
+---
+
+## Architecture and implementation
+
+A reward model is a causal language model with the vocabulary projection replaced by a scalar head. It reads the prompt and response and emits one number, usually taken at the final token position.
+
+```python
+import torch
+import torch.nn as nn
+from transformers import AutoModel
+
+class RewardModel(nn.Module):
+    def __init__(self, base: str):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(base)        # transformer stack, no LM head
+        self.value_head = nn.Linear(self.backbone.config.hidden_size, 1, bias=False)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        h = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        last = attention_mask.sum(1) - 1                       # (B,) index of the final real token
+        return self.value_head(h[torch.arange(h.size(0)), last]).squeeze(-1)   # (B,)
+```
+
+Reading at the last token is what the causal mask permits: that position attends to the whole sequence. Some implementations mean-pool over the response span instead, which is more stable on long outputs.
+
+```python
+import torch.nn.functional as F
+
+def bradley_terry_loss(r_chosen: torch.Tensor, r_rejected: torch.Tensor) -> torch.Tensor:
+    return -F.logsigmoid(r_chosen - r_rejected).mean()
+```
+
+Practical notes:
+
+- Initialise from the SFT model, not the base. The SFT model already understands instruction-following text.
+- The reward model is usually smaller than the policy. Its job is scoring, not generation. InstructGPT used 6B against a 175B policy.
+- Train for one epoch. Preference data overfits fast, and an overfit reward model is a reward hacking generator.
+- The output scale is arbitrary. Only differences matter, so a reward in `[-3, 3]` and one in `[-30, 30]` can represent the same ordering, and the PPO KL coefficient has to be retuned between them.
+
+---
+
+## Measuring a reward model
+
+Pairwise accuracy is the headline number and it is misleading.
+
+| Metric             | What it captures                                   | Weakness                          |
+| :----------------- | :------------------------------------------------- | :-------------------------------- |
+| Pairwise accuracy  | Fraction of held-out comparisons ordered correctly | Insensitive to margin calibration |
+| Accuracy by margin | Accuracy on close pairs only                       | The pairs that matter for PPO     |
+| Score distribution | Whether the model separates good from bad at all   | Catches degenerate models         |
+| Length correlation | Whether longer responses score higher              | Detects the most common bias      |
+| RewardBench        | A curated multi-category benchmark                 | Still gameable                    |
+
+The failure that matters is a high overall accuracy built entirely on easy pairs. PPO spends its optimisation pressure on the boundary, where the model is least reliable. Accuracy on the 10% of pairs with the smallest score gap predicts RLHF outcomes far better than the overall figure.
+
+Length bias is the best-documented pathology: reward models trained on human preferences learn that longer answers are preferred, because human labelers do prefer them, and PPO then inflates response length without improving quality. Singhal et al. (arXiv:2307.08701) measure this directly and show length explains a large share of reward model accuracy.
+
+---
+
+## Reward hacking and overoptimization
+
+Gao, Schulman and Hilton (arXiv:2210.10760) set up the clean experiment: train a reward model on a limited dataset, then optimise a policy against it while scoring with a much better proxy for the true objective. The result is a predictable curve.
+
+```text
+gold reward  ~=  alpha * sqrt(KL) - beta * KL
+```
+
+with KL measured between the optimised policy and the reference. Gold reward rises, peaks, then falls. The peak position depends on reward model quality: bigger models and more data push it further out, but the descent always comes.
+
+This is Goodhart's law with a fitted constant. A measure that becomes a target stops being a good measure, and the rate at which it stops is measurable.
+
+| Symptom                        | Mechanism                                      |
+| :----------------------------- | :--------------------------------------------- |
+| Responses grow monotonically   | Length bias in the reward model                |
+| Sycophantic openings multiply  | Labelers reward agreeable tone                 |
+| Markdown formatting explodes   | Formatting correlates with human preference    |
+| Repetition of the question     | Padding that the reward model scores neutrally |
+| Reward rises, human evals fall | The overoptimization regime proper             |
+
+Mitigations, in rough order of effectiveness:
+
+| Mitigation                          | Cost                        | Notes                                    |
+| :---------------------------------- | :-------------------------- | :--------------------------------------- |
+| KL penalty against a reference      | A frozen model in memory    | The standard; `beta` is the main knob    |
+| Early stopping on a held-out signal | Requires a gold eval        | The only fix that detects the peak       |
+| Reward model ensembles              | Several frozen models       | Averages away individual quirks          |
+| More and better preference data     | Expensive                   | Shifts the peak outward                  |
+| Larger reward model                 | Expensive at inference      | Diminishing returns past a point         |
+| Verifiable rewards                  | Only where a checker exists | Sidesteps the problem entirely; see RLVR |
+
+The last row is why reasoning models moved away from learned reward models. A unit test cannot be hacked the way a scalar regressor can, though it can be gamed in other ways.
+
+---
+
+## Alternatives to human labels
+
+| Approach                | Labels come from                                     | Source           |
+| :---------------------- | :--------------------------------------------------- | :--------------- |
+| RLHF                    | Human contractors                                    | arXiv:2203.02155 |
+| RLAIF                   | Another language model                               | arXiv:2309.00267 |
+| Constitutional AI       | A model critiquing itself against written principles | arXiv:2212.08073 |
+| Anthropic HH            | A model comparing helpfulness and harmlessness       | arXiv:2204.05862 |
+| Rule-based / verifiable | An executable checker                                | See RLVR         |
+
+Constitutional AI is the interesting one structurally. A model generates a response, critiques it against a written list of principles, revises it, and the revised-versus-original pair becomes preference data. No humans label anything after the initial principle set. RLAIF later showed that on summarisation, an AI-labelled reward model performs comparably to a human-labelled one.
+
+This matters for cost. Human preference labelling is the expensive, slow, non-scalable part of RLHF, and every one of these approaches is an attempt to remove it.
+
+---
+
+## Process reward models
+
+An outcome reward model scores the finished response. A process reward model scores each step.
+
+| Property          | Outcome RM (ORM)        | Process RM (PRM)                      |
+| :---------------- | :---------------------- | :------------------------------------ |
+| Labels needed     | One per response        | One per reasoning step                |
+| Credit assignment | Broadcast to all tokens | Localised to the failing step         |
+| Reward hacking    | Moderate                | Lower, since the reasoning is checked |
+| Labelling cost    | Low                     | Very high                             |
+
+Lightman et al. (arXiv:2305.20050) built PRM800K, roughly 75,000 step-level labels from 7,500 solutions, and showed a PRM used for best-of-N selection beats an ORM and reaches about 78% on MATH with GPT-4. The bottleneck is labelling: humans have to read and judge each step.
+
+Math-Shepherd (Wang et al., arXiv:2312.08935) removes humans by estimating a step's value empirically. Complete the solution from that step many times with the policy itself and use the fraction that reaches a correct answer as the step label. The label is then free, and it comes from the same distribution the PRM will be used on.
+
+DeepSeek-R1 reports that it tried process reward models and did not ship them, for two reasons: defining what counts as a step is ambiguous, and a learned PRM is itself hackable. That is a notable negative result from the group with the most resources to make it work.
+
+---
+
+## Interview questions
+
+1. Describe the three stages of RLHF.
+
+   Supervised fine-tuning on demonstration responses, reward model training on human comparisons, then PPO against the reward model with a KL penalty to a frozen reference. InstructGPT used 13,000 SFT prompts and 33,000 comparison prompts and produced a 1.3B model that labelers preferred over the 175B GPT-3 it came from.
+
+2. Why collect pairwise comparisons instead of numeric ratings?
+
+   Absolute ratings are noisy and miscalibrated across labelers, while a forced choice between two responses is easy, reproducible and directly usable by a ranking model. The cost is generating several candidates per prompt, and sampling them from the same prompt is what keeps the comparison about response quality rather than prompt difficulty.
+
+3. Write the Bradley-Terry model and its training loss.
+
+   `P(y_w preferred) = sigmoid(r(x,y_w) - r(x,y_l))`, giving the loss `-E[log sigmoid(r(x,y_w) - r(x,y_l))]`. Only the difference of scores is identifiable, so the reward is defined up to an additive constant and its output scale is arbitrary.
+
+4. How does that loss relate to DPO?
+
+   Substituting `beta * log(pi_theta(y|x) / pi_ref(y|x))` for `r(x,y)` turns the Bradley-Terry loss into the DPO loss exactly. DPO derives this by solving the RLHF objective for the optimal policy in closed form and rewriting the reward as a function of the policy, which removes the separate reward model.
+
+5. What architecture does a reward model use?
+
+   A causal transformer with the vocabulary projection replaced by a linear head to one scalar, read at the final response token. It is usually initialised from the SFT model rather than the base, and it is typically smaller than the policy because scoring is easier than generation.
+
+6. Why is pairwise accuracy a weak metric for a reward model?
+
+   It averages over easy and hard pairs, and PPO concentrates its optimisation pressure on the boundary where the model is least reliable. Accuracy restricted to small-margin pairs predicts RLHF outcomes much better. Length correlation is a second check, since reward models commonly learn that longer answers score higher.
+
+7. What is reward overoptimization and what does its scaling law say?
+
+   Optimising a policy against a learned reward model eventually degrades the true objective, because the policy finds inputs where the model's scores are wrong. Gao, Schulman and Hilton fit gold reward against KL to the reference as `alpha * sqrt(KL) - beta * KL`: it rises, peaks, then falls. Better reward models push the peak further out but do not remove it.
+
+8. Name four mitigations for reward hacking.
+
+   A KL penalty against a frozen reference, early stopping on a held-out gold signal, reward model ensembles, and more or better preference data. Only early stopping detects the peak; the rest delay it. Verifiable rewards sidestep the problem where an executable checker exists.
+
+9. What is Constitutional AI and what does it remove?
+
+   A model generates a response, critiques it against a written set of principles, and revises it; the revised-versus-original pair becomes the preference data. Human labellers are removed from the loop after the principles are written. RLAIF made the same substitution more directly and found comparable results on summarisation.
+
+10. Process reward model against outcome reward model?
+
+    An ORM emits one scalar for the finished response, which is broadcast back to every token and gives no credit assignment. A PRM scores each reasoning step, localising failures and resisting hacking better, but needs step-level labels that are expensive for humans to produce. Math-Shepherd automates the labels by completing from each step many times and using the success rate.
+
+11. Why does stage 1 constrain what stage 3 can achieve?
+
+    PPO reinforces actions the policy already samples. If the SFT model never produces the target behaviour, the sampler never proposes it, the reward model never scores it, and no gradient ever points toward it. This is why reasoning training often starts from a cold-start SFT stage on long chain-of-thought examples before any RL.

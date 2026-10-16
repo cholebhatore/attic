@@ -1,0 +1,260 @@
+---
+title: GRPO
+description: 'Group Relative Policy Optimization: the critic-free objective behind DeepSeek-R1, with the group advantage, the KL-in-the-loss difference, and the DAPO and Dr. GRPO corrections.'
+---
+
+PPO needs a value network the same size as the policy. On a 7B model that is another 7B of weights, another 7B of optimizer state, and another forward pass per token, all to produce a single scalar baseline. GRPO removes it by noticing that the baseline does not have to be learned: if you sample several responses to the same prompt, their average reward is already a valid baseline.
+
+This is the algorithm behind DeepSeekMath, DeepSeek-R1, Kimi k1.5, and the reasoning runs of Qwen3. It is the single most-asked RL question in LLM interviews after DPO.
+
+---
+
+## Why the critic is removable
+
+A baseline in a policy gradient may depend on the state but must not depend on the action, otherwise the estimator becomes biased. PPO satisfies this with a learned `V_phi(s_t)` that reads the prefix. GRPO satisfies it with something cheaper.
+
+Sample `G` responses `o_1 ... o_G` from the same prompt `x`. Every one of them shares the same starting state, so
+
+```text
+b(x) = (1/G) * sum_i r(x, o_i)
+```
+
+depends on `x` only. It is a legal baseline. It is also a much better estimate of `E[r | x]` than a value head trained for a few thousand steps, because it is computed from real samples of the current policy rather than extrapolated.
+
+The cost moves from parameters to inference. You now generate `G` responses per prompt instead of one, typically `G = 8` to `64`. Since RL for LLMs is dominated by rollout generation anyway, and since a critic forward pass per token is not free either, the trade is favourable.
+
+| Resource              | PPO                       | GRPO                 |
+| :-------------------- | :------------------------ | :------------------- |
+| Models in memory      | 4: actor, critic, ref, RM | 3: actor, ref, RM    |
+| Value network params  | Same order as the policy  | None                 |
+| Value optimizer state | 8 bytes per param (AdamW) | None                 |
+| Responses per prompt  | 1                         | `G`, usually 8 to 64 |
+| Advantage source      | GAE over learned values   | Group mean and std   |
+| KL handling           | Folded into the reward    | A term in the loss   |
+
+For DeepSeek-R1-Zero on a 671B MoE model, dropping the critic is what made the run possible at all. A 671B value head is not a rounding error.
+
+---
+
+## The algorithm
+
+<Mermaid
+  chart={`
+flowchart LR
+    P["Prompt x"] --> S["Sample G responses from pi_old"]
+    S --> R["Score each: r(x, o_i)"]
+    R --> N["Group-normalize rewards"]
+    N --> L["Clipped surrogate minus beta * KL"]
+    L --> U["Gradient step on pi_theta"]
+    U --> S
+`}
+/>
+
+1. Draw a batch of prompts.
+2. For each prompt, sample `G` completions from the current policy with temperature around 1.0.
+3. Score every completion. Either a reward model or a verifiable checker, which is the RLVR case.
+4. Normalize the `G` scores within each group to get `A_i`.
+5. Take one or a few gradient steps on the clipped surrogate, with the KL penalty as a loss term.
+6. Discard the rollouts and repeat.
+
+Step 4 is the whole contribution. Everything else is PPO.
+
+---
+
+## Group-relative advantage
+
+```text
+A_i = ( r(x, o_i) - mean_j r(x, o_j) ) / ( std_j r(x, o_j) + 1e-4 )
+```
+
+The same `A_i` is applied to every token in `o_i`. That is a real approximation: it assumes credit is uniform across the response, which is false. It works because the alternative, per-token credit from a learned critic, is only as good as the critic, and outcome-level rewards are what these tasks supply. DeepSeek-R1 reports that with a rule-based reward, token-level credit assignment emerges anyway: the model discovers on its own that reflection and backtracking raise the group-normalized score.
+
+The `1e-4` in the denominator is not cosmetic. When all `G` responses get the same reward, the std is zero and the advantage is undefined. Those groups carry no gradient signal and should be filtered, which is exactly what DAPO's Dynamic Sampling does.
+
+---
+
+## The objective
+
+```text
+J_GRPO(theta) = E[
+  (1/G) * sum_i (1/|o_i|) * sum_t min(
+      rho_{i,t} * A_i,
+      clip(rho_{i,t}, 1 - eps, 1 + eps) * A_i
+  )
+  - beta * D_KL[ pi_theta || pi_ref ]
+]
+
+rho_{i,t} = pi_theta(o_{i,t} | x, o_{i,<t}) / pi_theta_old(o_{i,t} | x, o_{i,<t})
+```
+
+The clipped surrogate is identical to PPO. The difference is where the KL sits.
+
+| Property               | PPO                               | GRPO                        |
+| :--------------------- | :-------------------------------- | :-------------------------- |
+| KL location            | Added to the per-token reward     | Added directly to the loss  |
+| KL estimator           | Usually k1, `log(pi/pi_ref)`      | k3, always non-negative     |
+| Does the critic see it | Yes, it must predict the penalty  | No, there is no critic      |
+| Effect on advantage    | Shifts the target the critic fits | Shifts the gradient only    |
+| Typical coefficient    | `beta` around 0.01 to 0.2         | `beta` around 0.001 to 0.04 |
+
+The k3 estimator is
+
+```text
+D_KL estimate per token = (pi_ref / pi_theta) - log(pi_ref / pi_theta) - 1
+```
+
+It is unbiased, always non-negative, and has lower variance than k1. GRPO can afford it because the term is differentiated directly rather than passed through a value function.
+
+---
+
+## Implementation
+
+```python
+import torch
+import torch.nn.functional as F
+
+
+def grpo_loss(
+    logp: torch.Tensor,       # (B, G, T) current policy log-probs
+    old_logp: torch.Tensor,   # (B, G, T) log-probs at rollout time
+    ref_logp: torch.Tensor,   # (B, G, T) reference model log-probs
+    rewards: torch.Tensor,    # (B, G)    one scalar per sampled response
+    mask: torch.Tensor,       # (B, G, T) 1.0 on response tokens only
+    clip: float = 0.2,
+    beta: float = 0.04,
+) -> torch.Tensor:
+    mean = rewards.mean(dim=1, keepdim=True)                     # (B, 1)
+    std = rewards.std(dim=1, keepdim=True)                       # (B, 1)
+    adv = (rewards - mean) / (std + 1e-4)                        # (B, G)
+    adv = adv.unsqueeze(-1)                                      # (B, G, 1)
+
+    ratio = torch.exp(logp - old_logp)                           # (B, G, T)
+    unclipped = ratio * adv
+    clipped = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * adv
+    policy = torch.min(unclipped, clipped)                       # (B, G, T)
+
+    kl = torch.exp(ref_logp - logp) - (ref_logp - logp) - 1.0    # (B, G, T), k3
+
+    per_token = -policy + beta * kl
+    return (per_token * mask).sum() / mask.sum()                 # token-level mean
+```
+
+Three details that change results:
+
+- **`mask` must be response-only.** The prompt tokens carry no advantage and no KL target. Including them is the most common GRPO bug and it shows up as a loss that refuses to move.
+- **The last line is DAPO-style token-level averaging.** Summing over all tokens and dividing by the total token count weights every token equally. Dividing per sequence first and then averaging across sequences weights every response equally, which gives long responses less per-token influence. See below.
+- **`old_logp` comes from the rollout engine, not a recomputation.** If you regenerate it with the training policy after any gradient step, the ratio is no longer a ratio and clipping does nothing.
+
+---
+
+## DAPO: the four fixes
+
+DAPO (Yu et al., arXiv:2503.14476) took GRPO to 50% on AIME 2024 with a 32B model, up from 30% for the vanilla version, by fixing four observed failures. Each fix is worth naming in an interview because each names a real collapse mode.
+
+| Fix                         | Problem observed                                     | Change                                                                |
+| :-------------------------- | :--------------------------------------------------- | :-------------------------------------------------------------------- |
+| Clip-Higher                 | Entropy collapses; the policy becomes deterministic  | Decouple `eps_low` and `eps_high`, raise `eps_high` to about 0.28     |
+| Dynamic Sampling            | Easy and impossible prompts contribute zero gradient | Drop groups where all `G` rewards are identical; oversample to refill |
+| Token-Level Policy Gradient | Long responses are underweighted                     | Normalize by total token count, not per sequence                      |
+| Overlong Reward Shaping     | Truncated outputs get a noisy penalty                | Ramp the penalty over the last `L_cache` tokens instead of a cliff    |
+
+**Clip-Higher** deserves the mechanism. The standard clip is asymmetric in effect even though `eps` is symmetric: for a positive advantage the ratio can only be pushed up to `1 + eps`, while for a negative advantage it can only be pushed down to `1 - eps`. Low-probability tokens with positive advantage get cut off at `1 + eps` before they can grow, so the distribution sharpens and entropy falls. Raising only the upper bound lets rare-but-good tokens survive.
+
+**Dynamic Sampling** is the practical fix for the zero-std group. If all eight samples on a prompt are correct, `A_i = 0` for all of them and the prompt wastes a rollout slot. DAPO keeps sampling until the batch is full of prompts with mixed outcomes. On a hard math set early in training most prompts are all-wrong, so the filter changes which prompts dominate learning.
+
+---
+
+## Dr. GRPO: two biases removed
+
+Liu et al., arXiv:2503.20783, argue the `1/|o_i|` and the `1/std` in the original objective are both biases rather than normalizations.
+
+**The length bias.** Dividing a response's loss by its own length means each token in a long response contributes less than each token in a short one. For a wrong answer this is backwards: the penalty for a long wrong response is diluted, so the model is pushed toward short wrong answers and long correct ones. Removing `1/|o_i|` fixes the direction.
+
+**The difficulty bias.** Dividing by the group std amplifies prompts where the responses barely differ and shrinks prompts where they differ a lot. A group of scores `[0, 0, 0, 1]` has a small std, so its single correct answer gets a huge advantage. That overweights questions the model nearly always fails, which are the ones with the least reliable signal.
+
+Dr. GRPO drops both terms. The reported effect is a meaningful gain on AIME and GPQA and, notably, an elimination of the length-growth artifact where response length inflates without accuracy improving.
+
+---
+
+## Failure modes
+
+| Symptom                                         | Likely cause                                         | Fix                                                  |
+| :---------------------------------------------- | :--------------------------------------------------- | :--------------------------------------------------- | --- | ------------ |
+| Reward flat, advantage all near zero            | `G` too small, or all samples identical              | Raise `G`; enable Dynamic Sampling                   |
+| Entropy drops to near zero in a few steps       | Clip asymmetry, `beta` too low                       | Clip-Higher; raise `beta`                            |
+| Response length grows without accuracy          | Length normalization bias                            | Remove `1/                                           | o_i | ` (Dr. GRPO) |
+| Loss spikes, ratio far outside `[1-eps, 1+eps]` | Stale `old_logp`, or lr too high                     | Recompute log-probs in the training engine; lower lr |
+| Policy drifts far from the reference            | `beta` too low or zero                               | Raise `beta`; monitor mean KL per step               |
+| Model answers correctly but stops showing work  | Reward is outcome-only and terse answers are shorter | Add a format reward term                             |
+
+Two diagnostics to log every step: the **clip fraction**, the share of tokens where the clipped branch was selected, which should sit in the low single digits; and the **mean KL to the reference**, which should rise slowly and monotonically. A clip fraction above about 20% means the trust region is being ignored.
+
+<Callout type="info">
+  ### GRPO and RLOO are close cousins
+
+RLOO (Ahmadian et al., arXiv:2402.14740) uses the leave-one-out mean as the baseline, `A_i = r_i - mean_{j != i} r_j`, with no std division and no KL term. That is Dr. GRPO's difficulty-bias fix, published two weeks earlier. The two algorithms converge to nearly the same update, and the practical differences come from the clipping and the KL rather than from the baseline.
+
+</Callout>
+
+---
+
+## Where GRPO is used
+
+| Model            | Reward source                            | `G`        | Notes                                                |
+| :--------------- | :--------------------------------------- | :--------- | :--------------------------------------------------- |
+| DeepSeekMath-7B  | Math verifier plus reward model          | Not stated | 51.7% on MATH from 120B math-filtered tokens         |
+| DeepSeek-R1-Zero | Rule-based only, exact match plus format | 8 to 16    | No SFT stage; reasoning emerges from RL alone        |
+| DeepSeek-R1      | Rule-based plus reward model for style   | Similar    | Cold-start SFT first, then multi-stage RL            |
+| Kimi k1.5        | Verifiable rewards plus a learned RM     | Not stated | Adds a length penalty and a cold-start stage         |
+| Qwen3            | Rule-based plus reward model             | Not stated | Two-stage RL; strong-to-weak distillation afterwards |
+| OpenAI o-series  | Presumed verifiable                      | Unknown    | Not published; cited here only as the same pattern   |
+
+The pattern in every published row is that verifiable rewards do most of the work. The learned reward model is used for style, helpfulness, and safety, where there is no checker.
+
+---
+
+## Interview questions
+
+1. What does GRPO stand for and what does it remove from PPO?
+
+   Group Relative Policy Optimization, from DeepSeekMath (Shao et al., arXiv:2402.03300). It removes the value network, and with it the critic's parameters, optimizer state, and per-token forward pass. The baseline becomes the mean reward of the other samples from the same prompt.
+
+2. Why is the group mean a valid baseline?
+
+   A baseline may depend on the state but not on the action. All `G` responses are sampled from the same prompt, so their mean reward is a function of the prompt only. Subtracting it leaves the gradient unbiased while cutting variance.
+
+3. Write the group-relative advantage.
+
+   `A_i = (r_i - mean_j r_j) / (std_j r_j + 1e-4)`, computed within each prompt's group of `G` samples. The same scalar is broadcast to every token of response `i`.
+
+4. Where does the KL penalty sit in GRPO, and how does that differ from PPO?
+
+   GRPO adds `beta * D_KL[pi_theta || pi_ref]` directly to the loss, usually with the k3 estimator `(pi_ref/pi_theta) - log(pi_ref/pi_theta) - 1`. PPO subtracts the KL from the per-token reward, so it flows through GAE and the critic has to learn to predict it. GRPO's version is differentiated directly, which is why it can use a lower-variance non-negative estimator.
+
+5. What is the cost GRPO pays instead of the critic?
+
+   Rollouts. You generate `G` responses per prompt rather than one, so generation cost scales with `G`. Since RL for LLMs is already generation-bound and the critic was not free either, the trade usually wins, and on very large models it is the difference between feasible and infeasible.
+
+6. What is Clip-Higher in DAPO and why does it work?
+
+   DAPO (arXiv:2503.14476) decouples the clip range into `eps_low` and `eps_high` and raises the upper one to about 0.28. Symmetric clipping caps how far a low-probability token with positive advantage can grow, which sharpens the distribution and collapses entropy. Raising only the upper bound preserves exploration. It took DAPO-32B from 30% to 50% on AIME 2024.
+
+7. What is Dynamic Sampling?
+
+   Groups where all `G` responses receive the same reward have zero std and therefore zero advantage, contributing no gradient. DAPO filters them out and oversamples prompts until the batch is full of groups with mixed outcomes.
+
+8. Which two biases does Dr. GRPO remove?
+
+   The `1/|o_i|` response-length normalization, which dilutes the penalty on long wrong answers and pushes the model toward short wrong ones, and the `1/std` difficulty normalization, which amplifies prompts where responses barely differ and overweights near-impossible questions. Both are dropped in arXiv:2503.20783.
+
+9. How does GRPO differ from RLOO?
+
+   RLOO uses the leave-one-out mean `A_i = r_i - mean_{j != i} r_j` with no std division and no explicit KL term. That is the same difficulty-bias correction Dr. GRPO makes. The updates are nearly identical; the practical differences are GRPO's clipping and KL penalty.
+
+10. What happens if you include prompt tokens in the loss mask?
+
+    Prompt tokens carry no advantage and no KL target, so they contribute a gradient that pushes the model toward or away from its own prompt for no reason. In practice the loss stops moving and training diverges slowly. This is the most common implementation bug.
+
+11. Name two diagnostics you would log every step.
+
+    The clip fraction, the share of tokens where the clipped branch was selected, which should stay in the low single digits; above about 20% the trust region is not holding. And the mean KL to the reference, which should rise slowly and monotonically rather than jumping.

@@ -1,0 +1,306 @@
+---
+title: PPO
+description: 'The importance sampling ratio, the clipped surrogate objective, Generalized Advantage Estimation with its lambda trade-off, the KL penalty against a reference model, and the four-model RLHF setup.'
+---
+
+REINFORCE is unbiased and unusable: one gradient step on a noisy batch can move the policy far enough that the batch is no longer representative, and the next step is worse. PPO's contribution is a mechanism that lets you take several steps on the same data without walking off a cliff.
+
+It was the RLHF default from InstructGPT through Llama 3, and understanding it is prerequisite to understanding what GRPO removed and why.
+
+---
+
+## The trust region problem
+
+Policy gradient methods have a monotonic improvement guarantee only while the new policy stays close to the old one. Kakade and Langford's performance difference lemma bounds how much performance can change in terms of the advantage under the old policy and the divergence between the two policies. Push the update too hard and the bound becomes vacuous, which in practice means collapse: the policy degenerates, rollouts get worse, and there is no way back.
+
+Two families of fixes exist.
+
+| Family       | Mechanism                                      | Cost                      |
+| :----------- | :--------------------------------------------- | :------------------------ |
+| Trust region | Constrain the KL of each update                | Second-order optimisation |
+| Proximal     | Clip the objective so large ratios stop paying | One extra line of code    |
+
+TRPO (Schulman et al., arXiv:1502.05477) takes the first route: maximise the surrogate subject to `mean KL(pi_old || pi_new) <= delta`, solved with a natural gradient, conjugate gradient iterations and a line search. It works and it is expensive, both in code complexity and in compute.
+
+PPO (Schulman et al., arXiv:1707.06347) takes the second. Same goal, no constrained optimisation.
+
+---
+
+## The importance sampling ratio
+
+To reuse data from `pi_old` under the current `pi_theta`, weight each sample by how much more or less likely it is now:
+
+```text
+r_t(theta) = pi_theta(a_t | s_t) / pi_theta_old(a_t | s_t)
+```
+
+At `r_t = 1` the policies agree on this action. `r_t = 2` means the current policy is twice as likely to take it. Multiply the advantage by this ratio and the expectation under the old policy becomes an estimate of the expectation under the new one.
+
+The surrogate objective is then
+
+```text
+L^CPI(theta) = E_t [ r_t(theta) * A_t ]
+```
+
+Unclipped, this is unbounded. If `A_t` is positive, the optimiser will drive `r_t` as high as it can, and a single batch can push the policy arbitrarily far.
+
+---
+
+## The clipped objective
+
+```text
+L^CLIP(theta) = E_t [ min( r_t * A_t ,  clip(r_t, 1 - eps, 1 + eps) * A_t ) ]
+```
+
+`eps = 0.2` is the standard value and the one the paper reports across its experiments.
+
+| Advantage | Ratio         | Which term wins | Gradient behaviour                         |
+| :-------- | :------------ | :-------------- | :----------------------------------------- |
+| `A > 0`   | `r > 1 + eps` | Clipped         | Zero. No further reward for increasing `r` |
+| `A > 0`   | `r < 1 - eps` | Unclipped       | Active. Pushes `r` back up                 |
+| `A < 0`   | `r < 1 - eps` | Clipped         | Zero. No further reward for decreasing `r` |
+| `A < 0`   | `r > 1 + eps` | Unclipped       | Active. Pushes `r` back down               |
+
+The `min` makes it a pessimistic bound: when clipping would help, clip; when clipping would hurt, use the raw value. Note the asymmetry in rows two and four. PPO caps how much a good action can be reinforced, but it does not cap how far a bad action can be suppressed. That asymmetry is what drives entropy collapse in long runs, and DAPO's Clip-Higher fix decouples `eps` into separate upper and lower values.
+
+```python
+import torch
+
+def ppo_clip_loss(
+    logits: torch.Tensor,       # (B, T, V)
+    old_logp: torch.Tensor,     # (B, T)  log pi_old(a_t|s_t), stored from the rollout
+    tokens: torch.Tensor,       # (B, T)
+    advantages: torch.Tensor,   # (B, T)
+    mask: torch.Tensor,         # (B, T)
+    clip: float = 0.2,
+) -> torch.Tensor:
+    logp = torch.log_softmax(logits, dim=-1).gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+    ratio = torch.exp(logp - old_logp)                            # (B, T)
+    unclipped = ratio * advantages
+    clipped = torch.clamp(ratio, 1 - clip, 1 + clip) * advantages
+    per_token = -torch.min(unclipped, clipped)                    # (B, T)
+    return (per_token * mask).sum() / mask.sum()
+```
+
+The ratio is computed in log space because `exp(logp - old_logp)` is numerically safer than dividing two small probabilities.
+
+---
+
+## Generalized Advantage Estimation
+
+The advantage `A_t` needs an estimate, and the estimate controls the bias-variance trade-off for the whole run. GAE (Schulman et al., arXiv:1506.02438) interpolates between two extremes with one parameter.
+
+Start from the TD residual:
+
+```text
+delta_t = r_t + gamma * V(s_t+1) - V(s_t)
+```
+
+Then form an exponentially weighted sum of future residuals:
+
+```text
+A_t^GAE(gamma, lambda) = sum_{l=0}^{inf} (gamma * lambda)^l * delta_{t+l}
+```
+
+Computed backwards with a one-line recursion:
+
+```text
+A_t = delta_t + gamma * lambda * A_{t+1}
+```
+
+| `lambda` | What `A_t` becomes          | Bias                  | Variance |
+| :------- | :-------------------------- | :-------------------- | :------- |
+| `0`      | `delta_t`, one-step TD      | High, from the critic | Low      |
+| `0.95`   | The usual setting           | Moderate              | Moderate |
+| `1`      | `G_t - V(s_t)`, Monte Carlo | None                  | High     |
+
+`lambda = 0` trusts the critic completely. `lambda = 1` ignores it except as a baseline and reverts to reward-to-go REINFORCE. `0.95` with `gamma = 1` is the standard LLM setting.
+
+```python
+def gae(rewards: torch.Tensor, values: torch.Tensor, gamma: float = 1.0, lam: float = 0.95):
+    # rewards: (B, T)   values: (B, T+1) with values[:, T] = 0 for a terminal step
+    B, T = rewards.shape
+    adv = torch.zeros_like(rewards)
+    running = torch.zeros(B, device=rewards.device, dtype=rewards.dtype)
+    for t in reversed(range(T)):
+        delta = rewards[:, t] + gamma * values[:, t + 1] - values[:, t]
+        running = delta + gamma * lam * running
+        adv[:, t] = running
+    returns = adv + values[:, :T]           # the critic's regression target
+    return adv, returns
+```
+
+Most implementations also whiten the advantages, subtracting the batch mean and dividing by the batch standard deviation before the loss. This is a scale normalisation, not a baseline, and it interacts with the clip: whitening changes what fraction of ratios fall outside `[1 - eps, 1 + eps]`.
+
+---
+
+## The KL penalty
+
+RLHF adds a term that classical PPO does not have. The reward model is a learned function with a bounded training distribution, and a policy optimised hard against it finds inputs where its scores are wrong. The fix is to charge the policy for moving away from the model it started as:
+
+```text
+r_t = r_RM(response) * [t == T]  -  beta * log( pi_theta(y_t | ...) / pi_ref(y_t | ...) )
+```
+
+Applied per token, with the reward model's scalar landing only on the final position.
+
+The `log(pi_theta / pi_ref)` form is the k1 estimator: unbiased but high variance, and it can be negative. Most implementations use the k3 estimator instead:
+
+```text
+KL_t ~= (pi_ref / pi_theta) - log(pi_ref / pi_theta) - 1
+```
+
+which is always non-negative and has lower variance at the cost of a small bias.
+
+`beta` is usually adaptive. Track the running mean KL and scale `beta` up when it exceeds a target and down when it falls below:
+
+```text
+beta <- beta * (1 + kappa * (mean_KL / target_KL - 1))
+```
+
+with `target_KL` around 6 nats and `kappa` around 0.1 in the InstructGPT setup. Adaptive control matters because a fixed `beta` either fails to restrain a rapidly improving policy or strangles a slow one.
+
+---
+
+## The full loss
+
+```text
+L = -L^CLIP  +  c1 * mean( (V_phi(s) - returns)^2 )  -  c2 * H[pi_theta]
+```
+
+| Term              | Trains | Typical coefficient  |
+| :---------------- | :----- | :------------------- |
+| Clipped surrogate | Actor  | 1.0                  |
+| Value MSE         | Critic | `c1 = 0.5` to `1.0`  |
+| Entropy bonus     | Actor  | `c2 = 0.0` to `0.01` |
+
+The value term is often clipped too, in the same pessimistic style, to stop the critic making large jumps. Some implementations train the critic with its own optimiser and learning rate, since the value function and the policy have different conditioning.
+
+---
+
+## Four models in memory
+
+This is the part that makes RLHF expensive, and the reason GRPO found an audience.
+
+| Model     | State   | Size for a 7B base | Purpose                    |
+| :-------- | :------ | :----------------- | :------------------------- |
+| Actor     | Trained | 7B                 | The policy being optimised |
+| Critic    | Trained | 7B                 | `V(s)` for GAE             |
+| Reference | Frozen  | 7B                 | The KL penalty anchor      |
+| Reward    | Frozen  | 7B                 | The scalar signal          |
+
+Rough memory arithmetic for a 7B base at bf16 with AdamW:
+
+```text
+actor   7B * 16 bytes (weights, grads, fp32 master, moments) = 112 GB
+critic  7B * 16                                              = 112 GB
+ref     7B *  2                                              =  14 GB
+RM      7B *  2                                              =  14 GB
+                                                          -----------
+                                                     total ~  252 GB
+```
+
+Plus activations, plus the KV cache for generation. That is four A100-80GB cards at minimum with ZeRO-3, before a single rollout is generated. Smaller critics help, and some setups use a critic sized below the actor, but the four-model structure is what PPO-based RLHF requires.
+
+GRPO removes the critic. RLVR removes the reward model. Together they take that table from four rows to two, which is most of why reasoning models train the way they do.
+
+---
+
+## The training loop
+
+```text
+for each iteration:
+  1. Sample B prompts
+  2. Generate responses with the current policy (inference engine, no gradients)
+  3. Score with the reward model, compute per-token KL against the reference
+  4. Compute V(s) for every token with the critic
+  5. GAE -> advantages and returns
+  6. Store old_logp = log pi_theta_old(y_t | ...)
+  7. For ppo_epochs in 1..4:
+       minibatch over the stored rollouts
+       compute L^CLIP, value loss, entropy
+       step
+```
+
+Step 7 is where the clipping earns its keep. Without it, one pass is all you can safely take. With it, two to four passes are normal, which multiplies sample efficiency by the same factor and matters enormously when step 2 costs more than everything else combined.
+
+Step 6 is easy to get wrong. `old_logp` must be recomputed by a forward pass over the generated tokens, not read from the generation engine's sampler output. Inference kernels and training kernels differ in precision and in how they batch, and the discrepancy shows up as a ratio that is not 1.0 on the first minibatch pass, which silently biases every update.
+
+---
+
+## Hyperparameters
+
+| Parameter           | Typical value for LLM RLHF    | Notes                                           |
+| :------------------ | :---------------------------- | :---------------------------------------------- |
+| Learning rate       | `1e-6` to `5e-6`              | An order of magnitude below SFT                 |
+| `clip eps`          | `0.2`                         | The paper's value, rarely changed               |
+| GAE `lambda`        | `0.95`                        |                                                 |
+| `gamma`             | `1.0`                         | Episodic, terminal reward                       |
+| `ppo_epochs`        | `1` to `4`                    | More needs a tighter clip                       |
+| Rollout batch       | `128` to `512` prompts        | Dominated by GPU memory for generation          |
+| `max_new_tokens`    | `512` chat, `32768` reasoning | The single biggest cost lever                   |
+| `beta` (KL)         | `0.01` to `0.2`, adaptive     | Target KL around 6 nats                         |
+| Rollout temperature | `0.7` to `1.0`                | Zero gives no exploration and identical samples |
+
+The learning rate is low because PPO compounds. Each iteration reuses data, and a large step makes the importance ratios extreme, at which point the clip is doing all the work and the update carries almost no information.
+
+---
+
+## Token-level against sequence-level ratios
+
+The equations above compute `r_t` per token, which is what the original PPO does and what TRL implements. For a language model this is a strange object: the trajectory is the response, but the ratio factorises over tokens, and the product of many small per-token ratios has very high variance.
+
+| Level    | Ratio                                            | Variance | Used by                |
+| :------- | :----------------------------------------------- | :------- | :--------------------- |
+| Token    | `pi(y_t) / pi_old(y_t)` per position             | High     | PPO, GRPO, TRL         |
+| Sequence | Geometric mean of token ratios over the response | Lower    | Proposed in later work |
+
+Sequence-level importance sampling treats the response as the action, which matches the fact that the reward is assigned to the response. It reduces the variance of the estimator at the cost of a coarser credit assignment. This is an active area and the token-level version remains the default in every shipped framework.
+
+---
+
+## Interview questions
+
+1. What problem does PPO solve that REINFORCE does not?
+
+   REINFORCE can only take one gradient step per batch of rollouts, because after the step the data is off-policy and the estimator is invalid. PPO's clipped surrogate bounds how much any single action's probability can change, so several steps on the same batch stay safe. That multiplies sample efficiency by the number of steps, which matters when generation is the bottleneck.
+
+2. Write the importance sampling ratio and explain why it appears.
+
+   `r_t(theta) = pi_theta(a_t|s_t) / pi_theta_old(a_t|s_t)`. Data was collected under `pi_theta_old`, but the objective is an expectation under `pi_theta`. Weighting each sample by the likelihood ratio converts one expectation into the other. It is exact in expectation and grows in variance as the two policies diverge.
+
+3. Explain the clipped objective mechanically.
+
+   `L = E[min(r A, clip(r, 1-eps, 1+eps) A)]`. When the advantage is positive and the ratio has already risen past `1 + eps`, the clipped term is smaller so `min` selects it and the gradient is zero: no further reward for pushing. When the ratio is below the band, the unclipped term is smaller and the gradient stays active. The `min` makes it a pessimistic bound in both directions.
+
+4. What is the asymmetry in PPO's clipping and why does it matter?
+
+   The clip caps how much a positive-advantage action can be reinforced, but for negative advantage it only caps suppression up to `1 - eps`, leaving the ratio unbounded below. Over many updates this systematically removes probability mass and collapses entropy, at which point all rollouts become identical and the advantage goes to zero. DAPO decouples `eps` into separate upper and lower bounds to fix it.
+
+5. Derive GAE's recursion and state its two endpoints.
+
+   From `A_t = sum_l (gamma lambda)^l delta_{t+l}`, factor out the first term: `A_t = delta_t + gamma lambda A_{t+1}`. At `lambda = 0` it reduces to the one-step TD residual, which is low variance and biased by the critic. At `lambda = 1` it becomes `G_t - V(s_t)`, the Monte Carlo advantage, which is unbiased and high variance. `0.95` is the standard compromise.
+
+6. Why does RLHF add a KL penalty against a reference model when classical PPO has none?
+
+   The reward model is a learned function, accurate only on the distribution it was trained on. A policy optimised hard against it finds adversarial inputs where its scores are wrong, which is reward hacking. Charging the policy for divergence from the frozen pre-SFT model bounds how far it can travel into that region. The reference plays the same stabilising role as DQN's target network, applied to the policy rather than the value.
+
+7. What is the difference between the k1 and k3 KL estimators?
+
+   k1 is `log(pi_theta / pi_ref)`, unbiased but high variance and able to go negative. k3 is `(pi_ref/pi_theta) - log(pi_ref/pi_theta) - 1`, always non-negative with lower variance and a small bias. Implementations use k3 for the per-token penalty because a negative KL estimate produces nonsense gradients.
+
+8. Name the four models resident during PPO-based RLHF and which are trainable.
+
+   The actor and the critic are trainable; the reference model and the reward model are frozen. For a 7B base at bf16 with AdamW that is roughly 112 GB for each trained model and 14 GB for each frozen one, so about 252 GB before activations and KV cache. GRPO removes the critic and RLVR removes the reward model.
+
+9. Why must `old_logp` be recomputed rather than taken from the generation engine?
+
+   Inference kernels and training kernels differ in precision, batching and sometimes in which attention implementation they use. If the stored log-probabilities came from the sampler, the ratio will not equal exactly 1.0 on the first pass even though the policy has not changed, and every subsequent update is biased by that offset. Recomputing with a forward pass in the training precision makes the first pass exact.
+
+10. Why is the PPO learning rate for LLMs an order of magnitude below the SFT rate?
+
+    PPO takes several steps per batch and compounds them. A large step makes the importance ratios extreme, so the clip saturates and the update carries little information while still moving the policy. `1e-6` to `5e-6` keeps ratios inside the band for most tokens, which is what makes the reuse worthwhile.
+
+11. What is the advantage of token-level against sequence-level importance ratios?
+
+    Token-level matches the original PPO formulation and gives per-position credit, but the product of many per-token ratios has high variance. Sequence-level treats the whole response as the action, which matches how the reward is assigned and reduces variance at the cost of coarser credit assignment. Token-level remains what every shipped framework implements.

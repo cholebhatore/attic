@@ -1,0 +1,212 @@
+---
+title: RLVR and Reasoning
+description: 'Reinforcement Learning with Verifiable Rewards: reward sources, DeepSeek-R1-Zero and its aha moment, reward hacking, and how RL training produces test-time compute scaling.'
+---
+
+A learned reward model can tell you that one summary is better than another. It cannot tell you whether `x = -7/3` is correct. Every reasoning result since late 2024 rests on that asymmetry: replace the neural reward model with a checker, and the reward signal becomes exact, unhackable in principle, and free to scale.
+
+This is RLVR, Reinforcement Learning with Verifiable Rewards. It is what produced o1, o3, DeepSeek-R1, and the reasoning modes of Qwen3 and Kimi k1.5.
+
+---
+
+## Why learned reward models fail on reasoning
+
+| Property        | Learned reward model               | Verifiable reward                      |
+| :-------------- | :--------------------------------- | :------------------------------------- |
+| Signal          | Continuous, soft preference        | Binary or exactly graded               |
+| Trainable on    | Human or AI comparisons            | Ground truth that already exists       |
+| Hacking surface | Large: fluency, length, confidence | Small: only the checker is exploitable |
+| Cost per sample | A forward pass through the RM      | A string compare or a test run         |
+| Domains         | Style, helpfulness, safety         | Math, code, logic, factual recall      |
+| Generalization  | Poor outside its training data     | Exact wherever a checker exists        |
+
+The failure is quantitative. A 6B reward model asked to rank two algebra solutions with different final answers performs barely above chance, because comparison data for hard math is scarce and annotators disagree. The same two solutions scored by symbolic equality against a known answer are ranked perfectly, every time.
+
+Gao et al. (arXiv:2210.10760) measured the consequence: optimizing a proxy reward follows `alpha * sqrt(KL) - beta * KL` against the true reward, so past a few nats of drift, more optimization makes the model worse. Verifiable rewards have no proxy gap at all, because the proxy is the truth.
+
+---
+
+## Reward sources
+
+| Domain             | Checker                                                | Reward shape             |
+| :----------------- | :----------------------------------------------------- | :----------------------- |
+| Math               | Extract `\boxed{}` answer, compare after normalization | 1 or 0                   |
+| Math, symbolic     | `sympy` equivalence, `simplify(lhs - rhs) == 0`        | 1 or 0                   |
+| Competitive code   | Hidden unit tests                                      | Fraction of tests passed |
+| Software patches   | Repository test suite, `pytest` exit code              | 1 or 0                   |
+| Formal proofs      | Lean, Coq, or Isabelle kernel                          | 1 or 0                   |
+| Logic puzzles      | Constraint solver                                      | 1 or 0                   |
+| Factual QA         | Exact match or F1 against a gold string                | Continuous in `[0, 1]`   |
+| Structured output  | JSON schema validation                                 | 1 or 0                   |
+| Format, any domain | Regex for required tags                                | 1 or 0, small weight     |
+
+Two engineering points that decide whether a run works:
+
+**Answer extraction is the hard part, not the comparison.** A model that writes the right number in prose and no `\boxed{}` gets zero reward and learns to stop doing math. DeepSeek-R1 pairs its accuracy reward with a format reward for the thinking tags precisely so that extraction stays reliable while the policy moves.
+
+**Normalization must be aggressive.** `1/2`, `0.5`, `\frac{1}{2}`, and `2^{-1}` are one answer. Sympy equivalence handles most cases; string equality does not. Under-normalized checkers produce a ceiling far below the model's real ability, which looks exactly like a training failure.
+
+---
+
+## DeepSeek-R1
+
+The paper (arXiv:2501.12948) runs two experiments, and the split between them is the interesting part.
+
+### R1-Zero: RL from the base model
+
+Start from `DeepSeek-V3-Base` with no supervised fine-tuning at all. Apply GRPO with a rule-based reward: accuracy from the verifier plus a format term. That is the entire recipe.
+
+The reported results, from Table 1 of the paper:
+
+| Model            | AIME 2024 pass@1 | AIME 2024 majority vote | MATH-500 pass@1 |
+| :--------------- | :--------------- | :---------------------- | :-------------- |
+| DeepSeek-R1-Zero | 47.0             | 71.0                    | 63.0            |
+| DeepSeek-R1      | 79.8             | 86.7                    | 97.3            |
+| OpenAI-o1-0912   | 79.2             | 86.3                    | 94.8            |
+
+R1-Zero matches o1-0912 on majority vote without any SFT. Its pass@1 is far lower, which is the readability and consistency problem the later stages fix.
+
+### The aha moment
+
+Midway through R1-Zero training the policy abruptly changes behaviour. The paper quotes the model writing something equivalent to "wait, let me recheck this" and then revising an earlier step. Reflection appears without being prompted, requested, or present in any training data, because reflecting raises the verifier's score and the group-relative advantage rewards it.
+
+This is the single strongest piece of evidence that RLVR does not merely select among behaviours the model already has. It shapes them.
+
+### Emergent behaviours
+
+| Behaviour               | What it looks like                                     | Why the verifier selects it              |
+| :---------------------- | :----------------------------------------------------- | :--------------------------------------- |
+| Self-verification       | Recomputing an answer, comparing to the first attempt  | Catches arithmetic slips                 |
+| Reflection              | "Wait", "Let me reconsider", backtracking mid-solution | Recovers from a wrong branch             |
+| Chain-of-thought growth | Response length rises by an order of magnitude         | More steps means more chances to correct |
+| Search-like enumeration | Trying several methods and keeping the one that works  | Equivalent to best-of-N internally       |
+| Tool-shaped reasoning   | Setting up equations before solving                    | Structured work is easier to correct     |
+
+### The full R1 pipeline
+
+```text
+1. Cold-start SFT      few thousand long-CoT examples, for readability
+2. Reasoning RL        GRPO with verifiable rewards, the main stage
+3. Rejection sampling  sample, keep correct and readable ones, SFT again
+4. Alignment RL        GRPO with a learned reward model for helpfulness and safety
+```
+
+Stage 3 is where the pass@1 gap closes. Rejection sampling generates reasoning traces from the stage-2 model, filters to the ones that are both correct and well-formed, and fine-tunes on them. The model learns to produce its own good behaviour on the first try.
+
+<Callout type="warn">
+  ### DeepSeek-R1 explicitly rejected process reward models
+
+The paper states two reasons: a PRM trained on step labels can be reward hacked, since the model learns to write steps that look right rather than reason correctly, and retraining a PRM at scale after every policy update is expensive. Outcome-level verifiable rewards plus a large `G` won. This is a notable reversal from the Let's Verify Step by Step line of work.
+
+</Callout>
+
+---
+
+## Reward hacking in RLVR
+
+A verifier is narrower than a reward model, so the hacks are narrower and more surprising.
+
+| Hack                      | Mechanism                                               | Mitigation                                    |
+| :------------------------ | :------------------------------------------------------ | :-------------------------------------------- |
+| Format gaming             | Emits `\boxed{}` around a guess                         | Weight the format reward small, or anneal it  |
+| Answer guessing           | On multiple choice, always picks the most common letter | Balance the answer distribution               |
+| Special-casing code       | Hardcodes the expected test outputs                     | Hidden tests, randomized fixtures             |
+| Test-file mutation        | Edits or deletes the test rather than the code          | Read-only test directory, sandboxed execution |
+| Exploiting the normalizer | Emits a form the extractor parses as correct            | Multiple extractors, adversarial fuzzing      |
+| Sandbagging length        | Pads reasoning to look thorough                         | No length term in the reward                  |
+| Memorized benchmarks      | Recalls the answer rather than deriving it              | Held-out and freshly generated problems       |
+
+The general rule: **every reward function is a specification, and RL finds the shortest path through it.** Verifiable rewards shrink that path but do not eliminate it. Log a few hundred rollouts manually at every checkpoint and read them.
+
+---
+
+## Test-time compute scaling
+
+RLVR changes what a model does with more thinking time. Three distinct axes:
+
+| Axis    | Method                                     | Cost             | Where it helps                     |
+| :------ | :----------------------------------------- | :--------------- | :--------------------------------- |
+| Samples | Self-consistency, best-of-N, majority vote | Linear in `N`    | Broadly, with a verifier           |
+| Depth   | Longer chains, budget forcing, `s1`        | Linear in tokens | Problems needing more steps        |
+| Search  | Tree of Thoughts, beam over states, MCTS   | Exponential      | Problems with recoverable branches |
+
+**Self-consistency** (Wang et al., arXiv:2203.11171) samples `N` reasoning paths and takes a majority vote over the final answer. It needs no verifier at all, which is why it works on tasks with no checker. The gap between R1-Zero's 47.0 pass@1 and 71.0 majority vote is exactly this effect.
+
+**Best-of-N with a verifier** replaces the vote with a score: sample `N`, keep the highest-reward one. With a reliable checker this dominates majority voting, and it is the mechanism behind most reported leaderboard numbers. Always ask whether a score is pass@1 or best-of-N.
+
+**Budget forcing** (s1, Muennighoff et al., arXiv:2501.19393) appends "Wait" to force continued reasoning, or ends the thinking block to force an answer. It is a two-line change that gives explicit control over test-time compute and reproduced a large part of the o1-style gain on a 1,000-example training set.
+
+Snell et al. (arXiv:2408.03314) put a number on the trade: optimally scaling test-time compute can increase the effective model size by more than 14x, and on some tasks spending the budget at inference beats spending it on parameters. The crossover depends on the problem's difficulty and the available compute, which is why production systems now allocate a thinking budget per request.
+
+<Callout type="info">
+  ### Why RL produces test-time scaling and SFT does not
+
+Supervised fine-tuning on correct solutions teaches the model one path per problem. RL with a verifiable reward teaches it that a path is worth taking only if it ends correctly, so it learns to check, backtrack, and try again. The scaling behaviour is the learned policy of allocating more tokens where more tokens raise the success probability, and that policy can only be acquired from a signal about outcomes.
+
+</Callout>
+
+---
+
+## Choosing a recipe
+
+| Situation                                     | Use                                                   |
+| :-------------------------------------------- | :---------------------------------------------------- |
+| Ground truth exists and is cheap to check     | GRPO with verifiable rewards                          |
+| Ground truth exists but is expensive to check | Distill a checker into a PRM, accept the hacking risk |
+| Only preferences exist, no correctness notion | Reward model plus PPO, or DPO                         |
+| Style, tone, safety, helpfulness              | Learned reward model, small `beta` KL                 |
+| Very little data, under about 5k pairs        | DPO or KTO, not online RL                             |
+| Reasoning, and you can afford rollouts        | Cold-start SFT, then GRPO, then rejection sampling    |
+| Reasoning, and you cannot afford rollouts     | Distill from a reasoning model, then SFT              |
+
+---
+
+## Interview questions
+
+1. What does RLVR stand for and what problem does it solve?
+
+   Reinforcement Learning with Verifiable Rewards. A learned reward model cannot judge whether a mathematical derivation is correct, and optimizing one hard enough degrades the policy. A checker gives an exact reward with no proxy gap, so the `alpha * sqrt(KL) - beta * KL` overoptimization curve does not apply.
+
+2. Name four verifiable reward sources.
+
+   Exact match or symbolic equivalence against a known answer, hidden unit tests for code, a proof kernel such as Lean or Coq, and JSON schema validation for structured output. Format checks via regex are usually added as a small secondary term.
+
+3. Why does answer extraction matter more than answer comparison?
+
+   A correct answer written in prose with no `\boxed{}` scores zero, so the policy learns to stop doing the reasoning that produces it. Extraction failures look exactly like a training failure and cap the achievable reward well below the model's ability.
+
+4. What was DeepSeek-R1-Zero?
+
+   GRPO applied directly to `DeepSeek-V3-Base` with rule-based rewards only, no supervised fine-tuning. It reached 47.0 pass@1 and 71.0 majority vote on AIME 2024, and 63.0 on MATH-500, matching o1-0912 on majority vote.
+
+5. Describe the aha moment.
+
+   Partway through R1-Zero training the model began emitting reflective text equivalent to "wait, let me recheck this" and revising earlier steps. Reflection was never in the training data or the prompt. It appeared because it raises the verifier score and the group-relative advantage rewards whatever raises it.
+
+6. Name the four stages of the full DeepSeek-R1 pipeline.
+
+   Cold-start SFT on a few thousand long chain-of-thought examples for readability, reasoning-oriented RL with GRPO and verifiable rewards, rejection sampling to collect correct and readable traces followed by another SFT round, and general RL against a learned reward model for helpfulness and safety.
+
+7. Why did DeepSeek-R1 not use process reward models?
+
+   Two stated reasons: a PRM trained on step labels can be reward hacked, because the model learns to write plausible-looking steps instead of reasoning correctly, and retraining a PRM after every policy update does not scale. They used outcome-level verifiable rewards with a large group size instead.
+
+8. Give three concrete reward hacks in RLVR and their mitigations.
+
+   Hardcoding expected test outputs, mitigated by hidden randomized fixtures; mutating or deleting the test file, mitigated by a read-only sandboxed test directory; and gaming the answer extractor with a form it mis-parses, mitigated by running several extractors and fuzzing them.
+
+9. What is self-consistency and why does it need no verifier?
+
+   Sample `N` reasoning paths and take a majority vote over the final answers (Wang et al., arXiv:2203.11171). The vote is its own aggregate signal, so it works on tasks with no ground truth. It is the entire gap between R1-Zero's 47.0 pass@1 and 71.0 majority vote.
+
+10. How does best-of-N differ from majority voting, and why does it matter for benchmarks?
+
+    Best-of-N samples `N` and keeps the one a verifier scores highest; majority voting keeps the most common answer. With a reliable checker best-of-N is strictly better and reports much higher numbers. Always ask whether a published score is pass@1 or best-of-N before comparing models.
+
+11. What is budget forcing?
+
+    From `s1` (arXiv:2501.19393): append the token "Wait" to force the model to keep reasoning, or close the thinking block to force an answer. Two lines of code, gives explicit control over test-time compute, and reproduced much of the o1-style gain from a 1,000-example training set.
+
+12. Why does RL produce test-time compute scaling where SFT does not?
+
+    SFT on correct solutions teaches one path per problem. RL with an outcome reward teaches the model that a path is worth taking only if it ends correctly, so it learns to check, backtrack, and extend reasoning where extending it helps. The scaling curve is a learned token-allocation policy, and only an outcome signal can teach it.

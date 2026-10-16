@@ -1,0 +1,270 @@
+---
+title: Policy Gradients
+description: 'Deriving REINFORCE from the log-derivative trick, why its variance is catastrophic, reward-to-go, the baseline proof, actor-critic, and how GRPO is the same equation with a group baseline.'
+---
+
+Value-based methods pick `argmax Q`. Policy-gradient methods parameterise the policy directly and sample from it, which is what generation needs. Everything in this phase, PPO, DPO, GRPO, traces back to one equation derived below, and to the single problem that equation creates: variance.
+
+---
+
+## The objective
+
+Parameterise the policy as `pi_theta(a|s)`, a network producing a distribution over actions. Maximise expected return:
+
+```text
+J(theta) = E_{tau ~ pi_theta} [ R(tau) ]
+```
+
+where `tau = (s_0, a_0, r_1, s_1, a_1, ...)` is a trajectory and `R(tau)` its total reward. For a language model, `tau` is one complete response and `R(tau)` is the reward model's or verifier's score for it.
+
+The difficulty is that `theta` appears inside the sampling distribution, not as an argument to a function you can differentiate. You cannot push the gradient through an expectation whose own domain depends on the parameter.
+
+---
+
+## The log-derivative trick
+
+Expand the expectation as a sum over trajectories:
+
+```text
+J(theta) = sum_tau P(tau; theta) R(tau)
+grad J   = sum_tau grad P(tau; theta) R(tau)
+```
+
+Multiply and divide by `P(tau; theta)`:
+
+```text
+grad J = sum_tau P(tau; theta) * [ grad P(tau; theta) / P(tau; theta) ] * R(tau)
+       = E_tau [ grad log P(tau; theta) * R(tau) ]
+```
+
+That identity, `grad log f = grad f / f`, is the whole trick. The gradient is now an expectation under the current policy, so it can be estimated by sampling.
+
+Expand `log P(tau; theta)`:
+
+```text
+log P(tau) = log p(s_0) + sum_t [ log pi_theta(a_t|s_t) + log P(s_t+1 | s_t, a_t) ]
+```
+
+The initial-state term and the transition terms do not involve `theta`, so their gradients are zero. What remains is the policy gradient theorem:
+
+```text
+grad J(theta) = E_tau [ sum_t grad log pi_theta(a_t | s_t) * R(tau) ]
+```
+
+No transition model appears. The method is model-free by construction, which is why it works when `P` is unknown or, as with a language model, deterministic and uninteresting.
+
+Reading the equation in words: increase the log-probability of actions that led to high return, decrease it for actions that led to low return, weighted by how high or low.
+
+---
+
+## REINFORCE
+
+Williams' 1992 algorithm is the theorem turned into a loop.
+
+```text
+1. Collect N episodes with the current policy
+2. For each episode, compute the return R(tau)
+3. Estimate  grad J = (1/N) sum_i sum_t grad log pi(a_t^i|s_t^i) * R(tau_i)
+4. Step theta <- theta + lr * grad J
+5. Discard the episodes and repeat
+```
+
+Step 5 is what makes it on-policy and sample-hungry. The gradient estimate is only valid for the policy that produced the data, so every update invalidates the batch.
+
+```python
+import torch
+import torch.nn.functional as F
+
+def reinforce_loss(
+    logits: torch.Tensor,          # (B, T, V)
+    tokens: torch.Tensor,          # (B, T)
+    returns: torch.Tensor,         # (B,)
+    mask: torch.Tensor,            # (B, T) 1.0 on generated tokens
+) -> torch.Tensor:
+    logp = torch.log_softmax(logits, dim=-1)                          # (B, T, V)
+    logp_tok = logp.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)      # (B, T)
+    per_token = -logp_tok * returns.unsqueeze(1)                      # (B, T)
+    return (per_token * mask).sum() / mask.sum()
+```
+
+The negative sign is because optimisers minimise. `gather` picks out the log-probability of the sampled token, which is the `log pi(a_t|s_t)` term.
+
+---
+
+## Causality and reward-to-go
+
+Using the full trajectory return `R(tau)` for every action is wasteful. An action at time `t` cannot influence rewards before `t`, and including them adds variance with zero signal, because their expected contribution to the gradient is zero.
+
+```text
+grad J = E[ sum_t grad log pi(a_t|s_t) * G_t ]        G_t = sum_{k>=t} gamma^{k-t} r_k+1
+```
+
+`G_t` is the reward-to-go. This substitution does not change the expectation, only its variance. With `gamma = 1` and a purely terminal reward, `G_t` equals `R` for every `t`, which is exactly the LLM case, and there is nothing to gain here.
+
+---
+
+## Variance
+
+REINFORCE's estimator is unbiased and has enormous variance. Three sources compound.
+
+| Source                   | Effect                                                        |
+| :----------------------- | :------------------------------------------------------------ |
+| Monte Carlo returns      | `G_t` accumulates randomness over the whole remaining episode |
+| Multiplicative structure | The gradient multiplies a log-prob term by a return term      |
+| On-policy discarding     | Few samples per update, so the estimate is noisy              |
+
+For a 2,000-token response with a terminal reward, every token in the sequence receives the same scalar. If the response scored well, all 2,000 log-probabilities are pushed up, including the ones that had nothing to do with the outcome. The signal-to-noise ratio per gradient step is poor, and the practical consequence is that REINFORCE needs many samples per update.
+
+Everything downstream in this phase is variance reduction. GAE trades bias for variance in the advantage estimate. PPO reuses a batch safely. GRPO gets a baseline for free by sampling several responses per prompt.
+
+---
+
+## Baselines
+
+Subtract a state-dependent quantity `b(s)` from the return:
+
+```text
+grad J = E[ sum_t grad log pi(a_t|s_t) * ( G_t - b(s_t) ) ]
+```
+
+This is still unbiased, for any `b` that does not depend on the action. The proof is three lines:
+
+```text
+E_a[ grad log pi(a|s) b(s) ] = b(s) sum_a pi(a|s) grad log pi(a|s)
+                             = b(s) sum_a grad pi(a|s)
+                             = b(s) grad sum_a pi(a|s)
+                             = b(s) grad 1 = 0
+```
+
+The second step uses the same log-derivative identity in reverse. The fourth uses the fact that probabilities sum to one, so their gradient is zero. Subtracting a baseline shifts nothing in expectation and strictly reduces variance.
+
+The variance-minimising baseline is
+
+```text
+b*(s) = E[ ||grad log pi||^2 * G_t ] / E[ ||grad log pi||^2 ]
+```
+
+which is a weighted mean of returns, not the plain mean. In practice everyone uses `V(s)`, the plain expected return, because estimating `b*` costs more than it saves. That gives the advantage:
+
+```text
+A_t = G_t - V(s_t)
+```
+
+---
+
+## Actor-critic
+
+Estimating `V(s)` requires a second network trained alongside the policy.
+
+| Role   | Network          | Trained on                                       |
+| :----- | :--------------- | :----------------------------------------------- |
+| Actor  | `pi_theta(a\|s)` | The policy gradient with advantages              |
+| Critic | `V_phi(s)`       | Regression toward observed returns or TD targets |
+
+The critic's loss is `mean( (G_t - V_phi(s_t))^2 )`, or a temporal-difference version that bootstraps. The two networks are usually optimised jointly with a combined loss:
+
+```text
+L = L_policy + c1 * L_value - c2 * H[pi]
+```
+
+`H[pi]` is the policy entropy and `c2` is small, typically `0.01`. The entropy bonus keeps the distribution from collapsing onto one action too early, which for a language model means keeping some sampling diversity during rollouts. A3C parallelised this across workers (Mnih et al., arXiv:1602.01783); A2C is its synchronous form and what most frameworks implement.
+
+The critic is a real cost. In LLM RL it is a second model roughly the size of the policy, needing its own weights, gradients and optimizer states. GRPO's central contribution is removing it.
+
+---
+
+## The family of LLM RL algorithms
+
+Once you see the baseline as the only design choice, most published methods collapse into one table.
+
+| Method                          | Baseline `b`                                 | Critic | Notes                                          |
+| :------------------------------ | :------------------------------------------- | :----- | :--------------------------------------------- |
+| REINFORCE                       | None                                         | No     | Unusable variance at scale                     |
+| REINFORCE with a value baseline | Learned `V(s)`                               | Yes    | Classical actor-critic                         |
+| RAFT                            | Implicit: keep only top-scoring samples      | No     | Rejection sampling plus SFT (arXiv:2304.06767) |
+| RLOO                            | Mean reward of the other `k-1` samples       | No     | Leave-one-out (arXiv:2402.14740)               |
+| GRPO                            | Mean reward of the group, divided by its std | No     | DeepSeekMath (arXiv:2402.03300)                |
+| PPO                             | GAE with a learned critic                    | Yes    | The RLHF default for two years                 |
+
+RAFT and the rejection-sampling stage in Llama 2 (arXiv:2307.09288) are the same idea from another direction: sample many responses, keep the best, and run supervised fine-tuning on them. Keeping only high-reward samples is a crude baseline, since it subtracts a threshold instead of a mean, and it loses the negative signal entirely.
+
+RLOO is the honest version. Sample `k` responses per prompt, and for response `i` use the mean reward of the other `k-1` as the baseline. Leaving out `i` keeps the baseline independent of the action being scored, which preserves unbiasedness.
+
+GRPO adds division by the group standard deviation. That is a scale normalisation rather than a baseline, and it introduces a bias that Dr. GRPO (arXiv:2503.20783) later points out and removes.
+
+<Callout type="info">
+  ### The one-line summary worth memorising
+
+REINFORCE multiplies the log-probability gradient by the return. Every improvement since 1992 is a better thing to multiply it by: the reward-to-go, then the return minus a baseline, then an advantage estimated with GAE, then a group-normalised advantage with no critic at all.
+
+</Callout>
+
+---
+
+## What the gradient looks like for a language model
+
+With `gamma = 1` and a terminal reward `R`, the per-response gradient is
+
+```text
+grad = R * sum_{t=1}^{T} grad log pi_theta(y_t | x, y_<t)
+```
+
+and with a group baseline,
+
+```text
+grad = A_i * sum_t grad log pi_theta(y_t^i | x, y_<i,t)        A_i = (R_i - mean(R)) / std(R)
+```
+
+Two consequences follow directly.
+
+The same advantage multiplies every token in the response. There is no per-token credit assignment unless you introduce a process reward model or a step-level verifier. A correct answer with a garbage middle gets the middle reinforced too.
+
+The gradient magnitude scales with response length, because you sum over `T` tokens. Dividing by `T` gives a per-token mean and changes which responses dominate the batch. GRPO divides by length; Dr. GRPO argues this penalises long reasoning chains and drops it. The choice is a real hyperparameter with a real effect, not a normalisation detail.
+
+---
+
+## Interview questions
+
+1. Derive the policy gradient.
+
+   Start from `J(theta) = sum_tau P(tau; theta) R(tau)` and differentiate: `grad J = sum_tau grad P(tau) R(tau)`. Multiply and divide by `P(tau)` to get `E_tau[R(tau) grad log P(tau)]`. Expanding `log P(tau)` gives the initial-state term, the policy terms and the transition terms; only the policy terms depend on `theta`, so `grad J = E[sum_t grad log pi(a_t|s_t) R(tau)]`.
+
+2. What is the log-derivative trick and why is it needed?
+
+   The identity `grad log f = grad f / f`, used to turn a gradient of an expectation into an expectation of a gradient. It is needed because the parameter sits in the sampling distribution rather than in the integrand, so you cannot differentiate through the expectation directly. After the transformation the gradient is estimable by sampling.
+
+3. Why does the policy gradient not need a transition model?
+
+   The environment terms `log P(s_t+1 | s_t, a_t)` appear in `log P(tau)` but carry no `theta`, so their gradient is zero and they drop out. This is what makes the method model-free, and it is why the LLM's deterministic string-concatenation transition costs nothing.
+
+4. Why is REINFORCE high variance, and what are the three sources?
+
+   Monte Carlo returns accumulate randomness over the whole remaining episode; the estimator multiplies a log-probability term by a return term, so noise in either is compounded; and on-policy discarding allows only a few samples per update. For a language model the terminal reward is broadcast to every token, so most of the signal in a given gradient step is noise.
+
+5. Prove that subtracting a baseline does not bias the gradient.
+
+   `E_a[b(s) grad log pi(a|s)] = b(s) sum_a pi(a|s) grad log pi(a|s) = b(s) sum_a grad pi(a|s) = b(s) grad sum_a pi(a|s) = b(s) grad 1 = 0`. The baseline must not depend on the action, otherwise the first step fails.
+
+6. What is the theoretically optimal baseline and why is it not used?
+
+   `b*(s) = E[||grad log pi||^2 G_t] / E[||grad log pi||^2]`, a return weighted by the squared gradient norm. It minimises the variance of the estimator exactly. Estimating it requires quantities nobody computes anyway, so practice uses `V(s)`, the unweighted mean return.
+
+7. What does the critic cost you in LLM RL?
+
+   A second model comparable in size to the policy, with its own weights, gradients and Adam states, plus the wall-clock cost of running it on every rollout token. On a 7B policy the critic roughly doubles the training memory. GRPO and RLOO exist to remove it.
+
+8. Explain RLOO and why the baseline leaves out the sample being scored.
+
+   Sample `k` responses per prompt and use the mean reward of the other `k-1` as the baseline for each one. Excluding response `i` keeps the baseline statistically independent of the action whose gradient is being taken, which is what preserves unbiasedness. Including it would correlate the baseline with the return and shrink the gradient systematically.
+
+9. How is GRPO related to REINFORCE?
+
+   It is REINFORCE with a group baseline plus a scale normalisation. Sample `G` responses per prompt, compute `A_i = (R_i - mean(R)) / std(R)`, and multiply each response's summed token log-probability gradient by `A_i`. The mean removal is the baseline; the division by the standard deviation is normalisation, not a baseline, and it introduces a bias that later work removes.
+
+10. Why does response length interact badly with the policy gradient?
+
+    The gradient sums over tokens, so a 4,000-token response contributes roughly eight times the magnitude of a 500-token one at the same advantage. Dividing by length equalises per-response influence but then penalises long chains for being long. GRPO normalises by length, Dr. GRPO drops the normalisation, and the choice measurably changes which reasoning style survives training.
+
+11. What is the entropy bonus for?
+
+    It adds `-c2 * H[pi]` to the loss, rewarding a spread-out action distribution and slowing premature convergence onto one action. Without it the policy collapses, all rollouts become identical, the group advantage goes to zero and learning stops. Entropy collapse is one of the standard failure modes to monitor in an LLM RL run.

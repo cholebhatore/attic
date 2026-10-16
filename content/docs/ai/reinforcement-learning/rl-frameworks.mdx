@@ -1,0 +1,232 @@
+---
+title: RL Frameworks
+description: 'verl, OpenRLHF, TRL, cleanrl, and Spinning Up compared: the rollout-training split, weight resync, parallelism choices, and which framework to pick for which cluster.'
+---
+
+RLHF and GRPO are not one training loop. They are two engines with different parallelism strategies passing weights and tensors back and forth, plus a reward function that may be a third model or an external sandbox. Every framework in this space is an answer to the same question: how do you keep a generation engine and a training engine on the same GPUs without them fighting?
+
+The canonical resources listed for this phase are `vwxyzjn/cleanrl`, `volcengine/verl`, `OpenRLHF/OpenRLHF`, OpenAI's Spinning Up, and the Hugging Face Ultra-Scale Playbook plus TRL docs. They sit at four different points on the learning-to-production spectrum.
+
+---
+
+## The structural problem
+
+```text
+rollout phase      pi_theta_old generates G responses per prompt
+                   needs: fast autoregressive decoding, paged KV cache
+                   engine: vLLM or SGLang
+                   parallelism: tensor parallel, little or no pipeline
+
+reward phase       score every response
+                   needs: a reward model forward, or a code/math sandbox
+                   engine: HF transformers, or a container pool
+
+training phase     one or a few gradient steps on the collected batch
+                   needs: activations, optimizer state, gradient sync
+                   engine: FSDP2 or Megatron-LM
+                   parallelism: data + tensor + pipeline + ZeRO, expert for MoE
+
+resync             push the updated weights into the rollout engine
+                   needs: a fast collective or shared memory, every step
+```
+
+The mismatch is the point. The rollout engine wants a sharded model optimized for memory-bound decoding with a paged KV cache. The training engine wants the same weights sharded differently so activations and optimizer state fit. Neither layout is a permutation of the other, so resync involves an actual re-sharding step, not a copy.
+
+On a 7B model at `ppo_epochs = 1`, resync happens once per rollout batch and costs a few seconds. On a 671B MoE model with expert parallelism it is one of the dominant costs in the run, and getting it wrong makes the whole system idle-bound.
+
+---
+
+## The five resources
+
+| Resource    | Scope               | Engine                             | Best for                         |
+| :---------- | :------------------ | :--------------------------------- | :------------------------------- |
+| `cleanrl`   | Single-file scripts | Pure PyTorch                       | Reading one algorithm end to end |
+| Spinning Up | Teaching library    | Pure PyTorch, MPI                  | Classical RL, VPG through PPO    |
+| TRL         | LLM post-training   | Accelerate, PEFT, vLLM             | One node to a small cluster      |
+| OpenRLHF    | Production RLHF     | Ray, vLLM, DeepSpeed               | Multi-node PPO, GRPO, DPO, KTO   |
+| verl        | Production RLHF     | Ray, vLLM/SGLang, FSDP or Megatron | Large-scale runs, MoE, research  |
+
+### cleanrl
+
+One file per algorithm, no abstractions, `python dqn.py` and it runs. The stated design goal is that the entire implementation of an algorithm is visible in a single read. It covers DQN, PPO, SAC, and about thirty variants, including PPO variants for Atari, MuJoCo, and environments with observation normalization.
+
+It does not train LLMs. It is the fastest way to build correct intuition about the classical algorithms that the LLM versions descend from, and the reference implementation people quote when arguing about a detail like advantage normalization or value clipping.
+
+### Spinning Up in Deep RL
+
+OpenAI's teaching repository, with VPG, TRPO, PPO, DDPG, TD3, and SAC, each paired with a written explanation. The documentation is still the clearest derivation of PPO available, and the exercises are the standard on-ramp. It has not been maintained as a production library and uses MPI rather than NCCL, so it is a reading resource now.
+
+### TRL
+
+Hugging Face's post-training library. `SFTTrainer`, `DPOTrainer`, `GRPOTrainer`, `PPOTrainer`, `KTOTrainer`, `ORPOTrainer`, `RewardTrainer`, plus `OnlineDPOTrainer` and the newer `GKDTrainer`. `GRPOTrainer` arrived in v0.14 and is the reason most small-scale RLVR work happens in TRL.
+
+Its strengths are integration and low ceremony. PEFT works out of the box, so you can run GRPO on a 7B model with a LoRA adapter on a single 24GB card. vLLM is used for generation when installed and supported. Reward functions are plain Python callables, which makes a verifier trivial to plug in.
+
+Its limits are scale and control. Beyond roughly two nodes the weight resync and the parallelism configuration become awkward, and there is no Megatron path.
+
+```python
+from trl import GRPOConfig, GRPOTrainer
+
+def correctness_reward(prompts, completions, answer, **kwargs) -> list[float]:
+    rewards = []
+    for completion, gold in zip(completions, answer):
+        pred = extract_boxed(completion)                 # your extractor
+        rewards.append(1.0 if pred is not None and normalize(pred) == normalize(gold) else 0.0)
+    return rewards
+
+config = GRPOConfig(
+    output_dir="qwen3-8b-grpo",
+    learning_rate=1e-6,
+    per_device_train_batch_size=8,
+    gradient_accumulation_steps=4,
+    num_generations=8,            # the G in GRPO
+    max_prompt_length=512,
+    max_completion_length=2048,
+    beta=0.04,                    # KL coefficient
+    temperature=1.0,
+    use_vllm=True,
+    bf16=True,
+    logging_steps=1,
+)
+
+trainer = GRPOTrainer(
+    model="Qwen/Qwen3-8B",
+    reward_funcs=correctness_reward,
+    args=config,
+    train_dataset=dataset,         # needs "prompt" and "answer" columns
+)
+trainer.train()
+```
+
+### OpenRLHF
+
+Ray plus vLLM plus DeepSpeed. The design is a set of Ray actors: an actor group for the policy, one for the critic, one for the reference model, one for the reward model, and a vLLM engine for generation, all placed by a scheduler that can colocate or separate them.
+
+It supports PPO, GRPO, DPO, KTO, ReMax, REINFORCE++, conditional SFT, and knowledge distillation, and it handles multi-node runs with a Ray cluster rather than `torchrun`. Weight resync goes over a NCCL broadcast or through Ray object store. It is the pragmatic choice when you need more than TRL offers and less than verl's flexibility.
+
+### verl
+
+`volcengine/verl`, built on the HybridFlow design (arXiv:2409.19256). HybridFlow splits the system into two programming models: a **single-controller** view for the RL control flow, so the algorithm reads as one linear Python program, and a **multi-controller** view for the computation, so each model shard runs its own SPMD process with native collective performance.
+
+That combination is why verl can express a full PPO or GRPO loop in a few hundred lines and still hit high GPU utilization on large clusters. It supports FSDP and FSDP2 as well as Megatron-LM backends, 3D parallelism, expert parallelism for MoE, vLLM and SGLang for rollout, and the resharding between them. Most open reproductions of DeepSeek-R1 used verl or a close fork.
+
+Configuration is Hydra-based, which means a run is a YAML file plus command-line overrides:
+
+```bash
+python -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=64 \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.model.path=deepseek-ai/DeepSeek-V3 \
+    data.train_batch_size=128 \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=4
+```
+
+Note `rollout.tensor_model_parallel_size` and the absent training-side TP setting: they are independent, and setting them equal is a common mistake that leaves memory on the table.
+
+---
+
+## Also worth knowing
+
+| Project                  | Position                                                                |
+| :----------------------- | :---------------------------------------------------------------------- |
+| NeMo-Aligner             | NVIDIA's stack; Megatron-native, strong on multi-node PPO and SteerLM   |
+| LLaMA-Factory            | Broad fine-tuning UI and CLI; DPO, KTO, ORPO, PPO; not RLVR-focused     |
+| Axolotl                  | YAML-driven SFT and DPO; good DX, limited online RL                     |
+| Unsloth                  | Fast single-GPU LoRA and QLoRA; added GRPO for small models             |
+| SkyRL                    | Berkeley's verl fork aimed at agentic and multi-turn RL                 |
+| slime                    | Recent Megatron-plus-SGLang framework, aimed at very large runs         |
+| Open-Instruct            | Allen AI's research stack behind Tulu 3; PPO and DPO at scale           |
+| The Ultra-Scale Playbook | Hugging Face's written guide to training LLMs on GPU clusters; not code |
+
+The Ultra-Scale Playbook is the one prose resource worth reading cover to cover. It covers data, tensor, pipeline, and ZeRO parallelism, the memory arithmetic behind each, and when a given strategy stops paying for its communication cost. Phase 5's [Scaling and Parallelism](/ai/llm/scaling-and-parallelism) is the short version.
+
+---
+
+## Choosing
+
+| Situation                                                | Pick                            |
+| :------------------------------------------------------- | :------------------------------ |
+| Learning how PPO or DQN works                            | cleanrl, then Spinning Up       |
+| DPO on a 7B model, one GPU                               | TRL plus PEFT                   |
+| GRPO with a math verifier, one to eight GPUs             | TRL `GRPOTrainer` plus vLLM     |
+| GRPO on a 70B model, two to eight nodes                  | OpenRLHF or verl with FSDP      |
+| GRPO on a 671B MoE model, a full cluster                 | verl with Megatron              |
+| Reproducing DeepSeek-R1                                  | verl, plus the published recipe |
+| Multi-turn agentic RL with tools                         | verl or SkyRL                   |
+| Production preference tuning inside an existing HF stack | TRL                             |
+
+---
+
+## Diagnostics that matter
+
+Whatever the framework, log these. They catch most RL failures before the run wastes GPU days.
+
+| Metric                        | Healthy range            | What a bad value means                                       |
+| :---------------------------- | :----------------------- | :----------------------------------------------------------- |
+| Mean reward                   | Rising, slowly           | Flat: reward function or extraction is broken                |
+| Reward std within a group     | Non-zero                 | Zero: no learning signal, need harder prompts                |
+| Mean KL to reference          | Rising monotonically     | Jumping: lr too high or `beta` too low                       |
+| Clip fraction                 | 1 to 10 percent          | Above 20: trust region not holding                           |
+| Policy entropy                | Falling slowly           | Collapsing to near zero: Clip-Higher or raise `beta`         |
+| Response length               | Growing then stable      | Growing without accuracy: length bias                        |
+| Gradient norm                 | Stable                   | Spiking: lower lr, check for NaN rewards                     |
+| Rollout throughput            | Above 50 percent of peak | Below: resync or scheduling is the bottleneck                |
+| Fraction of truncated outputs | Low                      | High: raise `max_completion_length`, or add overlong shaping |
+
+<Callout type="info">
+  ### The debugging order that saves time
+
+Reward function first, then extraction, then mask, then learning rate. Most reported "GRPO does not work" cases are a broken answer extractor or a loss mask that includes prompt tokens. Neither shows up in the loss curve, and both are ten minutes to check by printing a single decoded batch.
+
+</Callout>
+
+---
+
+## Interview questions
+
+1. Why is RLHF harder to implement than supervised fine-tuning?
+
+   Because it runs two engines with incompatible parallelism layouts. The rollout engine wants a sharded model with a paged KV cache for fast decoding, and the training engine wants the same weights sharded for activations and optimizer state. Resync between them requires actual resharding, and on top of that you may hold a critic, a reference model, and a reward model in memory at the same time.
+
+2. What is the HybridFlow design in verl?
+
+   It uses a single-controller programming model for the RL control flow, so the algorithm reads as one linear Python program, and a multi-controller model for the computation, so each shard runs as a native SPMD process with full collective performance. That combination is why verl expresses a full PPO loop in a few hundred lines without giving up GPU utilization at cluster scale.
+
+3. What is the difference between cleanrl and TRL?
+
+   cleanrl is single-file reference implementations of classical RL algorithms in plain PyTorch, for reading and learning. TRL is a Hugging Face post-training library with trainers for SFT, DPO, GRPO, PPO, and KTO, wired into Accelerate, PEFT, and vLLM, for training language models.
+
+4. When would you pick TRL over OpenRLHF or verl?
+
+   When the model fits on one to eight GPUs and you want integration with the Hugging Face stack, PEFT adapters, and a reward function that is a plain Python callable. TRL's `GRPOTrainer` is the fastest path to a working RLVR run. Above roughly two nodes, or when you need Megatron parallelism or MoE expert parallelism, move to OpenRLHF or verl.
+
+5. Why do rollout and training use different tensor parallel sizes?
+
+   Generation is memory-bandwidth bound and benefits from a layout that keeps the KV cache paged and the batch large, so a smaller TP degree with more data parallel replicas often wins. Training has to hold activations and optimizer state, so it needs a larger TP or ZeRO shard. They are configured independently in verl, and matching them by default wastes memory.
+
+6. What is weight resync and why does it dominate at large scale?
+
+   After each training step the updated policy weights must be pushed into the inference engine before the next rollout. On a 7B model that is a few seconds per batch. On a 671B MoE model with expert parallelism it is a resharding collective across hundreds of GPUs, and if it is not overlapped with anything the whole cluster sits idle during it.
+
+7. What role does Ray play in OpenRLHF and verl?
+
+   It is the actor and placement layer. Each model, the generation engine, and the reward function become Ray actors, and the scheduler decides whether to colocate them on the same GPUs or separate them. That is what makes multi-node RL runs expressible without hand-written `torchrun` orchestration.
+
+8. Name six metrics you would log during a GRPO run.
+
+   Mean reward, reward std within a group, mean KL to the reference, clip fraction, policy entropy, and response length. Gradient norm and rollout throughput are the next two. A zero within-group std means no learning signal; a clip fraction above about 20 percent means the trust region is not holding.
+
+9. What is the Ultra-Scale Playbook?
+
+   Hugging Face's written guide to training LLMs on GPU clusters. It covers data, tensor, pipeline, and ZeRO parallelism with the memory arithmetic and communication cost behind each, and where each strategy stops paying for itself. It is prose rather than code, and it is the best single read on the subject.
+
+10. You are asked to reproduce DeepSeek-R1 on eight nodes. What stack do you choose?
+
+    verl with the Megatron backend, vLLM or SGLang for rollout, GRPO with `adv_estimator=grpo`, a rule-based accuracy reward plus a format reward, and the published pipeline of cold-start SFT, reasoning RL, rejection sampling, and alignment RL. verl is what most open reproductions used, and it is the only one of the five with native expert parallelism at that scale.
