@@ -1,0 +1,173 @@
+---
+title: RAG vs Long Context
+description: 'Retrieval against stuffing a million-token window: cost per query, KV cache limits, time to first token, and how much of a claimed context is usable.'
+---
+
+Gemini 1.5 Pro took the context window to one million tokens in February 2024, and Llama 4 Scout claimed ten million in April 2025. The obvious question followed immediately: if the whole corpus fits in the window, why retrieve?
+
+Three answers survive contact with production. Retrieval is 100x cheaper per query. It is faster to first token. And the usable fraction of a claimed context window is much smaller than the number on the model card.
+
+---
+
+## The cost arithmetic
+
+Assume $3 per million input tokens, which is the Sonnet and GPT-4.1 class, and a corpus of one million tokens.
+
+| Approach                       | Input tokens per query | Cost per query | Cost at 10,000 queries per day |
+| :----------------------------- | :--------------------- | :------------- | :----------------------------- |
+| Stuff the whole corpus         | 1,000,000              | $3.00          | $30,000                        |
+| Stuff the whole corpus, cached | 1,000,000 at 0.1x      | $0.30          | $3,000                         |
+| Retrieve 4 chunks at 1,000     | 4,000                  | $0.012         | $120                           |
+| Retrieve plus rerank to 2,000  | 2,000                  | $0.006         | $60                            |
+
+The indexing side is negligible by comparison. Embedding one million tokens with a model priced at $0.02 per million costs $0.02 once, amortized across every query.
+
+Prefix caching closes the gap to 10x rather than 250x, and only if the corpus is byte-identical across requests and the provider's TTL does not expire between them. For a corpus that changes hourly, or a per-user filtered subset, the cache does not hold.
+
+<Callout type="warn">
+  ### Output tokens dominate once input is cheap
+
+A retrieval pipeline that returns 4,000 input tokens and a 1,500-token answer at $15 per million output tokens costs $0.012 input and $0.0225 output. The answer is now the majority of the bill. This flips the optimization target from context size to answer length, and it is why terse structured answers matter more than short prompts.
+
+</Callout>
+
+---
+
+## Latency and the KV cache
+
+Time to first token is prefill: one forward pass over every input token before the first output token exists. Prefill compute is linear in `n` for the matmuls and quadratic for attention, and it cannot be hidden behind streaming.
+
+The harder wall is memory. Phase 5 derived the per-token KV cache as `2 * n_layers * d_kv * bytes`:
+
+| Model             | Layers | Per-token, per-layer elements  | Bytes per token | 1M-token KV cache |
+| :---------------- | :----- | :----------------------------- | :-------------- | :---------------- |
+| Llama 3 8B (GQA)  | 32     | `2 * 8 * 128 = 2,048`          | 128 KiB         | 128 GiB           |
+| Llama 3 70B (GQA) | 80     | `2 * 8 * 128 = 2,048`          | 320 KiB         | 320 GiB           |
+| DeepSeek-V3 (MLA) | 61     | `576`, one latent, no K/V pair | 69 KiB          | 69 GiB            |
+
+A single H100 has 80 GB. Filling a million-token window on an 8B model already needs two GPUs for the cache alone, before weights and activations. This is why million-token contexts are served with tensor parallelism, paged attention, and often a reduced-precision cache, and why the effective concurrency at long context is a fraction of the concurrency at 4k. MLA is the reason DeepSeek can serve long contexts at all: it drops the leading 2 because one latent vector serves both key and value. See [Attention Variants](/ai/llm/attention-variants).
+
+Retrieval keeps the prefill at a few thousand tokens. Typical numbers on a well-served stack:
+
+| Input size | Prefill time, 8B class | Notes                        |
+| :--------- | :--------------------- | :--------------------------- |
+| 4,000      | 50 to 150 ms           | Comfortably interactive      |
+| 32,000     | 0.4 to 1.5 s           | Noticeable, still tolerable  |
+| 200,000    | 3 to 10 s              | Needs a progress indicator   |
+| 1,000,000  | 20 to 90 s             | A batch job, not a chat turn |
+
+These are prefill only. Add decode time for the answer and the network round trip.
+
+---
+
+## How much of the window is usable
+
+The gap between claimed and effective context is the least discussed part of this decision.
+
+**RULER** (Hsieh et al., arXiv:2404.06654) runs thirteen tasks that require more than locating a string: multi-key retrieval, aggregation, variable tracking, and question answering over long contexts. Its central finding is that most models' effective length is far below their claimed maximum. GPT-4 at a claimed 128k held performance to roughly 64k. Several open models claiming 32k fell below 8k on the harder tasks. Simple needle-in-a-haystack retrieval, which most model cards demonstrate, is the easiest task in the suite.
+
+**NoLiMa** (Modarressi et al., arXiv:2502.05167) removes the lexical overlap between the needle and the query, so the model must do latent matching rather than string search. Beyond 32k tokens, most models tested dropped below 50% of their own short-context baseline.
+
+**Lost in the middle** (Liu et al., arXiv:2307.03172) is the positional version of the same result, with a U-shaped accuracy curve.
+
+The practical reading: a 128k window is roughly a 32k window for anything harder than finding a literal string, and a million-token window is a research result rather than a product feature for most workloads.
+
+---
+
+## Which one, when
+
+| Factor                     | Retrieval wins                                | Long context wins                 |
+| :------------------------- | :-------------------------------------------- | :-------------------------------- |
+| Corpus size                | Above about 200k tokens                       | Below about 100k tokens           |
+| Query volume               | High; indexing amortizes                      | Low, or one-off analysis          |
+| Update frequency           | Frequent; re-embed changed chunks             | Rare; reload the whole document   |
+| Access control             | Per-document permissions via metadata         | Per-request corpus assembly       |
+| Citation requirement       | Chunks carry source ids natively              | Needs offset tracking             |
+| Cross-document synthesis   | Weak; retrieval returns fragments             | Strong; the model sees everything |
+| Multi-hop over a small set | Weak without query decomposition              | Strong                            |
+| Latency budget             | Sub-second                                    | Seconds                           |
+| Cost sensitivity           | 100x cheaper at scale                         | Cheaper to build                  |
+| Chunking coherence         | Hard for code, tables, legal cross-references | No chunking needed                |
+
+The last row is the honest case for long context. Recursive chunking damages source code, financial tables, and contracts with cross-referenced clauses, because meaning in those documents is not local. When the corpus is small enough to fit and the structure is hard to segment, stuffing the window produces better answers.
+
+---
+
+## The hybrid that production systems run
+
+```text
+corpus (millions of tokens)
+   |
+   +--> retrieve: hybrid search over chunks, top 40        ~40,000 tokens
+   |
+   +--> rerank: cross-encoder or ColBERT, keep top 8       ~8,000 tokens
+   |
+   +--> prune: sentence-level filtering within chunks      ~4,000 tokens
+   |
+   +--> long-context read: the model reasons over all 8    fits comfortably
+```
+
+Retrieval handles scale, reranking handles precision, and the long window handles the fact that the eight surviving chunks need to be read together. Almost every serious system lands here, because the two approaches solve different problems rather than competing for the same one.
+
+A second hybrid is document-level: retrieve to find which of ten thousand documents matter, then load the top three in full. This preserves internal structure and cross-references while keeping the window bounded, and it is the right answer for code and contracts.
+
+---
+
+## What changed the calculus
+
+| Development                            | Direction           |
+| :------------------------------------- | :------------------ |
+| Prefix caching                         | Favors long context |
+| MLA and latent KV compression          | Favors long context |
+| PagedAttention and continuous batching | Favors long context |
+| Cheaper embedding models               | Favors retrieval    |
+| Better rerankers                       | Favors retrieval    |
+| Per-user access control requirements   | Favors retrieval    |
+| Corpora that update hourly             | Favors retrieval    |
+| Output-token pricing staying high      | Neutral             |
+
+The trend on both sides is real, which is why the answer is workload-specific rather than universal. The decision procedure is the same every time: measure corpus size, query volume, update rate, and latency budget, then compute both options.
+
+---
+
+## Interview questions
+
+1. A corpus is one million tokens and you get ten thousand queries a day. Retrieve or stuff?
+
+   Retrieve. At $3 per million input tokens, stuffing costs $3.00 per query and $30,000 a day. Retrieving four 1,000-token chunks costs $0.012 per query and $120 a day. Prefix caching narrows the gap to about 10x, and only if the corpus is byte-identical across requests and stays inside the cache TTL.
+
+2. Why does the KV cache matter more than compute at long context?
+
+   Prefill compute is linear in the matmuls and quadratic in attention, but it finishes. The KV cache persists for the whole generation. Llama 3 8B with GQA stores 128 KiB per token, so a million-token window needs 128 GiB of cache before weights and activations, on a GPU with 80 GB. Long context is a memory problem first.
+
+3. What did RULER find?
+
+   Hsieh et al. (arXiv:2404.06654) tested thirteen tasks requiring multi-key retrieval, aggregation, and variable tracking rather than string lookup. Effective context length fell far below the claimed maximum for most models, with GPT-4 holding to roughly 64k of a claimed 128k and several open models below 8k of a claimed 32k. Needle-in-a-haystack, which model cards demonstrate, is the easiest task in the suite.
+
+4. How does NoLiMa differ from needle in a haystack?
+
+   It removes the lexical overlap between the needle and the query, forcing latent matching instead of string search. Beyond 32k tokens most tested models dropped below 50% of their own short-context baseline (arXiv:2502.05167). It is the cleaner measurement of whether a model uses a long context or merely stores it.
+
+5. Give two cases where long context genuinely beats retrieval.
+
+   Cross-document synthesis, where the answer depends on connecting material that no single chunk contains, and corpora whose meaning is not local, such as source code, financial tables, and contracts with cross-referenced clauses. Recursive chunking damages all three, and retrieval returns fragments.
+
+6. Give two cases where retrieval is the only option.
+
+   Per-user access control, where metadata filters must exclude unauthorized documents before they enter any context, and corpora that update frequently, where re-embedding changed chunks costs seconds and reloading a million-token window costs a full prefill on every request.
+
+7. What is the standard hybrid pipeline?
+
+   Retrieve a wide candidate set with hybrid search, rerank to the top handful with a cross-encoder or ColBERT, prune within chunks at the sentence level, then let the long window read the survivors together. Retrieval handles scale, reranking handles precision, and the window handles joint reasoning.
+
+8. What is document-level retrieval?
+
+   Retrieve to identify which documents matter, then load the top few in full rather than loading chunks. It preserves internal structure and cross-references while keeping the window bounded, and it is the right answer for code repositories and legal contracts.
+
+9. Once input tokens are cheap, what dominates the bill?
+
+   Output tokens. A pipeline with 4,000 input tokens at $3 per million and a 1,500-token answer at $15 per million costs $0.012 input and $0.0225 output. The answer is the majority of the cost, which shifts the optimization target from context size to answer length.
+
+10. What time to first token should you expect at 200k input tokens?
+
+    Roughly 3 to 10 seconds of prefill on an 8B-class model, before decode and network. That needs a progress indicator rather than a spinner. At 4,000 tokens the same prefill is 50 to 150 ms, which is why retrieval feels interactive and long context does not.

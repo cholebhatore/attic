@@ -1,0 +1,204 @@
+---
+title: Hybrid Search
+description: 'Dense vectors against sparse BM25, the BM25 formula and its two tuning constants, Reciprocal Rank Fusion with a worked example, and learned sparse retrieval.'
+---
+
+Vector search understands that "how do I reset my password" and "credential recovery steps" mean the same thing. It does not understand that `ERR-4032` is a specific string that must appear literally. Lexical search is the opposite. Production retrieval runs both and merges the results, because the failure modes are almost perfectly complementary.
+
+---
+
+## What each side misses
+
+| Query type                         | Dense    | Sparse BM25 | Why                                   |
+| :--------------------------------- | :------- | :---------- | :------------------------------------ |
+| "ways to speed up slow queries"    | Strong   | Weak        | Synonymy and paraphrase               |
+| `ERR-4032`                         | Weak     | Strong      | Rare token, no semantic neighbourhood |
+| "Kubernetes pod OOMKilled"         | Moderate | Strong      | Jargon and exact identifiers          |
+| "what happens when the disk fills" | Strong   | Weak        | No shared vocabulary with the answer  |
+| Product SKU `A19-XL-BLK`           | Weak     | Strong      | Subword tokenization destroys it      |
+| Person or organization name        | Weak     | Strong      | Names carry no compositional meaning  |
+| Cross-lingual query                | Strong   | None        | Multilingual embeddings share a space |
+| Long narrative question            | Strong   | Weak        | Term frequency saturates              |
+
+The rule: **anything that is an identifier, an acronym, a name, or a code must be matchable lexically.** Embeddings compress exactly the surface form those queries depend on.
+
+---
+
+## BM25
+
+The standard sparse scorer (Robertson and Zaragoza, _Foundations and Trends in IR_, 2009). For query terms `q_i` and document `d`:
+
+```text
+score(q, d) = sum_i  IDF(q_i) * f(q_i, d) * (k1 + 1)
+                                 ---------------------------------
+                                 f(q_i, d) + k1 * (1 - b + b * |d| / avgdl)
+
+IDF(q_i) = ln( 1 + (N - n(q_i) + 0.5) / (n(q_i) + 0.5) )
+```
+
+| Symbol     | Meaning                                             |
+| :--------- | :-------------------------------------------------- |
+| `f(q_i,d)` | Count of term `q_i` in document `d`                 |
+| `\|d\|`    | Length of `d` in terms                              |
+| `avgdl`    | Mean document length across the corpus              |
+| `N`        | Total documents                                     |
+| `n(q_i)`   | Documents containing `q_i`                          |
+| `k1`       | Term-frequency saturation, 1.2 to 2.0               |
+| `b`        | Length normalization strength, 0 to 1, default 0.75 |
+
+Two behaviours worth being able to explain:
+
+**Saturation.** As `f` grows the fraction approaches `k1 + 1`, so a term appearing twenty times is not twenty times as relevant as one appearing once. Setting `k1 = 0` removes frequency entirely and BM25 collapses to a sum of IDFs. This is the fix for keyword-stuffed documents.
+
+**Length normalization.** The `b * |d| / avgdl` term penalizes long documents, which have more chances to contain any given term. At `b = 0` there is no penalty. For a RAG corpus of uniform chunks the default 0.75 is fine; for chunks of very uneven length, lower it or normalize chunk size at index time.
+
+IDF is what makes rare terms matter. A term in every document has `n(q_i) = N`, so `IDF = ln(1 + 0.5/(N+0.5))` which is near zero. A term in one document out of a million gives `IDF = ln(1 + 999,999.5/1.5) ~= ln(666,667) ~= 13.4`.
+
+---
+
+## Fusion
+
+Both sides return a ranked list. Merging them is harder than it looks, because a cosine similarity in `[0, 1]` and a BM25 score in `[0, 40]` are not comparable.
+
+### Score fusion
+
+```text
+score(d) = alpha * norm(dense(d)) + (1 - alpha) * norm(sparse(d))
+```
+
+Requires normalizing each list, usually min-max over the returned candidates. Sensitive to outliers: one BM25 score of 38 against a field of 5s compresses everything else to near zero. Convex combination with `alpha` around 0.5 to 0.7 is what Weaviate's `relativeScoreFusion` and Elasticsearch's RRF alternative implement.
+
+### Reciprocal Rank Fusion
+
+Cormack et al., SIGIR 2009. Ignores scores entirely and uses only ranks.
+
+```text
+RRF(d) = sum over rankers r  of   1 / (k + rank_r(d))
+```
+
+with `k = 60` as the published default. The constant damps the influence of the very top ranks so that appearing in several lists beats appearing first in one.
+
+**Worked example.** Five documents, two rankers, `k = 60`.
+
+| Doc | Dense rank | Sparse rank | `1/(60+dense)` | `1/(60+sparse)` | RRF     |
+| :-- | :--------- | :---------- | :------------- | :-------------- | :------ |
+| A   | 1          | 2           | 0.01639        | 0.01613         | 0.03252 |
+| B   | 2          | 4           | 0.01613        | 0.01563         | 0.03175 |
+| C   | 3          | 1           | 0.01587        | 0.01639         | 0.03227 |
+| D   | 4          | absent      | 0.01563        | 0               | 0.01563 |
+| E   | absent     | 3           | 0              | 0.01587         | 0.01587 |
+
+Fused order: **A, C, B, E, D**. C was third in the dense list but first in the sparse one, and RRF promotes it above B, which was second dense and fourth sparse. That is the whole point: a document two independent systems both rank highly beats one that a single system ranks slightly higher.
+
+| Property                      | RRF        | Weighted score fusion      |
+| :---------------------------- | :--------- | :------------------------- |
+| Needs score normalization     | No         | Yes                        |
+| Tunable parameters            | One (`k`)  | At least two               |
+| Handles heterogeneous rankers | Naturally  | Poorly                     |
+| Loses magnitude information   | Yes        | No                         |
+| Default recommendation        | Start here | Tune later if RRF plateaus |
+
+<Callout type="info">
+  ### Candidate set size matters more than the fusion rule
+
+Both rankers should return more than you will use. Asking each for its top 20 and fusing to 10 discards documents that one ranker placed at 25 and the other at 3. Retrieve 50 to 100 per side, fuse, and pass the top 20 to a reranker. The reranker is where precision is won; fusion is where recall is protected.
+
+</Callout>
+
+---
+
+## Learned sparse retrieval
+
+BM25 scores the terms that appear. Learned sparse models also assign weight to terms that do not, which recovers some of what dense retrieval is for while staying in an inverted index.
+
+**SPLADE** (Formal et al., arXiv:2107.05720) passes the text through a masked language model head and produces a weight for every token in the vocabulary, most of them zero. A document about "car repair" can carry weight on "automobile" and "mechanic" without containing either word. Sparsity is enforced with an `L1` or log-saturation penalty so the inverted index stays usable.
+
+**BGE-M3** packs three retrieval modes into one model: dense, learned sparse, and multi-vector ColBERT-style. One forward pass produces all three, which makes hybrid search a single inference call rather than two systems.
+
+| Method            | Index type       | Handles synonyms | Handles exact ids | Extra cost             |
+| :---------------- | :--------------- | :--------------- | :---------------- | :--------------------- |
+| BM25              | Inverted         | No               | Excellent         | None                   |
+| SPLADE            | Inverted         | Partially        | Good              | Training and inference |
+| Dense embeddings  | ANN              | Excellent        | Poor              | Embedding model        |
+| ColBERT           | Multi-vector ANN | Excellent        | Good              | Storage, 50 to 100x    |
+| BGE-M3, all three | All of the above | Excellent        | Good              | One larger model       |
+
+---
+
+## Engine support
+
+| Engine                       | Hybrid mechanism                                               |
+| :--------------------------- | :------------------------------------------------------------- |
+| Elasticsearch/OpenSearch     | `rank_feature`, `hybrid` query, native RRF                     |
+| Weaviate                     | `hybrid` with `alpha`, `relativeScoreFusion` or `rankedFusion` |
+| Qdrant                       | Prefetch with a `FusionQuery` using RRF or DBSF                |
+| Milvus                       | `RRFRanker` and `WeightedRanker` over multiple ANN fields      |
+| Vespa                        | Arbitrary rank profiles; the most flexible                     |
+| `pgvector` plus Postgres FTS | Two queries, fused in application code                         |
+| Pinecone                     | Sparse-dense vectors in one index                              |
+
+`pgvector` plus Postgres full-text search is underrated for small corpora. Two queries in one transaction, `ts_rank_cd` against a `tsvector` column and `<=>` against the embedding, fused with RRF in twenty lines of Python. No second system to operate.
+
+---
+
+## Tuning
+
+| Knob                    | Start      | Direction when recall is low                     |
+| :---------------------- | :--------- | :----------------------------------------------- |
+| Candidates per ranker   | 50         | Raise to 100                                     |
+| RRF `k`                 | 60         | Lower it to sharpen the top ranks                |
+| Dense weight `alpha`    | 0.5 to 0.7 | Raise for narrative corpora, lower for technical |
+| BM25 `k1`               | 1.2        | Lower if documents are keyword-stuffed           |
+| BM25 `b`                | 0.75       | Lower if chunk lengths vary widely               |
+| Chunks to the reranker  | 20         | Raise if the right chunk is present but low      |
+| Final chunks to the LLM | 4 to 8     | Lower if answers cite only the first one         |
+
+Evaluate recall@k of the fused list against labelled data before touching any of these. A pipeline that loses the right chunk at retrieval cannot be fixed by reranking or prompting, and the fix is almost always on the sparse side.
+
+---
+
+## Interview questions
+
+1. Why run dense and sparse retrieval together?
+
+   Their failure modes are complementary. Dense embeddings handle synonymy, paraphrase, and cross-lingual queries but compress away exact surface forms. BM25 matches identifiers, error codes, acronyms, product SKUs, and names exactly but cannot bridge vocabulary. Any query containing an identifier must be matchable lexically.
+
+2. Write the BM25 scoring function and name its two constants.
+
+   `score = sum_i IDF(q_i) * f(q_i,d) * (k1+1) / (f(q_i,d) + k1*(1 - b + b*|d|/avgdl))`, with `IDF(q_i) = ln(1 + (N - n(q_i) + 0.5)/(n(q_i) + 0.5))`. `k1`, typically 1.2 to 2.0, controls term-frequency saturation. `b`, default 0.75, controls document-length normalization.
+
+3. What does setting `k1 = 0` do?
+
+   It removes term frequency entirely, so the score becomes a plain sum of IDFs over the matched query terms. A document mentioning a term twenty times scores the same as one mentioning it once. This is the fix for keyword-stuffed corpora.
+
+4. What does `b = 0` do and when would you use it?
+
+   It removes length normalization, so long documents are no longer penalized for having more chances to contain a term. Use it when chunks are already uniform in length, which is the common case in a RAG corpus with fixed-size chunking.
+
+5. Why is IDF the term that makes rare words matter?
+
+   `IDF(q_i) = ln(1 + (N - n(q_i) + 0.5)/(n(q_i) + 0.5))`. A term appearing in every document gives a value near zero; a term appearing in one document out of a million gives about 13.4. BM25 is essentially a weighted overlap count where the weights are inverse document frequency.
+
+6. What is Reciprocal Rank Fusion and why use it over score fusion?
+
+   `RRF(d) = sum_r 1/(k + rank_r(d))` with `k = 60`. It uses ranks only, so it needs no score normalization and works across heterogeneous rankers whose scores are not comparable. Score fusion requires min-max normalizing each list and is sensitive to a single outlier compressing everything else.
+
+7. Why is `k = 60` in RRF rather than `k = 0`?
+
+   The constant damps the influence of the very top ranks. At `k = 0` a document ranked first gets an infinite-ish score and fusion degenerates to picking one ranker's winner. At 60, appearing highly in two lists beats appearing first in one, which is the property you want from fusion.
+
+8. In the worked example, why does C outrank B?
+
+   C is third dense and first sparse, giving `0.01587 + 0.01639 = 0.03227`. B is second dense and fourth sparse, giving `0.01613 + 0.01563 = 0.03175`. Two independent rankers agreeing on C outweighs one ranker slightly preferring B.
+
+9. What is SPLADE?
+
+   A learned sparse model (Formal et al., arXiv:2107.05720) that passes text through a masked language model head and emits a weight for every vocabulary token, most of them zero. A document about car repair can carry weight on "automobile" without containing the word. An `L1` or log-saturation penalty keeps the index sparse enough for an inverted index.
+
+10. What does BGE-M3 offer?
+
+    Dense, learned sparse, and multi-vector ColBERT-style retrieval from one model and one forward pass. That collapses a hybrid pipeline from two systems into one inference call, at the cost of a larger model and a more complex index.
+
+11. How many candidates should each ranker return?
+
+    More than you will use, typically 50 to 100 per side. Asking each for its top 20 and fusing to 10 discards documents ranked 25 by one system and 3 by the other. Fuse wide, then pass the top 20 to a reranker, which is where precision is won.

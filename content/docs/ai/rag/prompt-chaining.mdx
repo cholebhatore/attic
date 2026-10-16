@@ -1,0 +1,211 @@
+---
+title: Prompt Chaining
+description: 'Decomposing one prompt into sequential steps, the five workflow patterns, and the cascading-error arithmetic that decides how long a chain can be.'
+---
+
+One prompt doing five jobs is hard to debug: when the output is wrong you cannot tell which job failed. Five prompts doing one job each are individually testable, individually cacheable, and individually replaceable with a cheaper model. That is prompt chaining.
+
+The trade is error propagation. A chain is only as reliable as the product of its steps, and that product falls fast. Most of the engineering in a chained system is about keeping the product high.
+
+---
+
+## When to chain
+
+| Signal that chaining helps             | Signal that it hurts                       |
+| :------------------------------------- | :----------------------------------------- |
+| The task has clearly separable stages  | The stages need each other's full context  |
+| Intermediate output is verifiable      | Intermediate output is free-form prose     |
+| Different stages need different models | Latency budget is under about 2 seconds    |
+| You need per-stage metrics             | The single prompt already scores above 95% |
+| Some stages can run in parallel        | The chain is longer than about 5 steps     |
+
+Anthropic's _Building Effective Agents_ (December 2024) makes the argument plainly: use the simplest thing that works, and add a step only when the simpler version demonstrably fails. Frameworks that force every task into a graph produce systems that are slower, costlier, and harder to reason about than one well-written prompt.
+
+---
+
+## The five workflow patterns
+
+| Pattern              | Structure                                             | Use when                                          |
+| :------------------- | :---------------------------------------------------- | :------------------------------------------------ |
+| Prompt chaining      | A then B then C, sequential                           | The task decomposes into fixed ordered stages     |
+| Routing              | Classify, then dispatch to one specialized prompt     | Distinct input categories need different handling |
+| Parallelization      | Fan out to N workers, aggregate                       | Subtasks are independent, or you want votes       |
+| Orchestrator-workers | A planner decomposes, then spawns workers dynamically | The decomposition is not known in advance         |
+| Evaluator-optimizer  | Generator plus critic, loop until the critic passes   | There is a clear quality bar and room to iterate  |
+
+Parallelization splits two ways. **Sectioning** divides the work, for example summarizing ten documents by summarizing each and then merging. **Voting** runs the same prompt N times and aggregates, which is self-consistency applied to any task rather than only to math.
+
+Evaluator-optimizer is the only pattern that improves accuracy without adding a stage. It is also the most expensive, because every iteration is a full generation.
+
+---
+
+## Cascading error propagation
+
+If each step succeeds with probability `p` and the steps are independent, an `n`-step chain succeeds with probability `p^n`.
+
+| Per-step accuracy | 2 steps | 3 steps | 5 steps | 8 steps |
+| :---------------- | :------ | :------ | :------ | :------ |
+| 0.80              | 64%     | 51%     | 33%     | 17%     |
+| 0.90              | 81%     | 73%     | 59%     | 43%     |
+| 0.95              | 90%     | 86%     | 77%     | 66%     |
+| 0.99              | 98%     | 97%     | 95%     | 92%     |
+
+Three consequences worth stating in an interview:
+
+- **Depth is the enemy.** Going from three steps to five at 90% per step costs 14 points of end-to-end accuracy. Every added stage must earn more than it costs.
+- **The weakest step dominates.** A chain of four 98% steps and one 70% step is 65%, not 90%. Find the weak step and fix or remove it before adding anything.
+- **Errors are not independent.** A bad extraction in step one produces a confidently wrong input to step two, which then reasons correctly about a wrong premise. Correlated failure makes the real numbers worse than `p^n` suggests.
+
+<Callout type="info">
+  ### The independence assumption is the optimistic case
+
+`p^n` assumes each step's error is unrelated to the others. In practice a retrieval step that returns the wrong document makes the summarization step wrong too, and no amount of downstream quality recovers it. This is why validation gates between steps matter more than better prompts within steps.
+
+</Callout>
+
+---
+
+## Mitigations
+
+| Technique                      | What it does                                                  | Cost                  |
+| :----------------------------- | :------------------------------------------------------------ | :-------------------- |
+| Validation gate                | Schema-check or rule-check the intermediate output, fail fast | One cheap call        |
+| Retry with feedback            | Re-run the failed step with the validation error appended     | Up to 2x on that step |
+| Structured intermediate format | Forces the output into a shape that can be checked            | None                  |
+| Reduce depth                   | Merge steps whose separation is not earning its keep          | Harder debugging      |
+| Vote and select                | Run a step N times, keep the majority or best-scored          | N times that step     |
+| Weakest-step upgrade           | Use a stronger model for the one stage that dominates         | Money, not latency    |
+| Escape hatch                   | Let a step return "cannot determine" and route to a human     | Process change        |
+
+The validation gate is the highest-value one. A step that outputs `{"entities": [...], "confidence": 0.0}` can be checked for free; a step that outputs a paragraph cannot. Design intermediate formats to be machine-checkable even when the final output is prose.
+
+---
+
+## Cost and latency
+
+| Property           | One big prompt                | Five-step chain                         |
+| :----------------- | :---------------------------- | :-------------------------------------- |
+| Calls              | 1                             | 5                                       |
+| Input tokens       | Paid once                     | Paid five times, each smaller           |
+| Output tokens      | Paid once                     | Paid five times, intermediates included |
+| Wall-clock latency | One generation                | Sum of five, unless parallel            |
+| Cache reuse        | High, if the prefix is stable | Low across steps, high within a step    |
+| Debuggability      | Poor                          | Per-stage metrics                       |
+
+The token arithmetic usually favours chaining less than people expect. Each step re-reads the accumulated context, so a five-step chain on a 4,000-token document can consume more input tokens than a single prompt with the same document plus 4,000 tokens of instructions. The win is accuracy and observability, not price.
+
+Latency is the harder constraint. Five sequential calls at 1.5 s each is 7.5 s, which is past the patience threshold for most interactive products. Parallelize what can be parallelized, stream what can be streamed, and keep interactive chains to two or three steps.
+
+---
+
+## A chained RAG pipeline
+
+```python
+from pydantic import BaseModel, Field
+
+
+class QueryPlan(BaseModel):
+    rewritten: str = Field(description="The query, rephrased for retrieval")
+    filters: dict = Field(default_factory=dict, description="Metadata filters")
+    needs_retrieval: bool = True
+
+
+class RetrievedChunk(BaseModel):
+    text: str
+    source: str
+    score: float
+
+
+class Answer(BaseModel):
+    text: str
+    citations: list[str] = Field(default_factory=list)
+    grounded: bool = Field(description="False if the context did not support an answer")
+
+
+def step_plan(query: str, history: list[str]) -> QueryPlan:
+    """Step 1: cheap model, structured output, validation gate on the schema."""
+    return client.beta.chat.completions.parse(
+        model="gpt-4.1-mini",
+        messages=[{"role": "user", "content": PLAN_PROMPT.format(query=query, history=history)}],
+        response_format=QueryPlan,
+    ).choices[0].message.parsed                              # QueryPlan or raises
+
+
+def step_retrieve(plan: QueryPlan) -> list[RetrievedChunk]:
+    """Step 2: no model. Deterministic, and where most quality is won or lost."""
+    hits = index.hybrid_search(plan.rewritten, filter=plan.filters, k=20)
+    return rerank(plan.rewritten, hits, top_n=5)
+
+
+def step_grounded(chunks: list[RetrievedChunk]) -> bool:
+    """Step 3: validation gate. Blocks the chain before it can hallucinate."""
+    if not chunks:
+        return False
+    return max(c.score for c in chunks) > 0.35
+
+
+def step_answer(query: str, chunks: list[RetrievedChunk]) -> Answer:
+    """Step 4: strong model, short context, citation contract."""
+    context = "\n\n".join(f"[{c.source}]\n{c.text}" for c in chunks)
+    return client.beta.chat.completions.parse(
+        model="gpt-4.1",
+        messages=[{"role": "user", "content": ANSWER_PROMPT.format(query=query, context=context)}],
+        response_format=Answer,
+    ).choices[0].message.parsed
+
+
+def run(query: str, history: list[str]) -> Answer:
+    plan = step_plan(query, history)
+    if not plan.needs_retrieval:
+        return Answer(text=direct_answer(query, history), citations=[], grounded=True)
+    chunks = step_retrieve(plan)
+    if not step_grounded(chunks):
+        return Answer(text="I could not find that in the available documents.", citations=[], grounded=False)
+    return step_answer(query, chunks)
+```
+
+Four steps, two of which call a model. `step_retrieve` is deterministic and `step_grounded` is a threshold, so the chain has one expensive generation and one cheap one. The `grounded=False` escape hatch is what prevents the most common production failure: a fluent answer to a question the corpus does not answer.
+
+---
+
+## Interview questions
+
+1. What is prompt chaining and when should you use it?
+
+   Decomposing one monolithic prompt into a sequence of single-job steps. Use it when the task has clearly separable stages, the intermediate output is verifiable, and different stages want different models. Avoid it when the stages need each other's full context, when the latency budget is under about two seconds, or when a single prompt already scores above 95%.
+
+2. Name the five agentic workflow patterns from Anthropic's Building Effective Agents.
+
+   Prompt chaining, routing, parallelization, orchestrator-workers, and evaluator-optimizer. Parallelization splits into sectioning, which divides the work, and voting, which repeats it and aggregates.
+
+3. What is cascading error propagation and how do you quantify it?
+
+   Each step's failure probability multiplies. With independent steps at accuracy `p`, an `n`-step chain succeeds with probability `p^n`. At 90% per step, three steps give 73% and five give 59%. Independence is the optimistic assumption, since an early extraction error makes every downstream step confidently wrong about a bad premise.
+
+4. Why does the weakest step dominate a chain?
+
+   Because the product is multiplicative. Four steps at 98% plus one at 70% gives 65% end to end, not the 90% an average would suggest. The correct response is to find and fix or remove the weak step before adding any new stage.
+
+5. What is a validation gate and why is it the highest-value mitigation?
+
+   A check between steps that schema-validates or rule-checks the intermediate output and fails fast rather than passing garbage downstream. It works because a structured intermediate can be checked for free, while prose cannot. Designing intermediate formats to be machine-checkable matters more than improving the prompt inside a step.
+
+6. Does chaining save tokens?
+
+   Usually not. Each step re-reads the accumulated context, so five steps over a 4,000-token document can consume more input tokens than one prompt with the same document plus instructions. The win is accuracy and per-stage observability, not cost.
+
+7. How does chaining affect latency, and what do you do about it?
+
+   Sequential calls add up: five at 1.5 s is 7.5 s, past the patience threshold for interactive products. Parallelize independent stages, stream partial output, use a small model for planning and extraction, and keep interactive chains to two or three steps.
+
+8. What is the difference between routing and orchestrator-workers?
+
+   Routing classifies the input and dispatches to one of a fixed set of specialized prompts, so the branches are known in advance. Orchestrator-workers has a planner decompose the task and spawn workers dynamically, so the branches depend on the input. Routing is cheaper and predictable; orchestrator-workers handles tasks you cannot enumerate.
+
+9. What is evaluator-optimizer and when is it worth the cost?
+
+   A generator produces output, a critic scores it against an explicit rubric, and the loop repeats until the critic passes or a budget runs out. It is the only pattern that raises accuracy without adding a pipeline stage, and it costs a full generation per iteration. Worth it when there is a clear quality bar, such as translation or code with tests, and latency is not interactive.
+
+10. In the pipeline above, what stops a fluent hallucination?
+
+    Two things. `step_grounded` blocks the chain when no chunk clears the score threshold, and the `Answer` schema carries a `grounded` boolean the model must set to false when the context does not support an answer. Both routes return an explicit "not found" rather than a generated guess, which is the failure mode users tolerate least.

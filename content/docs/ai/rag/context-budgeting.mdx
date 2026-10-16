@@ -1,0 +1,182 @@
+---
+title: Context Budgeting
+description: 'Ordering the window for prompt cache hits, fighting lost in the middle, and three compaction strategies: summarization, pruning, and memory tiers.'
+---
+
+A context window is a budget with three simultaneous constraints: tokens, attention, and money. Ordering decides the money. Placement decides the attention. Compaction decides whether the tokens fit at all.
+
+The three interact. Moving a retrieved chunk to the front to fight lost-in-the-middle can break a cache prefix and multiply the input price. Knowing which constraint is binding is the actual skill.
+
+---
+
+## Ordering for prompt caching
+
+Providers cache the longest matching prefix of the input and charge a fraction of the base rate for the cached portion. A cache hit requires byte-identical tokens from position zero up to the break, so anything volatile placed early invalidates everything after it.
+
+```text
+cacheable prefix ----------------------------> volatile tail
+system | tools | memory | few-shot | chunks | history | query
+```
+
+| Segment          | Volatility | Cached?   | Notes                                          |
+| :--------------- | :--------- | :-------- | :--------------------------------------------- |
+| System prompt    | Never      | Yes       | Put policies here, not in the query            |
+| Tool schemas     | Never      | Yes       | Serialize deterministically; key order matters |
+| Few-shot pool    | Rarely     | Yes       | Fixed examples, not query-selected ones        |
+| Long-term memory | Per user   | Partially | Stable within a session if you append only     |
+| Retrieved chunks | Per query  | No        | Everything after this point misses             |
+| History          | Per turn   | No        | Append-only growth helps the prefix above it   |
+| Query            | Per turn   | No        | Always last                                    |
+
+Two rules follow directly. Query-selected few-shot examples are a real accuracy lever but they sit before the chunks, so they destroy the cache for everything downstream; put them after the chunks if you use them. And tool schemas must serialize identically every call, which means stable key ordering and no embedded timestamps or request ids.
+
+### What caching pays
+
+| Provider      | Cache write      | Cache read        | Minimum length | TTL                             |
+| :------------ | :--------------- | :---------------- | :------------- | :------------------------------ |
+| Anthropic     | 1.25x base input | 0.1x base input   | 1,024 tokens   | 5 min, or 1 h at 2x write       |
+| OpenAI        | No surcharge     | 0.1x to 0.5x base | 1,024 tokens   | Minutes to hours, best effort   |
+| Google Gemini | 1.25x base input | 0.25x base input  | 1,024 to 4,096 | Configurable, billed while held |
+
+Anthropic requires explicit `cache_control` breakpoints, up to four per request, and refreshes the 5-minute TTL on every hit. OpenAI caches automatically with no markup. A 6,000-token stable prefix on a model charging $3 per million input tokens costs $0.018 uncached and $0.0018 on a read, which over a million requests is $16,200 saved.
+
+<Callout type="info">
+  ### Cache the prefix, not the whole request
+
+The common mistake is putting the retrieved chunks before the conversation history because chunks feel more important. Chunks change every turn, so nothing after them ever caches. History grows by appending, so the prefix up to the last turn still matches. Order by volatility, not by importance, and use placement within the tail to express importance.
+
+</Callout>
+
+---
+
+## Fighting lost in the middle
+
+Liu et al. (arXiv:2307.03172) measured accuracy as a function of where the relevant passage sits. The curve is U-shaped: strong at the start, strong at the end, and down by 20 points or more in the middle. The effect shows up in multi-document QA and key-value retrieval, and it persists across model families.
+
+Placement rules that follow:
+
+| What                             | Where                            | Why                                      |
+| :------------------------------- | :------------------------------- | :--------------------------------------- |
+| Core system instructions         | Very first                       | Primacy, and it caches                   |
+| Output contract and format rules | Very last, just before the query | Recency, closest to generation           |
+| Top-ranked retrieved chunk       | First among the chunks           | Primacy within the retrieved block       |
+| Second-ranked chunk              | Last among the chunks            | Recency within the retrieved block       |
+| Middle-ranked chunks             | Middle                           | They are the ones you can afford to lose |
+| Distractors                      | Nowhere                          | Prune rather than position               |
+
+Reranking to `top_n = 5` and then ordering those five as ranks 1, 3, 5, 4, 2 exploits both ends. This is a small win and it is free, but pruning from twenty chunks to four is a larger one.
+
+---
+
+## Compaction
+
+Three strategies, usually combined.
+
+### Recursive summarization
+
+Summarize the oldest turns into a running summary, then summarize the summary when it grows.
+
+```text
+turns 1-20    ->  summary_1     (400 tokens from 3,000)
+turns 21-40   ->  summary_2     (400 tokens from 3,100)
+summary_1 + summary_2 + turns 41-52 -> summary_3 + recent turns
+```
+
+| Property          | Value                                        |
+| :---------------- | :------------------------------------------- |
+| Compression ratio | 5x to 10x on conversational text             |
+| Cost              | One extra model call per compaction event    |
+| Loss              | Exact wording, numbers, and entity spelling  |
+| Failure mode      | A wrong fact in the summary persists forever |
+
+The failure mode is the reason to keep structured state alongside prose summaries. A summary that says "the user prefers option B" is unrecoverable if the user said C. Anything load-bearing, such as ids, amounts, and decisions, belongs in a structured object that is rewritten rather than summarized.
+
+### Token pruning
+
+Drop low-value content without summarizing it.
+
+| Target                        | Method                                             |
+| :---------------------------- | :------------------------------------------------- |
+| Tool output                   | Truncate to head and tail, or extract fields first |
+| Retrieved chunks              | Keep only sentences that match the query           |
+| HTML and markdown boilerplate | Strip tags, navigation, footers before embedding   |
+| Repeated content              | Semantic deduplication before insertion            |
+| Old turns                     | Keep the last N verbatim, drop the rest entirely   |
+
+Sentence-level pruning of retrieved chunks is the highest-yield version. A 800-token chunk where two sentences answer the question can usually be cut to 150 tokens with no loss, which is a 5x increase in how many chunks fit.
+
+### Memory tiers
+
+| Tier       | Location                        | Latency      | Lifetime       | Content                              |
+| :--------- | :------------------------------ | :----------- | :------------- | :----------------------------------- |
+| Working    | The context window              | None         | One turn       | Query, current chunks, recent turns  |
+| Session    | A summary object in cache       | None         | The session    | Compacted history, scratchpad        |
+| Episodic   | Key-value or document store     | Milliseconds | Days to months | Past interactions, outcomes          |
+| Semantic   | Vector store or knowledge graph | Tens of ms   | Indefinite     | Facts, preferences, entity relations |
+| Procedural | Files or a database             | Milliseconds | Indefinite     | Skills, playbooks, learned rules     |
+
+Only the working tier costs attention. The design question is what gets promoted into it and when, which is a retrieval problem rather than a storage one.
+
+---
+
+## A worked budget
+
+A coding agent on a 200,000-token window, mid-session.
+
+| Segment                 | Tokens     | Cached    | Notes                          |
+| :---------------------- | :--------- | :-------- | :----------------------------- |
+| System prompt           | 2,400      | Yes       | Stable across all sessions     |
+| Tool schemas (11 tools) | 4,100      | Yes       | Largest fixed cost             |
+| Project memory          | 1,800      | Yes       | Appended only                  |
+| Session summary         | 2,200      | Partial   | Rewritten every 20 turns       |
+| Retrieved code chunks   | 14,000     | No        | 8 files, sentence-pruned       |
+| Recent turns (verbatim) | 9,500      | No        | Last 6 turns                   |
+| Current query           | 180        | No        | Includes the diff under review |
+| **Total input**         | **34,180** | **8,300** | 17% of the window, 24% cached  |
+| Reserved for output     | 32,000     | —         | Reasoning plus the patch       |
+
+The trigger for compaction is not the window limit. It is a policy threshold, commonly 50% to 70% of the window, because latency grows superlinearly with input length and the lost-in-the-middle penalty grows with the number of competing segments. Waiting until 190,000 tokens means every turn is slow and every answer is degraded.
+
+---
+
+## Interview questions
+
+1. Why does context ordering affect cost?
+
+   Providers cache the longest byte-identical prefix of the input and charge a fraction of the base rate for the cached tokens. Anything volatile placed early invalidates the cache for everything after it, so ordering segments from most stable to most fresh is what makes caching possible at all.
+
+2. Give the stable-to-fresh ordering.
+
+   System prompt, tool schemas, fixed few-shot examples, long-term memory, retrieved chunks, conversation history, then the query. Chunks change every turn, so they must come after everything you want cached.
+
+3. What are Anthropic's cache economics?
+
+   A cache write costs 1.25x the base input price for a five-minute TTL, or 2x for one hour. A cache read costs 0.1x. The minimum cacheable prefix is 1,024 tokens, the TTL refreshes on each hit, and you place up to four explicit `cache_control` breakpoints.
+
+4. Why do query-selected few-shot examples hurt?
+
+   They change per request but sit early in the window, before the retrieved chunks. That breaks the cache prefix for everything downstream. Fixed examples cache; dynamic ones should be placed after the chunks or dropped.
+
+5. What is lost in the middle and what placement does it imply?
+
+   Liu et al. (arXiv:2307.03172) found a U-shaped accuracy curve over the position of the relevant passage, with a drop of 20 points or more in the middle. Put core instructions first, the output contract last, the top-ranked chunk first among the chunks, and the second-ranked last among them.
+
+6. If your reranker returns five chunks, in what order do you place them?
+
+   Ranks 1, 3, 5, 4, 2. That puts the two best at the two ends of the retrieved block and buries the weakest in the middle. It is a small free win, and pruning from twenty chunks to five is a larger one.
+
+7. What is recursive summarization and what is its failure mode?
+
+   Summarizing the oldest turns into a running summary, then summarizing that summary as it grows. It achieves 5x to 10x compression at the cost of one extra call per compaction. The failure mode is a wrong fact entering the summary and persisting indefinitely, which is why load-bearing values like ids, amounts, and decisions belong in a structured object that is rewritten rather than summarized.
+
+8. What is the highest-yield form of token pruning?
+
+   Sentence-level pruning of retrieved chunks. An 800-token chunk where two sentences answer the question can usually be cut to 150 tokens with no loss, which multiplies how many distinct chunks fit in the same budget.
+
+9. Name the five memory tiers.
+
+   Working memory in the context window, session memory as a summary object, episodic memory in a key-value store, semantic memory in a vector store or knowledge graph, and procedural memory as files or learned rules. Only the working tier costs attention; the design question is what gets promoted into it.
+
+10. When should compaction trigger?
+
+    At a policy threshold, commonly 50% to 70% of the window, not at the limit. Latency grows superlinearly with input length and the positional penalty grows with the number of competing segments, so waiting until the window is nearly full means every recent turn was already slow and degraded.

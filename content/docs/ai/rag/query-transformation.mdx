@@ -1,0 +1,220 @@
+---
+title: Query Transformation
+description: 'HyDE, query decomposition, step-back prompting, multi-query retrieval, and routing: turning a user question into the query your index can answer.'
+---
+
+Users do not write retrieval queries. They write "why did it break again", "compare the two options", and "what's the limit". These are short, anaphoric, multi-part, and phrased nothing like the documents they should match.
+
+Query transformation is the stage that turns one into the other. It costs an extra LLM call and usually returns more than any index change you could make, because a perfect retriever pointed at the wrong query returns the wrong documents perfectly.
+
+---
+
+## The five techniques
+
+| Technique     | Transformation                                      | Extra calls | Best when                                          |
+| :------------ | :-------------------------------------------------- | :---------- | :------------------------------------------------- |
+| Rewriting     | Resolve pronouns, expand abbreviations, formalize   | 1, small    | Conversational follow-ups                          |
+| Multi-query   | Generate `N` paraphrases, retrieve each, fuse       | 1           | Ambiguous phrasing, unknown corpus vocabulary      |
+| HyDE          | Generate a hypothetical answer, embed that          | 1           | Zero-shot, no relevance labels, conceptual queries |
+| Decomposition | Split a multi-part question into sub-queries        | 1 plus k    | Comparison, multi-hop, compound questions          |
+| Step-back     | Abstract to the underlying principle, retrieve both | 1           | Specific instances of a general rule               |
+
+Routing is orthogonal: classify the query and dispatch it to a different index, a different tool, or no retrieval at all.
+
+---
+
+## Rewriting
+
+The cheapest and most consistently useful one, especially in a chat product.
+
+```text
+history: "we use the managed Postgres on AWS"
+query  : "what's the connection limit?"
+rewrite: "What is the maximum number of client connections for Amazon RDS for PostgreSQL?"
+```
+
+Two jobs: **anaphora resolution**, replacing "it" and "that" with the entity from history, and **vocabulary alignment**, swapping the user's phrasing for the corpus's. The second requires knowing the corpus, so a good rewriter is prompted with the domain, the index description, and a few examples of real queries that worked.
+
+Do not let the rewriter answer the question. It should restate it. A rewrite that adds facts the user did not supply will retrieve documents matching those invented facts.
+
+---
+
+## Multi-query retrieval
+
+Generate several paraphrases, retrieve for each, and fuse the result lists with RRF.
+
+```python
+def multi_query_retrieve(query: str, index, n: int = 4, per_query: int = 20, top: int = 10):
+    variants = generate_variants(query, n)                 # one small-model call
+    lists = [index.hybrid_search(v, k=per_query) for v in [query] + variants]
+
+    scores: dict[str, float] = {}
+    k = 60
+    for ranked in lists:
+        for rank, hit in enumerate(ranked, start=1):
+            scores[hit.id] = scores.get(hit.id, 0.0) + 1.0 / (k + rank)
+
+    ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:top]
+    return [index.fetch(doc_id) for doc_id, _ in ordered]
+```
+
+This is the mechanism behind RAG-Fusion. It works because a single embedding of a single phrasing lands at one point in the space, and the correct chunk may be nearest to a differently-worded point. Four paraphrases cover four regions.
+
+The cost is `n + 1` retrieval round trips. At 20 ms each that is fine; at 200 ms each on a large index it dominates the latency budget. Generate variants with the smallest model that can do it, in one call, and batch the retrievals.
+
+---
+
+## HyDE
+
+Hypothetical Document Embeddings (Gao et al., arXiv:2212.10496) invert the direction. Instead of trying to make the query look like a document, generate the document.
+
+```text
+prompt: Write a passage that would answer the question: {query}
+
+hypothetical document -> embed -> ANN search -> real documents
+```
+
+The reasoning is distributional. Your index contains documents, so document-shaped text lands in a dense, well-populated region of the embedding space. A five-word question lands in a sparse region far from everything. The hypothetical answer, even if factually wrong, is in the right neighbourhood, and the correct document is near it.
+
+The paper reports zero-shot dense retrieval without any relevance labels beating zero-shot baselines across web search, news, question answering, and fact verification.
+
+| Property           | Query embedding     | HyDE                             |
+| :----------------- | :------------------ | :------------------------------- |
+| Extra LLM call     | No                  | Yes                              |
+| Added latency      | None                | 300 ms to 2 s                    |
+| Distribution match | Poor                | Good                             |
+| Fails when         | Vocabulary mismatch | The model cannot guess the topic |
+
+The failure mode is specific and worth naming. If the model has no knowledge of the domain, the hypothetical document invents plausible-sounding specifics, and those specifics drive retrieval toward documents that share the invented terms. HyDE is strong on general conceptual queries and weak on proprietary internal systems where the model has never seen the vocabulary.
+
+**Query2doc** (Wang et al., arXiv:2303.07678) is the sparse-side analogue: generate a pseudo-document and concatenate it with the original query before BM25. It improves lexical matching without replacing the query, and it is more forgiving than HyDE because the original terms are still present.
+
+---
+
+## Decomposition
+
+A compound question has no single nearest neighbour. Split it.
+
+```text
+query    : "How do the latency and cost of Pinecone compare with pgvector at 10M vectors?"
+sub-1    : "What is query latency for Pinecone at 10 million vectors?"
+sub-2    : "What is query latency for pgvector at 10 million vectors?"
+sub-3    : "What does Pinecone charge for a 10 million vector index?"
+sub-4    : "What does hosting pgvector at 10 million vectors cost?"
+compose  : retrieve for each, assemble one context, answer the original
+```
+
+| Variant                | Structure                                                                       | Source                           |
+| :--------------------- | :------------------------------------------------------------------------------ | :------------------------------- |
+| Parallel decomposition | Split once, retrieve all sub-queries concurrently                               | —                                |
+| Least-to-most          | Solve the easiest sub-question first, feed the answer into the next             | Zhou et al., arXiv:2205.10625    |
+| Self-Ask               | The model asks itself follow-up questions and answers them in turn              | Press et al., arXiv:2210.03350   |
+| IRCoT                  | Interleave retrieval and chain-of-thought, retrieving after each reasoning step | Trivedi et al., arXiv:2212.10509 |
+
+IRCoT is the one that handles genuine multi-hop questions, where the answer to the first sub-query determines what the second should ask. It reports large gains on multi-hop QA over single-shot retrieval, at the cost of several sequential LLM calls.
+
+The failure mode of naive decomposition is that sub-answers get composed without checking that they answer the original question. Keep the original query in the composition prompt.
+
+---
+
+## Step-back prompting
+
+Zheng et al., arXiv:2310.06117. Abstract the specific question to the general principle behind it, then retrieve on both.
+
+```text
+specific : "A 3.2 kg object slides down a 30 degree frictionless incline. What is its acceleration?"
+step back: "What is the formula for acceleration of an object on a frictionless inclined plane?"
+```
+
+The specific query embeds near other problems with the same numbers and the same wording. The abstracted query embeds near the derivation, which is what answers it. Retrieving with both and merging gives the model the principle and the worked example.
+
+The paper reports gains on high-school-level reasoning benchmarks, particularly MMLU physics and TimeQA, where the answer requires a fact or rule the specific phrasing does not name.
+
+It generalizes beyond physics. "What is the retry limit for the ingest worker in production?" steps back to "What are the retry and backoff settings for the ingest pipeline?" which is the sentence a runbook contains.
+
+---
+
+## Routing
+
+Not every query needs the same treatment, or any retrieval at all.
+
+```text
+                        +--> greeting / small talk      -> no retrieval
+                        |
+query -> classifier ----+--> factual lookup             -> dense + sparse, rerank
+                        |
+                        +--> comparison / multi-part    -> decompose, then retrieve
+                        |
+                        +--> aggregation over the corpus -> GraphRAG global search
+                        |
+                        +--> structured data            -> Text-to-SQL, no vectors
+                        |
+                        +--> actionable request         -> tool call, no retrieval
+```
+
+A small fine-tuned classifier, or a single structured-output LLM call, costs a few milliseconds to a few hundred and saves a full retrieval on the queries that do not need one. It is also where per-source permissions get enforced, since a router can refuse a source the user cannot access before any search runs.
+
+---
+
+## Choosing
+
+| Symptom                                              | Try                        |
+| :--------------------------------------------------- | :------------------------- |
+| Follow-up questions in a chat fail                   | Rewriting with history     |
+| Right documents exist but do not surface             | Multi-query plus RRF       |
+| No labelled data, new domain, conceptual questions   | HyDE or Query2doc          |
+| Comparison and compound questions                    | Decomposition              |
+| Specific instances of a documented rule              | Step-back                  |
+| Multi-hop, where the second hop depends on the first | IRCoT                      |
+| Some queries waste a retrieval entirely              | Routing                    |
+| Everything, and you have budget for one change       | Rewriting plus multi-query |
+
+Stacking all of them is a real pattern and a real latency problem. Four techniques at 400 ms each is 1.6 s before the first retrieval starts. Measure each one's marginal gain on your own eval set and keep only what earns its latency.
+
+---
+
+## Interview questions
+
+1. Why transform the query at all?
+
+   Users write short, anaphoric, multi-part questions phrased unlike the corpus, and a perfect retriever pointed at the wrong query returns the wrong documents perfectly. Transformation costs one small LLM call and typically returns more than any index change.
+
+2. What are the two jobs of query rewriting?
+
+   Anaphora resolution, replacing "it" and "that" with the entity from conversation history, and vocabulary alignment, swapping the user's phrasing for the corpus's. The rewriter must restate the question rather than answer it, since invented facts drive retrieval toward documents matching those facts.
+
+3. How does multi-query retrieval work and what does it cost?
+
+   Generate several paraphrases, retrieve for each, and fuse the lists with RRF. It works because one phrasing lands at one point in the embedding space and the correct chunk may be nearest a differently-worded point. The cost is `n + 1` retrieval round trips, so generate variants in one small-model call and batch the searches.
+
+4. Explain HyDE and why it works.
+
+   Hypothetical Document Embeddings (Gao et al., arXiv:2212.10496) prompt an LLM to write a passage that would answer the query, then embed that passage instead of the query. The index contains documents, so document-shaped text lands in a dense region of the embedding space while a five-word question lands in a sparse one. It reports zero-shot dense retrieval without relevance labels beating zero-shot baselines.
+
+5. When does HyDE fail?
+
+   When the model has no knowledge of the domain. The hypothetical document then invents plausible specifics, and those specifics steer retrieval toward documents sharing the invented terms. It is strong on general conceptual queries and weak on proprietary internal vocabularies.
+
+6. How does Query2doc differ from HyDE?
+
+   It generates a pseudo-document and concatenates it with the original query for BM25 rather than replacing the query for dense search (Wang et al., arXiv:2303.07678). Keeping the original terms makes it more reliable, since a bad generation adds noise instead of removing signal.
+
+7. What is query decomposition and when is it required?
+
+   Splitting a compound question into sub-queries, retrieving each, and composing one context. It is required for comparisons and multi-hop questions, which have no single nearest neighbour. Keep the original query in the composition prompt so the sub-answers are checked against what was asked.
+
+8. What is the difference between least-to-most prompting and IRCoT?
+
+   Least-to-most (Zhou et al., arXiv:2205.10625) orders sub-questions by difficulty and feeds each answer into the next, but the sub-questions are all known upfront. IRCoT (Trivedi et al., arXiv:2212.10509) interleaves retrieval and reasoning, deciding the next step from what the previous retrieval returned, which is what genuine multi-hop needs.
+
+9. What is step-back prompting?
+
+   Abstracting a specific question to the general principle behind it and retrieving on both (Zheng et al., arXiv:2310.06117). A specific physics problem embeds near other problems with the same numbers; the abstracted version embeds near the derivation that answers it. Reports gains on MMLU physics and TimeQA.
+
+10. What is query routing and why is it worth the extra call?
+
+    Classifying the query and dispatching it to the right treatment: no retrieval for small talk, dense plus sparse for factual lookup, decomposition for comparisons, Text-to-SQL for structured data, and a tool call for actionable requests. It costs milliseconds to a few hundred and saves a full retrieval on the queries that do not need one. It is also where per-source permissions are enforced before any search runs.
+
+11. Should you stack every transformation?
+
+    Rarely. Four techniques at 400 ms each add 1.6 s before the first retrieval starts. Measure marginal gain per technique on your own eval set and keep only what earns its latency. Rewriting plus multi-query is the usual starting point.

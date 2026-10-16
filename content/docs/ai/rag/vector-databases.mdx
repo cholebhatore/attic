@@ -1,0 +1,206 @@
+---
+title: Vector Databases and ANN
+description: 'HNSW graphs, IVF clustering, product and scalar quantization, the parameters that trade recall against latency, and pre-filtering by metadata.'
+---
+
+Exact nearest-neighbour search over `N` vectors of dimension `d` costs `O(N * d)` per query. At 100 million vectors of 1,536 dimensions that is 150 billion multiply-adds to answer one question, which is tens of seconds on a GPU and minutes on a CPU. No production system does this.
+
+Approximate nearest neighbour search trades a small, measurable loss in recall for one to three orders of magnitude in speed. Every vector database is an ANN index with persistence, filtering, and an API around it.
+
+---
+
+## The metric that matters
+
+**recall@k**: the fraction of the true top-k nearest neighbours that the index returns.
+
+| recall@10  | Assessment                             |
+| :--------- | :------------------------------------- |
+| 0.99       | Effectively exact; usually unnecessary |
+| 0.95       | The common production target           |
+| 0.90       | Acceptable when a reranker follows     |
+| 0.80       | Visible quality loss                   |
+| below 0.70 | The index is misconfigured             |
+
+Measure it against a brute-force scan on a sample of a few thousand queries. Every parameter below trades recall against latency and memory, and the only way to pick values is to measure your own corpus.
+
+---
+
+## HNSW
+
+Hierarchical Navigable Small World (Malkov and Yashunin, arXiv:1603.09320) is the default index almost everywhere. It builds a multi-layer proximity graph.
+
+```text
+layer 2      A ----------------------------- F          sparse, long edges
+             |                               |
+layer 1      A --------- C ----------------- F --- H    medium
+             |           |                   |     |
+layer 0      A --- B --- C --- D --- E ----- F --- H    every node, short edges
+```
+
+Search starts at the single entry point on the top layer and greedily walks to the node closest to the query. It then drops a layer and repeats, until layer 0, where it runs a best-first beam search of width `ef`. The upper layers are skip-list pointers that get you to the right region in `O(log N)` hops; layer 0 does the precise work.
+
+| Parameter        | Typical    | Effect of raising it                                                |
+| :--------------- | :--------- | :------------------------------------------------------------------ |
+| `M`              | 16 to 48   | More edges per node: higher recall, more memory, slower build       |
+| `efConstruction` | 100 to 500 | Wider beam at build time: better graph, slower build, no query cost |
+| `efSearch`       | 50 to 400  | Wider beam at query time: higher recall, higher latency             |
+
+`efConstruction` is the one to spend on. It costs index time only and produces a permanently better graph; `efSearch` costs every query forever. Build with `efConstruction = 400` and then tune `efSearch` down to the smallest value that holds your recall target.
+
+Memory overhead is small. At `M = 16`, layer 0 holds `2 * M = 32` neighbour ids per node, which is 128 bytes against 6,144 bytes for a 1,536-dimensional fp32 vector, so about 2%. The vectors dominate, which is why quantization matters more than graph parameters for memory.
+
+---
+
+## IVF and product quantization
+
+**IVF** partitions the space with k-means into `nlist` Voronoi cells, each with a centroid. A query finds its `nprobe` nearest centroids and scans only those cells.
+
+```text
+work per query ~= N * nprobe / nlist
+```
+
+At `N = 100M`, `nlist = 65,536` and `nprobe = 64` that is about 98,000 distance computations rather than 100 million, a 1,000x reduction. The failure mode is a query near a cell boundary whose true neighbour sits in an unprobed cell, which is why `nprobe` above 1 is mandatory and why IVF recall is more sensitive to corpus distribution than HNSW recall is.
+
+**Product quantization** (Jégou et al., IEEE TPAMI 2011) compresses the vectors themselves. Split each vector into `m` subvectors, run k-means on each subspace with 256 centroids, and store only the centroid id.
+
+| Setting                        | Value                                                           |
+| :----------------------------- | :-------------------------------------------------------------- |
+| Original, 1,536 dims fp32      | 6,144 bytes                                                     |
+| `m = 192` subvectors of 8 dims | 192 bytes, one per subvector                                    |
+| Compression                    | 32x                                                             |
+| Distance computation           | Asymmetric: exact query subvector against the codebook centroid |
+
+The lookup-table trick is what makes it fast. Precompute the distance from each query subvector to all 256 centroids in its subspace, giving `m * 256` values. Scanning a database vector is then `m` table lookups and an addition, with no floating-point multiply at all.
+
+**IVF-PQ** combines both: IVF narrows the candidate set, PQ makes scanning those candidates cheap and keeps them in memory.
+
+---
+
+## Quantization levels
+
+| Method            | Bits per dim | 1,536-dim vector | Compression | Recall impact                              |
+| :---------------- | :----------- | :--------------- | :---------- | :----------------------------------------- |
+| fp32              | 32           | 6,144 B          | 1x          | None                                       |
+| fp16 / bf16       | 16           | 3,072 B          | 2x          | Negligible                                 |
+| int8 scalar       | 8            | 1,536 B          | 4x          | Under 1% with rescaling                    |
+| Product, `m=192`  | 1 effective  | 192 B            | 32x         | 2 to 5%, recovers with rescore             |
+| Binary (sign bit) | 1            | 192 B            | 32x         | 5 to 15% on Hamming, recovers with rescore |
+
+Binary quantization is the surprising one. Taking the sign of each dimension and comparing with Hamming distance is 32x cheaper in memory and uses a `popcount` instruction rather than a multiply. On high-dimensional embeddings from modern models the recall loss is small, because in 1,536 dimensions the sign pattern carries most of the angular information.
+
+The standard production pattern is **quantize to search, rescore to rank**: use the binary or PQ index to fetch the top 100 candidates cheaply, then recompute exact fp32 distances on those 100 and return the top 10. You get 32x memory savings and near-fp32 recall.
+
+ScaNN (Guo et al., arXiv:1908.10396) formalizes why naive quantization loses recall: it weights the error parallel to the vector more heavily than the orthogonal error, since only the parallel component changes the inner product. Its anisotropic loss recovers several points of recall at the same compression.
+
+---
+
+## Metadata filtering
+
+Every real corpus has filters: tenant id, document type, date range, language, and access control. Where the filter is applied decides whether the result is correct.
+
+| Strategy           | How                                                  | Failure mode                                               |
+| :----------------- | :--------------------------------------------------- | :--------------------------------------------------------- |
+| Post-filter        | ANN search for top-K, then discard non-matching      | Recall collapse when the filter is selective               |
+| Pre-filter         | Build the candidate set first, then search within it | Requires index support; can be slow on tiny result sets    |
+| Filtered traversal | Apply the predicate during the graph walk            | The graph can become disconnected under a selective filter |
+| Partitioned        | A separate index per tenant or per filter value      | Index sprawl, cold partitions                              |
+
+The post-filter arithmetic is the thing to know. If the filter passes 1% of the corpus and you ask for `k = 10`, a top-10 ANN search returns on average 0.1 usable results. Over-fetching by `1 / selectivity` fixes it in expectation, so you would request 1,000, at which point the ANN search is no longer cheap.
+
+```text
+required_k ~= target_k / selectivity          post-filter only
+```
+
+Pre-filtering is what access control demands. A permission check applied after retrieval means unauthorized chunks were fetched, ranked, and possibly logged, and in a paginated or streamed system they can leak. The predicate must be enforced inside the index, before any vector comparison, so an unauthorized chunk can never enter the result set. See [Production Debugging](/ai/rag/production-debugging).
+
+---
+
+## Engines
+
+| Engine                   | Index                   | Filtering             | Notes                                            |
+| :----------------------- | :---------------------- | :-------------------- | :----------------------------------------------- |
+| `pgvector`               | IVFFlat, HNSW           | SQL `WHERE`, pre      | One fewer system; joins with your real data      |
+| Qdrant                   | HNSW                    | Native pre-filter     | Rust, payload indexes, strong filtering          |
+| Weaviate                 | HNSW, flat              | Native pre-filter     | Built-in hybrid BM25 plus vector, modules        |
+| Milvus                   | IVF, HNSW, DiskANN, GPU | Native                | Distributed, billion-scale, complex to operate   |
+| Pinecone                 | Proprietary             | Native pre-filter     | Managed; serverless billing                      |
+| Chroma                   | HNSW                    | Post-filter mostly    | Local development and prototypes                 |
+| LanceDB                  | IVF-PQ                  | Native                | Columnar on object storage, no server            |
+| Vespa                    | HNSW                    | Native pre-filter     | Hybrid search and ranking in one engine          |
+| Elasticsearch/OpenSearch | HNSW (Lucene)           | Native                | Best-in-class BM25 alongside vectors             |
+| FAISS                    | Everything above        | None, it is a library | The reference implementation; you build the rest |
+
+Two rules of thumb. If you already run Postgres and your corpus is under about 10 million vectors, `pgvector` with HNSW removes an entire system from your architecture and lets you join embeddings against relational filters in one query. If your bottleneck is hybrid search rather than scale, Elasticsearch or Vespa beats bolting BM25 onto a vector database.
+
+**DiskANN** (Subramanya et al., NeurIPS 2019) is the pattern for corpora that do not fit in RAM: a graph index whose edges live on SSD, with only compressed vectors in memory. It sustains thousands of queries per second on a billion vectors from one machine, and Milvus and Qdrant both ship variants.
+
+---
+
+## The triangle
+
+```text
+        recall
+         /\
+        /  \
+       /    \
+      /______\
+ latency   memory
+```
+
+You can hold two. Concretely:
+
+| Goal                          | Configuration                                      |
+| :---------------------------- | :------------------------------------------------- |
+| Maximum recall, small corpus  | HNSW, fp32, `M = 32`, `efSearch = 300`             |
+| Low latency, high QPS         | HNSW, int8 or binary with rescore, `efSearch = 64` |
+| Billion-scale, bounded RAM    | IVF-PQ or DiskANN, `nprobe` tuned, rescore top 100 |
+| Complex filters, modest scale | `pgvector` or Qdrant with payload indexes          |
+| Hybrid lexical plus semantic  | Vespa, Elasticsearch, or Weaviate                  |
+
+---
+
+## Interview questions
+
+1. Why is ANN necessary and what does it cost?
+
+   Exact kNN is `O(N * d)` per query, which at 100 million 1,536-dimensional vectors is 150 billion multiply-adds. ANN trades a measurable recall loss, typically under 5%, for one to three orders of magnitude in latency. The cost is that recall becomes a tunable you must measure rather than a guarantee.
+
+2. What is recall@k and what should you target?
+
+   The fraction of the true top-k nearest neighbours the index returns, measured against a brute-force scan on a few thousand sampled queries. 0.95 is the common production target, and 0.90 is acceptable when a reranker follows, since the reranker only needs the right document in the candidate set.
+
+3. How does HNSW work?
+
+   It builds a multi-layer proximity graph where upper layers are sparse with long edges and layer 0 contains every node with short edges. Search enters at the top layer, greedily walks to the closest node, drops a layer, and repeats, finishing with a best-first beam search of width `ef` on layer 0. The upper layers act as skip-list pointers giving `O(log N)` hops to the right region.
+
+4. What do `M`, `efConstruction`, and `efSearch` control?
+
+   `M` is the maximum edges per node, typically 16 to 48, raising recall and memory. `efConstruction` is the build-time beam width, 100 to 500, and improves the graph permanently at index time only. `efSearch` is the query-time beam width, 50 to 400, and trades recall against latency on every request. Spend on `efConstruction` first, because it costs nothing at query time.
+
+5. How does IVF reduce work and what is its failure mode?
+
+   K-means partitions the space into `nlist` cells; a query probes the `nprobe` nearest centroids, so work is roughly `N * nprobe / nlist`. At `nlist = 65,536` and `nprobe = 64` on 100 million vectors that is about 98,000 distance computations. The failure mode is a query near a cell boundary whose true neighbour sits in an unprobed cell, which makes IVF recall more distribution-sensitive than HNSW recall.
+
+6. Explain product quantization and why it is fast.
+
+   Split each vector into `m` subvectors, run k-means with 256 centroids per subspace, and store one byte per subvector. At `m = 192` a 6,144-byte vector becomes 192 bytes, a 32x compression. Distance computation precomputes the query-to-centroid distances into an `m * 256` table, so scanning a database vector is `m` lookups and additions with no floating-point multiply.
+
+7. Why does binary quantization work as well as it does?
+
+   Storing the sign of each dimension and comparing with Hamming distance gives the same 32x compression as PQ but uses a `popcount` instruction. In 1,536 dimensions the sign pattern carries most of the angular information, so recall loss is 5 to 15%, and rescoring the top 100 candidates with exact fp32 distances recovers nearly all of it.
+
+8. What is the quantize-to-search, rescore-to-rank pattern?
+
+   Use the compressed index to fetch a wide candidate set cheaply, then recompute exact distances on those candidates and return the top few. You get the memory and latency of the compressed index with recall close to fp32. It is the standard production configuration.
+
+9. Why does post-filtering break retrieval, and what is the arithmetic?
+
+   If the filter passes 1% of the corpus and you request `k = 10`, a top-10 ANN search yields 0.1 usable results on average. Over-fetching by `1 / selectivity` fixes the expectation but makes the search 1,000 vectors wide, which is no longer cheap. Pre-filtering inside the index, or partitioning per filter value, is the correct answer.
+
+10. Why must access control filters be applied before the vector search?
+
+    Because a post-filter means unauthorized chunks were fetched, ranked, and possibly logged before being discarded, and in a streamed or paginated response they can leak. The predicate has to be enforced inside the index so an unauthorized chunk can never enter the candidate set, let alone the LLM context.
+
+11. When would you use `pgvector` over a dedicated vector database?
+
+    When you already run Postgres, the corpus is under roughly 10 million vectors, and your filters are relational. You remove a system from the architecture and can join embeddings against your real tables in one query. Move to a dedicated engine when you need billion-scale, GPU indexing, DiskANN, or native hybrid search.

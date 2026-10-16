@@ -1,0 +1,244 @@
+---
+title: Chunking Strategies
+description: 'Fixed-size, recursive, semantic and parent-child chunking, with overlap arithmetic, structure-aware splitting, and the metadata every chunk needs.'
+---
+
+Chunking is the first irreversible decision in a RAG pipeline. Everything downstream retrieves from the chunks you created, so a boundary drawn in the wrong place cannot be fixed by a better embedding model or a stronger reranker.
+
+The core tension is granularity. A small chunk embeds precisely and retrieves well but arrives at the model without its surrounding context. A large chunk carries context but averages the meaning of several topics into one vector, which retrieves poorly. Every strategy below is a different answer to that tension.
+
+---
+
+## The size tradeoff
+
+| Chunk size   | Retrieval precision | Context for the LLM | Embedding quality | Chunks to fill a budget |
+| :----------- | :------------------ | :------------------ | :---------------- | :---------------------- |
+| 64 to 256    | High                | Poor                | Narrow, topical   | Many, more distractors  |
+| 256 to 512   | Good                | Adequate            | Good              | The common default      |
+| 512 to 1,024 | Moderate            | Good                | Diluted           | Few                     |
+| 1,024+       | Low                 | Excellent           | Averaged          | Very few                |
+
+Two hard limits frame the choice. The embedding model has a maximum input, commonly 512 tokens for older models and 8,192 for current ones; text past that is truncated silently, not error. And the context budget divided by the chunk size is how many chunks you can send, which is how many chances you have to include the right one.
+
+Chroma's technical report _Evaluating Chunking Strategies for Retrieval_ (January 2025) compared fixed, recursive, semantic, and proposition-based chunking across three corpora. The headline finding is that variation between corpora exceeded variation between strategies. There is no universally best chunker, which is why the decision is made by evaluating on your own data.
+
+---
+
+## Fixed-size chunking
+
+Split every `k` tokens with an overlap of `o`.
+
+```text
+chunk_0 = tokens[0 : k]
+chunk_1 = tokens[k - o : 2k - o]
+chunk_2 = tokens[2(k - o) : 3k - 2o]
+```
+
+At `k = 512` and `o = 64`, the overlap is 12.5% and each chunk boundary region appears in two chunks. Storage grows by `k / (k - o)`, so 512/448 = 1.14x, or 14% more chunks.
+
+| Property    | Assessment                                             |
+| :---------- | :----------------------------------------------------- |
+| Speed       | Fastest; no model calls, no parsing                    |
+| Determinism | Fully deterministic                                    |
+| Structure   | Ignores it; cuts mid-sentence, mid-table, mid-function |
+| Best for    | Homogeneous prose, quick baselines, uniform documents  |
+
+Overlap exists because a fact straddling a boundary is retrievable from neither chunk. The cost is duplication: the same sentence indexes twice, both copies can rank in the top-k, and the model then spends budget on a repeated passage. Overlap above about 20% usually does more harm than good.
+
+---
+
+## Recursive character chunking
+
+Try separators in order of decreasing structural strength, and only fall through to the next when a piece is still too large.
+
+```python
+SEPARATORS = [
+    "\n\n",     # paragraph
+    "\n",       # line
+    "。", ". ",  # sentence, CJK and Latin
+    "? ", "! ",
+    "; ", ", ", # clause
+    " ",        # word
+    "",         # character, last resort
+]
+
+
+def recursive_split(text: str, chunk_size: int = 512, overlap: int = 64) -> list[str]:
+    return _split(text, SEPARATORS, chunk_size, overlap)
+
+
+def _split(text: str, seps: list[str], size: int, overlap: int) -> list[str]:
+    if len(text) <= size:
+        return [text] if text.strip() else []
+    sep, rest = seps[0], seps[1:]
+    parts = text.split(sep) if sep else list(text)
+    chunks, buf = [], ""
+    for p in parts:
+        candidate = f"{buf}{sep}{p}" if buf else p
+        if len(candidate) <= size:
+            buf = candidate
+            continue
+        if buf:
+            chunks.append(buf)
+            buf = buf[-overlap:] + sep + p if overlap else p    # carry the tail forward
+        else:
+            chunks.extend(_split(p, rest, size, overlap))       # one part is too big: recurse
+            buf = ""
+    if buf:
+        chunks.append(buf)
+    return chunks
+```
+
+This is LangChain's `RecursiveCharacterTextSplitter` and the default in most pipelines. It respects paragraph and sentence boundaries where possible and degrades gracefully. The one thing it cannot do is know that a markdown heading introduces a section it should not split.
+
+Add structure-aware separators at the front of the list for the document type:
+
+| Document type | Prepend to the separator list                 |
+| :------------ | :-------------------------------------------- |
+| Markdown      | `"\n## "`, `"\n### "`, `"\n\n"`               |
+| Python        | `"\nclass "`, `"\ndef "`, `"\n\n"`            |
+| HTML          | `"</p>"`, `"</div>"`, `"</h2>"`               |
+| Legal         | `"\nSection "`, `"\n("`, `"\n\n"`             |
+| LaTeX         | `"\n\\section"`, `"\n\\subsection"`, `"\n\n"` |
+
+For code, splitting on the AST rather than text is strictly better. A function that is 900 tokens should stay whole with a truncation marker, not become two chunks that each fail to parse.
+
+---
+
+## Semantic chunking
+
+Embed each sentence, then break where consecutive sentences stop being similar.
+
+```text
+s_1 ... s_n                       sentences
+e_i = embed(s_i)                  per-sentence vectors
+d_i = 1 - cos(e_i, e_{i+1})       breakpoint distances
+```
+
+Three ways to turn the distance sequence into boundaries:
+
+| Method        | Rule                                                            | Sensitivity            |
+| :------------ | :-------------------------------------------------------------- | :--------------------- |
+| Percentile    | Break where `d_i` exceeds the 95th percentile of all `d`        | Fixed number of chunks |
+| Standard dev  | Break where `d_i > mean(d) + b * std(d)`, `b` around 0.5 to 1.0 | Tunable                |
+| Interquartile | Break where `d_i` falls outside the IQR fence                   | Robust to outliers     |
+
+Cost is one embedding call per sentence at index time, which is real money on a large corpus. The benefit is that boundaries land on topic changes rather than on token counts, producing chunks of uneven but semantically coherent length.
+
+It underperforms on text with no topic shifts, such as a single-argument essay or a wall of similar log lines, where it either produces one enormous chunk or fragments arbitrarily.
+
+---
+
+## Parent-child chunking
+
+Index small, return large. The child chunk is what the embedding sees; the parent chunk is what the model reads.
+
+```text
+parent (2,048 tokens)  =  section 4.2 of the handbook
+  child (256 tokens)   =  paragraphs 1-2      <- embedded and indexed
+  child (256 tokens)   =  paragraphs 3-4      <- embedded and indexed
+  child (256 tokens)   =  paragraphs 5-6      <- embedded and indexed
+
+query matches child 2 -> retrieve child 2 -> expand to parent -> send parent to the LLM
+```
+
+| Property      | Value                                                         |
+| :------------ | :------------------------------------------------------------ |
+| Retrieval     | Precise; the vector describes one narrow idea                 |
+| Generation    | Complete; the model sees the surrounding section              |
+| Storage       | Children indexed, parents stored as payloads                  |
+| Deduplication | Required; several children of one parent can all be retrieved |
+| Cost          | One extra lookup per hit                                      |
+
+The deduplication step is the part people omit. If three children of the same parent rank in the top ten, you should send that parent once and use the remaining slots for other parents. LlamaIndex implements this as `HierarchicalNodeParser` with `AutoMergingRetriever`, which merges children into their parent once enough of them are retrieved.
+
+A variant is the **sentence window**: retrieve a single sentence, then expand to `k` sentences on either side. It gives the finest possible retrieval granularity with a controllable context width, and it is the best default for narrative text where the answer is usually one sentence.
+
+---
+
+## Proposition chunking
+
+Chen et al., arXiv:2312.06648, decompose each chunk into self-contained propositions using a model: one factual statement per line, with all pronouns resolved and all necessary context inlined.
+
+```text
+source : "It was released in 2019 and quickly became the default."
+propos : "GPT-2 was released in 2019."
+         "GPT-2 quickly became the default language model."
+```
+
+Retrieval operates on propositions, which are maximally embeddable because each contains exactly one idea with no unresolved references. It reports gains over passage-level retrieval on open-domain QA. The cost is one LLM call per chunk at index time, which is the most expensive indexing strategy in common use.
+
+---
+
+## Late chunking
+
+A different route to the same problem. Günther et al., arXiv:2409.04701: run the whole document through a long-context embedding model first, then mean-pool the token embeddings within each chunk boundary.
+
+```text
+standard : chunk -> embed(chunk)          each vector sees only its own text
+late     : embed(document) -> pool per chunk boundary
+```
+
+The second gives every chunk vector the document's context at no extra retrieval cost, because the pooling happens after the transformer rather than before. It requires a long-context embedding model, such as jina-embeddings-v2 or v3 with 8,192 tokens. Contextual Retrieval achieves a similar effect with an LLM instead; see [Embeddings](/ai/rag/embeddings).
+
+---
+
+## Metadata every chunk needs
+
+| Field          | Purpose                                                                           |
+| :------------- | :-------------------------------------------------------------------------------- |
+| `source_id`    | Citation and deduplication                                                        |
+| `chunk_index`  | Ordering, neighbour expansion                                                     |
+| `parent_id`    | Parent-child retrieval                                                            |
+| `section_path` | "Handbook > 4. Security > 4.2 Tokens"; strong retrieval signal                    |
+| `page`, `bbox` | PDF citation with a clickable location                                            |
+| `doc_hash`     | Incremental re-indexing; see [Production Debugging](/ai/rag/production-debugging) |
+| `updated_at`   | Freshness filters and TTL                                                         |
+| `acl`          | Access control, applied as a pre-filter                                           |
+| `doc_type`     | Routing between corpora                                                           |
+
+`section_path` is the highest-value one relative to its cost. Prepending it to the text before embedding gives the vector the document structure, which is most of what contextual retrieval adds with an LLM call.
+
+---
+
+## Interview questions
+
+1. Why is chunking irreversible?
+
+   Retrieval operates on the chunk boundaries you created at index time. If a fact was split across two chunks, neither vector represents it well, and no embedding model, reranker, or prompt can recover it at query time. Changing the chunking means re-indexing the corpus.
+
+2. What is the core granularity tradeoff?
+
+   Small chunks embed precisely and retrieve well but reach the model without surrounding context. Large chunks carry context but average several topics into one vector, which retrieves poorly. Parent-child chunking is the standard resolution: index small, return large.
+
+3. What overlap fraction should you use and what does it cost?
+
+   Ten to twenty percent. At 512 tokens with 64 overlap, storage grows by `k/(k-o)` = 1.14x. The benefit is that facts straddling a boundary are retrievable; the cost is that duplicated sentences can both rank in the top-k and waste budget. Above about 20% the duplication cost exceeds the boundary benefit.
+
+4. How does recursive character chunking work?
+
+   It tries separators in order of decreasing structural strength, typically paragraph, line, sentence, clause, word, character, and only falls through to the next when a piece is still above the size limit. A single piece too large for any separator recurses with the remaining list.
+
+5. When is semantic chunking worth the extra embedding cost?
+
+   When the corpus has genuine topic shifts within documents, such as multi-topic reports or long web pages. It costs one embedding call per sentence at index time and underperforms on homogeneous text, where it either produces one enormous chunk or fragments arbitrarily.
+
+6. What is parent-child chunking and what step do people forget?
+
+   Index small child chunks for precise retrieval, then expand a hit to its larger parent before sending it to the model. The forgotten step is deduplication: if three children of one parent rank in the top ten, send that parent once and use the remaining slots for other parents.
+
+7. What is the sentence window variant?
+
+   Retrieve a single sentence, then expand to `k` sentences on either side. It gives the finest retrieval granularity with a controllable context width and is a good default for narrative text, where the answer is usually one sentence and the surrounding two carry the qualification.
+
+8. What is proposition chunking and why is it expensive?
+
+   Chen et al. (arXiv:2312.06648) use a model to decompose passages into self-contained factual statements with pronouns resolved and context inlined. Each proposition contains exactly one idea, which is maximally embeddable. The cost is one LLM call per chunk at index time.
+
+9. What is late chunking?
+
+   From arXiv:2409.04701: embed the whole document with a long-context model, then mean-pool the token embeddings within each chunk boundary. Each chunk vector inherits the document's context because pooling happens after the transformer. It needs a long-context embedding model and costs nothing extra at query time.
+
+10. Which metadata field gives the most retrieval value per unit of effort?
+
+    `section_path`, the chain of headings above the chunk. Prepending it to the text before embedding injects document structure into the vector, which captures much of what contextual retrieval achieves with a per-chunk LLM call. `acl` is the one you cannot ship without.

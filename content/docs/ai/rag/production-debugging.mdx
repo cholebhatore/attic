@@ -1,0 +1,337 @@
+---
+title: Production RAG Debugging
+description: 'Localizing a failure between retrieval and generation, then five scenarios: ungrounded answers, duplicate chunks, slow retrieval, access control, staleness.'
+---
+
+A RAG system fails in a way that looks uniform from the outside: the answer is wrong. Inside, the failure is in one of four places, and the fix for each is incompatible with the fixes for the others. Adding chunks to a hallucination problem makes it worse. Raising `efSearch` to fix a grounding problem does nothing.
+
+The discipline is to localize before tuning. Every scenario below starts with a test that tells you which stage owns the bug.
+
+---
+
+## Localizing the failure
+
+Run the failing query and dump the retrieved chunks. Read them. That single step splits the space:
+
+| Observation                                                            | Owning stage   | Go to                                          |
+| :--------------------------------------------------------------------- | :------------- | :--------------------------------------------- |
+| The answer is in the chunks, the response contradicts it               | Generation     | Scenario 1                                     |
+| The answer is in the corpus but not in the chunks                      | Retrieval      | Query transformation, hybrid search, reranking |
+| The answer is in the chunks, buried below ten near-duplicates          | Retrieval      | Scenario 2                                     |
+| The answer is nowhere in the corpus                                    | Data           | Ingest, coverage                               |
+| The right chunks arrive, the answer is right, and it took nine seconds | Latency        | Scenario 3                                     |
+| The answer leaks content the user cannot open                          | Access control | Scenario 4                                     |
+| The answer describes last quarter's policy                             | Freshness      | Scenario 5                                     |
+
+<Callout type="info">
+  ### Retrieval failures are usually query failures
+
+When the answer is in the corpus but not in the retrieved chunks, the cause is rarely the index. It is usually that the user's words do not match the document's words, that the question is compound and needs decomposition, or that the relevant term is an exact identifier that a dense embedding smooths over. Check the query first: rewrite it by hand into the sentence the document would contain, retrieve with that, and see whether the chunk appears. If it does, the index is fine and the problem is query transformation or hybrid search.
+
+</Callout>
+
+---
+
+## The harness you need before debugging
+
+Tuning against one anecdote produces a system tuned to that anecdote. The minimum viable harness:
+
+| Component           | What it is                                                              | Size to start |
+| :------------------ | :---------------------------------------------------------------------- | :------------ |
+| Golden question set | Real user questions with the correct answer and the source document ids | 50 to 200     |
+| Retrieval labels    | For each question, which chunks or documents are relevant               | Same set      |
+| Retrieval metrics   | recall@k, MRR, nDCG@10                                                  | Computed      |
+| Generation metrics  | Faithfulness, answer relevance, correctness                             | Computed      |
+| Regression runner   | Re-runs the whole set on every pipeline change and diffs the scores     | One script    |
+
+Recall@k is the one that pays for itself. It is computed against labels, not against a model's opinion, so it cannot drift. If recall@20 is 0.72, no amount of prompt engineering gets you past 0.72, and every conversation about the prompt is a waste of time until retrieval improves.
+
+Generation metrics come from LLM-as-judge in practice. RAGAS (arXiv:2309.15217) defines the four that get used:
+
+- **Faithfulness:** is every claim in the answer supported by the retrieved context? This catches hallucination.
+- **Answer relevancy:** does the answer address the question? This catches hedging and refusal-adjacent waffle.
+- **Context precision:** are the relevant chunks ranked above the irrelevant ones?
+- **Context recall:** did the retrieved context contain everything needed to produce the reference answer?
+
+Two cautions. A judge model shares failure modes with the generator, especially when both are the same family. And a judge scores a single trajectory, so run each item several times and average, or the noise will swamp the effect you are trying to measure. SelfCheckGPT (arXiv:2303.08896) is the cheap alternative for faithfulness: sample several answers and check whether they agree with each other, since a hallucinated claim varies between samples while a grounded one does not.
+
+---
+
+## Scenario 1: hallucinating despite correct context
+
+The chunks are right, the answer is wrong. This is a generation-stage failure and it has four causes worth ruling out in order.
+
+**Attention dilution.** Twenty chunks of which one matters. The relevant passage sits at rank 12 and the model averages over everything it was given. Fix by pruning: rerank and keep the top 4 to 8, not the top 20. LongLLMLingua (arXiv:2310.06839) compresses the prompt by removing tokens that contribute little to the answer, and reports accuracy gains alongside the token savings, which is the opposite of what naive truncation does.
+
+**Position.** Even at a fixed context size, information at the start and end is used more reliably than information in the middle (arXiv:2307.03172). If the good chunk is buried, move it. Order chunks by descending relevance and put the strongest first and second-strongest last.
+
+**Parametric prior winning.** The model believes it knows the answer and the context disagrees with it. It follows its prior. Fix in the system prompt with an explicit precedence rule and an explicit escape hatch:
+
+```text
+Answer using only the CONTEXT below.
+The CONTEXT is authoritative. If it conflicts with what you know, follow the CONTEXT.
+If the CONTEXT does not contain the answer, respond exactly: NOT_IN_CONTEXT.
+Do not combine the CONTEXT with outside knowledge.
+Quote the passage you used before answering.
+```
+
+The `NOT_IN_CONTEXT` path matters more than it looks. Without it, the model must produce something, and producing something means inventing. With it, refusal becomes a legal output and the measured refusal rate becomes a signal about retrieval coverage rather than a mystery.
+
+**Temperature and sampling.** For extraction and grounded QA, temperature 0 to 0.3. Creative range is wrong here: any sampling diversity is diversity in how the model fills a gap it should not have filled.
+
+**Structured citation extraction.** Force the shape so grounding is checkable rather than hoped for:
+
+```python
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+
+class GroundedAnswer(BaseModel):
+    answer: str
+    citations: list[int] = Field(
+        description="Indexes into the supplied context list. Empty if NOT_IN_CONTEXT."
+    )
+    confidence: Literal["high", "low"]
+
+
+# verify after the call, do not trust it
+cited = [ctx[i] for i in resp.citations]
+if not cited:
+    return refuse()
+if not answers_agree_with(resp.answer, cited):   # NLI model or a narrow judge call
+    return refuse()
+```
+
+`answers_agree_with` is an entailment check, either a small NLI model scoring each answer sentence against the concatenated cited text, or a judge call restricted to that pair. `refuse` returns the `NOT_IN_CONTEXT` response.
+
+The verification step is the part that reduces hallucination. Asking for citations alone produces confident citations of chunks that do not say what the answer claims. Checking the answer against only the cited chunks, with an entailment model or a narrow judge call, turns an unverifiable claim into a testable one.
+
+**Set the temperature lower, then check whether the answer got shorter.** Grounding prompts plus low temperature plus a refusal path reliably produce more refusals. That is the intended behaviour, and the right response is to improve retrieval coverage, not to loosen the prompt.
+
+---
+
+## Scenario 2: redundant and duplicate chunks
+
+The context contains the same fact six times. Two of the six are truncated mid-sentence, and the one complete copy is at rank 5.
+
+Three causes, three different fixes.
+
+**Overlap too wide.** Overlap exists so a claim is not cut in half at a boundary. Set too high, every chunk appears two or three times in the top-k. The storage arithmetic: a chunk size of `c` with overlap `o` produces `c / (c - o)` copies of each token, so 512 with 128 overlap is 1.33x, and 512 with 256 is 2x. Start at 10 to 15 percent of chunk size and raise it only if you can point to claims being split.
+
+**No diversity at retrieval.** Top-k by similarity returns k near-neighbours, and near-neighbours of the same query are usually near-neighbours of each other. Maximal Marginal Relevance (Carbonell and Goldstein, SIGIR 1998) fixes this by scoring a candidate against both the query and the already-selected set:
+
+```text
+MMR(d) = lambda * sim(d, q) - (1 - lambda) * max over selected s of sim(d, s)
+```
+
+With `lambda` around 0.7 you lose a little relevance and gain a lot of coverage. MMR is cheap: it re-scores the retrieved candidate set, so it costs `k * candidates` similarity computations rather than another index pass.
+
+**Duplicate documents in the corpus.** The same policy PDF uploaded by four teams, a web crawl that captured the print and mobile versions of a page, a doc that exists in both Confluence and the nightly export. This is the most common real cause and the one that no query-time technique fully repairs. Fix it at ingest with semantic deduplication: embed every chunk, cluster or greedily compare above a high cosine threshold, and keep one representative per cluster. SemDeDup (arXiv:2303.09540) uses this to remove near-duplicates from training corpora and reports large size reductions with minimal quality loss; the same mechanism applies to an index.
+
+Exact-hash dedup catches byte-identical documents and costs nothing, so run it first. It will not catch the reformatted copy.
+
+| Symptom                               | Likely cause       | Fix                        |
+| :------------------------------------ | :----------------- | :------------------------- |
+| Same paragraph, shifted by a sentence | Overlap too wide   | Reduce overlap             |
+| Five paraphrases of one policy        | Duplicate sources  | Ingest-time semantic dedup |
+| Correct chunk present but not cited   | Diversity collapse | MMR plus a reranker        |
+| Answer is generic and covers nothing  | k too large        | Cut k, add a reranker      |
+
+---
+
+## Scenario 3: slow retrieval at million-document scale
+
+First measure where the time goes, because the usual answer surprises people.
+
+| Stage                          | Typical range at 1M to 100M vectors | Notes                                                        |
+| :----------------------------- | :---------------------------------- | :----------------------------------------------------------- |
+| Query embedding                | 5 to 150 ms                         | Hosted API adds a network round trip                         |
+| ANN search                     | 1 to 50 ms                          | In-memory HNSW, single node                                  |
+| Metadata filter evaluation     | Sub-ms to hundreds of ms            | Depends on selectivity and whether it is pre- or post-filter |
+| Hybrid second pass plus fusion | 5 to 50 ms                          | BM25 is cheap                                                |
+| Cross-encoder rerank of 100    | 50 to 400 ms on GPU                 | The usual retrieval bottleneck                               |
+| Generation to first token      | 200 to 2000 ms                      | Usually the largest single term                              |
+
+These are orders of magnitude to check against, not measurements of your system. If generation is 1.5 s and the vector search is 8 ms, optimizing the index is wasted work.
+
+When retrieval genuinely is the bottleneck:
+
+**Sharding.** Partition the index by tenant, by time, or by document type, and route the query to the relevant shards before searching. Sharding a per-tenant index turns a 100M-vector search into a 2M-vector search and gives you access control for free, at the cost of cross-shard queries needing a merge step. Sharding for throughput rather than for scope means replicating the same index across nodes and load-balancing, which reduces tail latency but not per-query work.
+
+**Tune HNSW at query time.** `efSearch` is the only knob that does not require a rebuild. Lowering it from 200 to 64 cuts latency substantially and costs recall; measure recall@k on your golden set at each value rather than guessing. `M` and `efConstruction` are build-time, so changing them means reindexing.
+
+**Quantize.** Scalar quantization from fp32 to int8 gives a 4x memory reduction with a small recall loss. Binary quantization gives 32x and needs a rescore pass with the full-precision vectors to recover the ranking. Both shrink the working set, which is what makes the difference once the index no longer fits in cache or RAM.
+
+**Cut candidates before the reranker.** A cross-encoder over 100 candidates is the expensive stage. Retrieving 100 and reranking 25 costs a quarter as much and loses little, provided the first-stage recall@100 is high.
+
+**Semantic caching.** Embed the query, look it up in a small cache of recent queries, and return the stored answer above a similarity threshold. It is effective for high-traffic FAQ-shaped workloads and dangerous otherwise: two queries that embed at 0.97 can have different answers, especially with negation. Cache the retrieved chunks rather than the final answer when you are unsure, which keeps generation in the loop and removes only the retrieval latency.
+
+<Callout type="warn">
+  ### A cache hit is a freshness and an access-control event
+
+If you cache answers or chunks, the cache entry carries the ACL of whoever populated it and the document version that was current at the time. Scenario 4 and Scenario 5 both become cache bugs. Key the cache by the user's permission scope, never by the query alone, and invalidate on document update rather than relying on a TTL.
+
+</Callout>
+
+---
+
+## Scenario 4: per-user access control
+
+The requirement: user A must never see content from documents A cannot open, even though both users query the same index.
+
+**Filter before retrieval, not after.** Post-filtering retrieves the top 100 across the whole corpus and then removes the ones the user cannot see. Two problems, and the second is the one that gets systems failed in review:
+
+1. If 90 of the 100 belong to other users, the user gets 10 poor results instead of 10 good ones. Recall collapses precisely when the corpus is mostly restricted.
+2. Filtering happens after the vectors have been compared, so the restricted documents participated in the computation. Depending on the engine and the logging configuration, their ids and scores may be observable.
+
+Push the filter into the ANN traversal. Every engine listed on the vector databases page supports filtered search; the difference is whether the filter is applied during graph traversal or after it. During is what you want, and it needs `efSearch` raised, because a selective filter means the traversal discards most candidates it visits.
+
+**Model permissions as data.** Store the access control on the chunk, not in application code:
+
+```json
+{
+  "chunk_id": "policy-7f3a#12",
+  "doc_id": "policy-7f3a",
+  "acl_groups": ["finance", "exec"],
+  "acl_users": ["u_8812"],
+  "classification": "internal",
+  "expires_at": "2027-01-01"
+}
+```
+
+Filter with `acl_groups` intersecting the user's resolved group set, expanded through group membership before the query rather than inside it. Resolving membership at query time against the identity provider is the correct order; caching it is a security decision with a staleness bound you should write down.
+
+**Default deny.** A chunk with no `acl_groups` is either public or a bug. Make the field required at ingest and fail the document rather than defaulting to visible.
+
+**Four leak paths that are not the vector index:**
+
+| Path              | How it leaks                                                                 |
+| :---------------- | :--------------------------------------------------------------------------- |
+| Semantic cache    | User B gets user A's cached answer                                           |
+| Traces and logs   | Retrieved chunk text written to an observability backend at lower protection |
+| LLM provider      | Restricted text sent to a third party without a data agreement               |
+| Derived artifacts | Community reports or summaries that aggregate across ACL boundaries          |
+
+The last one is specific to GraphRAG and to any precomputed summary. A community report that summarizes entities from documents in three different ACL groups is itself a document with the union of those permissions, and it will be retrieved by users in any of the three. Either build the graph per ACL scope or propagate the strictest permission upward.
+
+---
+
+## Scenario 5: document updates and freshness
+
+The corpus changes. The index has to follow, and the failure modes are silent: nothing errors, answers just get stale or contradictory.
+
+**Incremental indexing by hash.** Store a content hash per document and per chunk. On each sync, compare hashes and touch only what changed:
+
+```text
+new hash not in index      -> chunk, embed, insert
+hash present               -> skip
+index hash not in source   -> delete (tombstone)
+same doc, new hash         -> delete old chunks, insert new
+```
+
+The fourth case is the one people get wrong. Inserting the new version without deleting the old leaves both in the index, and retrieval returns whichever embeds closer. The answer then quotes a policy that was superseded, with a citation that resolves to a document that still exists.
+
+Delete by `doc_id` rather than by chunk id list, so a change in chunk count cannot orphan anything.
+
+**TTL invalidation.** For sources with no reliable change signal, expire chunks after a bounded time and re-fetch. Set the TTL from the cost of being wrong, not from the crawl budget: a pricing page and a compliance policy need hours, an org chart can take a month. TTL alone leaves a window where stale content is served, so combine it with a last-verified timestamp in the citation.
+
+**Attribution makes staleness visible.** Every answer should carry, per cited chunk:
+
+| Field           | Why the user needs it                              |
+| :-------------- | :------------------------------------------------- |
+| Document title  | To judge authority                                 |
+| Section or page | To find it                                         |
+| Version or hash | To tell which copy was used                        |
+| Last updated    | To judge whether it is current                     |
+| Retrieved at    | To distinguish a stale index from a stale document |
+| URL or path     | To verify                                          |
+
+`Retrieved at` against `last updated` is the diagnostic. If a document was updated yesterday and the chunk says it was indexed three weeks ago, the sync is broken, not the source.
+
+**Contradiction is worse than staleness.** A stale index gives one wrong answer. A partially updated index gives two chunks that disagree, and the model picks one or blends them. When a document is superseded, delete the old version in the same transaction that inserts the new one, and check for cross-document contradictions on the documents that matter rather than assuming the corpus is internally consistent.
+
+---
+
+## An ordered checklist
+
+Work down this list. Each step is cheap and each one rules out a class of failure.
+
+1. Dump the retrieved chunks for the failing query and read them. Is the answer there?
+2. Compute recall@k on a golden set. Below 0.8 means retrieval owns the problem and nothing downstream matters yet.
+3. Hand-rewrite the query into the sentence the document would contain and retrieve with it. If that works, it is a query transformation or hybrid search problem.
+4. Check for duplicates in the top-k. More than two near-identical chunks means Scenario 2.
+5. Check the position of the relevant chunk. Rank 8 of 20 means reorder or cut k.
+6. Read the system prompt for a precedence rule and a refusal path. Add both if missing.
+7. Set temperature to 0 and re-run. If the answer changes qualitatively, sampling was filling gaps.
+8. Measure per-stage latency before optimizing any stage.
+9. Verify the ACL filter is applied inside the ANN search, and check the cache, the logs and any precomputed summaries.
+10. Check index lag: when was the source last updated, when was the chunk last indexed.
+
+---
+
+## Interview questions
+
+1. A RAG system gives a wrong answer. What do you check first?
+
+   Dump the retrieved chunks and read them. Whether the answer is present in the context separates a generation failure from a retrieval failure, and the two have incompatible fixes. Adding chunks to a grounding problem makes it worse; rewriting prompts for a recall problem wastes the afternoon.
+
+2. What is the difference between context precision and context recall?
+
+   Context precision asks whether the relevant chunks are ranked above the irrelevant ones in what was retrieved. Context recall asks whether everything needed to produce the reference answer was retrieved at all. Precision is a ranking property and is improved by reranking; recall is a coverage property and is improved by hybrid search, query transformation, or a larger k.
+
+3. Why does an LLM-as-judge score need multiple samples?
+
+   Because the judge scores one trajectory and the variance across runs can exceed the effect being measured. Run each item several times and average, and prefer a judge from a different model family than the generator, since shared failure modes make the score uninformative exactly where it matters.
+
+4. How does SelfCheckGPT detect hallucination without ground truth?
+
+   Sample several answers to the same question and check whether they agree. A grounded claim is reproduced across samples because it is copied from the context; a hallucinated one varies because it is generated fresh each time. Disagreement between samples is the hallucination signal.
+
+5. The context contains the answer and the model still makes something up. Name four fixes.
+
+   Prune the context so the relevant chunk is not diluted among twenty others, move it to the start or the end to escape the lost-in-the-middle penalty, add an explicit precedence rule plus a `NOT_IN_CONTEXT` refusal path so inventing is not the only legal output, and lower temperature to the 0 to 0.3 range. Structured citations verified against the cited chunks turn the remaining cases into a checkable failure.
+
+6. Why does asking for citations not solve hallucination?
+
+   Because the model cites confidently regardless. The citations have to be verified: extract the cited chunks, and check with an entailment model or a narrow judge call that the answer follows from only those chunks. Without the verification step, citations are decoration.
+
+7. Your top-k contains five near-identical chunks. What are the three possible causes?
+
+   Chunk overlap set too wide, so the same passage appears shifted by a sentence. No diversity mechanism, since top-k by similarity returns mutual near-neighbours; MMR with `lambda` around 0.7 fixes that. Duplicate source documents in the corpus, which is the most common cause and needs ingest-time semantic deduplication, since exact hashing only catches byte-identical files.
+
+8. What does MMR cost and what does it buy?
+
+   It re-scores the already-retrieved candidate set, so the cost is `k` times the candidate count in similarity computations, with no extra index pass. It buys coverage: each selected chunk is penalized by its similarity to what is already selected, so the top-k spans more distinct content.
+
+9. Retrieval takes 800 ms. What do you do first?
+
+   Measure the per-stage breakdown. At 1M to 100M vectors, ANN search is usually single-digit milliseconds and generation to first token is usually the largest term, so the search is often not the problem. If the reranker over 100 candidates is the term, cut candidates to 25 after a wide first stage rather than touching the index.
+
+10. Which HNSW parameter can you change without rebuilding?
+
+    `efSearch`, which controls how wide the query-time traversal is. Lowering it from 200 to 64 cuts latency and costs recall, so measure recall@k on a labeled set at each value. `M` and `efConstruction` are build-time and changing them means reindexing.
+
+11. What does binary quantization cost in recall and how do you recover it?
+
+    It reduces each dimension to one bit, a 32x memory reduction against fp32, and the ranking it produces is coarse. The standard recovery is a rescore pass: search with the binary vectors to get a wide candidate set, then re-rank those candidates with the full-precision vectors. Scalar int8 quantization gives 4x with a smaller loss and no rescore.
+
+12. Why is post-filtering for access control wrong?
+
+    Because retrieval happens over the whole corpus first. If most of the top 100 belongs to other users, the requesting user gets poor results rather than good ones, so recall collapses in proportion to how restricted the corpus is. Restricted documents also participate in the vector computation before being discarded. Push the filter into the ANN traversal instead, and raise `efSearch` to compensate for the candidates the filter discards.
+
+13. Name four access-control leak paths that are not the vector index.
+
+    A semantic cache keyed only on the query, which serves one user's answer to another. Observability traces containing retrieved chunk text at a lower protection level than the source. Restricted text sent to an LLM provider without a data agreement. And precomputed summaries such as GraphRAG community reports, which aggregate across ACL boundaries and so need the strictest permission of their inputs.
+
+14. How do you index a document update correctly?
+
+    Hash the document and the chunks, insert what is new, skip what is unchanged, tombstone what disappeared from the source, and for a document whose hash changed, delete all chunks under that `doc_id` in the same operation that inserts the new ones. Deleting by document id rather than by a stored chunk-id list means a change in chunk count cannot orphan anything.
+
+15. Why is a partially updated index worse than a stale one?
+
+    A stale index gives one consistently wrong answer, which a user can notice. A partially updated index contains two chunks that disagree, and the model either picks one arbitrarily or blends them into a claim that appears in neither source. Supersede atomically and check for cross-document contradictions on the documents where being wrong is expensive.
+
+16. What metadata makes staleness visible to a user?
+
+    Document title, section or page, version or hash, last updated, retrieved at, and a URL or path. Comparing `retrieved at` against `last updated` distinguishes a broken sync from a genuinely old source, which is the first question in any freshness investigation.

@@ -1,0 +1,245 @@
+---
+title: Vectorless RAG
+description: 'Retrieval without embeddings: text-to-SQL, Markdown tables as context, layout-aware parsing of multi-column PDFs, and grep-driven agentic search.'
+---
+
+An embedding is a lossy summary of text. When the data already has structure, the summary throws away exactly the part you need: the column name, the cell boundary, the join key, the file path.
+
+Vectorless RAG routes a natural-language query onto the structure instead. Four cases come up constantly: SQL databases, Markdown tables, complex PDFs, and source code.
+
+---
+
+## Text-to-SQL
+
+The pipeline, with the steps that decide quality marked:
+
+```text
+question
+   |
+   v
+[schema linking]        select the tables and columns the question needs
+   |
+   v
+[value retrieval]       match literals in the question to real values in the DB
+   |
+   v
+[SQL generation]        prompt with schema + few-shot examples + retrieved values
+   |
+   v
+[execute]
+   |
+   +-- error --> feed the error message back, regenerate, retry (bounded)
+   |
+   v
+[result -> answer]       summarize rows, never let the model invent numbers
+```
+
+Three of these are optional in a demo and mandatory in production.
+
+**Schema linking.** A 200-table schema does not fit, and even when it does, including all of it degrades generation. The standard move is a two-stage retrieval: embed the DDL of every table and column plus a description of what each holds, retrieve the top-n against the question, and generate from that subset. Column-level retrieval beats table-level, because the usual failure is right table, wrong column.
+
+**Value retrieval.** "How many orders did Acme Corp place" needs the literal `'Acme Corp'` to match whatever is stored, which might be `ACME CORPORATION` or an id. Index the distinct values of low-cardinality text columns and retrieve against them. BIRD made this explicit by supplying external-knowledge evidence with each question, and the gap between systems given that evidence and systems not given it is large.
+
+**Few-shot examples.** Retrieve examples whose question and schema overlap the current one, not a fixed set. DAIL-SQL (arXiv:2308.15363) studied exactly this and found that question-skeleton similarity plus SQL-skeleton similarity selects better examples than either alone.
+
+**Self-correction.** Execute the SQL. On a syntax or type error, feed the error string back and regenerate; this reliably helps. On a query that runs but is logically wrong, self-correction does not help and can hurt, because the model has no signal that the answer is wrong. Huang et al., arXiv:2401.16755, make that argument generally, and it holds here.
+
+---
+
+## Sandboxing generated SQL
+
+| Control                              | Why                                                            |
+| :----------------------------------- | :------------------------------------------------------------- |
+| Read-only database role              | Blocks `UPDATE`, `DELETE`, `DROP` even if the model emits them |
+| Statement timeout                    | A generated cross join can hang the server                     |
+| Injected `LIMIT` and row cap         | Bounds both result size and the tokens that come back          |
+| Allowlist of schemas and tables      | Prevents discovery of tables the user should not see           |
+| Query against a replica              | Isolates analytic load from production traffic                 |
+| Rollback-only transaction            | Belt and braces behind the read-only role                      |
+| Row-level security or per-user views | A `SELECT`-only role still leaks rows across tenants           |
+
+The last row is the one that gets missed. Restricting the model to `SELECT` does not restrict what the user is allowed to see. Enforce access control in the database with RLS policies bound to the requesting user's identity, not in the prompt.
+
+<Callout type="warn">
+  ### Never return rows straight to the model unbounded
+
+A `SELECT *` over a wide table returns tens of thousands of tokens of data that the model then summarizes, and the summary is where numbers get invented. Cap the row count, return the count alongside the rows, and if the true result set is larger than the cap, say so in the answer rather than summarizing the first page as if it were everything.
+
+</Callout>
+
+---
+
+## Benchmarks
+
+| Benchmark                     | Scale                                          | What it measures                                |
+| :---------------------------- | :--------------------------------------------- | :---------------------------------------------- |
+| Spider (arXiv:1809.08887)     | 10,181 questions, 200 databases, 138 domains   | Cross-domain generalization, clean schemas      |
+| BIRD (arXiv:2305.03111)       | 12,751 pairs, 95 databases, 37 domains, 33+ GB | Dirty real data, external knowledge, efficiency |
+| Spider 2.0 (arXiv:2411.07763) | 632 tasks over real cloud data platforms       | Enterprise workflows, multi-step, tool use      |
+
+Two published reference points. On BIRD, human performance was 92.96% execution accuracy while GPT-4 scored 54.89% at the time of publication, a gap that drove most of the work since. On Spider, top systems passed 85% execution accuracy on the dev set, which is why BIRD and Spider 2.0 exist: Spider saturated. On Spider 2.0 the best systems at publication cleared under 20% of tasks.
+
+**Execution accuracy versus exact set match.** Exact set match normalizes the SQL and compares its component sets, so two queries that return the same rows but order their `WHERE` clauses differently can fail. Execution accuracy runs both queries and compares result sets. It is the fairer metric and the one leaderboards report now, with the caveat that a wrong query can return the right rows by accident on a small database. BIRD adds a validity-efficiency score penalizing slow-but-correct SQL.
+
+Common failure modes, in rough order of frequency:
+
+| Failure                          | Fix                                                              |
+| :------------------------------- | :--------------------------------------------------------------- |
+| Wrong column, right table        | Column-level schema retrieval with descriptions                  |
+| Missing or wrong join            | Include foreign keys explicitly in the schema prompt             |
+| Aggregation over the wrong grain | Ask for the grain first, or generate a `COUNT` check             |
+| Ambiguous column names           | Alias every column in the prompt as `table.column`               |
+| Dialect differences              | Pin the dialect in the system prompt and validate with `sqlglot` |
+| Literal mismatch                 | Value retrieval against distinct values                          |
+| Date and timezone handling       | Supply the column's type and an example value                    |
+
+---
+
+## Markdown tables
+
+Small tables go in the prompt as-is. LLMs read pipe tables reliably up to a few dozen rows.
+
+Past that, three options in increasing order of effort:
+
+1. **Column selection.** Retrieve the columns the question needs and drop the rest. A 1,000-row by 10-column table is roughly 30,000 to 50,000 tokens; the same rows over 3 columns fit.
+2. **Row serialization.** For narrow-but-deep data, one line per record as `field: value` pairs separated by a delimiter reads better than a wide pipe table, because the header is not repeated far from the cells.
+3. **Load it into a database and run text-to-SQL.** DuckDB queries CSV, Parquet and JSON directly with no load step, so a table that is too big to prompt over becomes a table you can aggregate over. This is the right answer far more often than it looks.
+
+Indexing rule: embed the table's caption, header row, and surrounding prose, and store the table body as retrievable payload. Embedding a large body produces a vector dominated by cell noise, and the query never matches it.
+
+---
+
+## Complex multi-column PDFs
+
+Naive text extraction reads across a two-column page and returns interleaved line fragments from both columns. The resulting chunks are not merely poor retrieval targets, they are semantically wrong: a sentence assembled from the left half of one column and the right half of the other.
+
+What layout-aware parsing recovers:
+
+| Problem                        | What the parser does                                     |
+| :----------------------------- | :------------------------------------------------------- |
+| Multi-column body text         | Detects column boundaries and reconstructs reading order |
+| Headers, footers, page numbers | Removes them so they stop appearing in every chunk       |
+| Tables                         | Recognizes cell structure and emits HTML or Markdown     |
+| Captions                       | Attaches a caption to the table or figure it belongs to  |
+| Figures                        | Extracts as images with a generated or extracted caption |
+| Equations                      | Emits LaTeX rather than mangling it into unicode         |
+| Heading hierarchy              | Preserves levels so chunks carry their section path      |
+| Scanned pages                  | OCR before any of the above                              |
+
+Tools: Docling (arXiv:2408.09869), Unstructured, LlamaParse, Marker, MinerU, and Nougat (arXiv:2308.13418) for scientific documents. For tables specifically, Camelot and Tabula work on born-digital PDFs, and pdfplumber gives low-level control. PyMuPDF is the fast path when you need word boxes and are willing to write the layout logic.
+
+Two chunking rules that follow from parsing:
+
+- Never split a table across chunks. A table broken in half loses its header for the second half, and the second half becomes unretrievable noise.
+- Keep a table with its caption and section heading. "Table 4" is meaningless in isolation; "Table 4: Latency by region, from the Q3 performance review" is retrievable.
+
+If the parser emits a table as HTML, keep it as HTML rather than converting to Markdown when the table has merged cells or nested headers. Markdown cannot represent them.
+
+---
+
+## Agentic filesystem RAG
+
+Coding agents do not embed the repository. They grep it.
+
+```text
+question: "where do we set the retry limit?"
+   |
+   v
+glob   **/*.py, **/*.yaml, **/*.toml
+   |
+   v
+grep   retry|retries|max_attempts|backoff      --> file:line hits
+   |
+   v
+read   the surrounding 40 lines of the top hits
+   |
+   v
+grep   for callers of the symbol found          --> expand if needed
+   |
+   v
+answer with file:line citations
+```
+
+This works because code retrieval is dominated by exact identifiers. `parse_config` appears in a grep as itself; its embedding is close to the embeddings of every other parsing function in the repo. Structural queries like "find all callers" have no natural embedding at all.
+
+Aider's repo map is the more sophisticated version of the same idea: tree-sitter extracts the symbol definitions and references across the repo, builds a graph, and ranks it with PageRank to decide which files fit in the context budget. That is graph retrieval over structure, with no vectors.
+
+The hybrid that works in practice: keep a semantic index for intent-shaped questions like "how does authentication flow work", and grep for symbol-shaped questions like "who calls `validate_token`". Route on whether the query contains an identifier.
+
+---
+
+## When vectorless wins
+
+| Data                          | Use                                                 | Why                                     |
+| :---------------------------- | :-------------------------------------------------- | :-------------------------------------- |
+| Relational database           | Text-to-SQL                                         | Exact aggregation, no lossy summary     |
+| Large CSV or Parquet          | DuckDB plus text-to-SQL                             | Same, with no load step                 |
+| Source code                   | grep, glob, tree-sitter, plus a semantic index      | Identifiers are exact-match problems    |
+| Small Markdown tables         | Pass inline                                         | Cheaper than any index                  |
+| Large Markdown tables         | Column selection or SQL                             | Token cost and embedding noise          |
+| Forms, invoices, statements   | Layout-aware parse to fields, then query the fields | The value is the field, not the passage |
+| APIs with a schema            | Function calling                                    | The schema is the interface             |
+| Narrative prose at scale      | Vector plus BM25 plus a reranker                    | No structure to exploit                 |
+| Thematic questions over prose | GraphRAG                                            | See the GraphRAG page                   |
+
+The general rule: if the data has a schema, query the schema. Embeddings are for the residue.
+
+---
+
+## Interview questions
+
+1. What is vectorless RAG and when do you reach for it?
+
+   Retrieval that exploits existing structure instead of embedding text: text-to-SQL over databases, Markdown tables passed or queried directly, layout-aware parsing of PDFs into fields, and grep or tree-sitter navigation over a filesystem. Reach for it whenever the data has a schema, because an embedding is a lossy summary that discards column names, cell boundaries, join keys and file paths.
+
+2. Walk through a text-to-SQL pipeline.
+
+   Schema linking to select relevant tables and columns, value retrieval to match literals in the question against stored values, SQL generation prompted with the schema and retrieved few-shot examples, execution, bounded self-correction on execution errors, and answer generation over the returned rows. Schema linking and value retrieval are the two steps that separate a demo from something that works.
+
+3. Why is schema linking column-level rather than table-level?
+
+   Because the common failure is right table, wrong column. Retrieving at the table level and dumping the whole DDL leaves the model to guess among fifty columns, and it picks one with a plausible name. Retrieving at the column level with a description of what each column holds narrows it before generation.
+
+4. What is value retrieval and why does BIRD emphasize it?
+
+   Matching literals in the question to actual stored values, so "Acme Corp" resolves to `ACME CORPORATION` or to a customer id. BIRD supplies external-knowledge evidence with each question precisely because real databases contain dirty values that a model cannot guess. Indexing distinct values of low-cardinality text columns and retrieving against them closes the gap.
+
+5. Does self-correction help text-to-SQL?
+
+   For execution errors, yes: feeding the database's error message back and regenerating reliably fixes syntax and type problems. For queries that execute but are logically wrong, no, and it can make things worse, because the model has no signal that the result is incorrect. Huang et al., arXiv:2401.16755, argue this generally for self-correction without external feedback.
+
+6. Compare execution accuracy and exact set match.
+
+   Exact set match normalizes the SQL and compares component sets, so semantically equivalent queries with different clause order can fail. Execution accuracy runs both queries and compares result sets, which is fairer and is what leaderboards report now. Its weakness is that a wrong query can return the right rows on a small database. BIRD adds a validity-efficiency score to penalize slow-but-correct SQL.
+
+7. What do the three SQL benchmarks each stress?
+
+   Spider (arXiv:1809.08887) stresses cross-domain generalization over 200 clean databases and is largely saturated above 85% execution accuracy. BIRD (arXiv:2305.03111) stresses dirty real data over 33+ GB with external knowledge and efficiency, where humans reached 92.96% and GPT-4 reached 54.89% at publication. Spider 2.0 (arXiv:2411.07763) stresses enterprise workflows over real cloud platforms, where the best systems at publication cleared under 20%.
+
+8. How do you sandbox LLM-generated SQL?
+
+   A read-only role, a statement timeout, an injected `LIMIT` plus a hard row cap, an allowlist of schemas and tables, execution against a replica, and a rollback-only transaction. None of that handles authorization: a `SELECT`-only role still returns rows across tenants, so enforce row-level security bound to the requesting user's identity in the database, not in the prompt.
+
+9. How do you get a large Markdown table into context?
+
+   Select the columns the question needs, which cuts a 1,000-row by 10-column table from roughly 40,000 tokens to a quarter of that. For narrow-but-deep data, serialize each record as `field: value` pairs rather than repeating a wide header. For anything genuinely large, load it into DuckDB, which queries CSV, Parquet and JSON directly, and run text-to-SQL over it.
+
+10. Why does naive PDF text extraction fail on multi-column documents?
+
+    It reads across the page, so lines from the left and right columns interleave. The resulting text is not just a poor retrieval target, it is wrong: sentences are assembled from fragments of two different paragraphs. Layout-aware parsing detects column boundaries and reconstructs reading order before chunking.
+
+11. What should a PDF parser recover besides body text?
+
+    Reading order, table cell structure emitted as HTML or Markdown, caption-to-table and caption-to-figure association, the heading hierarchy so chunks carry their section path, headers and footers for removal, equations as LaTeX, figures as images, and OCR for scanned pages.
+
+12. Two chunking rules that follow from layout-aware parsing.
+
+    Never split a table across chunks, because the second half loses its header and becomes unretrievable noise. And always keep a table with its caption and section heading, since "Table 4" is meaningless in isolation while "Table 4: latency by region, Q3 performance review" is retrievable.
+
+13. Why do coding agents grep instead of embedding the repo?
+
+    Code retrieval is dominated by exact identifiers. `parse_config` matches itself under grep, while its embedding sits close to every other parsing function in the repository. Structural questions like "find all callers" have no natural embedding. Aider's repo map generalizes the idea: tree-sitter extracts definitions and references into a graph and PageRank decides which files fit the context budget.
+
+14. What hybrid works for a codebase?
+
+    A semantic index for intent-shaped questions like "how does authentication flow work", grep and tree-sitter for symbol-shaped questions like "who calls validate_token", and a router that checks whether the query contains an identifier. Both paths are cheap; picking the wrong one is what costs quality.

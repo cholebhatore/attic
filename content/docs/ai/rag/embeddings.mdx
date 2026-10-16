@@ -1,0 +1,194 @@
+---
+title: Embeddings
+description: 'How embedding models are trained, query-document asymmetry, Matryoshka dimensions, similarity metrics, storage arithmetic, and contextual retrieval.'
+---
+
+An embedding is a dense vector positioned so that cosine similarity tracks semantic similarity. Everything about RAG quality downstream depends on whether that positioning is right for your corpus, and almost nothing in a RAG pipeline gets less attention.
+
+Two things decide the result: which model you use, and what text you hand it. The second is where contextual retrieval comes in, and it is worth more than most model upgrades.
+
+---
+
+## How embedding models are trained
+
+Contrastive learning on pairs. Pull the vectors of a query and its relevant document together, push apart the query and everything else.
+
+```text
+L = -log( exp(sim(q, d+) / tau) / sum_j exp(sim(q, d_j) / tau) )
+```
+
+| Ingredient         | Role                                                              |
+| :----------------- | :---------------------------------------------------------------- |
+| In-batch negatives | Free contrast; the other pairs in the batch act as negatives      |
+| Hard negatives     | Semantically close but wrong; where most of the signal comes from |
+| Temperature `tau`  | Sharpens the softmax; typical 0.02 to 0.05                        |
+| Instruction tuning | A task prefix conditions the vector on what is being asked        |
+
+Sentence-BERT (Reimers and Gurevych, arXiv:1908.10084) established the siamese fine-tuning setup. E5 (Wang et al., arXiv:2212.03533) added the `query:` and `passage:` prefixes and weakly supervised pretraining on 270 million pairs. BGE and GTE followed the same recipe with better hard-negative mining.
+
+Hard negatives are the lever that matters. A negative sampled at random is trivially distinguishable and teaches nothing. A negative that is the right document for a different query in the same corpus teaches the boundary. Mining them with the previous version of the model, then retraining, is the standard loop.
+
+---
+
+## Query-document asymmetry
+
+Queries and documents are not the same kind of text. A query is short, interrogative, and keyword-dense; a document is long, declarative, and redundant. Most modern models require you to tell them which one they are looking at.
+
+| Model                               | Query prefix                                                  | Document prefix                |
+| :---------------------------------- | :------------------------------------------------------------ | :----------------------------- |
+| `intfloat/e5-large-v2`              | `"query: "`                                                   | `"passage: "`                  |
+| `BAAI/bge-large-en-v1.5`            | `"Represent this sentence for searching relevant passages: "` | none                           |
+| `google/gemma-3-270m-it` embeddings | `"query: "`                                                   | `"passage: "`                  |
+| OpenAI `text-embedding-3`           | None                                                          | None                           |
+| Cohere `embed-v4`                   | `input_type="search_query"`                                   | `input_type="search_document"` |
+
+Getting this backwards is a silent failure. The vectors are still produced, retrieval still returns something, and recall drops by 10 to 20 points with no error anywhere. It is the single most common embedding bug.
+
+---
+
+## Dimension and Matryoshka
+
+| Dimension | Bytes per vector (fp32) | 1M vectors | Typical use                                |
+| :-------- | :---------------------- | :--------- | :----------------------------------------- |
+| 384       | 1,536                   | 1.4 GiB    | Small and fast models                      |
+| 768       | 3,072                   | 2.9 GiB    | BERT-class base                            |
+| 1,024     | 4,096                   | 3.8 GiB    | BGE-M3, Jina v3                            |
+| 1,536     | 6,144                   | 5.7 GiB    | OpenAI `text-embedding-3-small`            |
+| 3,072     | 12,288                  | 11.4 GiB   | OpenAI `text-embedding-3-large`, Cohere v3 |
+
+Matryoshka Representation Learning (Kusupati et al., arXiv:2205.13147) trains the model so that the first `d'` dimensions of a `d`-dimensional vector are themselves a usable embedding. Truncate and renormalize, and you trade a small amount of accuracy for a proportional memory saving.
+
+```python
+import numpy as np
+
+
+def truncate(vec: np.ndarray, dims: int) -> np.ndarray:
+    t = vec[:dims]
+    return t / np.linalg.norm(t)          # (dims,) renormalization is required
+```
+
+OpenAI exposes this as the `dimensions` parameter. Cutting 3,072 to 256 reduces storage by 12x with a reported accuracy loss of a few points on MTEB, which is often a good trade. The renormalization is not optional: an unnormalized truncated vector changes the cosine similarity scale and silently reorders results.
+
+---
+
+## Similarity metrics
+
+| Metric         | Formula                   | When                                              |
+| :------------- | :------------------------ | :------------------------------------------------ |
+| Cosine         | `(a . b) / (\|a\| \|b\|)` | Default; scale-invariant                          |
+| Dot product    | `a . b`                   | Equivalent to cosine if vectors are L2-normalized |
+| Euclidean (L2) | `sqrt(sum (a_i - b_i)^2)` | Equivalent ranking to cosine when normalized      |
+| Hamming        | Count of differing bits   | Binary quantized vectors                          |
+
+For unit vectors, `L2^2 = 2 - 2 * cos`, so all three produce the same ranking. The distinction only matters if the model does not normalize its output, which most do and some do not. Check once at index time and store normalized vectors; it makes the database's inner-product index correct for cosine.
+
+---
+
+## Choosing a model
+
+| Model                             | Dims  | Max tokens | Notes                                                  |
+| :-------------------------------- | :---- | :--------- | :----------------------------------------------------- |
+| OpenAI `text-embedding-3-large`   | 3,072 | 8,191      | Matryoshka, strong general performance                 |
+| Cohere `embed-v4`                 | 1,536 | 128,000    | Late chunking support, multimodal, compressed variants |
+| Voyage `voyage-3-large`           | 1,024 | 32,000     | Strong on code and finance; domain variants            |
+| `BAAI/bge-m3`                     | 1,024 | 8,192      | Dense, sparse and multi-vector in one model            |
+| `jinaai/jina-embeddings-v3`       | 1,024 | 8,192      | Matryoshka, task LoRA adapters                         |
+| `intfloat/e5-mistral-7b-instruct` | 4,096 | 32,768     | LLM-based; expensive to run, strong on hard queries    |
+| `nomic-embed-text-v1.5`           | 768   | 8,192      | Open weights, Matryoshka, cheap to self-host           |
+
+MTEB is the standard leaderboard and it is a weak selection signal. Its retrieval tasks skew toward short Wikipedia-style passages, and the top of the leaderboard moves by a point or two between releases. Two models within three points on MTEB can differ by fifteen on your corpus. Evaluate on fifty of your own queries with labelled relevant documents before choosing.
+
+Fine-tuning is usually worth it once you have a few thousand query-document pairs. A LoRA pass on a 110M-parameter embedding model costs under an hour on one GPU and typically beats any model swap you could make from the leaderboard.
+
+---
+
+## Contextual retrieval
+
+Anthropic's technique (September 2024) addresses the failure that chunking creates: an isolated chunk loses the document context that made it meaningful. "The company's revenue grew by 3% over the previous quarter" is unembeddable without knowing which company and which quarter.
+
+The fix is to prepend a short LLM-generated situating header to each chunk **before** embedding it and before BM25 indexing it.
+
+```text
+prompt to the LLM:
+
+<document>
+{{WHOLE_DOCUMENT}}
+</document>
+Here is the chunk we want to situate within the whole document:
+<chunk>
+{{CHUNK_CONTENT}}
+</chunk>
+Please give a short succinct context to situate this chunk within the overall
+document for the purposes of improving search retrieval of the chunk.
+Answer only with the succinct context and nothing else.
+```
+
+The generated header is one or two sentences, appended in front of the chunk text, and the concatenation is what gets embedded and indexed.
+
+### The published numbers
+
+Anthropic measured the retrieval failure rate, defined as the relevant chunk not appearing in the top 20, on a 200-document internal knowledge base.
+
+| Configuration                                          | Failure rate | Reduction |
+| :----------------------------------------------------- | :----------- | :-------- |
+| Embeddings only                                        | 5.7%         | baseline  |
+| Contextual embeddings                                  | 3.7%         | 35%       |
+| Contextual embeddings plus contextual BM25             | 2.9%         | 49%       |
+| Contextual embeddings, contextual BM25, plus reranking | 1.9%         | 67%       |
+
+Reranking alone, without contextual retrieval, reduced failures by about 36%. The combination is what reaches 67%, and the three components are complementary rather than redundant: contextual retrieval fixes what gets indexed, hybrid search fixes lexical matching, and reranking fixes the final ordering.
+
+<Callout type="info">
+  ### Why this is affordable
+
+One LLM call per chunk sounds expensive on a million-chunk corpus. Anthropic reports about $1.02 per million document tokens using prompt caching, because the whole document is the cacheable prefix and only the chunk changes between calls. The context header is generated once at index time and never again, which makes this a capital cost rather than an operating one.
+
+</Callout>
+
+### Relationship to late chunking
+
+Late chunking gets document context into the vector by pooling after a long-context transformer. Contextual retrieval gets it there by generating text and prepending it. The second works with any embedding model and any BM25 index, and it is inspectable, since you can read the header and see whether it is right. The first is cheaper at index time and adds no tokens to storage. For most teams contextual retrieval is the practical choice, because it also improves the sparse side of a hybrid index.
+
+---
+
+## Interview questions
+
+1. How are embedding models trained?
+
+   Contrastive learning on query-document pairs, with an InfoNCE-style loss that pulls matched pairs together and pushes the query away from negatives. In-batch negatives give free contrast, but hard negatives, which are semantically close yet wrong, carry most of the learning signal.
+
+2. What is query-document asymmetry and why does it matter?
+
+   Queries are short and interrogative; documents are long and declarative. Models like E5 and BGE require a prefix such as `"query: "` or `"passage: "` so the model knows which side it is encoding. Getting it backwards produces valid vectors and a silent 10 to 20 point recall drop. It is the most common embedding bug.
+
+3. What is Matryoshka representation learning?
+
+   Training the model so the first `d'` dimensions of a `d`-dimensional vector form a usable embedding on their own (Kusupati et al., arXiv:2205.13147). Truncating 3,072 dimensions to 256 cuts storage by 12x for a few points of accuracy. You must renormalize after truncating or the cosine scale shifts and results reorder.
+
+4. When do cosine, dot product, and L2 give different rankings?
+
+   Only when the vectors are not unit norm. For normalized vectors, `L2^2 = 2 - 2*cos`, so all three rank identically and an inner-product index is a valid cosine index. Store normalized vectors and the distinction disappears.
+
+5. How much storage does a million 1,536-dimensional vectors take?
+
+   `1e6 * 1536 * 4` bytes = 5.7 GiB in fp32. Int8 scalar quantization brings it to about 1.4 GiB and one-bit binary quantization to 192 MB, at the cost of recall that a reranker usually recovers.
+
+6. Should you pick the top model on MTEB?
+
+   No. MTEB's retrieval tasks skew toward short Wikipedia-style passages and the top of the leaderboard moves by a point or two between releases. Two models within three points there can differ by fifteen on your corpus. Evaluate on fifty of your own queries with labelled relevant documents.
+
+7. What problem does contextual retrieval solve?
+
+   Chunking isolates text from the document context that makes it meaningful. Anthropic prepends a short LLM-generated situating header to each chunk before embedding and before BM25 indexing, so both the dense and sparse representations carry that context.
+
+8. Quote the contextual retrieval numbers.
+
+   On a 200-document knowledge base measuring whether the relevant chunk lands in the top 20: embeddings alone fail 5.7% of the time, contextual embeddings 3.7% (a 35% reduction), contextual embeddings plus contextual BM25 2.9% (49%), and adding reranking 1.9% (67%).
+
+9. Why is contextual retrieval cheap despite being one LLM call per chunk?
+
+   Prompt caching. The whole document is the cacheable prefix and only the chunk varies between calls, so Anthropic reports about $1.02 per million document tokens. The header is generated once at index time, making it a capital cost rather than an operating one.
+
+10. How does contextual retrieval differ from late chunking?
+
+    Late chunking embeds the whole document with a long-context model and pools the token embeddings per chunk boundary, so context enters the vector through the transformer. Contextual retrieval generates text and prepends it, so context enters through the input. The second works with any embedding model and any BM25 index and is inspectable; the first adds no storage and costs less at index time.

@@ -1,0 +1,189 @@
+---
+title: Context Engineering
+description: 'Tuning the wording against building the whole runtime window: system prompt, tools, retrieved chunks, memory, history, and query, under a token budget.'
+---
+
+A prompt is a string you write once. A context is a payload you assemble per request, from six sources you do not fully control, under a hard token limit, in an order that changes both the answer and the price. That difference is the whole subject.
+
+Prompt engineering asks how to phrase the instruction. Context engineering asks what should be in the window at all, how much of it, in what order, and what gets evicted when the budget runs out. Every other page in this phase is one answer to one part of that question.
+
+---
+
+## Inner box against outer box
+
+| Dimension        | Prompt engineering (inner box)          | Context engineering (outer box)              |
+| :--------------- | :-------------------------------------- | :------------------------------------------- |
+| Object           | The instruction text                    | The entire token payload sent to the model   |
+| Decided          | At authoring time                       | At request time                              |
+| Levers           | Wording, few-shot examples, CoT, format | Retrieval, tool schemas, memory, history     |
+| Constraint       | Clarity                                 | Token budget, cache layout, attention decay  |
+| Failure mode     | Ambiguous instruction                   | Right instruction, wrong or missing evidence |
+| Changes per call | No                                      | Yes                                          |
+
+The inner box still matters. Four techniques carry most of its weight:
+
+- **Wording.** Specific verbs, explicit output contract, one job per instruction. Negative constraints ("do not speculate") work better than positive ones when the failure is well understood.
+- **Few-shot examples.** Two to five demonstrations beat a paragraph of description for format-heavy tasks. Selecting them by similarity to the incoming query, rather than fixing them, is itself a retrieval problem.
+- **Chain-of-Thought.** Asking for reasoning before the answer (Wei et al., arXiv:2201.11903). Still the cheapest accuracy lever on multi-step problems, and the reason reasoning models exist.
+- **Schema enforcement.** Declaring a JSON schema and having the decoder reject any token that would violate it. See below.
+
+---
+
+## Anatomy of a runtime context
+
+```text
++--------------------------------------------------+  stable, cacheable
+| system instructions                              |
+| persona, policies, output contract               |
++--------------------------------------------------+
+| tool definitions (JSON schemas)                  |
++--------------------------------------------------+
+| long-term memory / user profile                  |
++--------------------------------------------------+  semi-stable
+| retrieved chunks, ranked                         |
++--------------------------------------------------+
+| conversation history (compacted)                 |
++--------------------------------------------------+  fresh, never cached
+| current user query                               |
++--------------------------------------------------+
+```
+
+| Component        | Who writes it    | Stability     | Typical share of a 32k budget |
+| :--------------- | :--------------- | :------------ | :---------------------------- |
+| System prompt    | You, once        | Fixed         | 500 to 2,000 tokens           |
+| Tool schemas     | You, once        | Fixed         | 200 to 3,000 tokens           |
+| Memory           | You, per user    | Slow-changing | 200 to 1,000 tokens           |
+| Retrieved chunks | The retriever    | Per query     | 2,000 to 12,000 tokens        |
+| History          | The conversation | Per turn      | 1,000 to 20,000 tokens        |
+| Query            | The user         | Per turn      | 10 to 200 tokens              |
+
+Tool schemas are the component everyone underestimates. Twenty tools with verbose descriptions and nested parameter schemas routinely cost 3,000 to 8,000 tokens on every single request, including the ones that use no tools at all.
+
+---
+
+## The four operations
+
+LangChain's framing, which matches how the work is organized:
+
+| Operation    | Meaning                                       | Mechanisms                                           |
+| :----------- | :-------------------------------------------- | :--------------------------------------------------- |
+| **Write**    | Put information somewhere outside the window  | Scratchpads, memory stores, artifact files           |
+| **Select**   | Pull the right information in at request time | Vector search, BM25, reranking, memory retrieval     |
+| **Compress** | Fit more signal into fewer tokens             | Summarization, pruning, compaction, chunk selection  |
+| **Isolate**  | Keep unrelated state out of the window        | Sub-agents, sandboxed tool results, scoped retrieval |
+
+Isolation is the one that scales. A tool that returns a 40,000-token HTML page should be handed to a sub-agent that reads it and returns 200 tokens, rather than dumped into the main context. The main agent's window then holds a decision, not a document.
+
+---
+
+## Why long contexts did not end the problem
+
+Two separate results kill the "just stuff everything in" answer.
+
+**Positional degradation.** Liu et al. (arXiv:2307.03172) placed a relevant passage at each position in the context and measured accuracy. Performance is U-shaped: highest when the evidence is first or last, dropping by 20 points or more in the middle, for both GPT-3.5-Turbo and early GPT-4 with long-context variants. The effect persists in newer models at a reduced magnitude. This is the **lost in the middle** problem, and it is a property of attention, not of the retrieval.
+
+**Length degradation at fixed difficulty.** Levy et al. (arXiv:2402.14848), _Same Task, More Tokens_, held the task constant and grew the surrounding context from 50 to 3,000 tokens. Performance fell across five models and four tasks, with the sharpest drop before 1,000 tokens. Adding irrelevant text hurts even when the model has plenty of room.
+
+The practical consequence: **the budget is not a ceiling, it is a cost.** Every token you add competes with every other token for attention, and the marginal token is usually negative-value.
+
+<Callout type="warn">
+  ### Context rot is not a benchmark artifact
+
+Levy et al. used synthetic filler and distractor documents. Production contexts are worse: retrieved chunks that are topically near but factually wrong, tool outputs containing their own instructions, and conversation history where an early guess becomes an established fact. If you only measure accuracy at a fixed context length, you will not see the degradation until users report it.
+
+</Callout>
+
+---
+
+## Schema enforcement
+
+Asking for JSON and hoping is not enforcement. Three levels, weakest first:
+
+| Level                | Mechanism                                       | Guarantees valid JSON | Guarantees the schema |
+| :------------------- | :---------------------------------------------- | :-------------------- | :-------------------- |
+| Instruction          | "Return JSON matching this shape" in the prompt | No                    | No                    |
+| Response format      | API-level `response_format` with a JSON schema  | Yes                   | Partially             |
+| Constrained decoding | A grammar masks the logit vector at every step  | Yes                   | Yes                   |
+
+Constrained decoding compiles the schema into a finite-state machine or pushdown automaton and sets the probability of every token that would leave the language to zero before sampling. Outlines (Willard and Louf, arXiv:2307.09702) precomputes an index over the tokenizer so the mask is a lookup rather than a regex scan per step. XGrammar (arXiv:2411.15100) does the same with a stack-based automaton and reports overhead in the low single-digit percent.
+
+Two things constrained decoding cannot do: it cannot make the values correct, and it cannot stop the model from emitting a syntactically valid `"unknown"`. Validate semantics separately.
+
+---
+
+## A worked assembly
+
+A support agent answering "why was I charged twice for order 4412?" against a 32,000-token budget.
+
+```text
+system prompt            900 tokens   fixed, cached
+tool schemas (4 tools)  1,400 tokens   fixed, cached
+customer profile         300 tokens   from the memory store
+retrieved policy chunks 3,200 tokens   4 chunks at 800, hybrid search plus rerank
+billing records         1,100 tokens   tool output, already summarized by the tool
+conversation history    2,400 tokens   last 6 turns, older turns compacted to 400
+current query             24 tokens
+                        --------
+total                   9,324 tokens   29% of the budget
+```
+
+Leaving 71% of the window empty is deliberate. The remaining budget absorbs the model's own reasoning and the next two turns without triggering compaction, and a shorter context means a lower lost-in-the-middle risk and a lower bill.
+
+---
+
+## What to measure
+
+| Metric                                  | Why                                                |
+| :-------------------------------------- | :------------------------------------------------- |
+| Median and p95 context tokens           | Cost and latency both scale with it                |
+| Cache hit rate on the stable prefix     | A 10x price difference on most providers           |
+| Retrieved-token utilization             | Share of retrieved tokens the answer cites         |
+| Share of turns triggering compaction    | Rising means history is growing faster than budget |
+| Answer accuracy at varying context size | Detects rot before users do                        |
+| Tool schema token cost                  | The most common silent budget leak                 |
+
+Retrieved-token utilization is the sharpest one. If you retrieve 8,000 tokens and the answer cites 300, you are paying for 7,700 tokens of distraction. The fix is fewer chunks or a reranker, not a bigger window.
+
+---
+
+## Interview questions
+
+1. What is the difference between prompt engineering and context engineering?
+
+   Prompt engineering tunes the instruction text, decided once at authoring time. Context engineering assembles the whole payload at request time from six sources: system instructions, tool schemas, memory, retrieved chunks, conversation history, and the query. The second has a token budget, a cache layout, and an ordering constraint that the first does not.
+
+2. Name the six components of a runtime context in order.
+
+   System instructions, tool definitions, long-term memory, retrieved chunks, conversation history, then the current query. The ordering runs from most stable to most fresh, which is what makes prefix caching possible.
+
+3. Which component is most often underestimated in cost?
+
+   Tool schemas. Twenty tools with verbose descriptions and nested parameters routinely cost 3,000 to 8,000 tokens on every request, including requests that call no tools. It is a fixed per-request tax that does not appear in any retrieval budget.
+
+4. Name the four context operations.
+
+   Write, Select, Compress, Isolate. Write moves information outside the window into a scratchpad or memory store, Select pulls the right information back in, Compress fits more signal into fewer tokens, and Isolate keeps unrelated state out of the window entirely, usually by handing it to a sub-agent.
+
+5. What is the lost in the middle problem and what causes it?
+
+   Liu et al. (arXiv:2307.03172) placed a relevant passage at each position and found a U-shaped accuracy curve, with a drop of 20 points or more when the evidence sits in the middle rather than at either end. It is a property of how attention distributes over long sequences, not of the retrieval, so it cannot be fixed by retrieving better.
+
+6. What did Same Task, More Tokens show?
+
+   Levy et al. (arXiv:2402.14848) held the task fixed and grew the surrounding context from 50 to 3,000 tokens. Accuracy fell across five models and four tasks, with the steepest drop before 1,000 tokens. Irrelevant text hurts even when the window has room, so the token budget is a cost rather than a ceiling.
+
+7. What are the three levels of JSON schema enforcement?
+
+   Instruction-level, where you ask for JSON in the prompt and get no guarantee; response-format level, where the API validates against a schema; and constrained decoding, where a compiled grammar masks the logits at every step so invalid tokens cannot be sampled. Only the third guarantees the schema holds.
+
+8. How does constrained decoding work and what does it cost?
+
+   The schema compiles to an automaton, and at each step every token that would leave the language gets its logit set to negative infinity. Outlines (arXiv:2307.09702) precomputes a tokenizer index so masking is a lookup; XGrammar (arXiv:2411.15100) uses a stack-based automaton and reports overhead in the low single-digit percent. It cannot make values correct, only well-formed.
+
+9. What is retrieved-token utilization and why does it matter?
+
+   The share of retrieved tokens the final answer cites. Retrieving 8,000 tokens to cite 300 means you are paying for 7,700 tokens of distraction, which raises cost, raises latency, and lowers accuracy through the length-degradation effect. The fix is fewer chunks or a reranker, not a larger window.
+
+10. Why would you deliberately leave most of a 32k window empty?
+
+    Because the marginal retrieved token is usually negative-value: it costs money and attention and adds distractors. Headroom also absorbs the model's own reasoning and the next few turns without triggering compaction, and a shorter prefix is cheaper to process on every subsequent turn.

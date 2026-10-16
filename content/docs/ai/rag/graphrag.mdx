@@ -1,0 +1,300 @@
+---
+title: GraphRAG
+description: 'Entity graphs over a corpus, Leiden communities, hierarchical reports, and the Local versus Global split that answers questions no single chunk contains.'
+---
+
+Vector retrieval finds chunks that look like the query. That works when the answer sits inside one chunk. It fails in two ways that no amount of reranking fixes: when the answer is a property of the whole corpus, and when the answer is a path through it.
+
+GraphRAG, published by Microsoft Research as _From Local to Global: A Graph RAG Approach to Query-Focused Summarization_ (Edge et al., arXiv:2404.16130), builds an entity graph plus a hierarchy of community summaries at index time, then queries that structure instead of only the chunks.
+
+---
+
+## The two failures
+
+| Failure                  | Example question                                                           | Why vector search misses                                                 |
+| :----------------------- | :------------------------------------------------------------------------- | :----------------------------------------------------------------------- |
+| Global sensemaking       | "What are the main themes across these 10,000 incident reports?"           | No chunk contains a theme. The answer is an aggregate.                   |
+| Multi-hop relational     | "Which vendors supply components used by the systems that failed in 2023?" | Each hop is a different chunk, and nothing links them.                   |
+| Entity disambiguation    | "Is the Acme in the Q3 filing the same Acme in the lawsuit?"               | Both chunks embed near the query; neither says they are the same entity. |
+| Counting and enumeration | "List every project that mentions the payments migration."                 | Top-k returns k chunks, not a complete set.                              |
+
+The common shape: the answer lives in the relationships between documents or in a summary over them, not in any passage. Retrieval over passages cannot see either.
+
+Query-focused summarization is the academic name for the first row, and it predates LLMs. The GraphRAG contribution is doing it over a private corpus at a scale where reading everything is impossible, by summarizing hierarchically ahead of time.
+
+---
+
+## The indexing pipeline
+
+<Mermaid
+  chart={`
+flowchart TD
+    A["Source documents"] --> B["TextUnits<br/>1200 tokens, 100 overlap"]
+    B --> C["LLM extraction<br/>entities, relationships, claims"]
+    C --> D["Graph build<br/>dedupe and merge by name and type"]
+    D --> E["Leiden community detection<br/>hierarchical partition"]
+    E --> F["Community reports<br/>LLM summary per community, bottom up"]
+    B --> G["Vector index<br/>text units and entity descriptions"]
+    D --> H["Graph store<br/>nodes, edges, covariates"]
+    F --> H
+    G --> I["Query time"]
+    H --> I
+`}
+/>
+
+Six stages, five of which run once and one of which runs on every update.
+
+| Stage               | What it produces                                                                                                           | LLM calls                                 |
+| :------------------ | :------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------- |
+| Text unitization    | Chunks with source provenance. Default 1200 tokens, 100 overlap.                                                           | None                                      |
+| Extraction          | A list of entities with name, type, description; relationships with source, target, description, strength; optional claims | One per text unit                         |
+| Graph build         | A merged graph. Descriptions of the same entity from different chunks are themselves summarized together                   | One per entity with multiple descriptions |
+| Community detection | A hierarchy of disjoint node clusters at several resolutions                                                               | None                                      |
+| Community reports   | A structured summary per community: title, summary, rating, findings, the entities and relations inside it                 | One per community                         |
+| Embedding           | Vectors for text units, entity descriptions, relationship descriptions, and community report text                          | None, embeddings only                     |
+
+Extraction is the expensive stage and the one that determines everything downstream. The prompt is gleaning-based: the model extracts, is then asked whether it missed anything, and repeats up to a configured number of gleaning rounds. More rounds means more entities and more cost.
+
+A claim, or covariate, is a typed statement attached to an entity with a subject, object, type, status, description, source text and a date range. Claim extraction is off by default in `microsoft/graphrag` because it roughly doubles extraction cost, and because claims are only useful for queries about assertions rather than about structure.
+
+---
+
+## Community detection
+
+Leiden (Traag et al., arXiv:1810.08473, _From Louvain to Leiden: guaranteeing well-connected communities_) partitions the graph into densely connected groups. GraphRAG uses its hierarchical variant, which yields a tree of partitions rather than a single flat one.
+
+Level 0 is the coarsest: a handful of large communities covering the whole corpus. Each subsequent level subdivides, so the deepest level has many small communities. The resolution parameter controls where the cut falls and is worth tuning per corpus, because the right community size depends on how dense the entity graph is.
+
+Two properties matter for retrieval:
+
+- Communities are disjoint at a given level, so a map-reduce over them covers the corpus exactly once with no double counting.
+- The hierarchy means you can trade answer granularity against cost by choosing a level. Coarse is cheap and broad; fine is expensive and specific.
+
+Leiden is guaranteed to produce well-connected communities, which is the fix over Louvain: Louvain can leave a community internally disconnected, which makes its summary incoherent.
+
+---
+
+## Community reports
+
+Each community gets an LLM-written report built bottom up. A leaf community's report summarizes its entities and relationships directly. A parent's report is written from its children's reports plus any entities that sit above the cut.
+
+The report is structured, not free prose:
+
+```text
+title:       short name for the community
+summary:     two to five sentences over the whole community
+rating:      0.0 to 10.0, relevance and importance of this community in the corpus
+findings:    a list of short paragraphs, each with a summary and an explanation
+             each finding cites the entities and relationships behind it
+```
+
+The rating is used at query time to sort and prune. The findings are what get consumed, because they are the atomic units that a global search scores and filters.
+
+Bottom-up generation is the reason this scales. Summarizing 10,000 documents directly would need one call over 10,000 documents. Summarizing a tree needs many small calls, each inside a context window, and the root level ends up summarizing maybe twenty reports instead of twenty thousand documents.
+
+---
+
+## Local Search
+
+Local Search answers a question about specific entities. It is what you use when the query names something.
+
+1. Embed the query and find the nearest entity descriptions. These are the seed entities.
+2. Walk the graph from each seed to its neighbours, collecting related entities and the relationships between them.
+3. Gather the text units that produced those entities and relationships, the community reports for the communities the seeds belong to, and any covariates.
+4. Assemble all of it into a token budget. Each component type gets a configured share, and items within a type are ranked by how connected they are to the seeds.
+5. Generate the answer from the assembled context.
+
+The context builder is the part worth understanding, because it is where the graph earns its keep. A vector retriever would return the top-k chunks. Local Search returns entity summaries, relationship descriptions, a community report that places the entity in the wider corpus, and the raw text units behind the claims, all budgeted together. That mixture is what lets it answer "who does this person work with and what did they do" in one pass.
+
+---
+
+## Global Search
+
+Global Search answers a question about the corpus. It never touches individual chunks.
+
+1. Pick a community level.
+2. Map: batch the community reports at that level and ask the model to produce partial answers from each batch, each with an importance score from 0 to 100.
+3. Filter: drop partial answers below a score threshold.
+4. Reduce: sort the survivors descending by score and assemble them into one final answer.
+
+The map phase is embarrassingly parallel, so wall-clock time is roughly one call, not one call per community. Token cost is not parallel, and it is the full set of community reports at the chosen level.
+
+Choosing the level is the main knob. Coarse communities give a broad, thematic answer with fewer tokens. Fine communities give a detailed answer with many more tokens and many more partial answers to reduce.
+
+---
+
+## Local versus Global
+
+| Property         | Local Search                                | Global Search                               |
+| :--------------- | :------------------------------------------ | :------------------------------------------ |
+| Question shape   | About named entities                        | About the corpus                            |
+| Entry point      | Query embedding against entity descriptions | A chosen community level                    |
+| Uses chunks      | Yes, the text units behind the entities     | No                                          |
+| Uses communities | Only the ones containing the seeds          | All of them at that level                   |
+| Pattern          | Single assembled context                    | Map-reduce                                  |
+| Latency          | One generation call                         | One map wave plus one reduce call           |
+| Token cost       | Moderate, bounded by the context budget     | High, scales with the number of communities |
+| Fails when       | The entity was never extracted              | The theme spans communities unevenly        |
+
+Most production questions are local. Global search is the one that makes GraphRAG distinctive, and it is also the one that costs the most per query.
+
+---
+
+## DRIFT Search
+
+DRIFT (_Dynamic Reasoning and Inference with Flexible Traversal_, arXiv:2411.03083) exists because the local/global split is a false dichotomy for real questions. "What problems did the payments migration cause, and how do they compare to the ones from the 2022 outage?" needs global context to frame the comparison and local traversal to get the specifics.
+
+Three phases:
+
+| Phase        | What it does                                                                               |
+| :----------- | :----------------------------------------------------------------------------------------- |
+| Primer       | Walks the community hierarchy to build initial context, then generates follow-up questions |
+| Follow-up    | Runs iterative local searches over those generated questions, accumulating results         |
+| Final output | Synthesizes everything collected into one answer with citations                            |
+
+DRIFT reports better answer completeness and output relevance than either search alone on the same corpora. The cost is that it issues several local searches per query, so it is the most expensive of the three.
+
+---
+
+## Combining with vector search
+
+GraphRAG is not a replacement for vector retrieval, and the paper does not present it as one. The two indexes coexist:
+
+- The vector index over text units stays, and plain similarity search remains the cheapest path for lookup questions.
+- Entity and relationship descriptions are embedded too, so a query can enter the graph semantically rather than by exact name match.
+- Community reports are embedded, which lets a router pick a level for global search based on the query.
+
+A sensible router: try vector plus BM25 first, escalate to local search when the question names entities that have many relationships, and escalate to global search when the question asks for themes, counts, or comparisons across the corpus. Classification of that router is a small model call, not a heuristic, and it is where most of the cost saving comes from.
+
+---
+
+## Indexing cost
+
+The cost is structural, so the arithmetic is worth doing once with your own numbers rather than quoting a figure.
+
+```text
+corpus              5,000 pages at ~500 tokens        = 2,500,000 document tokens
+text units          2,500,000 / 1,100 effective       ~= 2,300 units
+extraction input    2,300 x (600 prompt + 1,200 chunk) = 4,140,000 tokens
+extraction output   2,300 x ~1,000 (entities, relations, gleanings)
+                                                      = 2,300,000 tokens
+graph merge         one summary per entity with >1 description
+                    ~8,000 such entities x ~500 in    = 4,000,000 input
+                                                      = 800,000 output
+community reports   ~200 communities x ~4,000 in      = 800,000 input
+                                                      = 400,000 output
+                    ------------------------------------------------
+totals              ~8,900,000 input, ~3,500,000 output
+```
+
+Compare with vector indexing of the same corpus: 2,500,000 tokens through an embedding model, once, with no output tokens at all. At any realistic price ratio, extraction output tokens dominate the GraphRAG bill, and they scale linearly with corpus size while embedding cost scales linearly too but at a much lower unit price.
+
+Three consequences:
+
+- Gleaning rounds multiply extraction output. Two rounds is not twice the cost of one, it is closer to three times, because each round re-reads the chunk.
+- Claim extraction roughly doubles it again.
+- Re-indexing on every document change is not viable. Incremental update, where a new document only re-extracts its own text units and then updates the affected communities, is a requirement.
+
+<Callout type="warn">
+  ### Index cost is a design decision
+
+A team that builds a GraphRAG index over a fast-changing corpus discovers the cost after the fact, when a nightly re-index becomes the largest line item in the stack. Decide up front whether the corpus is stable enough. Reference documentation, filings, incident archives and research corpora are. Live ticket queues and chat logs are not. For a changing corpus, index a stable snapshot on a schedule and serve vector retrieval against the live data.
+
+</Callout>
+
+---
+
+## Cutting the cost
+
+| Technique                               | Saving                                   | Trade-off                                                  |
+| :-------------------------------------- | :--------------------------------------- | :--------------------------------------------------------- |
+| One gleaning round instead of three     | Roughly half of extraction output        | Fewer low-salience entities                                |
+| Smaller extraction model                | Proportional to the price ratio          | Lower extraction recall, worse merges                      |
+| NLP-based NER instead of LLM extraction | Almost all of the extraction cost        | Entities without descriptions, no relations with reasoning |
+| Skip claim extraction                   | Roughly half                             | No covariate-backed queries                                |
+| Larger text units                       | Fewer calls, but each costs more         | Extraction quality drops on long inputs                    |
+| Cache extraction by text-unit hash      | Everything on re-index of unchanged text | Storage                                                    |
+| Community reports only at two levels    | Fewer report calls                       | Coarser global search                                      |
+
+The NER substitution deserves a note. A fast statistical or small-transformer extractor finds entity mentions cheaply, but GraphRAG's power comes from the natural-language description attached to each entity and each relationship, which is what the embeddings search and what the community reports summarize. Mention detection without descriptions gives you a graph you can traverse but not one you can query semantically. A hybrid that uses NER for candidate mentions and an LLM only to describe the merged entity is a reasonable middle ground.
+
+---
+
+## When GraphRAG wins
+
+| Situation                                                    | Verdict                                  |
+| :----------------------------------------------------------- | :--------------------------------------- |
+| Narrative corpus, thousands of documents, thematic questions | GraphRAG, global search                  |
+| Multi-hop questions where hops are in different documents    | GraphRAG, local search                   |
+| Compliance or audit trails needing explicit relationships    | GraphRAG, plus claims                    |
+| Fact lookup in reference docs                                | Vector plus BM25 plus a reranker         |
+| Freshness matters more than coverage                         | Vector, incremental indexing             |
+| Small corpus under a context window                          | Neither, just stuff it                   |
+| Corpus already has a schema                                  | Text-to-SQL, see vectorless RAG          |
+| Corpus is mostly tables and forms                            | Layout-aware parsing, see vectorless RAG |
+
+The honest summary: GraphRAG is a summarization system with a retrieval front end. Reach for it when the question is about the corpus, and reach for vectors when the question is about a passage.
+
+---
+
+## Implementations
+
+- [`microsoft/graphrag`](https://github.com/microsoft/graphrag) — the reference pipeline: indexing CLI, prompt auto-tuning, local, global and DRIFT search, and an incremental update path.
+- [`neo4j/neo4j-graphrag-python`](https://github.com/neo4j/neo4j-graphrag-python) — graph construction and retrieval against Neo4j, with vector and full-text indexes in the same store.
+- LlamaIndex `PropertyGraphIndex` — schema-free or schema-guided graph construction, plus retrievers that combine graph traversal with vector similarity.
+- Neo4j LLM Knowledge Graph Builder — a hosted path from documents to a graph, useful for a first prototype.
+- [`stanford-futuredata/ColBERT`](https://github.com/stanford-futuredata/ColBERT) and the vector side remain relevant: a GraphRAG deployment almost always keeps a dense index alongside the graph.
+
+Auto-tuning in `microsoft/graphrag` optimizes the extraction prompts against your corpus before a full index run. Use it. The default prompts are tuned for English narrative text and lose recall on technical, multilingual, or heavily structured corpora.
+
+---
+
+## Interview questions
+
+1. What two question classes does vector RAG fail on that GraphRAG handles?
+
+   Global sensemaking, where the answer is an aggregate over the whole corpus and no chunk contains it, and multi-hop relational, where the answer is a path through several documents that nothing links together. GraphRAG answers the first with hierarchical community summaries and the second with graph traversal from seed entities.
+
+2. Walk through the GraphRAG indexing pipeline.
+
+   Documents are split into text units, default 1200 tokens with 100 overlap. An LLM extracts entities, relationships and optional claims from each unit, with gleaning rounds to catch misses. Entities are merged by name and type, and duplicate descriptions are summarized together. Leiden partitions the graph into a hierarchy of communities. Each community gets an LLM-written report built bottom up. Text units, entity descriptions, relationships and reports are embedded for query-time entry.
+
+3. Why Leiden rather than Louvain?
+
+   Leiden guarantees well-connected communities. Louvain can produce a partition where a community is internally disconnected, which makes the LLM summary of that community incoherent because the members have nothing to do with each other. Leiden also converges faster in practice.
+
+4. What is in a community report?
+
+   A title, a two-to-five-sentence summary, a 0.0 to 10.0 relevance rating, and a list of findings where each finding has a summary, an explanation, and citations to the entities and relationships behind it. The rating is used to sort and prune at query time; the findings are what global search scores.
+
+5. How does Local Search build its context?
+
+   Embed the query, find the nearest entity descriptions as seeds, walk the graph to neighbouring entities and the relationships between them, then gather the text units that produced those, the community reports the seeds belong to, and any covariates. All of it is assembled into a token budget with a configured share per component type, ranked within type by graph connectivity to the seeds.
+
+6. How does Global Search work and why is it map-reduce?
+
+   Pick a community level, batch the reports at that level, and have the model emit partial answers with 0-to-100 importance scores per batch. Filter below a threshold, sort descending, and reduce into a final answer. It is map-reduce because no single context holds every report, and because the map wave is parallel so latency stays near one call while token cost stays high.
+
+7. What does the community level control in Global Search?
+
+   Granularity against cost. Coarse levels have fewer reports, so fewer tokens and a broad thematic answer. Fine levels have many more reports, so more tokens, more partial answers to reduce, and a more specific answer.
+
+8. What is DRIFT Search?
+
+   Dynamic Reasoning and Inference with Flexible Traversal, arXiv:2411.03083. A primer phase walks the community hierarchy to build context and generate follow-up questions, an iterative phase runs local searches over those questions, and a final phase synthesizes everything with citations. It handles questions that need both global framing and local detail, and costs several local searches per query.
+
+9. Where does GraphRAG indexing cost go?
+
+   Into LLM extraction. For a 2.5M-token corpus split into roughly 2,300 text units, extraction alone is about 4.1M input tokens and 2.3M output tokens, and the graph merge and community reports add several million more. Output tokens from extraction dominate, and gleaning rounds multiply them because each round re-reads the chunk.
+
+10. Name three ways to cut indexing cost and what each sacrifices.
+
+    One gleaning round instead of three, saving roughly half the extraction output at the cost of low-salience entities. Disabling claim extraction, saving roughly half again at the cost of covariate-backed queries. Replacing LLM extraction with NLP-based NER, saving almost all of it but losing the natural-language entity descriptions that make the graph semantically searchable. Caching extraction by text-unit hash and generating reports at only two levels help further without quality loss on unchanged text.
+
+11. Should GraphRAG replace a vector index?
+
+    No. They coexist. Text units stay embedded for cheap lookup, entity and relationship descriptions are embedded so a query can enter the graph semantically, and community reports are embedded so a router can pick a level. A router that starts with vector plus BM25 and escalates to local or global search only when the question shape demands it is where most of the cost saving comes from.
+
+12. When would you not use GraphRAG?
+
+    When the corpus changes fast, because re-indexing is expensive and incremental update only helps if changes are localized. When the corpus is small enough to fit in a context window. When the questions are fact lookups in reference material. When the corpus already has a schema, in which case text-to-SQL is cheaper and exact.
