@@ -1,0 +1,204 @@
+---
+title: Data Preparation
+description: 'Instruction pairs, chat templates, completion-only loss masking, multi-turn formatting, synthetic data generation, and decontaminating against eval sets.'
+---
+
+Fine-tuning data is smaller and more consequential than pretraining data. A few thousand rows will move an 8B model, which means every bad row moves it too. LIMA (Zhou et al., arXiv:2305.11206) trained on 1,000 hand-curated examples and produced a model whose outputs were preferred over GPT-3's on 43% of comparisons. The paper's own framing is the lesson: quality of the curated set beat scale.
+
+---
+
+## The instruction pair
+
+Three fields, one job each.
+
+| Field       | Role                                                   | Optional |
+| :---------- | :----------------------------------------------------- | :------- |
+| `system`    | Standing constraints for the whole conversation        | Yes      |
+| `user`      | The instruction, plus any context or input             | No       |
+| `assistant` | The target completion. This is what the loss trains on | No       |
+
+Two shapes dominate the ecosystem. The older Alpaca style is flat:
+
+```json
+{ "instruction": "Convert this to SQL", "input": "top 5 users by spend", "output": "SELECT ..." }
+```
+
+The modern style is a message list, which handles multi-turn and matches what the tokenizer expects:
+
+```json
+{
+  "messages": [
+    { "role": "system", "content": "You are a SQL generator. Output only SQL." },
+    { "role": "user", "content": "top 5 users by spend" },
+    { "role": "assistant", "content": "SELECT user_id, SUM(amount) ..." }
+  ]
+}
+```
+
+Prefer the message list. It round-trips through `apply_chat_template` without a custom formatter, and it does not need a convention for where `input` goes when it is empty.
+
+---
+
+## Chat templates
+
+Every model family has its own wire format, and getting it wrong is the most common cause of a fine-tune that trains fine and generates endlessly at inference.
+
+| Family            | Format               | End-of-turn token |
+| :---------------- | :------------------- | :---------------- | --------------- | ------------- | --- | --- | ------ | --- |
+| Qwen, most new    | ChatML: `<           | im_start          | >role\ncontent< | im_end        | >`  | `<  | im_end | >`  |
+| Llama 3 and 4     | `<                   | start_header_id   | >role<          | end_header_id | >`  | `<  | eot_id | >`  |
+| Mistral, Mixtral  | `[INST] ... [/INST]` | `</s>`            |
+| GPT-3.5 and later | ChatML               | `<                | endoftext       | >`            |
+
+Never hand-write these. The tokenizer carries the template:
+
+```python
+text = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+ids = tok(text, return_tensors="pt")["input_ids"]   # shape (1, seq_len)
+```
+
+`add_generation_prompt=True` appends the opening assistant header without a closing token, which is what you want when prompting. When building training targets you want `False`, because the closing token must be in the target for the model to learn to stop.
+
+<Callout type="error">
+  ### A wrong template is invisible in the training loss
+
+The model happily learns to predict whatever tokens you fed it. The failure appears at inference as generation that never stops, or that emits raw `<|im_start|>` markers, because the model was trained on a turn structure that does not match the one your serving stack renders. Print one fully templated training example and read it token by token before launching a run.
+
+</Callout>
+
+---
+
+## Loss masking
+
+The loss should cover assistant tokens only. Training on the user turn teaches the model to generate questions, which is not what you asked for.
+
+```python
+from trl import DataCollatorForCompletionOnlyLM
+
+collator = DataCollatorForCompletionOnlyLM(
+    response_template="<|im_start|>assistant\n",
+    tokenizer=tok,
+)
+```
+
+The collator sets labels to `-100` for every position before the response marker. `CrossEntropyLoss` ignores `-100` by default, so those positions contribute nothing to the loss or the gradient.
+
+Two failure modes to check:
+
+- **The marker never appears.** If the tokenizer merges your `response_template` string into different token IDs than the ones in the actual text, every label becomes `-100` and the loss is `0` or `nan`. Assert that at least some labels survive on a sample batch.
+- **Multi-turn masking.** In a conversation with three assistant turns you must mask before _each_ one, not just the first. A collator that only finds the first marker trains the model on the user turns in between.
+
+---
+
+## Multi-turn conversations
+
+| Strategy                   | What one training row contains              | When to use                       |
+| :------------------------- | :------------------------------------------ | :-------------------------------- |
+| Full conversation, one row | All turns, masked to assistant spans only   | Context-dependent follow-ups      |
+| One row per assistant turn | Prefix turns as context, one target         | Each turn is independently valid  |
+| Last turn only             | Full context, only the final assistant span | Cheap, loses intermediate signals |
+
+The first is the default. It matches inference, where the whole history is in context, and one forward pass trains every assistant span at once.
+
+The trap is context bleed: if turn four's answer only makes sense given turn two, and you train turn four alone with turn two dropped, you teach the model to answer questions it was never given.
+
+---
+
+## Curation
+
+Ordering by expected value per row:
+
+1. **Correctness.** A wrong answer is worse than no row. It is a direct gradient towards the wrong output.
+2. **Deduplication.** Near-duplicate rows multiply one pattern's gradient. MinHash or embedding similarity at a cosine threshold around 0.9 catches most of it.
+3. **Length distribution.** If every example is 40 tokens, the model learns to answer briefly and truncates long ones. Bin by output length and check the spread.
+4. **Difficulty mix.** All-easy data plateaus; all-hard data destabilizes. A rough split of easy, medium, and hard converges better than any single band.
+5. **Style consistency.** One tone, one formatting convention. Contradictory house styles produce a model that alternates between them.
+6. **Negative examples.** Inputs the model should refuse or flag, with the refusal as the target. Without them, fine-tuning strips the base model's refusals in your domain.
+
+---
+
+## Synthetic data
+
+Generating training data with a stronger model is now the normal path, and it has three established recipes.
+
+| Method           | Mechanism                                                     | Source                        |
+| :--------------- | :------------------------------------------------------------ | :---------------------------- |
+| Self-Instruct    | Seed with a few tasks, have the model generate more, filter   | Wang et al., arXiv:2212.10560 |
+| Alpaca-style     | Generate instructions from a fixed taxonomy, then answer them | Taori et al., 52,000 rows     |
+| Evol-Instruct    | Iteratively rewrite prompts to be harder, deeper, or broader  | Xu et al., arXiv:2304.12244   |
+| Rejection sample | Generate N answers, keep the ones that pass a verifier        | Standard in reasoning data    |
+
+Rejection sampling is the highest-value one when a checker exists. If you can execute the SQL, run the unit test, or parse the JSON, filter on the result rather than on the teacher's confidence.
+
+<Callout type="warn">
+  ### Model collapse is a real failure mode
+
+Training on model-generated data across generations narrows the distribution. Shumailov et al. (arXiv:2305.17493) showed the tail of the distribution disappears first and the loss of variance compounds. Practically: keep a slice of human-written data in every synthetic set, and never train a generation exclusively on the output of a model that was itself trained on synthetic data.
+
+</Callout>
+
+Synthetic data also homogenizes style. Every row carries the teacher's cadence, its favorite transitions, and its habitual structure. A student trained only on one teacher inherits all of it.
+
+---
+
+## Decontamination
+
+If your training set contains your evaluation set, the score is a lie. This happens accidentally more than deliberately, because public datasets overlap.
+
+Two standard passes:
+
+- **Exact and near-exact n-gram overlap.** Hash every 13-gram in each eval example and drop any training row that shares one. The 13-gram threshold is what GPT-3 (Brown et al., arXiv:2005.14165) used and what the LM Evaluation Harness still applies.
+- **Semantic overlap.** Embed both sets and drop training rows above a cosine similarity threshold against any eval example. Catches paraphrase, which n-grams miss.
+
+Decontaminate against every benchmark you intend to report, not just the primary one. A model can be clean on your task eval and contaminated on the general regression suite you use to detect forgetting.
+
+---
+
+## How much data
+
+Rough ranges, because the right answer depends on how far the behavior is from the base model's default:
+
+| Goal                                | Rows                                |
+| :---------------------------------- | :---------------------------------- |
+| Lock down an output format          | 200 to 2,000                        |
+| Teach a narrow style or tone        | 1,000 to 10,000                     |
+| Domain task with reasoning          | 5,000 to 50,000                     |
+| New capability the base model lacks | 50,000+, or reconsider the approach |
+
+Doubling a bad dataset does not make it good. Fixing 500 rows beats adding 5,000.
+
+---
+
+## Interview questions
+
+1. Why does loss masking matter in instruction fine-tuning?
+
+   Without it the model is trained to predict the user's tokens as well as the assistant's, which spends gradient on generating questions and dilutes the signal from the answers you want. Masking sets labels to `-100` on non-target positions so `CrossEntropyLoss` skips them.
+
+2. What happens if you fine-tune with the wrong chat template?
+
+   Training succeeds and the loss looks normal, because the model learns whatever tokens you gave it. The failure shows up at inference as generation that never emits a stop token, or that leaks raw special-token markers into output, because the served prompt has a turn structure the model never saw.
+
+3. What does `add_generation_prompt` control?
+
+   It appends the opening assistant header without a closing token, which is correct when prompting a model to continue. For training targets you want it off, so the closing end-of-turn token is part of the label and the model learns to stop.
+
+4. Name three synthetic data recipes and say which is strongest when a verifier exists.
+
+   Self-Instruct generates new tasks from a seed set, Evol-Instruct rewrites existing prompts to be harder or broader, and rejection sampling generates many answers and keeps the ones that pass a check. Rejection sampling is strongest when you can verify, because it filters on correctness rather than on the teacher's confidence.
+
+5. What is model collapse and how do you guard against it?
+
+   Successive generations trained on model-generated data lose distributional tail mass, and the variance loss compounds. Shumailov et al. (arXiv:2305.17493) demonstrated it. Guard by keeping human-written data in every synthetic set and never training exclusively on the output of a model that was itself trained synthetically.
+
+6. How do you decontaminate a fine-tuning set?
+
+   Two passes. Hash the 13-grams of every eval example and drop training rows that share one, which catches exact and near-exact copies. Then embed both sets and drop training rows above a cosine threshold against any eval example, which catches paraphrase.
+
+7. In multi-turn training, why keep the whole conversation in one row?
+
+   It matches inference, where the entire history is in context, and one forward pass trains every masked assistant span. Splitting turns into separate rows risks context bleed: an answer that only makes sense given an earlier turn gets trained without it.
+
+8. Your fine-tuned model now answers every question in two sentences, including ones that need a page. What went wrong?
+
+   The length distribution of the training set. If the outputs were uniformly short, the model learned brevity as part of the task. Bin the dataset by output length, check the spread, and add long examples before retraining.

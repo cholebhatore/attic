@@ -1,0 +1,163 @@
+---
+title: Why Fine-Tune
+description: 'Prompting against RAG against fine-tuning, what each one can and cannot change about a model, and how catastrophic forgetting constrains the whole decision.'
+---
+
+Phase 6 built frontier models. Almost nobody reading this will train one. The 671B parameter DeepSeek-V3 cost 2.788M H800 GPU hours, and the useful work downstream of it is adaptation: taking weights someone else paid for and bending them towards one job.
+
+That bending has four levers, and picking the wrong one is the most expensive mistake in applied LLM work. This page is the decision framework. The rest of the phase is the mechanics.
+
+---
+
+## The four levers
+
+| Lever        | Changes                        | Cost per change       | Latency impact    | Reversible |
+| :----------- | :----------------------------- | :-------------------- | :---------------- | :--------- |
+| Prompting    | Behavior at inference time     | Tokens in the prompt  | Higher, longer in | Trivially  |
+| RAG          | Available facts                | Retrieval plus tokens | Higher, longer in | Trivially  |
+| Fine-tuning  | Weights, so behavior and style | A training run        | Lower, shorter in | Retraining |
+| Distillation | Model size                     | A training run        | Much lower        | No         |
+
+The first two touch nothing permanent. The last two change the artifact you ship.
+
+---
+
+## What fine-tuning is good at
+
+Fine-tuning changes the distribution the model samples from. Anything that is a _disposition_ rather than a _fact_ responds to it:
+
+- **Output format.** Strict JSON, a fixed XML schema, a specific markdown structure. A prompt can request this and get it 95% of the time; fine-tuning gets it to 99.9% and removes the 400-token schema description from every request.
+- **Domain register.** Medical notes, legal drafting, internal engineering shorthand. The vocabulary and sentence rhythm of a specialty is a style, and style lives in weights.
+- **Tool-call syntax.** Emitting the exact function-call shape your runtime parses, including argument ordering and escaping.
+- **Refusal calibration.** Narrowing over-broad safety refusals on legitimate domain content, or widening them.
+- **Latency and cost.** A fine-tuned small model often replaces a large model plus a long system prompt. Both terms shrink: fewer input tokens and fewer parameters.
+
+## What it is bad at
+
+- **Injecting new facts.** This is the classic failure. Fine-tuning a model on a product catalogue does not make it answer catalogue questions reliably; it makes it produce catalogue-_shaped_ prose, which can include confident inventions. Knowledge is distributed across billions of weights and a small gradient update does not file a lookup table into it.
+- **Frequently changing information.** Every change is a training run plus a redeploy. RAG is an index rebuild.
+- **Traceability.** A retrieved chunk can be cited and audited. A weight update cannot be attributed after the fact.
+
+<Callout type="warn">
+  ### The question that settles most arguments
+
+Ask whether the thing you want to change is a fact or a behavior. Facts go in the context window, retrieved at request time. Behaviors go in the weights, trained once. Teams that fine-tune for facts get hallucinations; teams that prompt for behaviors get fragility.
+
+</Callout>
+
+---
+
+## Fine-tuning against RAG
+
+The two are complementary more often than they are alternatives, but the interview question is usually framed as a choice.
+
+| Requirement                               | Reach for   |
+| :---------------------------------------- | :---------- |
+| Answer changes daily                      | RAG         |
+| Source must be cited                      | RAG         |
+| Corpus too large for any context window   | RAG         |
+| Consistent output schema                  | Fine-tuning |
+| Specialty tone and terminology            | Fine-tuning |
+| Must run on a small, cheap model          | Fine-tuning |
+| Reduce prompt tokens and first-token time | Fine-tuning |
+| New domain knowledge plus a fixed format  | Both        |
+
+RAG's hidden cost is the context window: retrieved chunks are input tokens, billed and attended to on every request. At 8,000 retrieved tokens per call, the retrieval is doing to your latency and your bill what a system prompt would. Fine-tuning pays once at training time and then costs nothing at inference.
+
+---
+
+## The ladder
+
+Try the cheap lever before the expensive one, because each rung invalidates less work:
+
+1. **Prompt.** Rewrite the instruction. Add a worked example. This is free and takes minutes.
+2. **Few-shot.** Put three real examples in the context. Costs tokens, no training.
+3. **RAG.** Add retrieval when the missing piece is information.
+4. **Constrained decoding.** Force JSON schema or a grammar at the sampler. Fixes format without touching weights.
+5. **LoRA.** Train a small adapter when the missing piece is behavior.
+6. **Full fine-tune.** Only when LoRA plateaus and you have the data and the GPUs.
+7. **Continue pre-training.** Only when the domain vocabulary is genuinely absent, which is rare.
+
+Most requests that arrive as "we need to fine-tune" resolve at rung 1, 3, or 4.
+
+---
+
+## Catastrophic forgetting
+
+A neural network stores everything in the same weights. Training on a narrow distribution moves those weights, and capabilities that depended on their previous values degrade. The model gets better at your 5,000 SQL examples and worse at general reasoning, instruction following, and the 200 languages it once handled.
+
+This is not a bug in the optimizer. It is what gradient descent does when the loss function stops mentioning a capability.
+
+### Why it is worse than it looks
+
+The failure is silent. Your eval set measures the thing you trained on, so it goes up. The regression lives in everything you did not measure, and users find it before your dashboard does.
+
+### Mitigations
+
+| Mitigation                       | Mechanism                                                      | Cost                    |
+| :------------------------------- | :------------------------------------------------------------- | :---------------------- |
+| Parameter-efficient methods      | Base weights frozen, so most of the prior is never overwritten | Lower ceiling on change |
+| Low learning rate                | Smaller steps away from the pretrained point                   | Slower convergence      |
+| Few epochs                       | Less total drift                                               | Underfitting risk       |
+| Replay                           | Mix general data into the fine-tuning batch                    | Needs a general corpus  |
+| Regularization to the base model | KL penalty against the reference model's outputs               | Extra forward pass      |
+| Early stopping on a held-out set | Stop before the regression passes the improvement              | Needs a broad eval set  |
+| Multiple adapters                | Keep the base model general; load task adapters per request    | Serving complexity      |
+
+LoRA is the most popular mitigation and it is partly accidental: freezing `W_0` means the pretrained knowledge cannot be overwritten, only supplemented. The trade-off is that a frozen base also caps how far the model can move, which is why full fine-tuning still wins on tasks that need a genuinely new capability.
+
+### Measuring it
+
+Keep a regression suite that has nothing to do with your task: general instruction following, a reasoning benchmark, a multilingual sample, and a safety probe set. Run it before and after every training run. If the task score rises 4 points and the regression suite drops 6, you lost.
+
+---
+
+## The cost arithmetic
+
+Rough figures for a LoRA run on an 8B model, since the shape matters more than the exact numbers:
+
+| Component           | Typical magnitude                                           |
+| :------------------ | :---------------------------------------------------------- |
+| Weights in BF16     | About 16 GB                                                 |
+| Optimizer state     | Avoided entirely for frozen base weights                    |
+| Adapter parameters  | Tens of millions, usually under 1% of the base              |
+| Adapter checkpoint  | Tens to a few hundred MB                                    |
+| Run time on one GPU | Hours for a few thousand to a few hundred thousand examples |
+
+The checkpoint size difference is the operational point. A full fine-tune of an 8B model produces a 16 GB artifact per experiment. A LoRA produces something you can keep hundreds of, version in git-adjacent storage, and A/B test. LoRA's paper reports the checkpoint for GPT-3 175B shrinking from 350 GB to 35 MB.
+
+---
+
+## Interview questions
+
+1. When would you choose fine-tuning over RAG?
+
+   When the thing you need to change is a behavior rather than a fact: output format, domain register, tool-call syntax, or latency. RAG changes what the model knows at request time; fine-tuning changes what the model is disposed to do. If you need a fixed JSON schema at 99.9% reliability with no 400-token schema in the prompt, fine-tune.
+
+2. Why does fine-tuning fail at injecting new facts?
+
+   Knowledge is distributed across billions of weights, and a small gradient update on a narrow dataset does not install a lookup table. What you get instead is prose shaped like the domain, generated from whatever the model already believed, which produces confident invention. Retrieval puts the fact in the context window where the model can read it.
+
+3. What is catastrophic forgetting and why is it dangerous in production?
+
+   Capabilities degrade when training on a narrow distribution moves shared weights away from the values those capabilities depended on. It is dangerous because it is silent: the metric you trained on improves, and the regression lives in everything you did not measure.
+
+4. Name four mitigations for catastrophic forgetting.
+
+   Freeze most weights with a parameter-efficient method, use a low learning rate for few epochs, mix general replay data into the training batches, and keep a regression suite unrelated to the task so early stopping has something honest to look at.
+
+5. Your team wants to fine-tune so the model answers questions about an internal wiki that changes weekly. What do you say?
+
+   That is RAG. Weekly-changing content means weekly retraining plus redeployment against an index rebuild, and a fine-tuned model still cannot cite the page it got an answer from. Fine-tune only if you also need a fixed answer format, and then do both.
+
+6. Why does LoRA reduce catastrophic forgetting compared to full fine-tuning?
+
+   The base weights are frozen, so pretrained knowledge cannot be overwritten; the adapter adds a low-rank correction on top. The same property caps how far the model can move, which is why full fine-tuning still wins when the task needs a genuinely new capability.
+
+7. What is the ladder you would walk before deciding to fine-tune?
+
+   Rewrite the prompt, add few-shot examples, add retrieval if information is missing, try constrained decoding if the problem is format, then LoRA, then full fine-tuning, then continued pre-training. Most "we need to fine-tune" requests resolve at the first, third, or fourth rung.
+
+8. Fine-tuning reduces inference latency. Explain the mechanism.
+
+   Two terms shrink. The system prompt and few-shot examples that coerced the behavior are no longer needed, so input tokens fall and prefill gets faster. And a fine-tuned small model can replace a larger general model, so per-token decode cost falls too.

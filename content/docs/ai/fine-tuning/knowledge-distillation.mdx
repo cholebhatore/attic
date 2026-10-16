@@ -1,0 +1,205 @@
+---
+title: Knowledge Distillation
+description: 'Teacher-student training, dark knowledge, the temperature-scaled soft targets, why the loss carries a T squared factor, and forward against reverse KL for LLMs.'
+---
+
+Fine-tuning makes a model better. Distillation makes a model smaller while keeping as much of the better behaviour as it can carry. The mechanism is one sentence: train a compact student to reproduce a large teacher's output distribution instead of only its final answer.
+
+The idea predates LLMs. Hinton, Vinyals and Dean published it in 2015 (arXiv:1503.02531), and the term "dark knowledge" for what the teacher's wrong answers reveal is theirs.
+
+---
+
+## Teacher-student distillation
+
+| Role    | What it is                                          | Requirements                       |
+| :------ | :-------------------------------------------------- | :--------------------------------- |
+| Teacher | A large model already good at the task              | Frozen, inference only             |
+| Student | A small model you want to deploy                    | Trained                            |
+| Signal  | The teacher's probability distribution over outputs | Richer than the ground-truth label |
+
+The student trains on two signals at once. The hard label is the correct answer. The soft label is the teacher's full distribution, which says how confident it was and which wrong answers it considered close.
+
+Why the soft signal carries more information: a single ground-truth token gives the student one bit of preference per position. A distribution over a 150,000-token vocabulary gives it a ranking, a confidence, and a shape. DistilBERT (Sanh et al., arXiv:1910.01108) reached 97% of BERT-base's language understanding at 40% fewer parameters and 60% faster inference, and soft targets were the main reason the gap was that small.
+
+---
+
+## Dark knowledge and soft labels
+
+Consider a next-token prediction where the correct continuation is `dog`.
+
+```text
+ground truth  : dog 1.000, cat 0.000, car 0.000, wolf 0.000, ...
+teacher T = 1 : dog 0.910, cat 0.040, wolf 0.020, car 0.001, ...
+teacher T = 4 : dog 0.320, cat 0.240, wolf 0.160, car 0.050, ...
+```
+
+The hard label says only that `dog` is right. The teacher at temperature 1 says `cat` is a nearer miss than `car`. At temperature 4 the whole similarity structure is visible: `wolf` sits between `dog` and `cat`, `car` is far away. That relational information is the dark knowledge, and it is what makes a small model learn a task from fewer examples than it would need from labels alone.
+
+### The temperature
+
+Softmax over logits divided by `T`:
+
+```text
+p_i = exp(z_i / T) / sum_j exp(z_j / T)
+```
+
+| `T`   | Effect                                                                  |
+| :---- | :---------------------------------------------------------------------- |
+| `1`   | The distribution the model samples from at inference                    |
+| `2-4` | The usual distillation range; wrong answers become visible              |
+| `>10` | Approaches uniform; the ranking survives but the magnitude signal fades |
+
+Hinton's paper notes a useful limit. When the logits are small relative to `T`, the softmax gradient makes matching soft targets approximately equivalent to matching the logits themselves after centering. High-temperature distillation is close to logit regression, which is why it trains stably.
+
+---
+
+## The loss
+
+The standard objective combines a distillation term and a hard-label term:
+
+```text
+L = alpha * T^2 * KL(p_teacher || p_student) + (1 - alpha) * CE(y, p_student)
+```
+
+| Symbol  | Meaning                                                       |
+| :------ | :------------------------------------------------------------ |
+| `T`     | Distillation temperature, applied to both teacher and student |
+| `alpha` | Weight on the soft term; `0.5` to `0.9` is common             |
+| `KL`    | Forward KL, summed over the vocabulary at every position      |
+| `CE`    | Cross-entropy against the ground-truth token, at `T = 1`      |
+
+### Why the `T^2` factor is there
+
+This is the detail interviewers ask about. The gradient of the soft-target cross-entropy with respect to a student logit `z_i` is
+
+```text
+dL/dz_i = (1/T) * (softmax(z_i / T) - softmax(t_i / T))
+```
+
+The `1/T` in front means the soft gradient shrinks quadratically as `T` rises, while the hard-label term's gradient does not. Multiplying the soft loss by `T^2` cancels that, so the relative weight of the two terms stays roughly constant when you sweep temperature. Without it, raising `T` from 1 to 4 silently down-weights the distillation signal by about 16x and you end up training mostly on hard labels while thinking you are distilling.
+
+---
+
+## Forward KL against reverse KL
+
+`KL(p_teacher || p_student)` is the forward direction and it is mass-covering: wherever the teacher has probability, the student is penalised for having none. That is the right behaviour for a classifier and a debatable one for a generator.
+
+| Direction | Form                       | Behaviour                                       | Used by                          |
+| :-------- | :------------------------- | :---------------------------------------------- | :------------------------------- |
+| Forward   | `KL(teacher \|\| student)` | Mass-covering; student spreads over every mode  | Hinton 2015, classic KD          |
+| Reverse   | `KL(student \|\| teacher)` | Mode-seeking; student commits to plausible text | MiniLLM (Gu et al., 2306.08543)  |
+| JSD       | Symmetric interpolation    | Tunable between the two                         | GKD (Agarwal et al., 2306.13649) |
+
+A student trained with forward KL on a multimodal teacher distribution assigns probability to continuations it cannot produce coherently, because it is too small to hold all the modes. Reverse KL lets it pick one mode and be good at it. GKD generalises this with a skew parameter that interpolates, and combines it with on-policy student samples.
+
+---
+
+## On-policy against off-policy
+
+The bigger practical split for LLMs is where the training sequences come from.
+
+| Variant    | Sequences generated by | Student learns from                      | Exposure bias |
+| :--------- | :--------------------- | :--------------------------------------- | :------------ |
+| Off-policy | The teacher            | Teacher logits on teacher text           | Present       |
+| On-policy  | The student            | Teacher logits on the student's own text | Removed       |
+
+Off-policy distillation trains on prefixes the student would never produce, so at inference it drifts into states it never saw a correction for. On-policy distillation samples from the student, then scores those samples with the teacher, which fixes exactly the states that matter. It costs a forward pass through the teacher per batch instead of one cached generation pass.
+
+Qwen3 (arXiv:2505.09388) uses both, in two stages: off-policy on teacher-generated data for the three dense models, then on-policy with a reverse-KL-style objective. The report credits the distillation with better performance than training the dense models directly, plus roughly 30% lower GPU memory and roughly 43% faster training in the 8K and 32K context settings.
+
+---
+
+## Black-box distillation
+
+If the teacher is an API, you cannot see logits. Two things survive: the text it generates, and sometimes its top-k logprobs.
+
+```python
+# Sequence-level knowledge distillation (Kim and Rush, arXiv:1606.07947)
+from openai import OpenAI
+client = OpenAI()
+
+def teacher_completion(prompt: str) -> dict:
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,          # non-zero on purpose: sample several outputs per prompt
+        max_tokens=1024,
+    )
+    return {"prompt": prompt, "completion": resp.choices[0].message.content}
+```
+
+The student then trains with ordinary cross-entropy on the teacher's completions. This is the same pipeline as synthetic-data instruction tuning, and Alpaca (Taori et al., 2023) is the canonical example: 52,000 instructions generated by `text-davinci-003` self-instruct, used to train a 7B model that behaved like a much larger assistant.
+
+| Property             | White-box (logits)     | Black-box (text only)          |
+| :------------------- | :--------------------- | :----------------------------- |
+| Signal per position  | Full vocabulary        | One token                      |
+| Tokenizer must match | Yes                    | No                             |
+| Teacher cost         | Forward pass per batch | One generation, cacheable      |
+| Quality ceiling      | Higher                 | Lower, but far more accessible |
+
+---
+
+## The tokenizer constraint
+
+Logit distillation compares distributions over a vocabulary. If teacher and student use different tokenizers, position `t` in one is not position `t` in the other and the distributions are not comparable. This is why open-weight distillation almost always happens within a family: Qwen3 dense models from Qwen3 MoE, Gemma small from Gemma large.
+
+Cross-tokenizer approaches exist and all of them give something up. ULD trains the student to match a sorted probability vector with the token identities removed. DSKD (Zhang et al., arXiv:2406.17328) projects both distributions into a shared dual space. Neither matches same-tokenizer distillation, which is why nobody bothers when they have a choice.
+
+---
+
+## Distillation against quantisation and pruning
+
+| Technique    | Shrinks         | Keeps architecture | Needs training | Typical loss |
+| :----------- | :-------------- | :----------------- | :------------- | :----------- |
+| Distillation | Parameter count | No                 | Yes            | Small        |
+| Quantisation | Bytes per param | Yes                | Usually no     | Small        |
+| Pruning      | Parameter count | Yes                | Often yes      | Medium       |
+
+These compose. A distilled 3B model quantised to 4-bit is a normal production artefact. Distillation is the only one of the three that changes what the model knows, which is why it is also the only one that can make a small model beat a naive larger one on a narrow task.
+
+<Callout type="warn">
+  ### Distillation clauses
+
+Most commercial API terms of service prohibit using outputs to train a competing model. OpenAI, Anthropic and Google all have language to this effect. Sequence-level distillation from a closed API is a licensing question before it is a technical one, and it is worth checking the current terms rather than assuming the practice described in a 2023 paper is still permitted.
+
+</Callout>
+
+---
+
+## Interview questions
+
+1. What is knowledge distillation, and what does the student learn that labels alone cannot teach?
+
+   Training a small student model to match a large frozen teacher's output distribution. Beyond the correct token, the teacher's distribution reveals which wrong answers were close, how confident it was, and the similarity structure between candidates. That relational signal is the dark knowledge, and it lets the student reach a given quality from less data.
+
+2. Why raise the temperature during distillation?
+
+   At `T = 1` a confident teacher puts nearly all mass on one token, so the soft distribution carries almost no information beyond the hard label. Raising `T` flattens it and exposes the ranking of the alternatives. Distillation typically uses `T` between 2 and 4, and both teacher and student are computed at the same temperature.
+
+3. Why is the distillation loss multiplied by `T^2`?
+
+   The gradient of the soft cross-entropy with respect to a student logit carries a `1/T` factor, and the softmax flattening contributes another, so the soft gradient shrinks quadratically as `T` rises. Multiplying by `T^2` keeps the soft and hard terms at a comparable scale when you sweep temperature. Omit it and raising `T` silently turns the run into mostly hard-label training.
+
+4. What is the difference between forward and reverse KL for distillation, and which suits a generative LLM?
+
+   Forward KL, `KL(teacher || student)`, is mass-covering and penalises the student for assigning zero probability anywhere the teacher does not. Reverse KL, `KL(student || teacher)`, is mode-seeking and lets the student commit to a subset of the teacher's modes. For a student too small to represent every mode of a large generator, reverse KL produces more coherent text, which is what MiniLLM argues and what GKD generalises with an interpolation parameter.
+
+5. Off-policy against on-policy distillation?
+
+   Off-policy trains on sequences the teacher generated, which is cheap to cache but leaves exposure bias because the student never sees corrections for states it drifts into. On-policy samples sequences from the student and scores them with the teacher, so training matches inference. It costs a teacher forward pass per batch. Qwen3 uses both stages.
+
+6. Why does logit distillation require the teacher and student to share a tokenizer?
+
+   The loss compares distributions position by position. Different tokenizers segment the same text differently, so position `t` is not the same span in both models and the two distributions are over different alphabets. This is why open-weight distillation happens within a family. Cross-tokenizer methods such as ULD and DSKD exist but lose information.
+
+7. What can you do when the teacher is a closed API?
+
+   Sequence-level distillation: generate completions from the teacher and train the student with ordinary cross-entropy on them. You lose the full distribution and keep one sample per position. This is identical in mechanism to synthetic-data instruction tuning, which is how Alpaca was built. Check the provider's terms first, since most prohibit training competing models on their outputs.
+
+8. What did DistilBERT achieve, and why is it the standard citation?
+
+   97% of BERT-base's language understanding capability at 40% fewer parameters and 60% faster inference, reported in Sanh et al., arXiv:1910.01108. It established that distillation on a transformer language model works at scale and gave the field its baseline for compression ratios.
+
+9. How does distillation differ from quantisation and pruning, and can you combine them?
+
+   Quantisation reduces bytes per parameter and keeps the architecture. Pruning removes parameters and keeps the architecture. Distillation trains a different, smaller model, so it is the only one that can change what the model knows rather than just how it is stored. They compose: a distilled 3B model served at 4-bit is a normal production artefact.

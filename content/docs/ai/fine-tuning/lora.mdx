@@ -1,0 +1,208 @@
+---
+title: LoRA and DoRA
+description: 'The low-rank update h = W0x + BAx, the alpha over r scaling, why B starts at zero, choosing rank and target modules, DoRA magnitude-direction split, and adapter variants.'
+---
+
+Full fine-tuning of an 8B model needs the weights, their gradients, and Adam's two moment buffers. That is roughly 16 bytes per parameter, or about 128 GB, before a single activation. LoRA's insight is that you almost never need to move all of it.
+
+---
+
+## The update
+
+LoRA (Hu et al., arXiv:2106.09685) freezes the pretrained weight `W_0` and trains a low-rank correction beside it:
+
+```text
+h = W_0 x + (alpha / r) * B A x
+
+W_0 : (d_out, d_in)   frozen
+A   : (r, d_in)       trainable, random Gaussian init
+B   : (d_out, r)      trainable, zero init
+```
+
+`r` is far smaller than both dimensions. For a `4096 x 4096` projection at `r = 16`, the adapter holds `16 * 4096 + 4096 * 16 = 131,072` parameters against `16,777,216` in the original matrix, about 0.8%.
+
+`B` starts at zero so `BA = 0` on step one and the model behaves exactly like the base model. Training starts from the pretrained point rather than from a random perturbation of it. `A` must be random; if both were zero the gradients would be zero and nothing would learn.
+
+The merged inference form is just `W = W_0 + (alpha / r) * BA`, one matrix, no extra latency.
+
+---
+
+## Why low rank works
+
+The claim in the paper is that the _change_ in weights during adaptation has low intrinsic rank, even though the weights themselves do not. Fine-tuning to a new task nudges the model in a direction that lives in a small subspace.
+
+The evidence is that `r` can be tiny. The paper sweeps `r = 1, 2, 4, 8, 64` and finds `r = 4` already close to full fine-tuning on GPT-3 175B, with `r = 64` buying little. A rank-4 update to a `12288 x 12288` matrix is 0.07% of its entries.
+
+<Callout type="info">
+  ### The numbers LoRA reports on GPT-3 175B
+
+Trainable parameters drop by 10,000x and GPU memory by 3x. VRAM during training goes from 1.2 TB to 350 GB. The checkpoint goes from 350 GB to 35 MB, because only the adapter is saved. Quality on RoBERTa, DeBERTa, GPT-2, and GPT-3 is on par with or better than full fine-tuning.
+
+</Callout>
+
+---
+
+## Choosing `alpha`
+
+`alpha` is a fixed scalar, not learned, and it multiplies the update by `alpha / r`. It sets how strongly the adapter can move the output, independently of how much capacity `r` gives it.
+
+The paper's own guidance is blunt: set `alpha` to the first `r` you try, then vary `r` while holding the ratio. The common defaults in practice are `alpha = 2r` or `alpha = r`.
+
+What matters is the ratio, because doubling `r` while holding `alpha` halves the effective step size and can look like underfitting. If you sweep rank, sweep it at a fixed `alpha / r` or your comparison is confounded.
+
+A too-large ratio destabilizes early training; the adapter overshoots and the base model's behavior breaks before it recovers. Typical learning rates sit between `1e-4` and `3e-4`, roughly ten times higher than full fine-tuning, precisely because the update is scaled down.
+
+---
+
+## Choosing target modules
+
+The original paper adapts attention only, specifically `W_q` and `W_v`. Modern practice targets more.
+
+| Target set                      | Trainable share | Notes                                       |
+| :------------------------------ | :-------------- | :------------------------------------------ |
+| `q_proj`, `v_proj`              | Smallest        | The paper's setting; often enough           |
+| All four attention projections  | Small           | Adds `k_proj`, `o_proj`                     |
+| Attention plus MLP              | Moderate        | The current default for good reason         |
+| Every `nn.Linear` in the block  | Larger          | Include `gate_proj`, `up_proj`, `down_proj` |
+| Plus embeddings and the LM head | Largest         | Usually a bad idea; see below               |
+
+Targeting the MLP matters more than it used to. Phase 5 covered the evidence that feed-forward blocks act as key-value memories, so a task that needs new associations benefits from adapting them.
+
+Leave the embedding table and the output head alone unless you have a specific reason. They are the largest single matrices in the model, adapting them is expensive, and moving the output head changes the token distribution over the whole vocabulary, which is how fine-tunes lose general capability.
+
+```python
+from peft import LoraConfig, TaskType
+
+LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM,
+    modules_to_save=[],      # full-precision extras, e.g. a new head
+)
+```
+
+`target_modules` matches by suffix, so `"q_proj"` hits every layer. A name that matches nothing produces a model with no adapter and no error.
+
+---
+
+## A minimal implementation
+
+```python
+import math
+import torch
+import torch.nn as nn
+
+
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r=16, alpha=32, dropout=0.05):
+        super().__init__()
+        self.base = base                       # frozen, (d_out, d_in)
+        for p in self.base.parameters():
+            p.requires_grad = False
+
+        d_in, d_out = base.in_features, base.out_features
+        self.scaling = alpha / r
+        self.dropout = nn.Dropout(dropout)
+        self.A = nn.Parameter(torch.empty(r, d_in))       # (r, d_in)
+        self.B = nn.Parameter(torch.zeros(d_out, r))      # (d_out, r)
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+
+    def forward(self, x):
+        # x: (B, T, d_in)
+        base_out = self.base(x)                            # (B, T, d_out)
+        lora_out = (self.dropout(x) @ self.A.T @ self.B.T) * self.scaling
+        return base_out + lora_out                         # (B, T, d_out)
+
+    @torch.no_grad()
+    def merged(self):
+        """Fold the adapter into the base weight; no inference overhead."""
+        self.base.weight.add_((self.B @ self.A) * self.scaling)
+```
+
+`self.A.T @ ...` rather than `x @ self.A` because `A` is stored `(r, d_in)` to match the paper's convention.
+
+---
+
+## DoRA
+
+DoRA (Liu et al., arXiv:2402.09353) observes that full fine-tuning and LoRA change weights differently. Full fine-tuning shifts both how _large_ a weight vector is and which _direction_ it points; LoRA at small rank mostly changes direction.
+
+So DoRA splits the pretrained weight into the two components explicitly:
+
+```text
+W = m * (V / ||V||_c)
+
+m : (d_out, 1)     magnitude, trainable, initialized from ||W_0||_c
+V : (d_out, d_in)  direction, frozen, updated by LoRA as V + BA
+```
+
+`||.||_c` is the norm across each column. LoRA is applied to the direction only, and the magnitude gets its own small trainable vector.
+
+The result is closer to the full fine-tuning update pattern at the same parameter budget. The paper reports consistent gains over LoRA on LLaMA, LLaVA, and VL-BART across commonsense reasoning, visual instruction tuning, and image-to-text.
+
+The cost is a norm computation and a division per forward pass on every adapted layer, which is real but small. `peft` supports it with `use_dora=True` in `LoraConfig`.
+
+---
+
+## Adapter variants
+
+| Method         | What is trained                                   | Params, 8B, rough           | Merges into base |
+| :------------- | :------------------------------------------------ | :-------------------------- | :--------------- |
+| Full fine-tune | Everything                                        | 8B                          | Trivially        |
+| LoRA           | Low-rank `BA` beside selected projections         | 10M to 40M                  | Yes              |
+| DoRA           | LoRA on direction, plus a magnitude vector        | LoRA plus `d_out` per layer | Yes              |
+| Prefix tuning  | Virtual key and value tokens at every layer       | Under 1M                    | No               |
+| Prompt tuning  | Virtual tokens at the embedding layer only        | Tens of thousands           | No               |
+| Adapters       | A bottleneck MLP inserted after each sublayer     | 10M to 100M                 | No               |
+| IA3            | Three learned rescaling vectors for `k`, `v`, FFN | Under 1M                    | Yes              |
+| BitFit         | Bias terms only                                   | Under 1M                    | Yes              |
+
+LoRA dominates because it merges. A merged adapter is a normal weight matrix, so serving needs no runtime changes and no extra latency. Prefix, prompt, and adapter methods add a computation at every forward pass forever.
+
+Adapters (Houlsby et al., arXiv:1902.00751) predate LoRA and insert a down-projection, a nonlinearity, and an up-projection after each sublayer, with a residual around the whole thing. They work, and they are the reason LoRA's "no inference overhead" claim is a selling point.
+
+IA3 (Liu et al., arXiv:2205.05638) learns three vectors that rescale keys, values, and the feed-forward activation elementwise. It has fewer parameters than LoRA and is worth knowing as the extreme end of the parameter-efficiency curve, but it plateaus earlier.
+
+---
+
+## Interview questions
+
+1. Write the LoRA update and explain the scaling term.
+
+   `h = W_0 x + (alpha / r) * B A x`. `W_0` is frozen, `A` is `(r, d_in)` initialized from a Gaussian, `B` is `(d_out, r)` initialized to zero. `alpha / r` decouples the strength of the update from its capacity, so you can raise `r` without also raising the effective step size.
+
+2. Why is `B` initialized to zero but `A` is not?
+
+   With `B = 0` the product `BA` is zero, so the model at step one is exactly the pretrained model and training starts from that point instead of a random perturbation of it. If both were zero the gradients would vanish and nothing would learn, which is why `A` must be random.
+
+3. What rank should you pick?
+
+   Start at 8 or 16. The LoRA paper sweeps `r = 1, 2, 4, 8, 64` and finds `r = 4` already near full fine-tuning on GPT-3 175B, so the marginal gain from large ranks is small. Raise it only if the task plateaus and you have evidence the capacity is the limit.
+
+4. You doubled `r` from 16 to 32 and the model got worse. What happened?
+
+   Holding `alpha` fixed while doubling `r` halves `alpha / r`, which halves the effective magnitude of the update. That reads as underfitting. Sweep rank at a constant `alpha / r` or raise `alpha` alongside it.
+
+5. Which modules should LoRA target, and which should you avoid?
+
+   Target the attention projections and the MLP projections, since the MLP is where key-value memories live and new associations need it. Avoid the embedding table and the output head: they are the largest matrices, adapting them is expensive, and moving the output head shifts the distribution over the entire vocabulary.
+
+6. What does DoRA change about LoRA?
+
+   It decomposes the pretrained weight into a magnitude and a direction, applies LoRA to the direction only, and gives the magnitude its own trainable vector. This reproduces the update pattern of full fine-tuning more closely at the same parameter budget, at the cost of a per-layer norm computation.
+
+7. Why does LoRA dominate prefix tuning and adapters in production?
+
+   It merges. `W = W_0 + (alpha / r) BA` is a single matrix, so a merged LoRA model is served by an unmodified inference engine at unmodified latency. Prefix tuning, prompt tuning, and adapters add computation to every forward pass permanently.
+
+8. LoRA cuts GPT-3 175B training VRAM from 1.2 TB to 350 GB. Where does the saving come from?
+
+   Almost all of it is optimizer state and gradients. Adam keeps two moment buffers per trainable parameter in FP32, plus an FP32 master copy, so full fine-tuning costs roughly 16 bytes per parameter. Freezing the base means those buffers exist only for the adapter, while the frozen weights still have to sit in memory to run the forward pass.
+
+9. What is IA3 and when would you prefer it?
+
+   IA3 learns three elementwise rescaling vectors applied to keys, values, and the feed-forward activation, for well under a million parameters on a large model. Prefer it when memory is the binding constraint and the task is close to the base model's default behavior; it plateaus earlier than LoRA on tasks that need real change.

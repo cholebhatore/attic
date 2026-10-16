@@ -1,0 +1,229 @@
+---
+title: Merging and Deployment
+description: 'Folding a LoRA adapter into base weights, why QLoRA adapters need dequantising first, regression suites, export formats, and choosing a serving engine.'
+---
+
+A trained adapter is not a deployable model. It is a few hundred megabytes of deltas that only mean something next to a specific base checkpoint, and getting it into production involves merging, exporting, quantising, and then proving you did not break anything the base model could do.
+
+---
+
+## Merging a LoRA adapter
+
+LoRA's update is additive, so folding it in is exact arithmetic rather than an approximation:
+
+```text
+W_served = W_0 + (alpha / r) * B @ A
+```
+
+`alpha / r` is applied once at merge time and disappears afterwards. The merged model is a normal weight file with the same shape and the same inference cost as the base, which is the entire reason LoRA won over prefix tuning in production.
+
+```python
+import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+BASE = "Qwen/Qwen3-8B"
+ADAPTER = "./sql-ckpt/checkpoint-final"
+
+base = AutoModelForCausalLM.from_pretrained(BASE, dtype=torch.bfloat16)
+model = PeftModel.from_pretrained(base, ADAPTER)
+
+merged = model.merge_and_unload()        # folds B @ A into W_0 and strips the PEFT wrapper
+merged.save_pretrained("./merged")
+
+tok = AutoTokenizer.from_pretrained(BASE)
+tok.save_pretrained("./merged")          # the tokenizer is not saved by merge_and_unload
+```
+
+Forgetting the tokenizer save is the most common mistake here. The merged directory needs `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json` and the chat template, or every serving engine will fail to load it.
+
+`merge_adapter()` and `unmerge_adapter()` are the reversible pair, useful for A/B testing two adapters against one loaded base in a single process.
+
+<Callout type="info">
+  ### Recording what you merged
+
+A merged directory looks identical to a base model directory. Write a `merge_info.json` next to it with the base revision, adapter path, `r`, `alpha`, `target_modules`, the training dataset hash, the chat template version and the training config. Six months later this is the only way to answer which run produced the model in production.
+
+</Callout>
+
+---
+
+## Merging a QLoRA adapter
+
+A 4-bit base cannot absorb an FP16 or BF16 delta in place. `bitsandbytes` stores the frozen weights in packed NF4 with block-wise scales, and adding a full-precision matrix to that requires dequantising, adding, and requantising, which the merge path does not do silently.
+
+The standard sequence:
+
+```python
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+import torch
+
+# 1. Load the base in full precision, not 4-bit.
+base = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3-8B", dtype=torch.bfloat16)
+
+# 2. Attach the QLoRA adapter. peft upcasts the adapter weights to the base dtype.
+model = PeftModel.from_pretrained(base, "./qlora-ckpt/checkpoint-final")
+
+# 3. Merge and save in bf16.
+model = model.merge_and_unload()
+model.save_pretrained("./merged-bf16")
+
+# 4. Quantise for serving, if the deployment needs it.
+```
+
+Step 4 uses a serving-oriented quantiser rather than `bitsandbytes`. AWQ (Lin et al., arXiv:2306.00978) and GPTQ (Frantar et al., arXiv:2210.17323) both calibrate on a representative sample and produce kernels that inference engines run fast. `bitsandbytes` 4-bit is a training convenience, not a serving format, and is noticeably slower per token.
+
+Two alternatives if you want to skip merging: serve the 4-bit base with the adapter applied at runtime, which `peft` supports and costs a small latency penalty, or merge into a bf16 copy and keep that as the archive artefact.
+
+---
+
+## When not to merge
+
+| Situation                            | Serve merged          | Serve adapter              |
+| :----------------------------------- | :-------------------- | :------------------------- |
+| One model, one task                  | Yes                   | No reason                  |
+| Many tenants on one base             | No                    | Yes, hot-swapped           |
+| Frequent adapter updates             | No                    | Yes, no reload of the base |
+| Base was 4-bit during training       | Merge into bf16 first | Also fine                  |
+| Maximum throughput, no multi-tenancy | Yes                   | Small per-request overhead |
+
+vLLM loads several adapters against one resident base with `--enable-lora` and `--lora-modules name=path`, and swaps them per request. Merging defeats that entirely, since each merged model is a full copy of the weights in memory.
+
+---
+
+## Regression testing
+
+Narrow-task metrics go up after a fine-tune and general capability goes down, and the second change is invisible unless you measure it. A regression suite is a fixed set of prompts with expected properties, run against every candidate checkpoint.
+
+```text
+suite/
+  format.jsonl        # 200 task prompts, exact-match or exec-accuracy scored
+  general.jsonl       # 150 prompts from the base model's strengths
+  safety.jsonl        # 60 prompts that must refuse
+  long_context.jsonl  # 30 prompts with answers near the end of a long input
+  style.jsonl         # 20 prompts checking register and length
+```
+
+Score each file separately and gate deployment on all of them. A single blended number hides the case where task accuracy rises 6 points while refusal behaviour falls 20.
+
+| Suite        | Metric                            | Gate                       |
+| :----------- | :-------------------------------- | :------------------------- |
+| format       | Exact match or execution accuracy | Must improve               |
+| general      | Win rate against the base model   | Must not drop more than 2% |
+| safety       | Refusal rate on harmful prompts   | Must not drop at all       |
+| long_context | Accuracy on late-position facts   | Must not drop more than 5% |
+| style        | Length and register checks        | Advisory                   |
+
+Judged suites need a fixed judge. Use the same model, same prompt, same temperature 0, and the same pairwise order for every run, otherwise you are measuring judge noise. Swapping the order of the two candidates and averaging removes position bias.
+
+---
+
+## Export formats
+
+| Format          | Target                          | Quantisation             | Notes                                        |
+| :-------------- | :------------------------------ | :----------------------- | :------------------------------------------- |
+| safetensors     | vLLM, SGLang, TGI, transformers | bf16, fp8, AWQ, GPTQ     | Default; the format `save_pretrained` writes |
+| GGUF            | llama.cpp, Ollama, LM Studio    | Q2 through Q8, and mixed | Per-layer quantisation, CPU friendly         |
+| ONNX            | ONNX Runtime, some edge targets | int8                     | Rarely worth it for decoder LLMs             |
+| TensorRT engine | TensorRT-LLM                    | fp8, int4                | Built per GPU architecture                   |
+
+GGUF conversion goes through `llama.cpp`'s `convert_hf_to_gguf.py`, which expects a HuggingFace-style directory and reads `config.json` to pick the architecture handler. An architecture it does not know fails at conversion, so check support before choosing a base model for an edge deployment.
+
+---
+
+## Choosing a serving engine
+
+| Engine       | Strength                                         | Multi-LoRA      | When to pick it                     |
+| :----------- | :----------------------------------------------- | :-------------- | :---------------------------------- |
+| vLLM         | PagedAttention, continuous batching              | Yes             | Default for high-throughput serving |
+| SGLang       | RadixAttention prefix caching, structured output | Yes             | Heavy prefix reuse, agent loops     |
+| TGI          | Hugging Face integration, production-ready       | Yes             | Already on the HF stack             |
+| TensorRT-LLM | Maximum throughput on NVIDIA hardware            | Limited         | Fixed model, high volume            |
+| llama.cpp    | CPU and edge, GGUF, low memory                   | Adapter loading | Local and on-device                 |
+| Ollama       | llama.cpp with a developer-facing API            | Limited         | Local development                   |
+
+vLLM's PagedAttention (Kwon et al., arXiv:2309.06180) manages the KV cache in fixed blocks rather than one contiguous allocation per sequence, and the paper reports 2x to 4x throughput over FasterTransformer and Orca at the same latency. Continuous batching, which admits new sequences as old ones finish instead of waiting for the whole batch, is most of the remaining gain.
+
+```bash
+vllm serve ./merged \
+  --dtype bfloat16 \
+  --max-model-len 8192 \
+  --gpu-memory-utilization 0.90 \
+  --tensor-parallel-size 1 \
+  --served-model-name sql-writer-v3
+```
+
+`--served-model-name` is what clients pass, so bump it per release and keep the old name routable during a rollout.
+
+---
+
+## Rollout
+
+```text
+build -> eval suite -> shadow traffic -> canary 5% -> 50% -> 100%
+                        (no user impact)   (monitor)   (monitor)
+```
+
+Shadow traffic replays production requests against the new model without returning its output. It is the only cheap way to catch a distribution shift between your eval set and reality, and it costs inference compute rather than user trust.
+
+Things to monitor per version: p50 and p99 latency, output token length distribution, refusal rate, downstream parse or validation failure rate, and a sampled human rating. Output length is the cheapest early signal, since a fine-tune that changes verbosity shows up there before it shows up in quality scores.
+
+Keep the previous version loadable. Rolling back a merged model means redeploying weights, which takes minutes, and only works if you kept the artefact.
+
+---
+
+## Deployment checklist
+
+1. Merged directory contains weights, config, tokenizer files and the chat template.
+2. `merge_info.json` records base revision, adapter config, dataset hash and template version.
+3. The chat template used at serving matches the one used in training, byte for byte.
+4. Regression suite passes all gates, not just the task metric.
+5. Quantised artefact validated separately from the bf16 one, since quantisation changes outputs.
+6. Load test at expected concurrency, not at batch size one.
+7. Previous version still deployable, with a documented rollback path.
+8. Logging captures the prompt hash, model version and output for post-hoc review.
+
+---
+
+## Interview questions
+
+1. What does merging a LoRA adapter do, and is it lossless?
+
+   It computes `W = W_0 + (alpha / r) * B @ A` and writes the result as an ordinary weight file. For an FP16 or BF16 base it is exact up to the dtype's rounding, since the LoRA update is additive by construction. The served model then has the base model's shapes, its inference cost, and no runtime dependency on PEFT.
+
+2. Why can't you merge a QLoRA adapter directly into the 4-bit base?
+
+   The base weights are stored as packed NF4 values with block-wise quantisation constants, and adding a BF16 matrix to them requires dequantising, adding, and requantising. The supported path is to load the base in full precision, attach the adapter, merge, save in bf16, and then quantise for serving with AWQ or GPTQ.
+
+3. Why quantise with AWQ or GPTQ instead of `bitsandbytes` for serving?
+
+   Both calibrate against a representative activation sample and produce kernels that inference engines execute fast. `bitsandbytes` 4-bit is designed for training memory, not throughput, and is slower per token. The training-time quantiser and the serving-time quantiser solve different problems.
+
+4. When would you serve adapters instead of merging them?
+
+   Multi-tenant serving, where one resident base carries many task adapters and vLLM swaps them per request, and any setup where adapters update often enough that redeploying full weights each time is wasteful. Merging costs a full copy of the weights per variant in GPU memory.
+
+5. What is a regression suite and why does a task metric not replace it?
+
+   A fixed set of prompts covering general ability, safety, long context and style, scored separately and gated independently. A fine-tune raises the narrow metric while degrading things you did not train on, and a blended score hides that. The safety suite in particular should be allowed to fail the release on its own.
+
+6. How do you remove position bias from an LLM judge?
+
+   Score each pair twice, once in each order, at temperature 0 with an identical prompt, and average. Judges favour the first candidate presented, and a single-order comparison measures that preference as much as the models. Pin the judge model and version, since changing the judge invalidates comparisons across runs.
+
+7. What is shadow traffic and what does it catch that an eval set does not?
+
+   Replaying real production requests against the candidate model without returning its output. It catches distribution shift between your curated eval set and actual user prompts, including lengths, languages and malformed inputs you never wrote a test for. It costs inference compute and carries no user-facing risk.
+
+8. Which monitoring signal detects a bad deployment fastest?
+
+   The output token length distribution. A fine-tune that changed verbosity, or a serving config that truncated generation, moves the mean and the tail before any quality score does. Parse or validation failure rate is the next fastest, and latency percentiles catch serving regressions.
+
+9. What must be saved alongside the merged weights for the model to load?
+
+   The tokenizer files and the chat template. `merge_and_unload` followed by `save_pretrained` writes weights and config only, so a missing `tokenizer.json` or `chat_template` makes the directory unloadable by every serving engine. Save the tokenizer explicitly into the same directory.
+
+10. Why does the chat template have to match between training and serving?
+
+    The adapter learns a conditional distribution over completions given a specific rendered input shape, including special tokens and role markers. Changing the template at serving time gives the model an input format it never saw, and the failure is usually subtle: correct-looking output with wrong stop behaviour or degraded format adherence.

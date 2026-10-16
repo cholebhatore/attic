@@ -1,0 +1,329 @@
+---
+title: Capstone Projects
+description: 'Three end-to-end fine-tunes worked through: a text-to-SQL generator, a medical scribe, and a low-latency classifier, with base model choice, data shape, and evaluation for each.'
+---
+
+The previous pages cover the mechanisms in isolation. A real project has to sequence them: pick a base model against a hardware budget, decide whether fine-tuning is even the right lever, build data in the format the chat template expects, train, and then measure the thing you care about rather than the training loss.
+
+Three capstones follow, each chosen because it stresses a different part of the pipeline.
+
+---
+
+## The pipeline
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Task spec"] --> B["Baseline: prompt only"]
+    B --> C{"Good enough?"}
+    C -->|Yes| D["Ship"]
+    C -->|No| E["Add RAG or constrained decoding"]
+    E --> F{"Good enough?"}
+    F -->|Yes| D
+    F -->|No| G["Collect and format data"]
+    G --> H["Pick base model"]
+    H --> I["LoRA or QLoRA"]
+    I --> J["Evaluate on held-out set"]
+    J --> K{"Regressions?"}
+    K -->|Yes| G
+    K -->|No| L["Merge and deploy"]
+`}
+/>
+
+The two decision diamonds are the part that gets skipped. Roughly half of candidate tasks are solved by a better prompt or a constrained decoder, and running the ladder first costs an afternoon instead of a GPU week.
+
+---
+
+## Choosing the base model
+
+| Size      | Example                  | Fits on           | Suitable for                                       |
+| :-------- | :----------------------- | :---------------- | :------------------------------------------------- |
+| 0.5B-1.5B | Qwen3-0.6B, Llama 3.2 1B | 8 GB consumer GPU | Classification, extraction, reranking              |
+| 3B-4B     | Qwen3-4B, Phi-4-mini     | 16 GB             | Narrow generation, summarisation, tool calls       |
+| 7B-8B     | Qwen3-8B, Llama 3.1 8B   | 24 GB             | Most instruction tasks; the default starting point |
+| 14B-32B   | Qwen3-32B, Qwen3-30B-A3B | 48-80 GB          | Complex reasoning, code, long structured output    |
+| 70B+      | Llama 3.3 70B            | Multi-GPU         | Rarely worth fine-tuning; distil from it instead   |
+
+Three rules that override size:
+
+- **Use an instruct model for behaviour, a base model for format.** Instruct checkpoints already follow chat structure, so they need fewer examples to adapt. Base checkpoints are better when you want to overwrite the existing style entirely.
+- **Match the tokenizer to the domain.** Code models have vocabularies weighted toward programming tokens, which is why Qwen2.5-Coder is the right base for SQL and a general model is not.
+- **Check the licence.** Llama community licences have a monthly-active-user threshold. Apache 2.0 models (Qwen, OLMo, Gemma with its own terms) have different constraints. This is a shipping blocker, not a footnote.
+
+---
+
+## Capstone A: text-to-SQL
+
+Generate a query from a natural-language question plus a database schema. The evaluation is unusually clean because correctness is executable, which makes this the best first capstone.
+
+### Baseline and target
+
+Published numbers give the target. On Spider (Yu et al., arXiv:1809.08887) strong models pass 85% of execution-accuracy checks. On BIRD (Li et al., arXiv:2305.03111), which uses large dirty real-world databases and needs external knowledge, the same class of model lands in the 60s. A fine-tune on your own schema should beat both, because you are evaluating on one database rather than two hundred.
+
+### Data format
+
+```json
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You write SQLite for the analytics database. Reply with SQL only."
+    },
+    {
+      "role": "user",
+      "content": "Schema:\nCREATE TABLE orders (id INT, user_id INT, total DECIMAL(10,2), created_at TIMESTAMP);\nCREATE TABLE users (id INT, country TEXT, tier TEXT);\n\nQuestion: total revenue per country for tier 'gold' in 2025"
+    },
+    {
+      "role": "assistant",
+      "content": "SELECT u.country, SUM(o.total) FROM orders o JOIN users u ON u.id = o.user_id WHERE u.tier = 'gold' AND o.created_at >= '2025-01-01' GROUP BY u.country"
+    }
+  ]
+}
+```
+
+Every example must carry the schema. The model cannot know your column names, and omitting the schema trains it to hallucinate plausible ones. Keep the `CREATE TABLE` text identical in form to what production will send, including column order and casing, because the adapter learns the surface pattern.
+
+### Training
+
+```python
+import torch
+from datasets import load_dataset
+from peft import LoraConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, SFTConfig, SFTTrainer
+
+BASE = "Qwen/Qwen2.5-Coder-7B-Instruct"
+
+tok = AutoTokenizer.from_pretrained(BASE)
+model = AutoModelForCausalLM.from_pretrained(
+    BASE,
+    dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+)
+
+ds = load_dataset("json", data_files="sql_train.jsonl", split="train")
+
+def render(ex):
+    return {"text": tok.apply_chat_template(ex["messages"], tokenize=False)}
+
+ds = ds.map(render, num_proc=8)
+
+peft_config = LoraConfig(
+    r=32,
+    lora_alpha=64,
+    lora_dropout=0.05,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    task_type="CAUSAL_LM",
+)
+
+trainer = SFTTrainer(
+    model=model,
+    args=SFTConfig(
+        output_dir="./sql-ckpt",
+        num_train_epochs=2,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=16,
+        learning_rate=2e-4,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.03,
+        bf16=True,
+        gradient_checkpointing=True,
+        packing=False,               # queries are short; padding waste is acceptable
+        max_seq_length=3072,         # large schemas dominate the length
+        logging_steps=10,
+        save_strategy="epoch",
+    ),
+    train_dataset=ds,
+    processing_class=tok,
+    peft_config=peft_config,
+)
+
+trainer.train()
+```
+
+### Evaluation
+
+Execution accuracy is the metric: run the generated SQL against a test database and compare result sets.
+
+```python
+import sqlite3
+
+def execution_accuracy(pred_sql: str, gold_sql: str, db_path: str) -> bool:
+    con = sqlite3.connect(db_path)
+    try:
+        got = set(con.execute(pred_sql).fetchall())
+        want = set(con.execute(gold_sql).fetchall())
+        return got == want
+    except sqlite3.Error:
+        return False
+    finally:
+        con.close()
+```
+
+Comparing sets rather than lists makes the check insensitive to `ORDER BY` differences that do not change the answer. Add a syntax-error rate alongside accuracy: a model that produces unparsable SQL 5% of the time needs a retry or a constrained decoder, and accuracy alone hides that.
+
+Report four numbers: exact execution accuracy, syntax-error rate, accuracy on queries containing a `JOIN`, and accuracy on queries containing an aggregate. The last two localise the failure, which the headline number cannot.
+
+---
+
+## Capstone B: medical scribe
+
+Turn a clinician's dictation into structured notes. The difficulty here is not capability, it is that the cost of a fabricated finding is clinical.
+
+### Data format
+
+Output is JSON with a fixed key set, which means the evaluation is exact-match per field rather than a generation metric.
+
+```json
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "Extract structured fields from the dictation. Use null for anything not stated. Never infer."
+    },
+    {
+      "role": "user",
+      "content": "52 y.o. female, three weeks of exertional chest pressure, no radiation, takes metformin 500 twice daily."
+    },
+    {
+      "role": "assistant",
+      "content": "{\"chief_complaint\":\"exertional chest pressure\",\"duration\":\"3 weeks\",\"radiation\":null,\"medications\":[{\"name\":\"metformin\",\"dose\":\"500 mg\",\"frequency\":\"BID\"}],\"patient\":{\"age\":52,\"sex\":\"female\"}}"
+    }
+  ]
+}
+```
+
+The `null` convention is the important design decision. Without it the model fills every slot, because a language model trained on next-token prediction is biased toward producing something. Explicitly labelling unstated fields as `null` in a few thousand examples is what teaches abstention.
+
+### Constraints that change the approach
+
+| Constraint                      | Consequence                                                     |
+| :------------------------------ | :-------------------------------------------------------------- |
+| PHI and HIPAA                   | No cloud API training. On-premise or a VPC with a BAA.          |
+| Fabricated findings are harmful | Fine-tune for format only; put drug references in RAG.          |
+| Vocabulary is domain-specific   | Check tokenizer coverage of drug names before assuming quality. |
+| Output must parse               | Constrained decoding or JSON schema validation with one retry.  |
+| Errors need attribution         | Keep the source span for each extracted field.                  |
+
+The RAG split is the load-bearing decision. Dose ranges, interaction checks and formulary status change and need citations, so they belong in a retrieval layer. The fine-tune handles turning prose into the right JSON shape, which is a behaviour problem and exactly what fine-tuning is good at.
+
+### Evaluation
+
+Field-level exact match plus a fabrication rate: the fraction of non-null predicted fields with no supporting span in the dictation. Fabrication rate is the number a reviewer will ask for, and it does not correlate tightly with exact match. A model can score 91% exact match while hallucinating in the 9%.
+
+---
+
+## Capstone C: low-latency classifier
+
+Route an incoming request to one of twelve intents in under 40 ms at the 99th percentile. This capstone is about compression, so it uses distillation rather than plain fine-tuning.
+
+### Latency budget
+
+| Component                             | Typical cost at 512 input tokens |
+| :------------------------------------ | :------------------------------- |
+| 7B model, first token                 | 80-200 ms                        |
+| 0.6B model, first token               | 15-40 ms                         |
+| Encoder classifier (BERT-class, 110M) | 3-8 ms on GPU, 20-40 ms on CPU   |
+| Network and queueing                  | 5-20 ms                          |
+
+A 7B model cannot meet a 40 ms budget on a single request. The realistic options are a distilled sub-1B decoder, or a fine-tuned encoder, which is the cheapest thing that works if the task is genuinely classification.
+
+### Two-stage build
+
+```python
+# Stage 1: label unlabelled production traffic with the big teacher.
+from openai import OpenAI   # or a local vLLM endpoint serving the 7B model
+
+def teacher_label(text: str) -> str:
+    ...  # 7B model, temperature 0, returns one of the twelve intent names
+
+# Stage 2: train the student on teacher labels plus a small human-verified set.
+from transformers import AutoModelForSequenceClassification, TrainingArguments, Trainer
+import torch
+
+student = AutoModelForSequenceClassification.from_pretrained(
+    "distilbert-base-uncased",
+    num_labels=12,
+    torch_dtype=torch.bfloat16,
+)
+```
+
+Keep a few thousand human-labelled examples out of the distillation set and evaluate on those. Teacher labels carry the teacher's systematic errors, and evaluating the student on teacher-labelled data measures agreement rather than accuracy.
+
+### Evaluation
+
+Macro-F1 across the twelve intents, not accuracy. Intent distributions are heavily skewed, and accuracy will look excellent while two rare intents are never predicted. Add a p99 latency measurement from the serving stack, since the model is only part of the budget.
+
+---
+
+## Evaluation across all three
+
+| Capstone       | Primary metric     | Secondary metrics                            | Held-out set size |
+| :------------- | :----------------- | :------------------------------------------- | :---------------- |
+| Text-to-SQL    | Execution accuracy | Syntax-error rate, join and aggregate splits | 200-500 queries   |
+| Medical scribe | Field exact match  | Fabrication rate, null recall                | 300-500 notes     |
+| Classifier     | Macro-F1           | p99 latency, per-intent recall               | 1,000+ examples   |
+
+Two habits make these numbers trustworthy:
+
+- **Build the eval set before training.** Splits decided after the fact are contaminated, usually by the person who wrote the training data also writing the eval data from the same source.
+- **Run the base model through the same eval.** Without a pre-fine-tune baseline you cannot say whether the improvement came from the adapter or from the prompt engineering you did along the way.
+
+---
+
+## Common failure modes
+
+| Symptom                                        | Cause                                                 | Fix                                         |
+| :--------------------------------------------- | :---------------------------------------------------- | :------------------------------------------ |
+| Training loss falls, eval metric does not move | Format examples dominate; no hard cases               | Rebalance toward failures                   |
+| Model outputs training-set strings verbatim    | Too many epochs, or duplicates between train and eval | One epoch, deduplicate, check leakage       |
+| General ability degraded                       | Catastrophic forgetting                               | Mix in 5-10% general instruction data       |
+| SQL parses but is subtly wrong                 | Schema in training differs from schema at inference   | Generate training schemas from the real DDL |
+| JSON occasionally truncated                    | `max_seq_length` shorter than the longest output      | Measure the output length distribution      |
+| Works in the notebook, fails in production     | Different chat template or system prompt              | Version the template with the adapter       |
+
+The last one is the most common and the most avoidable. The adapter learns a joint distribution over the template and the task. Change the template at serving time and you are running a different model.
+
+---
+
+## Interview questions
+
+1. Walk through the steps you would take before deciding to fine-tune a model for a new task.
+
+   Establish a prompt-only baseline, then add few-shot examples, then retrieval if the task needs external facts, then constrained decoding if the output must follow a schema. Fine-tuning comes after those, and is justified when the task needs a behaviour change, a domain register, or a latency reduction rather than new knowledge. Running the ladder first costs an afternoon against a GPU week.
+
+2. Why does every text-to-SQL training example include the schema?
+
+   The model cannot know your table and column names. Omitting the schema trains it to invent plausible ones, and at inference it will do exactly that. Including it in every example, in the same textual form production will send, also teaches the model to condition on the schema rather than memorise one.
+
+3. Why is execution accuracy a better metric than exact string match for SQL?
+
+   Many queries are semantically equivalent but textually different: column order, alias names, `IN` against `EXISTS`, and `ORDER BY` on ties. Executing both and comparing result sets measures whether the answer is right. Comparing as sets rather than lists removes sensitivity to row order when the query did not specify one.
+
+4. In the medical scribe capstone, why does the output schema include an explicit `null`?
+
+   A language model is biased toward producing a token rather than abstaining, so an empty slot gets filled with an inference. Labelling unstated fields as `null` across a few thousand examples teaches abstention, and it makes the fabrication rate measurable as the fraction of non-null predictions with no supporting span in the source.
+
+5. Which parts of the medical scribe belong in RAG rather than in the fine-tune?
+
+   Anything factual and changing: dose ranges, interaction checks, formulary status. Those need citations and get stale. The fine-tune handles the conversion from prose to a fixed JSON shape, which is a behaviour problem. Splitting it this way means clinical reference data can be updated without retraining.
+
+6. A 40 ms p99 latency budget rules out a 7B model. What do you build instead?
+
+   Either distil the 7B model's labels into a sub-1B decoder or into an encoder classifier, or use a fine-tuned encoder directly if the task is genuinely classification. A BERT-class encoder runs in single-digit milliseconds on a GPU. Keep a human-labelled evaluation set separate from the teacher-labelled training data, since teacher labels encode the teacher's errors.
+
+7. Why macro-F1 rather than accuracy for the classifier?
+
+   Intent distributions are skewed, so accuracy can be high while rare intents are never predicted. Macro-F1 averages per-class F1 equally and exposes that. Per-intent recall alongside it shows which classes are being absorbed into a dominant one.
+
+8. Why build the evaluation set before training rather than after?
+
+   A split decided after training is contaminated, typically because the same source produced both halves and near-duplicates ended up on either side. Building it first also fixes the metric before you can be tempted by a result.
+
+9. A fine-tuned model works in the notebook and fails in production. What is the most likely cause?
+
+   A different chat template or system prompt. The adapter learns the joint distribution over template and task, so changing the template at serving time produces a model that was never trained on that input shape. Version the template alongside the adapter and assert it at load time.
+
+10. How do you prevent catastrophic forgetting during a narrow capstone?
+
+    Mix 5% to 10% general instruction data into the training set, keep epochs low, use LoRA rather than a full fine-tune, and run a regression suite of general prompts through every candidate checkpoint. The regression suite is what detects it, since narrow-task metrics improve while general ability degrades silently.

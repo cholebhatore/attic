@@ -1,0 +1,274 @@
+---
+title: Training Run
+description: 'Hyperparameters that move the result, learning rate schedules, gradient accumulation, sequence packing, the bf16 memory budget, and FlashAttention-2.'
+---
+
+Every fine-tuning framework ships defaults that work. Knowing which defaults matter, what to change when the loss misbehaves, and where the memory goes is the difference between a run that trains and one that wastes a GPU day.
+
+---
+
+## The hyperparameters that matter
+
+| Hyperparameter       | Full fine-tune   | LoRA             | QLoRA            | Effect if wrong                            |
+| :------------------- | :--------------- | :--------------- | :--------------- | :----------------------------------------- |
+| Learning rate        | `1e-5` to `2e-5` | `1e-4` to `3e-4` | `1e-4` to `2e-4` | Too high destroys the base model           |
+| Epochs               | `1` to `3`       | `1` to `3`       | `1` to `3`       | More than 3 memorises the training set     |
+| Warmup ratio         | `0.03` to `0.1`  | `0.03`           | `0.03`           | None means a large first update            |
+| Effective batch size | `32` to `128`    | `16` to `64`     | `16` to `64`     | Too small makes the loss noisy             |
+| Max sequence length  | Data-dependent   | Data-dependent   | Data-dependent   | Too short truncates; too long costs memory |
+| Weight decay         | `0.0` to `0.1`   | `0.0`            | `0.0`            | Minor at these step counts                 |
+| Gradient clipping    | `1.0`            | `1.0`            | `1.0`            | Off means one bad batch can end the run    |
+
+LoRA tolerates a learning rate an order of magnitude higher than full fine-tuning because the base weights are frozen and the adapter starts at zero. The update cannot corrupt pretrained knowledge directly, only fail to help.
+
+### Counting steps
+
+```text
+effective_batch = per_device_batch * grad_accum_steps * num_gpus
+total_steps     = (num_examples / effective_batch) * epochs
+```
+
+50,000 examples, per-device batch 4, accumulation 4, one GPU, three epochs: effective batch 16, so 3,125 steps per epoch and 9,375 total. At `warmup_ratio=0.03` that is 281 warmup steps.
+
+---
+
+## Learning rate schedules
+
+```text
+lr(step) = warmup:   lr_max * step / warmup_steps
+           cosine:   lr_min + 0.5 * (lr_max - lr_min) * (1 + cos(pi * progress))
+```
+
+| Schedule               | Shape                                | When to use                   |
+| :--------------------- | :----------------------------------- | :---------------------------- |
+| Linear warmup + cosine | Rises, then decays smoothly to ~0    | Default for fine-tuning       |
+| Constant with warmup   | Rises, then flat                     | Short runs, few hundred steps |
+| WSD                    | Warmup, stable plateau, sharp decay  | Continued pretraining         |
+| Linear decay           | Rises, then falls in a straight line | Rarely better than cosine     |
+
+Warmup exists because Adam's second-moment estimate is garbage for the first tens of steps. Dividing by an underestimate of gradient variance produces an oversized update, and on a pretrained model that update is unrecoverable. Three percent of total steps is enough.
+
+Cosine decay to near zero at the end is what makes the final checkpoint usable without extra averaging. If you stop a cosine run at 60% of its schedule, you are reading a model that was still at a high learning rate.
+
+```python
+from transformers import get_cosine_schedule_with_warmup
+
+scheduler = get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=281,
+    num_training_steps=9375,
+    num_cycles=0.5,               # half a cosine period: peak down to zero
+)
+```
+
+---
+
+## Gradient accumulation
+
+Trade steps for memory. Run `k` forward-backward passes, accumulate gradients, then one optimizer step.
+
+```python
+SFTConfig(
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,     # effective batch 32 on one GPU
+    ...
+)
+```
+
+Memory cost is flat in `k` because activations from each micro-batch are freed after its backward pass; only the gradient buffers persist. Wall-clock cost is linear, so accumulation buys batch size, not speed.
+
+Two things that go wrong:
+
+- **Batch-norm statistics.** Not an issue for transformers, which use LayerNorm or RMSNorm. If you distil into a CNN, accumulation does not give you the statistics of a real large batch.
+- **Loss logging.** The logged per-step loss is the mean over micro-batches. With `gradient_accumulation_steps=8` you get one logged number per eight forward passes, so a `logging_steps=1` run still looks eight times sparser than a non-accumulating one.
+
+---
+
+## Sequence packing
+
+Most instruction datasets are far shorter than `max_seq_length`. Without packing, a 4,096-token budget holding a 400-token example wastes 90% of the compute.
+
+```text
+no packing : [ex1 | pad pad pad pad]  [ex2 | pad pad pad]   -> 2 forward passes, mostly padding
+packing    : [ex1 | ex2 | ex3 | ex4 ]                        -> 1 forward pass, no padding
+```
+
+`trl`'s `SFTTrainer(packing=True)` concatenates examples into fixed-length blocks. Reported throughput gains on short instruction data are 2x to 5x.
+
+<Callout type="warn">
+  ### Packing needs a block-diagonal mask
+
+Naive packing lets example 3 attend to example 1, because the attention mask is a single causal triangle over the whole block. The model then learns to continue text that was never its prompt, which shows up as outputs that reference content from unrelated examples.
+
+Correct implementations build a block-diagonal mask so each example only sees itself. `SFTTrainer` with `packing=True` and `attn_implementation="flash_attention_2"` uses FlashAttention's variable-length path, which handles it. Verify on your version rather than assuming: run one batch and check that the attention mask has more than one contiguous block.
+
+</Callout>
+
+---
+
+## Mixed precision
+
+| Format | Exponent bits | Mantissa bits | Range              | Use                         |
+| :----- | :------------ | :------------ | :----------------- | :-------------------------- |
+| FP32   | 8             | 23            | ~`1e-38` to `3e38` | Optimizer master weights    |
+| TF32   | 8             | 10            | Same as FP32       | Matmuls on Ampere and later |
+| FP16   | 5             | 10            | ~`6e-8` to `65504` | Legacy; needs loss scaling  |
+| BF16   | 8             | 7             | Same as FP32       | Default for training        |
+
+BF16 keeps FP32's exponent width, so it cannot overflow on a large loss or underflow on a small gradient. It gives up mantissa precision, which matters less than range during training because gradient magnitudes vary by orders of magnitude while the relative error from 7 mantissa bits is uniform. FP16's narrow range is why it needs loss scaling and why bf16 replaced it for anything but inference.
+
+```python
+SFTConfig(bf16=True, fp16=False, tf32=True)
+```
+
+Set `bf16=True` unless the hardware predates Ampere. Mixing `bf16=True` and `fp16=True` raises.
+
+---
+
+## The memory budget
+
+Full fine-tuning with AdamW, per parameter:
+
+| Component           | Bytes | Notes                       |
+| :------------------ | :---- | :-------------------------- |
+| bf16 weights        | 2     | Forward and backward        |
+| bf16 gradients      | 2     | Or 4 if kept in FP32        |
+| FP32 master weights | 4     | The optimizer updates these |
+| FP32 momentum       | 4     | Adam first moment           |
+| FP32 variance       | 4     | Adam second moment          |
+| **Total**           | 16    | Plus activations            |
+
+A 7B model is 112 GB before a single activation. That is why full fine-tuning of anything above 7B needs ZeRO-3 across multiple GPUs, which shards the optimizer states, gradients and parameters across devices:
+
+| ZeRO stage | Shards           | 7B memory per GPU on 8 GPUs |
+| :--------- | :--------------- | :-------------------------- |
+| 0          | Nothing          | 112 GB                      |
+| 1          | Optimizer states | ~28 GB                      |
+| 2          | Plus gradients   | ~24 GB                      |
+| 3          | Plus parameters  | ~14 GB                      |
+
+Activations are separate and scale with batch size and sequence length, not parameter count. `gradient_checkpointing=True` recomputes them during the backward pass instead of storing them, trading roughly 30% more compute for a large memory cut. It is almost always on for fine-tuning.
+
+For QLoRA the picture is different. Base weights sit in 4-bit at about 0.5 bytes per parameter, gradients and optimizer states exist only for the adapter, so a 7B model fits in under 8 GB.
+
+---
+
+## FlashAttention-2
+
+Standard attention materialises an `n x n` score matrix in HBM, writes it out, reads it back for the softmax, then reads it again for the value product. At 8,192 tokens that matrix is 64 million entries per head, and the memory traffic dominates the arithmetic.
+
+FlashAttention (Dao et al., arXiv:2205.14135) tiles the computation so the score matrix never leaves SRAM, using an online softmax that updates the running maximum and denominator per tile. FlashAttention-2 (arXiv:2305.14135) reworks the work partitioning between warps and reaches 50% to 73% of theoretical peak FLOPS on an A100, about 2x the first version.
+
+```python
+model = AutoModelForCausalLM.from_pretrained(
+    "Qwen/Qwen3-8B",
+    dtype=torch.bfloat16,
+    attn_implementation="flash_attention_2",
+)
+```
+
+Practical notes:
+
+- Requires Ampere or newer (A100, A10, RTX 30xx, H100). On a GTX 1650 or T4 it will not load.
+- Falls back to `sdpa` silently in some versions if the kernel is missing. Check `model.config._attn_implementation` after loading.
+- It is what makes `packing=True` correct, via the variable-length path.
+- Memory is linear in sequence length instead of quadratic, which is why long-context fine-tuning is possible at all.
+
+Alternatives when FlashAttention-2 is unavailable: `attn_implementation="sdpa"` uses PyTorch's scaled dot-product attention with its own fused kernels and gets most of the benefit on supported hardware; `"eager"` is the reference implementation and should only be used for debugging.
+
+---
+
+## Reading the loss curve
+
+| Pattern                             | Diagnosis                                  | Fix                                |
+| :---------------------------------- | :----------------------------------------- | :--------------------------------- |
+| Sharp drop, then smooth plateau     | Normal                                     | None                               |
+| Loss goes near zero within an epoch | Memorisation or leakage                    | Fewer epochs, check for duplicates |
+| Drops then spikes and stays high    | Learning rate too high, or a corrupt batch | Lower LR, enable clipping          |
+| Flat from step one                  | Adapter not attached, or LR far too low    | `print_trainable_parameters()`     |
+| Train falls, eval rises             | Overfitting                                | Early stop, more data, lower LR    |
+| Both fall slowly then stall         | Effective batch too small                  | Raise accumulation steps           |
+
+A fine-tuning loss curve should drop a long way in the first few dozen steps, because the model already knows how to produce text and mostly needs to learn the format. If it does not drop at all, the problem is usually plumbing rather than optimisation.
+
+---
+
+## A complete config
+
+```python
+from transformers import SFTConfig
+
+config = SFTConfig(
+    output_dir="./ckpt",
+    num_train_epochs=2,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,          # effective batch 32
+    learning_rate=2e-4,                     # LoRA range
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    max_grad_norm=1.0,
+    weight_decay=0.0,
+    bf16=True,
+    tf32=True,
+    gradient_checkpointing=True,
+    optim="paged_adamw_8bit",               # QLoRA: 8-bit optimizer, paged to CPU under pressure
+    packing=True,
+    max_seq_length=2048,
+    logging_steps=10,
+    save_strategy="steps",
+    save_steps=200,
+    save_total_limit=3,
+    eval_strategy="steps",
+    eval_steps=200,
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_loss",
+    report_to="wandb",
+    seed=42,
+)
+```
+
+`paged_adamw_8bit` keeps optimizer states in 8-bit and pages them to CPU memory when the GPU is full, which is what lets QLoRA survive an occasional long batch. `save_total_limit=3` prevents a long run from filling the disk with checkpoints.
+
+---
+
+## Interview questions
+
+1. Why is the LoRA learning rate an order of magnitude higher than the full fine-tuning rate?
+
+   The base weights are frozen and the adapter's `B` matrix starts at zero, so the first update is small regardless of the step size. There is no pretrained knowledge in the trainable parameters to destroy. `1e-4` to `3e-4` is typical against `1e-5` to `2e-5` for full fine-tuning.
+
+2. Why does the schedule include warmup?
+
+   Adam's second-moment estimate is unreliable for the first tens of steps. Dividing by an underestimate of gradient variance produces an oversized update, and on a pretrained model that update is not recoverable. Three to ten percent of total steps is the usual range.
+
+3. What does gradient accumulation buy, and what does it not buy?
+
+   A larger effective batch at constant memory, since activations from each micro-batch are freed after its backward pass and only gradient buffers persist. It does not buy speed: wall-clock cost is linear in the accumulation count.
+
+4. What is the failure mode of naive sequence packing?
+
+   Without a block-diagonal attention mask, examples concatenated into one block attend to each other. The model learns to continue text that was never part of its prompt, which surfaces as outputs referencing unrelated examples. FlashAttention's variable-length path and `trl`'s packing implementation handle the mask correctly.
+
+5. Why bf16 rather than fp16 for training?
+
+   BF16 keeps FP32's 8 exponent bits, so it has the same dynamic range and cannot overflow on a large loss or underflow on a small gradient. FP16's 5 exponent bits cap out at 65504, which is why it needs loss scaling. BF16 gives up mantissa precision instead, which costs less during training.
+
+6. Give the memory per parameter for full fine-tuning with AdamW.
+
+   Sixteen bytes: 2 for bf16 weights, 2 for gradients, 4 for the FP32 master weights, and 8 for Adam's momentum and variance. A 7B model is therefore 112 GB before activations, which is why ZeRO-3 sharding across GPUs is required above that scale.
+
+7. What does each ZeRO stage shard?
+
+   Stage 1 shards optimizer states, stage 2 adds gradients, stage 3 adds parameters. Each stage divides that component's memory by the number of GPUs. Activations are handled separately by gradient checkpointing.
+
+8. How does FlashAttention make attention memory linear instead of quadratic?
+
+   It never materialises the `n x n` score matrix in HBM. The computation is tiled so scores live in SRAM, and an online softmax maintains a running maximum and denominator per tile so the result is exact rather than approximated. FlashAttention-2 improves warp partitioning and reaches 50% to 73% of peak FLOPS on an A100.
+
+9. Your training loss is flat from the first step. What do you check first?
+
+   That the adapter is attached and trainable. Call `print_trainable_parameters()` and confirm the count is nonzero. Then check the learning rate and the data formatting, in particular whether the chat template produced labels that are all `-100`, which masks every token and gives zero gradient.
+
+10. What does `gradient_checkpointing=True` trade?
+
+    Stored activations for recomputation. During the backward pass the forward activations are rebuilt from the checkpointed layer inputs rather than read from memory. It costs roughly 30% more compute and removes the activation memory term, which otherwise scales with batch size and sequence length.

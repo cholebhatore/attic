@@ -1,0 +1,189 @@
+---
+title: Prefix and Prompt Tuning
+description: 'Virtual tokens at every layer against virtual tokens at the embedding only, with exact trainable parameter counts including the GQA correction most writeups miss.'
+---
+
+LoRA changes weights. Prefix tuning and prompt tuning change inputs. Both freeze the model entirely and train a small set of continuous vectors that are prepended to the sequence, which makes them the cheapest adapters in existence and the ones with the sharpest parameter-count arithmetic.
+
+---
+
+## The distinction
+
+| Property                 | Prompt tuning                   | Prefix tuning                           |
+| :----------------------- | :------------------------------ | :-------------------------------------- |
+| Where the vectors go     | Input embedding layer only      | Key and value states at **every** layer |
+| Depth                    | Shallow                         | Deep                                    |
+| Params scale with        | `d_model`                       | `n_layers * d_kv`                       |
+| Consumes sequence budget | Yes, at the tokenizer level     | Yes, at every layer                     |
+| Source                   | Lester et al., arXiv:2104.08691 | Li and Liang, arXiv:2101.00190          |
+
+The one-line version, and the one interviewers are listening for: prompt tuning adds virtual tokens at the embedding layer; prefix tuning adds virtual keys and values inside the attention of every transformer block.
+
+---
+
+## Prompt tuning
+
+Prepend `n` learnable vectors to the input embeddings, and train only those.
+
+```text
+input   : [p_1 ... p_n, e(x_1) ... e(x_T)]
+params  : n * d_model
+```
+
+The paper's central finding is about scale. At small model sizes prompt tuning underperforms full fine-tuning, and the gap closes as the model grows. On T5-XXL at 11B parameters it matches full model tuning on SuperGLUE. The mechanism is plausible: a larger model has more capacity to be steered, so a smaller handle suffices.
+
+Two practical consequences:
+
+- **Prompt ensembling.** One frozen backbone can hold many prompt sets, one per task, swapped per request. Storage per task is `n * d_model` floats, which for 20 tokens at `d_model = 4096` is about 320 KB in FP32.
+- **It is hard to optimize.** The vectors are the only free parameters and they sit at the input, so gradients reach them after passing through the whole network. Prompt tuning wants a much higher learning rate than LoRA, typically `0.1` to `1.0` rather than `1e-4`, and it is sensitive to initialization.
+
+---
+
+## Prefix tuning
+
+Give every layer its own learnable prefix on the key and value projections.
+
+```text
+layer i attention:
+  K = [P_K^i ; K x]      P_K^i : (n, d_kv)
+  V = [P_V^i ; V x]      P_V^i : (n, d_kv)
+  params: 2 * n_layers * n * d_kv
+```
+
+The queries are untouched, so real tokens attend to the prefix but the prefix does not need to be a coherent input. The paper reports optimizing 0.1% of the parameters, and that prefix tuning matches full fine-tuning in data-rich settings while outperforming it in low-data ones, where the small parameter count acts as a regularizer.
+
+One detail that surprises people: the original method reparameterizes the prefix through a small MLP during training and discards the MLP afterwards. Only the prefix values are kept. The MLP exists because directly optimizing the prefix is poorly conditioned; the reparameterization smooths the loss surface and then disappears, so it costs nothing at inference.
+
+**P-tuning v2** (Liu et al., arXiv:2110.07602) is the same construction generalized to encoder-decoder and classification tasks, and is why you will see "deep prompt tuning" used as a synonym for prefix tuning.
+
+---
+
+## Exact parameter counts
+
+This is the part worth being able to do on a whiteboard.
+
+### The naive formula
+
+```text
+prompt tuning : n * d_model
+prefix tuning : 2 * n_layers * n * d_model
+```
+
+### The correction for grouped-query attention
+
+Prefix tuning injects into key and value states, not into the full hidden dimension. On a GQA model the key and value projections are narrower than `d_model`:
+
+```text
+d_kv = num_key_value_heads * head_dim
+```
+
+For Qwen3-8B, `num_key_value_heads = 8` and `head_dim = 128`, so `d_kv = 1024` against `d_model = 4096`. The naive formula overcounts prefix tuning by 4x on this model.
+
+### Worked numbers
+
+At `n = 20` virtual tokens:
+
+| Model       | Config                                 | Prompt tuning | Prefix, naive | Prefix, GQA-correct |
+| :---------- | :------------------------------------- | :------------ | :------------ | :------------------ |
+| Qwen3-8B    | `d_model 4096`, 36 layers, `d_kv 1024` | 81,920        | 5,898,240     | 1,474,560           |
+| Llama 3 70B | `d_model 8192`, 80 layers, `d_kv 1024` | 163,840       | 26,214,400    | 3,276,800           |
+| Llama 3 8B  | `d_model 4096`, 32 layers, `d_kv 1024` | 81,920        | 5,242,880     | 1,310,720           |
+
+For scale, a rank-16 LoRA on Qwen3-8B across attention and MLP projections is roughly 21 million parameters. Prompt tuning is about 250x smaller than that, and GQA-correct prefix tuning about 14x smaller.
+
+<Callout type="info">
+  ### Where the sequence-length cost lands
+
+Virtual tokens occupy positions. Twenty prefix tokens at every layer means the effective context for real content drops by 20, and attention cost grows with the square of the total. At `n = 20` against a 4,096-token window this is noise. At `n = 200`, which some prompt-tuning papers use, it is 5% of the window and the quadratic term is not negligible.
+
+</Callout>
+
+---
+
+## Implementation
+
+```python
+from peft import PrefixTuningConfig, PromptTuningConfig, get_peft_model
+
+prefix = PrefixTuningConfig(
+    num_virtual_tokens=20,
+    prefix_projection=True,     # the MLP reparameterization; set False to train the prefix directly
+    task_type="CAUSAL_LM",
+)
+
+prompt = PromptTuningConfig(
+    num_virtual_tokens=20,
+    prompt_tuning_init="TEXT",              # initialize from the embedding of a text string
+    prompt_tuning_init_text="Classify the sentiment of this review:",
+    tokenizer_name_or_path="Qwen/Qwen3-8B",
+    task_type="CAUSAL_LM",
+)
+
+model = get_peft_model(model, prefix)
+model.print_trainable_parameters()
+```
+
+`prompt_tuning_init="TEXT"` initializes the soft prompt from the token embeddings of a real sentence rather than at random, which materially improves convergence at small model sizes. `RANDOM` is the default and the reason prompt tuning sometimes appears not to work.
+
+`prefix_projection=True` adds the MLP. It costs parameters during training and none at inference, since the MLP is dropped after the prefix is computed.
+
+---
+
+## Why LoRA won anyway
+
+| Property                   | LoRA             | Prefix and prompt tuning                |
+| :------------------------- | :--------------- | :-------------------------------------- |
+| Merges into base weights   | Yes              | No                                      |
+| Inference latency overhead | None once merged | Extra positions every request           |
+| Sequence budget            | Unchanged        | Reduced by `n`                          |
+| Optimization stability     | Good at `1e-4`   | Needs `0.1` to `1.0`, sensitive to init |
+| Quality on hard tasks      | Strong           | Weaker below about 10B                  |
+| Serving stack support      | Universal        | Patchy                                  |
+
+The decisive factor is merging. A LoRA adapter folds into `W_0` and the served model is a normal weight file. A prefix has to be injected at runtime by an inference engine that knows about it, and most production engines do not.
+
+## Where they still win
+
+- **Multi-tenant serving.** One frozen backbone, hundreds of task prefixes. Swapping a 320 KB prompt is cheaper than swapping a 200 MB adapter or reloading a model.
+- **Extreme memory limits.** Prompt tuning's parameter count does not grow with depth, so it stays tiny on a 400B model.
+- **Studying steering.** Soft prompts are the cleanest probe for what a model can be pushed to do without weight changes.
+
+---
+
+## Interview questions
+
+1. What is the difference between prefix tuning and prompt tuning?
+
+   Prompt tuning prepends learnable vectors at the input embedding layer only, so its parameter count is `n * d_model` and independent of depth. Prefix tuning prepends learnable keys and values inside the attention of every transformer block, so its count scales with `n_layers`.
+
+2. Give the trainable parameter count for prefix tuning with 20 virtual tokens on Qwen3-8B.
+
+   `2 * 36 * 20 * d_kv`. With `num_key_value_heads = 8` and `head_dim = 128`, `d_kv` is 1024, so 1,474,560 parameters. Using `d_model = 4096` instead gives 5,898,240, which is wrong by 4x because the prefix is injected into key and value states, not the full hidden dimension.
+
+3. Why does prompt tuning need a much higher learning rate than LoRA?
+
+   The soft prompt is the only free parameter and it sits at the input, so its gradient travels back through the entire network. It is also a tiny number of parameters steering a large model, which means the loss surface is flat with respect to a `1e-4` step. Typical values are `0.1` to `1.0`.
+
+4. What is the scale finding in the prompt tuning paper?
+
+   The gap to full fine-tuning closes as model size grows. On T5-XXL at 11B parameters, prompt tuning matches full model tuning on SuperGLUE. Below roughly 10B it is clearly weaker, which is why it saw less adoption than LoRA once 7B and 8B models became the common target.
+
+5. Why does prefix tuning use an MLP reparameterization, and does it cost anything at inference?
+
+   Optimizing the prefix vectors directly is poorly conditioned, so the original method parameterizes them as the output of a small MLP, trains that, then discards it and keeps only the prefix values. At inference there is no MLP and no extra cost beyond the prefix positions themselves.
+
+6. Neither method can merge into the base weights. Why does that decide the production question?
+
+   A merged LoRA is a normal weight matrix, so any inference engine serves it with no code changes and no latency penalty. A prefix or soft prompt has to be injected at runtime by an engine that understands the format, and it permanently consumes `n` positions of the context window on every request.
+
+7. When would you still pick prompt tuning over LoRA today?
+
+   Multi-tenant serving, where one frozen backbone carries hundreds of task prompts and each is a few hundred kilobytes rather than a few hundred megabytes. Also on very large models where prompt tuning's parameter count does not grow with depth, and as a research probe for steering.
+
+8. What does `prompt_tuning_init="TEXT"` do and why does it matter?
+
+   It initializes the soft prompt from the token embeddings of a real sentence instead of at random. At small model sizes random initialization frequently fails to converge, and text initialization is the difference between a method that looks broken and one that works.
+
+9. Prefix tuning adds 20 virtual tokens to a model with a 4,096-token window. What does that cost?
+
+   Real content loses 20 positions and attention cost grows with the square of the total length, so the quadratic term rises by about 1%. At 20 tokens it is noise; at the 200 tokens some prompt-tuning work uses it is 5% of the window and worth measuring.

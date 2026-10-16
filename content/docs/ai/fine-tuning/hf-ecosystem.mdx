@@ -1,0 +1,200 @@
+---
+title: The Hugging Face Stack
+description: 'What transformers, datasets, accelerate, peft, trl, and unsloth each own, how they compose into one training script, and which to reach for.'
+---
+
+Six libraries cover almost every fine-tuning job. They are layered, not alternatives, and the confusion in most tutorials comes from not saying which layer a line of code belongs to.
+
+---
+
+## The stack
+
+| Library        | Owns                                            | Depends on                           |
+| :------------- | :---------------------------------------------- | :----------------------------------- |
+| `transformers` | Model classes, tokenizers, weights, `Trainer`   | `torch`                              |
+| `datasets`     | Loading, mapping, streaming, Arrow storage      | `pyarrow`                            |
+| `accelerate`   | Device placement, distributed launch, precision | `torch`                              |
+| `peft`         | Adapter methods: LoRA, QLoRA, prefix, IA3       | `transformers`                       |
+| `trl`          | Task trainers: SFT, DPO, PPO, GRPO, reward      | `transformers`, `peft`, `accelerate` |
+| `unsloth`      | Fused kernels replacing the above at runtime    | `torch`, `trl`                       |
+
+`transformers` and `datasets` are the substrate. `accelerate` handles where tensors live. `peft` changes what is trainable. `trl` changes what the loss is. `unsloth` rewrites the hot path.
+
+---
+
+## transformers
+
+Model loading, tokenization, and the generic training loop.
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+name = "Qwen/Qwen3-8B"
+tok = AutoTokenizer.from_pretrained(name)
+model = AutoModelForCausalLM.from_pretrained(
+    name,
+    dtype=torch.bfloat16,                    # named torch_dtype before transformers 4.56
+    attn_implementation="flash_attention_2",  # "sdpa" or "eager" are the fallbacks
+)
+```
+
+`Trainer` plus `TrainingArguments` is the generic loop. For LLM work you usually want `trl`'s subclass instead, because the generic one does not know about completion-only masking or chat templates.
+
+## datasets
+
+Arrow-backed, memory-mapped, and lazy. `map` is the workhorse.
+
+```python
+from datasets import load_dataset
+
+ds = load_dataset("json", data_files="train.jsonl", split="train")
+
+def format_example(row):
+    return {"text": tok.apply_chat_template(row["messages"], tokenize=False)}
+
+ds = ds.map(format_example, num_proc=8, remove_columns=ds.column_names)
+```
+
+Things worth knowing: `num_proc` parallelizes and is the single biggest speedup on a large `map`; `streaming=True` gives an `IterableDataset` that never materializes on disk; `select(range(1000))` subsets without copying; `interleave_datasets` is how you mix replay data into a narrow set.
+
+## accelerate
+
+The layer that decides how many GPUs you use. You rarely call it directly, but you always launch through it.
+
+```bash
+accelerate config            # writes ~/.cache/huggingface/accelerate/default_config.yaml
+accelerate launch train.py   # reads that config, spawns one process per GPU
+```
+
+`Trainer` builds an `Accelerator` internally, so `TrainingArguments` fields such as `bf16`, `gradient_accumulation_steps`, and `fsdp` are forwarded to it. `Accelerator.prepare(model, optimizer, loader)` is the manual path when you write your own loop.
+
+## peft
+
+Adapter methods. Two calls do most of the work.
+
+```python
+from peft import LoraConfig, TaskType, get_peft_model
+
+cfg = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM,
+)
+model = get_peft_model(model, cfg)
+model.print_trainable_parameters()
+# trainable params: 20,971,520 || all params: 8,211,706,880 || trainable%: 0.2554
+```
+
+`print_trainable_parameters` is the sanity check that the freeze happened. If it prints 100%, your `target_modules` did not match any layer name and peft silently fell back.
+
+## trl
+
+Task-specific trainers. `SFTTrainer` is the one this phase uses.
+
+```python
+from trl import SFTConfig, SFTTrainer
+
+args = SFTConfig(
+    output_dir="runs/sql-lora",
+    per_device_train_batch_size=2,
+    gradient_accumulation_steps=8,       # effective batch 16
+    learning_rate=2e-4,
+    num_train_epochs=3,
+    lr_scheduler_type="cosine",
+    warmup_ratio=0.03,
+    bf16=True,
+    packing=True,                        # concatenate short examples to max_seq_length
+    max_seq_length=2048,
+    logging_steps=10,
+    save_strategy="epoch",
+    report_to="none",
+)
+
+trainer = SFTTrainer(
+    model=model,
+    args=args,
+    train_dataset=ds["train"],
+    eval_dataset=ds["test"],
+    processing_class=tok,                # named tokenizer= in older trl releases
+)
+trainer.train()
+```
+
+`trl` also ships `DPOTrainer`, `PPOTrainer`, `GRPOTrainer`, and `RewardTrainer`, which is Phase 8.
+
+<Callout type="warn">
+  ### `packing=True` changes what the model sees
+
+Packing concatenates unrelated examples into one sequence up to `max_seq_length`. Without a block-diagonal attention mask, tokens from one example attend to the previous example's tokens, and the model learns to condition on garbage. Recent `trl` handles this; older versions did not. Check which you have before trusting a packed run.
+
+</Callout>
+
+## unsloth
+
+Hand-written Triton kernels for the LoRA, RoPE, RMSNorm, and cross-entropy paths, plus gradient checkpointing tuned for adapters. It claims 2x faster training and 70% less VRAM against the standard stack, and it is usually in the right ballpark on a single GPU.
+
+```python
+from unsloth import FastLanguageModel
+from unsloth.chat_templates import standardize_sharegpt
+
+model, tok = FastLanguageModel.from_pretrained(
+    model_name="Qwen/Qwen3-8B",
+    max_seq_length=2048,
+    dtype=None,              # auto-detect; bf16 on Ampere and newer
+    load_in_4bit=True,       # QLoRA path
+)
+model = FastLanguageModel.get_peft_model(
+    model, r=16, lora_alpha=32, target_modules=[...], lora_dropout=0.05,
+)
+```
+
+The API deliberately mirrors `peft` so you can drop it into an existing `trl` script. The catch: it patches modules at load time, so a model class it has not implemented falls back to the slow path or errors, and debugging lands you inside generated Triton code.
+
+---
+
+## Choosing
+
+| Situation                               | Use                               |
+| :-------------------------------------- | :-------------------------------- |
+| Single GPU, LoRA, supported model       | `unsloth` on top of `trl`         |
+| Multi-GPU or multi-node                 | `trl` plus `accelerate` plus FSDP |
+| Non-standard architecture               | `peft` directly, manual loop      |
+| Preference optimization                 | `trl` `DPOTrainer`                |
+| Just loading and prompting, no training | `transformers` or `vllm`          |
+
+---
+
+## Interview questions
+
+1. What is the difference between `peft` and `trl`?
+
+   `peft` decides which parameters are trainable by wrapping the model in adapters; it has no opinion about the loss. `trl` decides what the loss is by providing task trainers such as `SFTTrainer` and `DPOTrainer`. You normally use both: `peft` to build the adapter, `trl` to train it.
+
+2. What does `accelerate` do that `Trainer` does not?
+
+   `Trainer` is the loop; `accelerate` is the placement and launch layer underneath it. `accelerate launch` spawns one process per GPU from a config file, and `Accelerator.prepare` wraps the model, optimizer, and loader for distributed or mixed-precision execution. `Trainer` builds an `Accelerator` internally and forwards arguments like `bf16` and `fsdp` to it.
+
+3. How do you confirm LoRA froze the base model?
+
+   Call `model.print_trainable_parameters()`. It prints trainable, total, and the percentage. If `target_modules` matched no layer names, peft can silently produce a model with nothing trainable or everything trainable, and this line is the check.
+
+4. What breaks when you enable `packing=True`?
+
+   Examples get concatenated into one sequence, so without a block-diagonal attention mask a token attends across the example boundary and learns to condition on unrelated text. Verify your `trl` version builds the mask, or evaluate a packed and unpacked run against each other.
+
+5. What does `unsloth` change, and when should you avoid it?
+
+   It replaces the LoRA, RoPE, RMSNorm, and cross-entropy paths with fused Triton kernels and tunes gradient checkpointing for adapters, for roughly 2x speed and 70% less VRAM on one GPU. Avoid it on architectures it has not implemented, on multi-node setups where its single-GPU focus does not help, and when you need to debug numerics, because the failure surfaces inside generated kernel code.
+
+6. `dtype` versus `torch_dtype` in `from_pretrained`?
+
+   `torch_dtype` was the argument name and was renamed to `dtype` in transformers 4.56. Both appear in the wild; passing the wrong one to the wrong version raises a `TypeError` at load time, so check the installed version.
+
+7. Why is `num_proc` on `Dataset.map` worth setting?
+
+   Tokenization and chat-template rendering are pure CPU work over millions of rows, and a single process makes dataset preparation the bottleneck before the GPU is ever busy. `num_proc=8` runs the map across processes and typically cuts it by close to that factor.
