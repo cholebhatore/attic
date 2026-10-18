@@ -1,0 +1,181 @@
+---
+title: Monitoring and Cost
+description: 'Dashboards, rules that route bad runs, online evaluators, annotation queues, and knowing what each request costs.'
+---
+
+Evaluation asks whether a change helped. Monitoring asks whether anything broke out of sight, and it is the half teams skip because nothing fails the day they skip it. Something fails the following week, and the answer is in traces nobody opened.
+
+---
+
+## The dashboard worth building
+
+Six panels cover most of what an on-call person needs about an LLM service.
+
+| Panel                        | Why it is there                                            |
+| :--------------------------- | :--------------------------------------------------------- |
+| Request volume by route      | A drop is an outage someone else is having                 |
+| Latency p50 and p95 per step | Decode time is not the local bug; a retrieval hop is       |
+| Error rate, split by type    | Provider 429s and parse failures need different owners     |
+| Cost per request, and total  | The number that turns a quality discussion into a decision |
+| Feedback rate                | The only quality signal that arrives unprompted            |
+| Fallback and guardrail hits  | Silent degradations surface here or nowhere                |
+
+Two habits make these useful. Build the dashboard in advance, because the first incident is the wrong day to design a query. And put the p95 next to the p50 every time: an average hides a tail, and the tail is where the complaints come from.
+
+---
+
+## Rules: routing runs as they arrive
+
+A rule watches incoming runs, matches a filter, and acts. That is the mechanism that turns tracing from a debugging tool into a data pipeline.
+
+| Trigger                                    | Action                         | What it produces                            |
+| :----------------------------------------- | :----------------------------- | :------------------------------------------ |
+| Feedback score is negative                 | Add the run to a dataset       | A growing eval set made of real failures    |
+| Output failed a schema check               | Send it to an annotation queue | Human review on exactly the broken cases    |
+| Latency above a threshold                  | Tag the run                    | A filterable population for later analysis  |
+| A specific error string appears            | Alert the channel              | A page that fires on a cause, not a symptom |
+| Metadata says this is a new experiment arm | Route to its own project       | Clean comparisons without a filter          |
+
+The high-value one is the first row. A negative-feedback run landing in a dataset means the eval set grows in the shape of the actual failures, without anyone remembering to curate it.
+
+---
+
+## Online evaluators
+
+The same evaluators can run against live traffic, sampled, so quality drift surfaces without waiting for a user to complain. Configure it in the project's rules, pick the filter, and set the sampling rate deliberately rather than leaving it at whatever the form defaults to.
+
+Three cautions, because online evaluation is where a good idea gets expensive:
+
+- **It costs tokens.** A judge on 100 percent of traffic can outspend the feature it is watching. Sample, and set the rate deliberately rather than by default.
+- **A judge that drifts produces a misleading trend line.** Recalibrate against human labels on the same cadence as the dashboard review.
+- **Scores without owners are decoration.** Route the bad ones to a queue, and decide who reads it.
+
+---
+
+## Annotation queues
+
+A queue is a worklist: runs arrive by rule, a person labels them, and the label becomes feedback on the run. That is the bridge between a machine noticing something odd and a human deciding whether it is wrong, and it is where reference answers come from.
+
+Make the labels cheap and the decision explicit: a binary correct-or-not plus one free-text reason beats a five-point scale everyone reads differently. Whatever the queue produces should be exportable into a dataset, or the review is a dead end.
+
+---
+
+## Cost
+
+Token counts arrive per run, so cost is arithmetic once per-model pricing is configured.
+
+```python title="cost.py"
+# Set per-model pricing once; every run then carries a cost estimate.
+client.create_model_price(
+    model="gemini-2.5-flash",
+    price={
+        "prompt": 0.00000030,        # USD per input token
+        "completion": 0.00000250,    # USD per output token
+    },
+)
+```
+
+The questions cost data answers, in the order teams discover them:
+
+1. **What does one request cost?** Divide the day's spend by successful runs, per route.
+2. **Which feature is expensive?** Group by the metadata tag set in the first week, which is why that tag matters.
+3. **Where do the tokens go?** The trace tree shows the input dominating, and the input is usually history or retrieved passages.
+4. **What would a cheaper model cost in quality?** Run the eval from lesson 4 against it and read accuracy per dollar.
+
+Output tokens cost several times input tokens on most models, and decode time scales with them, so `max_output_tokens` is simultaneously a cost lever and a latency lever. That is the cheapest first move in almost every optimization conversation.
+
+---
+
+## Alerts, retention, and what leaves the network
+
+An alert is a dashboard with a pager attached. Write the threshold so it fires on a cause with an action behind it: error rate by type, p95 latency per step, cost per request, and the fallback rate. Fire it rarely enough that people read it, and every alert should have a runbook line that says what to look at first, which is usually a filtered trace list.
+
+Retention is a policy decision, not a default. Traces contain prompts, tool output, and user text, so the retention window, the access list, and the export path all need an owner. On the hosted product, prompt and completion text leaves the VPC, which is the reason some teams mask fields before they are logged and others self-host; the comparison is on [Observability and Guardrails](/ai/agents/observability-guardrails).
+
+---
+
+## The weekly loop
+
+The pieces above are one cycle, and it is worth being able to describe it in an interview, because most candidate answers stop at "everything is logged".
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Dashboard shows a trend"] --> B["Open the worst traces"]
+    B --> C["Label them in a queue"]
+    C --> D["Add confirmed failures to a dataset"]
+    D --> E["Fix, then evaluate against that dataset"]
+    E --> F["Ship, and watch the dashboard"]
+    F --> A
+`}
+/>
+
+A team running that loop gets better every week without deciding to. A team that only has dashboards gets a wall of charts and the same complaints in March.
+
+---
+
+## Common mistakes
+
+- **A dashboard nobody has an alert for.** Monitors are read on the day something already went wrong.
+- **Alerting on averages.** A p50 that hides a p95 tail gives the page too late, or not at all.
+- **Online judges on full traffic.** The monitoring bill exceeds the feature's margin.
+- **Cost tracked only at the account level.** Then no team can answer "what does this endpoint cost".
+- **Labels that live in the review tool.** Export them to a dataset or the review changes nothing.
+- **No retention policy.** That gap opens at a compliance question, not at the storage bill.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Which metrics go on an LLM service dashboard?">
+
+    Volume, latency percentiles per step, error rate split by type, cost per request, user feedback rate, and the rate at which fallbacks or guardrails fired. The last one matters because a silent degradation looks like success on every other panel.
+
+  </Accordion>
+  <Accordion title="2. What is a rule or automation?">
+
+    A filter over incoming runs plus an action: add to a dataset, tag, route to an annotation queue, or alert. It is what turns a trace store into a pipeline that feeds the eval set.
+
+  </Accordion>
+  <Accordion title="3. What is an online evaluator and what is the catch?">
+
+    The same evaluators running on live traffic, sampled, so quality drift surfaces without waiting for a user to complain. The catch is cost, judge drift, and the fact that a score nobody reviews changes nothing.
+
+  </Accordion>
+  <Accordion title="4. How do reference answers actually get produced?">
+
+    Annotation queues. Runs arrive by rule, a person labels them, the label attaches as feedback, and the labeled rows export into a dataset. Without that path, review is theatre.
+
+  </Accordion>
+  <Accordion title="5. What produces cost per request?">
+
+    Token counts arrive per run, so with per-model pricing configured, spend divides by successful runs per route. Then group by a metadata tag to see which feature the money went to.
+
+  </Accordion>
+  <Accordion title="6. What is the cheapest latency and cost win on most systems?">
+
+    Capping output tokens. Decode time scales with generated length and output is priced several times above input, so one parameter moves both numbers.
+
+  </Accordion>
+  <Accordion title="7. What does monitoring not show?">
+
+    Whether the answer was correct. It shows a distribution of behaviour, not ground truth, which is why the eval loop needs labeled examples from somewhere.
+
+  </Accordion>
+  <Accordion title="8. P95 latency doubled and cost per request doubled. The first three places to look?">
+
+    The step-level latency panel to see whether it is the model or a tool, the trace tree for a run that took more steps than it should, and the input token distribution, because a retrieval change or unpruned history shows up there first.
+
+  </Accordion>
+  <Accordion title="9. How does an alert fire without training people to ignore it?">
+
+    Fire on causes with an action attached, at a threshold the team can meet, with a runbook line pointing at the filtered trace list. An alert that fires correctly and helps nobody gets muted within a month.
+
+  </Accordion>
+  <Accordion title="10. What is the privacy exposure of a trace store?">
+
+    Prompts and tool output are user data, so the retention window, access list, masking, and export path all need an owner. On hosted tracing the text leaves the network, which decides the deployment model for some teams.
+
+  </Accordion>
+</Accordions>

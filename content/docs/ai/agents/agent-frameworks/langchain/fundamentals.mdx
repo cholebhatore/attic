@@ -1,0 +1,182 @@
+---
+title: LangChain Fundamentals
+description: 'What the framework is, what it is not, the same job with a provider SDK and with LangChain, and how LangChain, LangGraph, LangSmith split up.'
+---
+
+LangChain standardizes how a language model connects to the rest of an application. It is a layer of interfaces and ready-made components, not a model and not a runtime that gets deployed.
+
+The running example is a fact-checking service. It sends a claim to a model, searches the web for evidence, pulls documents from an internal store, asks the model to weigh the evidence, and hands back a structured verdict. Every one of those steps is a decision about interfaces: which provider SDK makes the call, how a prompt is stored, how a search result becomes a string, how a JSON answer becomes a Python object. All of it can be written by hand with `requests` and a provider SDK. LangChain exists so that a large part of that glue is already written, already typed, and already swappable.
+
+---
+
+## The shape of the layer
+
+<Mermaid
+  chart={`
+flowchart TD
+    A["The application<br/>business logic, API endpoints"] --> B["LangChain<br/>model interfaces, prompts, tools,<br/>retrievers, output handling"]
+    B --> C["Model provider APIs<br/>Google, OpenAI, Anthropic, a local server"]
+    B --> D["Outside world<br/>search, databases, vector stores, application functions"]
+`}
+/>
+
+Two boundaries matter there. LangChain sits **below** the business logic, so application code decides what to do and the framework decides how the pieces talk. And it sits **above** the provider APIs, so the model is always someone else's process. LangChain never runs a model locally. When `model.invoke(...)` returns, an HTTP call happened.
+
+What LangChain puts at each boundary:
+
+| Boundary           | Without LangChain                                               | With it                                                       |
+| :----------------- | :-------------------------------------------------------------- | :------------------------------------------------------------ |
+| Application, model | Provider client objects, hand-built message dicts               | One chat-model interface per provider, same call signature    |
+| Prompt, input      | f-strings scattered through modules                             | Prompt templates that take variables and return messages      |
+| Model, data        | `json.loads` plus regex, plus a retry when the model adds prose | Output parsers and schema-based structured output             |
+| Model, app code    | A switch statement over tool names                              | Tool definitions with schemas the model can see               |
+| Model, the corpus  | A client per vector database                                    | One retriever and vector-store interface over many backends   |
+| Any of it, truth   | Print statements                                                | Runnable metadata and tags that a tracer like LangSmith reads |
+
+---
+
+## The same task twice
+
+Summarize a piece of text. First with the provider SDK directly:
+
+```python title="sdk_direct.py"
+from google import genai
+
+client = genai.Client()  # reads GOOGLE_API_KEY from the environment
+
+resp = client.models.generate_content(
+    model="gemini-2.5-flash",
+    contents="Summarize this incident report in three bullets: ...",
+)
+print(resp.text)
+```
+
+Now with LangChain:
+
+```python title="langchain_way.py"
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+
+msg = model.invoke("Summarize this incident report in three bullets: ...")
+print(msg.content)  # str
+```
+
+For one call, LangChain adds nothing. The value appears at the second and third thing built, because `ChatGoogleGenerativeAI` is a `Runnable`, and everything else in the framework speaks `Runnable` too. Swap the provider and the prompt template, the parser, the retriever, and the agent built around it keep working.
+
+```python title="swap_providers.py"
+from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
+
+# Same downstream code, three different vendors.
+model = ChatAnthropic(model="claude-sonnet-4-5")
+# model = ChatOpenAI(model="gpt-4.1-mini")
+# model = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
+```
+
+---
+
+## What the layer provides, what it costs
+
+| Gain                                                 | Cost                                                                    |
+| :--------------------------------------------------- | :---------------------------------------------------------------------- |
+| Provider swap is a constructor change                | Another dependency, and another set of release notes to read            |
+| Components compose because they share one interface  | An error can surface three frames away from where it was caused         |
+| Structured output, retries, streaming come built in  | Version churn: the import paths moved more than once before 1.0         |
+| Tracing hooks are already on every object            | A prebuilt agent hides the loop that has to be answered for             |
+| Interviewers and hiring managers know the vocabulary | Nothing here makes a bad prompt good, or an unmeasured system shippable |
+
+The honest summary: LangChain is worth it when several moving parts are being assembled and switching any of them is plausible. With one prompt, one model, and no plans beyond that, it is dead weight.
+
+---
+
+## Three products, one ecosystem
+
+Worth separating, because candidates mix them up in interviews.
+
+| Product   | What it is                                                     | The moment it fits                                       |
+| :-------- | :------------------------------------------------------------- | :------------------------------------------------------- |
+| LangChain | Components and abstractions for building LLM applications      | Models, prompts, tools, and retrieval are being wired    |
+| LangGraph | An execution runtime for stateful, branching, cyclic workflows | The run has to loop, pause, resume, or survive a restart |
+| LangSmith | Hosted tracing, evaluation, and prompt management              | What happened inside a run has to be seen                |
+
+They are made by the same company and work together, and none of them is required by the others. Plenty of production systems use LangGraph with hand-written prompts and no LangChain at all.
+
+---
+
+## The version line
+
+LangChain's history is the first thing an interviewer who stopped paying attention in 2023 will ask about.
+
+| Era                       | Agent path                                                       | Composition path          | Status                                                  |
+| :------------------------ | :--------------------------------------------------------------- | :------------------------ | :------------------------------------------------------ |
+| Classic, 0.x              | `initialize_agent`, `AgentExecutor`, string-keyed memory objects | LCEL pipes, still current | Retired from the 1.0 path, lives in `langchain-classic` |
+| 1.0, from 22 October 2025 | `create_agent`, built on the LangGraph runtime                   | Unchanged                 | Current                                                 |
+
+Two other 1.0 changes bite anyone reading old tutorials. Provider and vector-store integrations moved out of the core package into their own (`langchain-google-genai`, `langchain-anthropic`, `langchain-openai`) or into `langchain-community`. And the model response shape was standardized into typed content blocks, so text, reasoning, and tool calls arrive the same way whatever the provider returned.
+
+---
+
+## Common mistakes
+
+- **Importing from the wrong package.** `langchain` is the high-level surface, `langchain_core` holds the primitives, and provider classes live in the provider package. Tutorials from 2023 put `ChatOpenAI` in `langchain.chat_models`, which no longer resolves.
+- **Treating the framework as the architecture.** It supplies components. The system design is still what goes into the context window, when the loop stops, and how the team knows the answer was right.
+- **Assuming a model runs locally.** Every chat-model call is a network call to a provider, with its latency, its rate limits, and its per-token bill.
+- **Adopting it to avoid learning the underlying pieces.** [Function calling](/ai/agents/function-calling), [chunking](/ai/rag/chunking), and [the agent loop](/ai/agents/agent-loop) are the parts that transfer between frameworks. Those are what this curriculum covers first, on purpose.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What is LangChain, in one sentence?">
+
+    A framework that standardizes how a language model connects to the rest of an application: model interfaces, prompt templates, output handling, tools, and retrievers, all sharing one composable interface.
+
+  </Accordion>
+  <Accordion title="2. Does LangChain run models?">
+
+    No. It builds the request, sends it to a provider API, and parses the response. Every call is a network call, so latency, rate limits, and token cost behave exactly as they do with the raw SDK.
+
+  </Accordion>
+  <Accordion title="3. When is a provider SDK the better choice?">
+
+    One prompt, one model, no retrieval, no tools, no plan to switch vendors. The SDK has fewer layers to debug and no dependency to track, and the resulting code is the same HTTP call the framework would have made.
+
+  </Accordion>
+  <Accordion title="4. Separate LangChain, LangGraph, and LangSmith.">
+
+    LangChain is components and abstractions. LangGraph is the execution runtime for stateful, cyclic, resumable workflows. LangSmith is hosted tracing, evaluation, and prompt management. They cooperate, and none of them requires the others.
+
+  </Accordion>
+  <Accordion title="5. What changed in LangChain 1.0?">
+
+    It became the high-level layer on the LangGraph runtime: one `create_agent` entry point, middleware hooks around model and tool calls, typed content blocks across providers, structured output by default, integrations split into their own packages, and the old `AgentExecutor` path retired to `langchain-classic`.
+
+  </Accordion>
+  <Accordion title="6. Why does swapping providers become cheap in LangChain?">
+
+    Because everything downstream talks to the `Runnable` interface, not to a vendor client. Change the constructor and the prompt template, parser, retriever, and agent still compose the same way, as long as no provider-specific fields were used.
+
+  </Accordion>
+  <Accordion title="7. A teammate says LangChain is over-engineered. What is a fair reply?">
+
+    Both halves are true. The pre-1.0 agent abstractions hid the loop and were hard to debug, which is where the reputation came from. The parts that survive are thin: an interface every component implements, plus parsers and retry and streaming behaviour that would otherwise be written by hand. Judge it per layer, not as a brand.
+
+  </Accordion>
+  <Accordion title="8. What does the framework still not do?">
+
+    Decide what goes into the context window, stop a runaway loop, prove the answer was correct, defend against injection through tool output, or hold p99 latency. Those stay with the design, the budget, the evals, the policy, and the serving layer.
+
+  </Accordion>
+  <Accordion title="9. Where do provider integrations live now?">
+
+    In their own packages, `langchain-google-genai`, `langchain-openai`, `langchain-anthropic`, and the community-maintained ones in `langchain-community`. Core keeps the primitives and the high-level agent.
+
+  </Accordion>
+  <Accordion title={<>10. Inheriting a codebase full of <code>initialize_agent</code> calls. First move?</>}>
+
+    Do not rewrite it for taste. `initialize_agent` and `AgentExecutor` are the classic path and still run, so the first move is characterization tests around the loop and a trace of one real run, then migrate to `create_agent` when there is a reason to touch that code.
+
+  </Accordion>
+</Accordions>

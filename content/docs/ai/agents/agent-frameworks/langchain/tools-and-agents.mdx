@@ -1,0 +1,296 @@
+---
+title: Tools and Agents
+description: 'Define tools, bind them to a model, write the loop by hand once, then replace it with create_agent, middleware, and a step budget.'
+---
+
+A tool is a function the model is allowed to ask for, and application code runs it. An agent is a loop that keeps asking until the model stops asking. That is the whole idea, and this lesson builds it twice: once by hand, to show every message, and once with `create_agent`, to show what the framework removes.
+
+---
+
+## Defining a tool
+
+The `@tool` decorator turns a Python function into a tool definition. The docstring becomes the description the model reads, and the type hints become the argument schema.
+
+```python title="tools.py"
+from langchain_core.tools import tool
+
+
+@tool
+def search_web(query: str) -> str:
+    """Search the public web and return the top result snippets."""
+    results = serp_client.run(query, limit=5)
+    return "\n".join(f"{r.title}: {r.snippet}" for r in results)
+
+
+print(search_web.name)          # search_web
+print(search_web.description)   # Search the public web and return the top result snippets.
+print(search_web.args)          # {'query': {'description': ..., 'type': 'string'}}
+print(search_web.invoke({"query": "gemini 2.5 rate limits"}))  # str
+```
+
+The description is the only thing the model sees before it decides to call the tool. A tool named `utils` with a description of `handles web` will be called at the wrong time and skipped at the right one. [Function Calling](/ai/agents/function-calling) covers how to write these; the framework does not make a bad description work.
+
+For a richer schema, declare an `args_schema` and keep the function signature simple:
+
+```python title="args_schema.py"
+from langchain_core.tools import BaseTool, Tool
+from pydantic import BaseModel, Field
+
+
+class SearchInput(BaseModel):
+    query: str = Field(description="Keywords only, no operators")
+    recency_days: int = Field(default=30, ge=1, le=365, description="Restrict results")
+
+
+search = Tool(
+    name="search_web",
+    description="Search the public web for recent engineering sources.",
+    func=lambda **kw: serp_client.run(**kw),
+    args_schema=SearchInput,
+)
+```
+
+---
+
+## The loop, written out once
+
+`bind_tools` puts the schemas in front of the model. The model then either answers, or returns a request to call something.
+
+```python title="manual_loop.py"
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+
+model_with_tools = model.bind_tools([search_web, read_incident_log])
+
+messages = [
+    SystemMessage(content="You triage production incidents. Use tools before answering."),
+    HumanMessage(content="API error rate spiked at 14:02 UTC."),
+]
+
+tools = {"search_web": search_web, "read_incident_log": read_incident_log}
+
+while True:
+    ai = model_with_tools.invoke(messages)
+    messages.append(ai)
+
+    if not ai.tool_calls:                 # the model answered instead of asking
+        break
+
+    for call in ai.tool_calls:            # parallel calls arrive as a list
+        out = tools[call["name"]].invoke(call["args"])
+        messages.append(ToolMessage(content=str(out), tool_call_id=call["id"]))
+
+print(messages[-1].content)
+```
+
+Five lines of that loop are the entire agent. `AIMessage.tool_calls` is a list of `{"name", "args", "id"}` dicts, and the `ToolMessage` must carry the matching `tool_call_id` or the provider rejects the next request.
+
+Every framework agent is this loop plus bookkeeping: a step counter, error handling, a checkpointer, and a place to hang hooks.
+
+---
+
+## create_agent
+
+LangChain 1.0 ships the loop as one function, compiled onto the LangGraph runtime.
+
+```python
+create_agent(model, tools, system_prompt=None, response_format=None,
+             state_schema=None, context_schema=None, middleware=[], name=None)
+```
+
+```python title="agent.py"
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage
+from pydantic import BaseModel, Field
+
+
+class TriageResult(BaseModel):
+    severity: int = Field(ge=1, le=5)
+    suspected_cause: str
+    evidence: list[str]
+
+
+agent = create_agent(
+    model="google_genai:gemini-2.5-flash",
+    tools=[search_web, read_incident_log],
+    system_prompt="You triage production incidents. Cite the evidence you found.",
+    response_format=TriageResult,
+)
+
+result = agent.invoke(
+    {"messages": [HumanMessage("API error rate spiked at 14:02 UTC")]},
+    {"recursion_limit": 25},
+)
+
+print(result["messages"][-1].content)     # the last assistant turn
+print(result["structured_response"])      # a TriageResult instance
+```
+
+| Argument          | What it does                                                        |
+| :---------------- | :------------------------------------------------------------------ |
+| `model`           | A chat model instance, or a provider string like `google_genai:...` |
+| `tools`           | Objects implementing the tool interface                             |
+| `system_prompt`   | The stable instruction turn                                         |
+| `response_format` | A schema for the **final** answer, so the loop ends in typed data   |
+| `state_schema`    | Custom state keys, when the default message list is not enough      |
+| `middleware`      | Hooks that run around the model and tool calls                      |
+| `name`            | The node name that shows up in traces                               |
+
+The return value is the graph state: a replayable `messages` list, and `structured_response` when a format was requested.
+
+---
+
+## Middleware: the hooks around the loop
+
+Behaviour that is neither the model's job nor a tool's job belongs in middleware. Each hook is a small function, or a class with several.
+
+| Hook              | Fires                             | Typical use                                        |
+| :---------------- | :-------------------------------- | :------------------------------------------------- |
+| `before_agent`    | Once, before the first model call | Load context, set up state                         |
+| `before_model`    | Before every model call           | Trim history, inject the current time, count steps |
+| `after_model`     | After every model call            | Validate the plan, log token spend                 |
+| `wrap_model_call` | Around the call itself            | Retries, timeouts, model routing                   |
+| `wrap_tool_call`  | Around each tool execution        | Permission checks, timing, argument redaction      |
+| `dynamic_prompt`  | When the prompt is built          | Per-user or per-tenant instructions                |
+
+```python title="middleware.py"
+from langchain.agents import create_agent
+from langchain.agents.middleware import (
+    HumanInTheLoopMiddleware,
+    SummarizationMiddleware,
+    before_model,
+    wrap_tool_call,
+)
+
+
+@before_model
+def count_steps(state, runtime):
+    print("step", len(state["messages"]))
+    return None                      # None means leave the state alone
+
+
+@wrap_tool_call
+def block_writes(request, handler):
+    if request.tool_call["name"] == "delete_record" and not runtime.context.approved:
+        return "refused: this run has no write permission"
+    return handler(request)          # otherwise run the tool
+
+
+agent = create_agent(
+    model="google_genai:gemini-2.5-flash",
+    tools=[search_web, read_incident_log, delete_record],
+    middleware=[
+        count_steps,
+        block_writes,
+        SummarizationMiddleware(model="google_genai:gemini-2.5-flash-lite",
+                                trigger=("tokens", 100_000)),
+        HumanInTheLoopMiddleware(interrupt_on={"delete_record": True}),
+    ],
+)
+```
+
+`SummarizationMiddleware` keeps a long run inside the window by compressing older turns. `HumanInTheLoopMiddleware` pauses on named tools and waits for approval, which is `interrupt()` from [LangGraph](/ai/agents/agent-frameworks/langgraph), wired up in advance.
+
+---
+
+## Bounding the run
+
+An agent without a ceiling is a bill that has not finished arriving. The controls, ordered by which to reach for first:
+
+| Control                          | Where                      | What it stops                                  |
+| :------------------------------- | :------------------------- | :--------------------------------------------- |
+| `recursion_limit` in config      | Every graph run            | An unbounded number of steps; it raises        |
+| A step counter in `before_model` | Middleware                 | The same, with a chosen graceful exit          |
+| `timeout` on the model           | Constructor                | One slow provider call                         |
+| `max_output_tokens`              | Constructor                | A rambling answer                              |
+| A tool allow-list per run        | Middleware or tool wrapper | Doing something it was never meant to do       |
+| `handle_tool_errors` on the node | `ToolNode`                 | One bad tool call killing the whole trajectory |
+
+Know what happens when the limit trips. `recursion_limit` raises, so an agent that should answer "I could not finish, here is what I found" needs routing on a custom counter and a deliberate end to the graph.
+
+---
+
+## What the abstraction hides
+
+`create_agent` removes about forty lines a reader would otherwise have. What it also removes: the exact message list at each step, when a tool fails, why the loop chose what it chose, and where the tokens went. Three habits keep that survivable.
+
+- **Trace every run.** The message list is the debugging artifact, and a tracer makes it free. See [Production Integration](/ai/agents/agent-frameworks/langchain/production).
+- **Keep tools dumb and inspectable.** A tool that itself calls a model makes the trajectory unreadable.
+- **Write the loop by hand once, on a branch that gets deleted.** Knowing what `ToolMessage.tool_call_id` is for changes how a failed trace reads.
+
+---
+
+## Common mistakes
+
+- **A tool whose docstring describes the implementation instead of the use case.** The model routes on the description.
+- **Side effects without idempotency.** A retried request runs the `send_email` tool twice.
+- **Returning objects from tools.** The content goes back to the model as text; serialize what needs saying, and keep it short.
+- **Trusting tool output as instructions.** Retrieved text and third-party API responses are the classic injection channel. See [Agent Security](/ai/agents/agent-security).
+- **One tool that does six things.** `do_ticket(action, id, body)` is a schema the model has to fill correctly every time; six named tools route better.
+- **No stop condition beyond the recursion limit.** Then the first production incident is a crash instead of an answer that says "not enough evidence".
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What makes a function a tool?">
+
+    A name, a description, and an argument schema the model can see. `@tool` derives all three from the function name, docstring, and type hints, and `bind_tools` puts them into the request.
+
+  </Accordion>
+  <Accordion title="2. Walk through one agent step.">
+
+    The model receives the messages and the tool schemas and returns either content or `tool_calls`. For each call, application code runs the function and appends a `ToolMessage` carrying the matching `tool_call_id`. The model is called again with the new list, and the loop ends when it answers without asking.
+
+  </Accordion>
+  <Accordion title={<>3. What does <code>create_agent</code> add over that loop?</>}>
+
+    The loop itself on the LangGraph runtime, a state schema, middleware hooks, optional structured final output via `response_format`, and checkpointing if a checkpointer is passed. It is the same cycle, with the bookkeeping done.
+
+  </Accordion>
+  <Accordion title="4. Where does middleware run, and name three hooks.">
+
+    Inside the compiled graph, around the model and tool nodes. `before_model` and `after_model` run either side of a model call, `wrap_model_call` and `wrap_tool_call` wrap the call itself so they can retry, route, or refuse, and `dynamic_prompt` builds the instruction turn per run.
+
+  </Accordion>
+  <Accordion title="5. What stops an agent from running forever?">
+
+    A chosen ceiling, not the default one. `recursion_limit` raises when tripped, so a step counter in `before_model` that routes to a give-up node buys a graceful answer, plus a token or cost budget and a wall-clock timeout.
+
+  </Accordion>
+  <Accordion title="6. A tool call fails. What should the model see?">
+
+    The error as the tool result, so it can change approach. Swallowing it hides the problem; raising kills the trajectory and the work before it. `ToolNode` has a handler for exactly this.
+
+  </Accordion>
+  <Accordion title="7. How does an agent produce a typed final answer?">
+
+    `response_format=MySchema`. The loop ends with a validated object in `structured_response` instead of prose that has to be parsed, which is lesson 3's structured output applied to the end of a run.
+
+  </Accordion>
+  <Accordion title="8. The agent calls the wrong tool. What gets checked first?">
+
+    The descriptions and names, then the count of tools in the list. Routing is a text-similarity decision made by the model over the schemas as written, so overlapping descriptions are the usual cause and a tool allow-list per run is the usual fix.
+
+  </Accordion>
+  <Accordion title="9. Describe an approval gate before a destructive tool.">
+
+    `HumanInTheLoopMiddleware(interrupt_on={"delete_record": True})`, which suspends the graph, checkpoints state, and resumes when a human answers. Underneath it is `interrupt()`, so the wait survives a restart.
+
+  </Accordion>
+  <Accordion title="10. What is the security risk of a large tool list?">
+
+    Every tool is a capability the model can be talked into using. Prompt injection through retrieved text or an API response becomes action, so scope tools per run, require confirmation on writes, and treat tool output as untrusted input.
+
+  </Accordion>
+  <Accordion title={<>11. Why does a <code>ToolMessage</code> need an id?</>}>
+
+    Because a single assistant turn can request several calls, including parallel ones. The id binds each result to the request it answers, and a mismatch is rejected by the provider before the model ever sees it.
+
+  </Accordion>
+  <Accordion title={<>12. When is writing the loop by hand the better choice than <code>create_agent</code>?</>}>
+
+    When the control flow is not the standard cycle: a fixed pipeline with one model call, a state machine with hard rules, or a runtime where every message has to stay visible. Around 150 lines covers it, and the trade is owning retries, streaming, and persistence.
+
+  </Accordion>
+</Accordions>

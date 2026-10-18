@@ -1,0 +1,279 @@
+---
+title: Production Integration
+description: 'Serve a chain from FastAPI, pin dependencies with uv, test without a network, trace every run, and deploy something that can be rolled back.'
+---
+
+Everything up to lesson 6 ran in a script started by hand. The moment it has users, four new things are true: someone waits on it, someone pays for it, something fails at 3am, and a change to a prompt can break a behaviour nobody tested. This lesson is the layer between a working notebook and a service worth leaving running.
+
+---
+
+## The service
+
+Build the chain once at import time. It holds configuration and a connection pool, not conversation state, so every worker can share it.
+
+```python title="app.py"
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+model = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0,
+    max_output_tokens=512,
+    timeout=20,
+    max_retries=2,
+)
+
+
+class AskIn(BaseModel):
+    question: str = Field(min_length=3, max_length=2000)
+    tenant: str
+
+
+class AskOut(BaseModel):
+    answer: str
+    model: str
+    tokens: int
+
+
+@app.post("/ask", response_model=AskOut)
+async def ask(body: AskIn) -> AskOut:
+    msg = await model.ainvoke(
+        [
+            SystemMessage(content="Answer from the context only. Say so if it is missing."),
+            HumanMessage(content=body.question),
+        ],
+        {"tags": ["ask"], "metadata": {"tenant": body.tenant}},
+    )
+    usage = msg.usage_metadata or {}
+    return AskOut(answer=msg.content, model="gemini-2.5-flash",
+                  tokens=usage.get("total_tokens", 0))
+
+
+@app.get("/ask/stream")
+async def ask_stream(question: str, tenant: str) -> StreamingResponse:
+    async def events():
+        async for chunk in model.astream([HumanMessage(content=question)],
+                                         {"metadata": {"tenant": tenant}}):
+            yield f"data: {chunk.content}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
+Three things in that file are load-bearing, and all three are easy to skip under deadline:
+
+- **`ainvoke`, not `invoke`.** The blocking call pins one request per worker.
+- **A timeout on the model.** Without it, a slow provider holds the connection pool open and the provider's outage becomes the service's.
+- **`max_output_tokens`.** The cheapest cap on both latency and spend, because decode time is proportional to output length.
+
+Return the model name and token count in the response body. When a user reports a wrong answer, that is the first thing asked for.
+
+---
+
+## Dependencies
+
+The lock file is the deployment artifact. `uv` writes one and CI should refuse to deviate from it.
+
+```bash title="terminal"
+uv add langchain langchain-google-genai fastapi "uvicorn[standard]" python-dotenv
+uv add --dev pytest pytest-asyncio ruff httpx
+uv lock
+uv sync --frozen          # in CI and in the container: install exactly what is locked
+```
+
+```dockerfile title="Dockerfile"
+FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev
+COPY src ./src
+CMD ["uv", "run", "uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+LangChain moves fast and its import paths have changed across majors, so pin the range in `pyproject.toml`, upgrade on purpose rather than on a rebuild, and read the release notes for `langchain-core` before bumping it. An unpadded `uv sync` in CI is how a Tuesday deploy picks up a framework change nobody reviewed.
+
+---
+
+## Tests that never call the network
+
+The split from lesson 2 does the work here: prompt formatting costs nothing, so most of the test suite should stop at the message list.
+
+```python title="test_prompts.py"
+def test_prompt_renders_both_variables():
+    messages = prompt.invoke({"technology": "MCP", "level": "senior"})
+    assert len(messages) == 2
+    assert messages[0].type == "system"
+    assert "MCP" in messages[1].content
+```
+
+For chain behaviour, swap the model for a fake that replays canned replies.
+
+```python title="test_chain.py"
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage
+
+fake = GenericFakeChatModel(messages=iter([AIMessage(content="billing")]))
+chain = prompt | fake | StrOutputParser()
+
+assert chain.invoke({"text": "charged twice"}) == "billing"
+```
+
+| Layer              | Test                                                                    | Runs in           |
+| :----------------- | :---------------------------------------------------------------------- | :---------------- |
+| Prompt template    | Render with representative variables, assert on roles and substrings    | Every commit      |
+| Parser             | Feed it a good string, a fenced one, and an apology                     | Every commit      |
+| Chain logic        | `GenericFakeChatModel` replaying scripted answers                       | Every commit      |
+| Provider behaviour | Recorded HTTP cassettes, or one live smoke test off the critical path   | Nightly           |
+| Answer quality     | A labeled set scored by an eval, with a threshold that blocks the merge | On prompt changes |
+
+Structured output is the exception: the fake models do not implement `with_structured_output`, so test the schema against a recorded provider response, and keep one live test behind a flag that is run deliberately.
+
+---
+
+## Observability
+
+A trace is the only honest record of an LLM run: the input, the rendered prompt, every tool call, the token counts, the latency per step, and the failure.
+
+```bash title=".env"
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=your_key
+LANGSMITH_PROJECT=ticket-triage
+```
+
+```python title="traced.py"
+chain.invoke(
+    {"text": ticket},
+    {"tags": ["triage", "paid-tier"], "metadata": {"user_id": uid, "prompt_version": "v7"}},
+)
+```
+
+Tags filter the trace list; metadata carries the fields that matter when two prompt versions are compared. Both ride on every call in the run because the config propagates through the chain.
+
+Whatever tracing product is chosen, the dashboard questions stay the same: p50 and p95 latency per route, tokens and cost per request, the rate at which a fallback fired, the parse-failure rate, and the distribution of retrieved passage scores. Those four numbers say whether a change helped.
+
+---
+
+## Failure handling
+
+| Failure                          | Symptom                                         | Response                                                           |
+| :------------------------------- | :---------------------------------------------- | :----------------------------------------------------------------- |
+| Rate limit (429)                 | Spikes of errors under load                     | `with_retry` on the limit exception, plus backpressure at the edge |
+| Timeout                          | p99 blows out, then a late answer               | Model `timeout`, then a fallback model or a cached answer          |
+| Provider outage                  | Every call fails together                       | `with_fallbacks` to a second vendor, and a circuit breaker         |
+| Invalid structured output        | Parse error, no evidence                        | `include_raw=True`, one repair round, then a human queue           |
+| Tool raised                      | The trajectory dies mid-task                    | Return the error text as the tool result so the model adapts       |
+| Empty retrieval                  | Confident answer with no citations              | Refuse-and-say-so branch in the prompt, and alert on the rate      |
+| Context overflow                 | Request rejected, or silently truncated         | Budget the window, summarize older turns, cap `k`                  |
+| Injection through retrieved text | The answer follows instructions from a document | Treat tool output as data, sandbox the write path, log the source  |
+
+The general shape: retry what is transient, degrade what is permanent, and never let a failure erase the record of what the model said.
+
+---
+
+## Caching
+
+Identical calls to an LLM are the purest waste in the stack: same cost, same latency, no new information.
+
+```python title="cache.py"
+from langchain_core.caches import InMemoryCache
+from langchain_core.globals import set_llm_cache
+
+set_llm_cache(InMemoryCache())     # SQLiteCache from langchain-community for a shared disk cache
+```
+
+Prompt caching at the provider is the bigger win and it is a different mechanism: it bills a discounted rate for a repeated prefix, which means the static parts of a prompt go first and the prefix never gets poisoned by a timestamp. [Context Budgeting](/ai/rag/context-budgeting) has the arithmetic. Semantic caching, where a near-duplicate question reuses an answer, sits above both and needs an eval to prove it is not degrading quality.
+
+---
+
+## Deployment
+
+- **Workers are stateless.** Conversation state belongs in a checkpointer or the application database, keyed by thread, so any worker can serve any turn.
+- **One connection pool per process.** Build the model once; do not construct it per request.
+- **Concurrency matches the provider quota.** More workers than the rate limit allows converts a slow period into a 429 storm.
+- **Secrets in the environment**, never in the image, and a separate key per environment so a leaked dev key is not a production incident.
+- **A budget enforced in code.** A daily spend cap and a per-request token ceiling, checked before the call.
+- **Version everything that can be rolled back.** Prompt, model name, schema, and index build in one release artifact, so a rollback is a pointer move, not a hunt.
+- **Stream with an exit.** If the client disconnects mid-generation, cancel the request; otherwise the spend keeps going on text nobody reads.
+
+---
+
+## Common mistakes
+
+- **Testing against the live API in CI.** It is slow, it costs money, and it fails when the provider degrades rather than when the code does.
+- **No timeout anywhere.** The default is the provider's patience, not the caller's.
+- **Logging the whole prompt at info level.** Prompts carry user data; the trace product is where that belongs, with retention chosen deliberately.
+- **Treating a fallback as invisible.** Log which model answered, or a quality regression hides inside an outage.
+- **Caching by request string when the prompt has a timestamp in it.** Every key misses, and the bill arrives twice for the illusion of a cache.
+- **Shipping without a per-run cost number.** Then the first invoice is the alert.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>1. An endpoint calls <code>chain.invoke</code> inside an <code>async def</code>. What is wrong?</>}>
+
+    It blocks the event loop, so one worker serves one request at a time no matter how many workers are configured. Use `ainvoke`, and `astream` for streaming responses.
+
+  </Accordion>
+  <Accordion title="2. Where does the model object get built?">
+
+    Once, at import or application startup. It is configuration and a client, not per-request state, and rebuilding it per request throws away connection reuse.
+
+  </Accordion>
+  <Accordion title="3. How is a chain tested without calling a provider?">
+
+    Assert on rendered prompts, run parsers over canned strings, and drive the chain with a fake chat model that replays scripted replies. Live calls belong in a nightly or a flagged smoke test.
+
+  </Accordion>
+  <Accordion title="4. What is the minimum set of metrics for an LLM endpoint?">
+
+    Latency percentiles per route, tokens and cost per request, fallback rate, parse-failure rate, and retrieval score distribution. Quality needs an eval set; the rest can be watched at 3am.
+
+  </Accordion>
+  <Accordion title="5. A prompt change makes answers slightly worse and nothing failed. How does that get found?">
+
+    Version the prompt in the trace metadata and gate merges on a labeled eval set with a threshold. Without a golden set, a quality regression is only visible in a complaint.
+
+  </Accordion>
+  <Accordion title="6. The provider is down. What should the service do?">
+
+    Fail fast to a fallback model where quality allows, serve a cached answer where one exists, and return an honest error with a retry hint where neither applies. Queueing requests behind a dead provider turns an outage into a timeout storm.
+
+  </Accordion>
+  <Accordion title="7. How is an agent kept from running up a bill?">
+
+    A step budget and a token ceiling per run, checked before the call rather than after, plus a wall-clock timeout and a daily spend cap with an alert wired to whoever is on call.
+
+  </Accordion>
+  <Accordion title="8. What is the difference between LLM caching and prompt caching?">
+
+    LLM caching stores the whole response for an identical request and skips the call. Prompt caching is a provider discount on a repeated prefix: generation still happens, at a lower rate, and it needs a stable prefix with the variable parts at the end.
+
+  </Accordion>
+  <Accordion title="9. The service holds multi-turn conversations. Where does the state live?">
+
+    Outside the process: a checkpointer or a database keyed by thread id. Workers restart, scale, and get replaced, and a conversation that dies with a pod is a bug users feel.
+
+  </Accordion>
+  <Accordion title="10. How does a bad release get rolled back?">
+
+    Prompt, model, decoding parameters, schema, and index build live in one versioned artifact, so rollback is pointing at the previous version. If rollback means editing code and rebuilding, it will be slow at exactly the wrong moment.
+
+  </Accordion>
+  <Accordion title="11. What is the dependency risk of a fast-moving framework in production?">
+
+    Import paths and defaults change between minors, and an unpinned install can pick that up mid-incident. Lock the file, install `--frozen`, upgrade deliberately with the release notes open, and keep the abstraction thin enough that a version bump is not a rewrite.
+
+  </Accordion>
+  <Accordion title="12. Name three checks that belong before the first production deploy.">
+
+    A timeout and a retry policy on every model call, a token and cost ceiling per request, and tracing on every run with the prompt and model version attached. Then the eval gate, because the other three keep the service alive while that one says whether it is any good.
+
+  </Accordion>
+</Accordions>

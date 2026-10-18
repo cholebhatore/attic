@@ -1,0 +1,218 @@
+---
+title: Tracing
+description: 'Three environment variables, automatic instrumentation for chains and graphs, @traceable for plain functions, and reading what came back.'
+---
+
+Tracing is worth enabling before any other decision about the rest of LangSmith. A week of real runs answers more questions than any configuration tutorial, and where LangChain or LangGraph is already in use, the cost is one environment variable.
+
+---
+
+## Setup
+
+```bash title="terminal"
+uv add langsmith
+```
+
+```bash title=".env"
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_your_key
+LANGSMITH_PROJECT=ticket-triage
+```
+
+That is the whole installation for LangChain and LangGraph code. Every chain, agent, and graph in the process now reports its runs to that project. Nothing in the application logic changes, which matters: instrumentation that has to be threaded through business code is instrumentation that gets removed under pressure.
+
+`LANGSMITH_PROJECT` is optional and defaults to `default`. Set it anyway, per service and per environment, because a dashboard mixing staging and production is not a dashboard.
+
+---
+
+## A chain, with the fields that make it findable
+
+```python title="traced_chain.py"
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+prompt = ChatPromptTemplate.from_messages(
+    [("system", "Classify the ticket in one word: billing, bug, or other."),
+     ("human", "{text}")]
+)
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+chain = prompt | model | StrOutputParser()
+
+result = chain.invoke(
+    {"text": "I was charged twice this month"},
+    {
+        "tags": ["triage", "paid-tier"],
+        "metadata": {"user_id": "u_8821", "prompt_version": "v7", "tenant": "acme"},
+    },
+)
+print(result)   # billing
+```
+
+The trace records the rendered prompt, the model's raw reply, tokens in and out, and wall time. The `metadata` dict is the search surface later on, so the fields to put in it are the ones the questions come back to: user, tenant, prompt version, experiment arm, feature flag. `tags` are coarse labels for filtering; metadata is key-value data for queries.
+
+---
+
+## A graph run
+
+Nothing extra is required. Each node becomes a run in the tree, and the `thread_id` already passed for checkpointing is what groups the conversation.
+
+```python title="traced_graph.py"
+config = {
+    "configurable": {"thread_id": "incident-4821"},
+    "tags": ["triage-agent"],
+    "metadata": {"incident_id": "4821", "severity": "sev2"},
+}
+
+for step in app.stream(inputs, config, stream_mode="updates"):
+    print(step)
+```
+
+In the UI, that trace shows the model call, the tool calls with their arguments and results, and the routing decision that sent the run where it went. This is where a graph pays for itself in observability: the shape of the run is visible, not inferred.
+
+---
+
+## Plain Python functions
+
+Plain Python is one decorator away. `@traceable` records the arguments and return value as a run, and nests under whatever run is already active, so a traced chain calling a traced helper produces one tree rather than two unrelated rows.
+
+```python title="traceable.py"
+from langsmith import traceable
+
+
+@traceable(run_type="tool")
+def fetch_customer_history(user_id: str) -> dict:
+    """Pulled from the warehouse; used to ground the classifier."""
+    return warehouse.query(user_id=user_id, limit=20)
+
+
+@traceable(run_type="chain")
+def triage(ticket: str, user_id: str) -> str:
+    history = fetch_customer_history(user_id)          # child run
+    return chain.invoke({"text": f"{ticket}\n\nHistory: {history}"},
+                        {"metadata": {"user_id": user_id}})
+```
+
+| `run_type`  | What it labels                       |
+| :---------- | :----------------------------------- |
+| `llm`       | A model call, with token counts      |
+| `tool`      | An external call the model asked for |
+| `chain`     | A composition step in the pipeline   |
+| `retriever` | A lookup that returned context       |
+| `parser`    | Output shaping                       |
+
+The type is not decoration. Cost views, latency views, and filters group by it, so a mislabelled run shows up in the wrong dashboard.
+
+---
+
+## Attaching feedback
+
+A score on a run is what turns a trace into data. It can come from the user, from a judge, or from validation code inside the application.
+
+```python title="feedback.py"
+from langsmith import get_current_run_tree
+from langsmith.client import Client
+
+# Inside a traced call: score the currently active run.
+run = get_current_run_tree()
+if run is not None:
+    run.post_feedback(key="correct", score=0, comment="wrong category, said billing")
+
+# Elsewhere, by id: the endpoint that received a thumbs-up button.
+client = Client()
+client.create_feedback(run_id=trace_id, key="thumbs_up", score=1)
+```
+
+Attach it at the moment the signal arrives, which for user feedback means a rating control in the UI calls the API, and the API writes the feedback. A product that never collects a score has no ground truth, and no ground truth means lesson 4 has nothing to build a dataset from.
+
+---
+
+## What a trace shows
+
+| Field              | Signal                                              |
+| :----------------- | :-------------------------------------------------- |
+| Inputs and outputs | The actual prompt, not the template in the code     |
+| Token counts       | Cost, and the first sign of context bloat           |
+| Latency per step   | Whether the model or the retrieval is the slow one  |
+| Error and stack    | Which stage raised, with the payload that caused it |
+| Metadata and tags  | The filter that finds this run next week            |
+| Feedback           | Whether anyone thought the answer was good          |
+
+Read a trace top-down for cost and bottom-up for a bug. Top-down asks where the tokens went; bottom-up asks which leaf produced the wrong value that the parent then trusted.
+
+---
+
+## Volume, size, and privacy
+
+- **Traces hold prompt and completion text.** For most teams that is user data, so the retention and access policy applied to the database applies here. Self-hosting or field-level masking are the answers when the text cannot leave the network, and the comparison is on [Observability and Guardrails](/ai/agents/observability-guardrails).
+- **Do not put a whole document in a run input.** Log the reference and the excerpt that made it into the prompt.
+- **Sampling can wait.** A 10 percent sample of a system nobody understands yet is a system nobody can debug.
+- **One project per environment.** Otherwise every query starts with a filter that eventually gets forgotten.
+
+---
+
+## Common mistakes
+
+- **Turning tracing on and never opening the UI.** The traces are the input to a decision, not a compliance artifact.
+- **No metadata contract.** Six months later nobody remembers which keys exist, and the data is unqueryable.
+- **Tracing at the HTTP layer only.** The request took 4.2 seconds, and the 3.9 of them spent inside a reranker stay invisible.
+- **Forgetting the thread id on an agent.** Multi-turn behaviour stops being reconstructable.
+- **Labelling everything `chain`.** Cost and latency views become meaningless.
+- **Assuming tracing equals evaluation.** A trace records what happened. A score says whether it was right, and nothing scores itself.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. How much code changes to trace a LangChain application?">
+
+    None. Three environment variables enable it, and the metadata dict on each call is the addition that keeps the runs findable later.
+
+  </Accordion>
+  <Accordion title="2. What is the difference between tags and metadata?">
+
+    Tags are labels for filtering and grouping. Metadata is key-value data attached to the run, and it is what answers "every trace for this tenant, this prompt version".
+
+  </Accordion>
+  <Accordion title="3. What traces a function that is not part of LangChain?">
+
+    Decorate it with `@traceable` and give it the right `run_type`. It records arguments and return value and nests under the active run, so the tree stays intact.
+
+  </Accordion>
+  <Accordion title="4. Why does the run type matter?">
+
+    Because cost, latency, and error views group by it. A tool call labelled `chain` lands in the wrong dashboard, and the first person to notice is the one paying the bill.
+
+  </Accordion>
+  <Accordion title="5. How does a graph run appear in a trace?">
+
+    As a tree with one run per node, including the model call, each tool call with its arguments and result, and the routing decision. The `thread_id` groups the whole conversation, which is the same id the checkpointer uses.
+
+  </Accordion>
+  <Accordion title="6. How does user feedback reach the system?">
+
+    A rating control calls the endpoint, and the endpoint writes feedback against the run id it received when serving the answer. That means the run id has to reach the client, which is a design decision, not an afterthought.
+
+  </Accordion>
+  <Accordion title="7. Traces are huge and slow to load. What is the usual cause?">
+
+    Logged a whole document or tool payload into the run input. Record the reference and the excerpt that entered the prompt, and keep the rest in the application's own storage.
+
+  </Accordion>
+  <Accordion title="8. A run took 4.2 seconds. What shows where the time went?">
+
+    Open the trace and read the per-run latencies in the tree. Tracing at the HTTP layer shows a slow request; step-level traces show the reranker.
+
+  </Accordion>
+  <Accordion title="9. What is the minimum data on every run from day one?">
+
+    Tenant or user id, prompt version, model name, and a feature or experiment tag. Those four turn a pile of traces into a comparison that can be run later.
+
+  </Accordion>
+  <Accordion title="10. Does tracing replace logging?">
+
+    No. Traces are request-scoped and structured, and they are the wrong place for a startup banner or a background job that never made a model call. Keep both, and put the trace id in the log line where they meet.
+
+  </Accordion>
+</Accordions>

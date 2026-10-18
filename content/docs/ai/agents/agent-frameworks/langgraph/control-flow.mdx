@@ -1,0 +1,203 @@
+---
+title: Control Flow
+description: 'Edges decide what runs next: conditional routes, cycles with a ceiling, static fan-out, Send for unknown counts, and subgraphs.'
+---
+
+Nodes do work. Edges decide the order, and the order is the part a graph exists to express. Four mechanisms cover almost everything: a plain edge, a conditional edge, a parallel branch, and a `Send` for when the branch count is not known in advance.
+
+---
+
+## The edge kinds
+
+| Form                                | Fires when                           | Decided by                       |
+| :---------------------------------- | :----------------------------------- | :------------------------------- |
+| `add_edge(A, B)`                    | `A` finishes                         | The developer, at write time     |
+| `add_conditional_edges(A, fn, map)` | `A` finishes and `fn(state)` returns | The router function, at run time |
+| `add_edge([A, B], C)`               | both `A` and `B` have finished       | The runtime, waiting             |
+| `Send(node, payload)` from a router | once per item in the returned list   | The router function, at run time |
+
+`START` is where a run enters and `END` is where it leaves. A node that returns without routing anywhere ends the run, which is why forgetting a route is a silent early exit rather than an error.
+
+---
+
+## Conditional edges
+
+The router is a plain function that reads state and returns a key from the map it was given.
+
+```python title="routing.py"
+def decide(state: State) -> str:
+    last = state["messages"][-1]
+    if getattr(last, "tool_calls", None):
+        return "act"
+    if state["attempts"] >= 25:
+        return "give_up"
+    return "finish"
+
+
+g.add_conditional_edges(
+    "think", decide,
+    {"act": "act", "finish": END, "give_up": "give_up"},
+)
+```
+
+Return a name the map does not contain and the failure lands at run time rather than at build time. Two habits keep that honest: keep the route names in the map literal, so the graph's shape is readable, and unit-test the router as a function, because it is one.
+
+A router that returns a constant is a plain edge with extra steps. The interesting ones read state, and the state worth reading is the same one the loop-engineering guards use: step count, spend so far, whether the last action repeated. See [The Agent Loop](/ai/agents/agent-loop).
+
+---
+
+## Cycles, and the ceiling the code controls
+
+```python title="cycle.py"
+g.add_edge("act", "think")     # back to an already-visited node
+```
+
+That edge is the whole reason a graph beats a pipeline for agents, and the whole reason an agent can run all night on the bill.
+
+| Ceiling                 | Where                         | Behaviour when hit                               |
+| :---------------------- | :---------------------------- | :----------------------------------------------- |
+| `recursion_limit`       | config on every call          | Raises; no partial result comes back             |
+| A counter in the router | state plus a conditional edge | The router chooses: route to give-up, and answer |
+| A wall-clock check      | inside a node                 | Ends the run mid-step, by design                 |
+| A spend cap in state    | router                        | Stops before the next expensive call, not after  |
+
+`recursion_limit` counts super-steps, so size it against the shape of the loop. Treat it as the guard rail, not the budget: the difference is that a guard rail ends the run in an error, and a budget ends it with an answer that says what was not finished.
+
+```python title="bounded.py"
+def decide(state: State) -> str:
+    if state["attempts"] >= 12 or state["cost_usd"] >= 2.0:
+        return "summarise_what_we_have"
+    return "act" if state["messages"][-1].tool_calls else "finish"
+```
+
+---
+
+## Static parallel branches
+
+Two edges out of one node run in parallel. One edge with two sources waits for both.
+
+```python title="fanout.py"
+g.add_edge("split", "check_security")
+g.add_edge("split", "check_performance")
+g.add_edge(["check_security", "check_performance"], "merge")
+```
+
+The merge node runs once both branches have finished in the same super-step round, and any key both branches wrote needs a reducer, or one write is lost. This is the shape for work that can be counted when the graph is built.
+
+---
+
+## Send: fan-out with an unknown count
+
+When the number of branches is only known at run time, a static edge cannot express it. `Send` returns a payload per branch, and each branch gets its own local state.
+
+```python title="send.py"
+from langgraph.types import Send
+
+
+def route(state: State):
+    return [
+        Send("per_doc", {"doc": d, "question": state["query"]})
+        for d in state["docs"]
+    ]
+
+
+g.add_conditional_edges("split", route, "per_doc")
+```
+
+Each `per_doc` run receives the dict it was sent, not the parent state, so the payload carries what that branch needs. Results come back to the parent through its reducers, which is why the accumulator key has to be an append key.
+
+Two limits worth knowing. A `Send` payload is state for one node, so a branch that needs several steps should be its own subgraph. And a hundred documents means a hundred branches: bound the list, or the result is a rate-limit incident.
+
+---
+
+## Subgraphs
+
+Compile a graph and add it as a single node in another graph. The parent sees one node; the child keeps its own state and its own checkpointing.
+
+```python title="subgraph.py"
+researcher = build_research_graph().compile()
+
+
+def delegate(state: State):
+    out = researcher.invoke({"query": state["question"]})
+    return {"findings": out["findings"]}
+
+
+supervisor = StateGraph(SupervisorState)
+supervisor.add_node("researcher", delegate)
+```
+
+Wrap the child in a function when the two schemas differ, which is most of the time, and pass through the config so the child's steps land in the same trace. A subgraph is also the mechanism behind [Multi-Agent Topologies](/ai/agents/multi-agent): a supervisor node whose internals are a whole agent, still checkpointed per step.
+
+---
+
+## Common mistakes
+
+- **A router that can return a name the map lacks.** Test it as a function with the states that matter.
+- **No give-up path.** The recursion limit raises, and the user sees a 500 instead of "here is what I found in twelve steps".
+- **A cycle with no counter in state.** Then the only signal that the loop is stuck is the invoice.
+- **Two parallel branches writing one un-annotated key.** The merge is a race; declare the reducer.
+- **Unbounded `Send`.** Fan-out should have a cap, and the cap belongs in the router that builds the list.
+- **Deep subgraphs with no shared config.** The trace breaks at the boundary, and debugging covers two systems instead of one.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Name the four ways control moves in a graph.">
+
+    A plain edge to a fixed target, a conditional edge whose function returns a route name, parallel edges that fan out and a multi-source edge that joins, and `Send`, which dispatches a runtime-counted set of branch runs with their own payloads.
+
+  </Accordion>
+  <Accordion title="2. What happens when a conditional edge returns an unmapped name?">
+
+    It fails at run time, because no static analysis can know what the function will return. Compile-time validation covers node and edge targets, not route values.
+
+  </Accordion>
+  <Accordion title="3. Two nodes hang off one node, and both point at a third. What is the execution?">
+
+    The two run in parallel in the same super-step, and the third waits for both. Any key they both write needs a reducer or one write is lost.
+
+  </Accordion>
+  <Accordion title={<>4. When does <code>Send</code> beat parallel edges?</>}>
+
+    When the branch count is data. Parallel edges are drawn at build time; `Send` builds a list of runs at run time, each with its own payload, converging back through the parent's reducers.
+
+  </Accordion>
+  <Accordion title="5. What is the difference between recursion_limit and a budget?">
+
+    The limit counts super-steps and raises when tripped, so the outcome is an exception. A budget is a value in state that the router checks, so the run picks an exit node and still produces a partial answer.
+
+  </Accordion>
+  <Accordion title="6. Why does recursion_limit burn faster than expected?">
+
+    Because it counts steps, not model calls. A loop of think, act, validate consumes three per iteration, so a limit of 30 is ten iterations.
+
+  </Accordion>
+  <Accordion title="7. What is a subgraph, and when is it worth extracting?">
+
+    A compiled graph used as a single node elsewhere. Reach for it when a component has its own state and loop, such as a sub-agent, and it needs to stay testable and checkpointed independently of the parent.
+
+  </Accordion>
+  <Accordion title="8. A subgraph needs different state keys than the parent. How is that handled?">
+
+    Wrap it: a node function that maps the parent state into the child's input and maps the child's result back into a parent update. Sharing one schema across the boundary is how the two become impossible to change separately.
+
+  </Accordion>
+  <Accordion title="9. How is retry logic added to a single node?">
+
+    Keep it inside the node body, where it is visible and testable: the LCEL wrappers, or a plain try and loop. Then write the failure into state so a router can send the run somewhere useful rather than round the same cycle.
+
+  </Accordion>
+  <Accordion title="10. An agent keeps repeating the same tool call. What is the fix?">
+
+    Detect it rather than hope. Keep recent actions in state, compare the last few, and route to a give-up or ask-the-user node when the trajectory has stalled. A cycle with no stuck detector is an infinite loop with a rate limit.
+
+  </Accordion>
+  <Accordion title="11. Where does a deterministic router belong in an interview answer?">
+
+    In the graph, as a conditional edge over state the code controls: budgets, retries, escalation. The model decides *what to try next*; the router decides whether trying is still allowed.
+
+  </Accordion>
+</Accordions>

@@ -1,0 +1,258 @@
+---
+title: Structured Output
+description: 'Output parsers, Pydantic schemas, with_structured_output, and the difference between JSON that parses and a schema that was followed.'
+---
+
+A chat model returns text. The backend wants an object. The gap between those two is where a surprising number of LLM applications fail in production, because the model is free to answer with a paragraph, an apology, or JSON wrapped in a markdown fence.
+
+The running example is a resume analyzer. The useful output is:
+
+```python title="expected.py"
+{
+    "candidate_name": "Rahul Sharma",
+    "skills": ["Python", "FastAPI", "PostgreSQL"],
+    "experience_years": 2,
+    "is_suitable": True,
+}
+```
+
+LangChain offers two routes to `result.skills` in Python rather than a regex over a paragraph, and the difference between them is the interview answer.
+
+| Approach          | What it does                                                | Guarantee                                                                |
+| :---------------- | :---------------------------------------------------------- | :----------------------------------------------------------------------- |
+| Output parser     | Transforms the model's text into a Python object afterwards | Parses. Says nothing about the shape                                     |
+| Structured output | Tells the model, through the provider, what shape to return | Constrained decoding or schema enforcement, depending on the integration |
+
+Parsing valid JSON does not mean the model followed the schema. It can return valid JSON with a missing key, a string where an integer was asked for, or a confident invention. Schema-based output closes most of that gap, and validation catches the rest.
+
+---
+
+## Output parsers
+
+A parser is the last stage of a chain: it takes a model response and hands the calling code something usable.
+
+```python title="parsers.py"
+from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
+
+str_parser = StrOutputParser()
+text = str_parser.invoke(model.invoke("Explain embeddings in one sentence."))
+print(type(text))  # <class 'str'>
+
+json_parser = JsonOutputParser()
+msg = model.invoke(
+    "Return only valid JSON with fields name (string) and skills (array of strings). "
+    "Candidate: Rahul Sharma. Skills: Python, FastAPI, PostgreSQL."
+)
+data = json_parser.invoke(msg)
+print(data["name"])   # Rahul Sharma
+print(type(data))     # <class 'dict'>
+```
+
+`StrOutputParser` looks pointless in isolation; composed into a chain it converts the `AIMessage` into a string so the next stage receives text. `JsonOutputParser` returns a dict, and raises if the text was not JSON.
+
+Neither of them knows the schema. They check syntax, not meaning.
+
+---
+
+## Pydantic: describe the shape once
+
+Pydantic is a validation library. A class is declared, and it checks incoming data against the declaration and returns typed attributes.
+
+```python title="schemas.py"
+from pydantic import BaseModel, Field, ValidationError
+
+
+class ResumeAnalysis(BaseModel):
+    candidate_name: str = Field(description="Full name of the candidate")
+    skills: list[str] = Field(description="Technical skills found in the resume")
+    experience_years: int = Field(ge=0, description="Total years of professional experience")
+    is_suitable: bool = Field(description="Whether the candidate fits the role")
+
+
+try:
+    analysis = ResumeAnalysis(
+        candidate_name="Rahul Sharma",
+        skills=["Python", "FastAPI"],
+        experience_years=2,
+        is_suitable=True,
+    )
+except ValidationError as exc:
+    print(exc)
+
+print(analysis.skills)        # ['Python', 'FastAPI']  list[str]
+print(analysis.model_dump())  # dict, ready for JSON or a DB column
+```
+
+The parts that matter here:
+
+- `BaseModel` makes the class a validated schema.
+- Type annotations are the contract: `str`, `list[str]`, `int`, `bool`.
+- `Field(description=...)` documents a field, and that description is what the model sees when structured output is requested.
+- `ge=0` is a constraint, so a negative year count fails at validation instead of reaching the database.
+- A violation raises `ValidationError` rather than returning something half-built.
+
+The descriptions are not comments. They are instructions to the model, and a vague description produces a vague answer.
+
+---
+
+## Structured output with <code>with_structured_output()</code>
+
+Instead of asking for JSON and parsing it afterwards, hand the schema to the model.
+
+```python title="structured.py"
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field
+
+load_dotenv()
+
+
+class ResumeAnalysis(BaseModel):
+    candidate_name: str
+    skills: list[str]
+    experience_years: int = Field(ge=0)
+    is_suitable: bool
+
+
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+structured_model = model.with_structured_output(ResumeAnalysis)
+
+result = structured_model.invoke(
+    "Screen this candidate for a junior backend role. "
+    "Name: Rahul Sharma. Skills: Python, FastAPI, PostgreSQL. Experience: 2 years."
+)
+
+print(type(result))            # <class 'ResumeAnalysis'>
+print(result.candidate_name)   # Rahul Sharma
+print(result.skills)           # ['Python', 'FastAPI', 'PostgreSQL']
+```
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Pydantic schema<br/>fields, types, constraints"] --> B["with_structured_output(Schema)"]
+    B --> C["invoke(input)"]
+    C --> D["Provider returns schema-shaped output"]
+    D --> E["Validated object<br/>access fields as attributes"]
+`}
+/>
+
+The return value is an instance of the schema class, not an `AIMessage`. That is the convenience and the trap: the raw text is gone unless it is asked for.
+
+### Keep the raw response
+
+```python title="include_raw.py"
+checker = model.with_structured_output(ResumeAnalysis, include_raw=True)
+
+out = checker.invoke("Screen this candidate ...")
+print(out.keys())  # dict_keys(['raw', 'parsed', 'parsing_error'])
+
+if out["parsing_error"] is not None:
+    print(out["raw"].content)   # what the model actually said
+    # log it, retry with a stricter instruction, or fall back to a human queue
+else:
+    analysis = out["parsed"]    # ResumeAnalysis
+```
+
+Always do this for anything that ships. A bare call raises on a bad response and destroys the evidence of what the model said, which is the one thing needed to fix the prompt.
+
+---
+
+## <code>PydanticOutputParser</code> against <code>with_structured_output()</code>
+
+| Feature                       | `PydanticOutputParser`                        | `with_structured_output()`                     |
+| :---------------------------- | :-------------------------------------------- | :--------------------------------------------- |
+| Main purpose                  | Parse text into a Pydantic model              | Ask the model to return structured data        |
+| Where the schema goes         | Into the prompt text                          | Into the provider request                      |
+| Parsing and validation        | Yes                                           | Yes, when it returns a Pydantic model          |
+| Provider-native enforcement   | No                                            | Yes where the integration supports it          |
+| Works with any model          | Yes, if it can follow formatting instructions | Only where the integration implements it       |
+| Cost of a non-compliant reply | A raised parse error                          | A refusal, an empty object, or a fallback path |
+
+Default to `with_structured_output()`. Reach for the parser when the model cannot do schema-constrained output, or when formatted text has to be parsed on purpose.
+
+---
+
+## Which one for which job
+
+- **Chat reply to a human**: read `response.content`, or pipe through `StrOutputParser`.
+- **Resume analyzer, classifier, extractor**: `with_structured_output(Schema)`.
+- **Category plus confidence**: a schema with `Literal[...]` for the label and a bounded `float` for the score, so both the vocabulary and the range are enforced.
+- **Model writes formatted text that is parsed afterwards**: an output parser, and a prompt that shows the format.
+- **Anything that must not silently disappear**: `include_raw=True`, and a handler for `parsing_error`.
+
+The rule underneath the list: choose by what the next line of code consumes. If it is a database column, an API response, or a branch, it wants a type.
+
+---
+
+## What validation does not catch
+
+`is_suitable=True` passing validation proves the shape is right, not that the judgement is. Structure and constraints are checkable; factual correctness is not. The failure that survives every guard is a well-formed, confident wrong answer, and the only defence is an eval set with labels, which is what [RAG and Agent Evaluation](/ai/agents/rag-and-agent-eval) covers.
+
+---
+
+## Common mistakes
+
+- **"Return valid JSON" with no schema.** Valid JSON arrives with whatever keys the model found interesting.
+- **Empty field descriptions.** The model guesses what `experience_years` means for a career-break candidate. Tell it, and tell it what to do when the value is absent.
+- **No path for the failure case.** A parse error without `include_raw` is an exception with no evidence attached.
+- **Required fields the source may not contain.** Use `Optional[...]` with a default, or the model will invent a value to satisfy the schema.
+- **Re-asking forever.** One repair attempt with the validation error appended to the prompt, then stop. An unbounded retry loop is a cost incident.
+- **Trusting a schema-valid answer.** Validation checks the box, not the content.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What is the difference between parsing output and structured output?">
+
+    Parsing happens after the model replies: a parser converts text into an object and can only report that the text did not match. Structured output is requested before the call, through the provider, so the response is constrained toward the schema. Parsing checks syntax; structured output plus validation checks shape.
+
+  </Accordion>
+  <Accordion title="2. Why is valid JSON not enough?">
+
+    Because JSON says nothing about which keys exist, which types they hold, or whether the values are within range. A model can return perfectly formed JSON that application code cannot use.
+
+  </Accordion>
+  <Accordion title={<>3. What does <code>Field(description=...)</code> actually do?</>}>
+
+    Two jobs. It documents the schema for humans and for error messages, and when the schema is sent to a provider it becomes the instruction the model reads for that field, so the description shapes the answer.
+
+  </Accordion>
+  <Accordion title={<>4. When is <code>PydanticOutputParser</code> the right pick over <code>with_structured_output()</code>?</>}>
+
+    When the model or integration has no schema-constrained mode, when the formatted text came from somewhere else and needs parsing, or when one prompt has to work across providers that differ in structured-output support.
+
+  </Accordion>
+  <Accordion title={<>5. Why use <code>include_raw=True</code>?</>}>
+
+    It returns the raw `AIMessage`, the parsed object, and the parsing error together, so a failure keeps the evidence. Without it, a bad reply raises and the text that caused it is gone.
+
+  </Accordion>
+  <Accordion title="6. How is a model that keeps returning invalid output handled?">
+
+    One repair round-trip with the validation message appended, then a fallback: a cheaper or stricter model, a schema with fewer required fields, or a human queue. Retrying the identical request indefinitely converts a prompt bug into a bill.
+
+  </Accordion>
+  <Accordion title="7. A field the resume may not contain is declared required. What happens?">
+
+    The model invents a value to satisfy the schema. Declare it `Optional` with a default, or give an explicit instruction to use null when absent, and check for that pattern in the eval set.
+
+  </Accordion>
+  <Accordion title="8. How is a classification label constrained?">
+
+    `Literal["billing", "bug", "other"]` on the field. The provider can enforce the vocabulary where it supports enums, and validation rejects anything else even when it cannot.
+
+  </Accordion>
+  <Accordion title="9. A structured extractor is 100 percent valid and still wrong. Explain.">
+
+    Validation covers structure. A confident wrong value passes every check, so correctness needs a labeled set and a metric, not a stricter schema. This is the point where an engineering answer turns into an evaluation answer.
+
+  </Accordion>
+  <Accordion title="10. What is the cheapest way to make extraction more reliable?">
+
+    Constrain the output shape, lower the temperature, put the schema in the prompt as an example, and cut the unused fields. Every field removed is a field that cannot be wrong.
+
+  </Accordion>
+</Accordions>

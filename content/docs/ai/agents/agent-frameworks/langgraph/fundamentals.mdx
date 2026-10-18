@@ -1,0 +1,226 @@
+---
+title: Graph Fundamentals
+description: 'A graph is state plus functions plus edges. Build one, compile it, run it, stream it, and learn when the shape is wrong.'
+---
+
+A chain runs once and ends. A graph runs until something decides it is finished. That difference is not cosmetic: it changes what can be expressed, what has to be bounded, and what a run can recover from.
+
+Three objects make up a graph. **State** is one typed object that the whole run shares. **Nodes** are ordinary functions: state in, an update out. **Edges** say which node runs after which. Compiling that description yields a runnable object that can then be invoked or streamed.
+
+---
+
+## One graph, end to end
+
+```python title="incident_graph.py"
+from typing import Annotated, TypedDict
+from operator import add
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.prebuilt import ToolNode
+
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+
+
+class State(TypedDict):
+    messages: Annotated[list, add]     # append-only
+    attempts: int                       # last write wins
+    findings: Annotated[list, add]
+
+
+def think(state: State):
+    resp = model.invoke(state["messages"])
+    return {"messages": [resp], "attempts": state["attempts"] + 1}
+
+
+def decide(state: State) -> str:
+    last = state["messages"][-1]
+    if getattr(last, "tool_calls", None):
+        return "act"
+    if state["attempts"] >= 25:
+        return "give_up"
+    return "finish"
+
+
+def give_up(state: State):
+    return {"findings": ["stopped: budget exhausted"]}
+
+
+g = StateGraph(State)
+g.add_node("think", think)
+g.add_node("act", ToolNode(tools))
+g.add_node("give_up", give_up)
+g.add_edge(START, "think")
+g.add_conditional_edges("think", decide, {"act": "act", "finish": END, "give_up": "give_up"})
+g.add_edge("act", "think")              # the cycle
+
+app = g.compile(checkpointer=MemorySaver())
+
+out = app.invoke(
+    {"messages": [SystemMessage(content="Triage the incident."),
+                  HumanMessage(content="API error rate spiked at 14:02 UTC.")],
+     "attempts": 0, "findings": []},
+    {"configurable": {"thread_id": "incident-4821"}, "recursion_limit": 50},
+)
+
+print(len(out["messages"]), out["findings"])
+```
+
+The diagram is the faster read:
+
+<Mermaid
+  chart={`
+flowchart TD
+    S["START"] --> T["think<br/>call the model"]
+    T -->|tool calls present| A["act<br/>run the tools"]
+    A --> T
+    T -->|answer ready| E["END"]
+    T -->|attempts >= 25| G["give_up"]
+    G --> E
+`}
+/>
+
+`think` runs, the model asks for a tool, `act` runs it, the edge sends the result back to `think`, and the loop repeats until `decide` routes out. That edge back to an already-visited node is the thing a pipeline cannot express.
+
+---
+
+## What each piece is allowed to do
+
+| Piece            | Contract                                                            | Fails how                                                     |
+| :--------------- | :------------------------------------------------------------------ | :------------------------------------------------------------ |
+| `StateGraph(S)`  | Declares the schema; keys are the only thing nodes may write        | Writing an undeclared key raises                              |
+| Node function    | Takes state, returns a **partial update** dict, not the whole state | Returning the full state double-applies reducers              |
+| Plain edge       | Runs the next node when this one finishes                           | Nothing subtle here                                           |
+| Conditional edge | Takes state, returns a route name from the provided map             | Returning an unmapped name raises at run time, not build time |
+| `compile()`      | Validates the graph and produces a runnable                         | Unreachable nodes and missing routes surface here             |
+
+A node returning `{"messages": [resp]}` means "append this". It does not mean "the state is now this list". That distinction is lesson 2.
+
+Compile-time validation is worth a sentence: `compile()` checks the structure, so a typo in an edge target fails when the graph is built, not on the request that happens to hit that branch at 3am. A conditional edge's return value is not checked, because no one can know it statically.
+
+---
+
+## Running it
+
+| Call                            | Returns                           | Use for                         |
+| :------------------------------ | :-------------------------------- | :------------------------------ |
+| `app.invoke(state, config)`     | the final state                   | Scripts, tests, background jobs |
+| `app.stream(state, config)`     | an iterator, one item per event   | Anything a human is watching    |
+| `app.ainvoke` / `app.astream`   | awaitable versions                | Web handlers                    |
+| `app.get_state(config)`         | the current snapshot for a thread | Resuming a conversation         |
+| `app.get_state_history(config)` | every past snapshot               | Debugging, audit                |
+
+`stream_mode` chooses what the caller receives:
+
+```python title="stream.py"
+for chunk in app.stream(inputs, config, stream_mode=["updates", "messages"]):
+    if isinstance(chunk, tuple) and chunk[0] == "messages":
+        token, metadata = chunk[1]
+        print(token.content, end="", flush=True)     # LLM tokens, as generated
+    else:
+        print(chunk)                                  # {node_name: state_update}
+```
+
+| Mode       | What it yields                                                  |
+| :--------- | :-------------------------------------------------------------- |
+| `values`   | The full state after every step                                 |
+| `updates`  | Only what each node changed, keyed by node name                 |
+| `messages` | LLM tokens as they are generated, for typing out an answer      |
+| `custom`   | Whatever a node pushes through the stream writer, e.g. progress |
+| `debug`    | Everything, including task and checkpoint events                |
+
+Pass a list to mix them, which is what the code above does: token streaming for the user, node updates for the logs.
+
+---
+
+## Super-steps, and why the term matters
+
+LangGraph executes in **super-steps**: one round where every node scheduled to run runs, including parallel branches, and then state is merged once through the reducers. Edges schedule the next round.
+
+Three consequences follow from that model, and all three show up in production:
+
+- A node's writes are invisible to other nodes in the same step, because the merge happens at the end.
+- The checkpointer snapshots at the end of each super-step, so resume granularity is one step, not one line of Python.
+- `recursion_limit` counts steps, not model calls, so a graph with three nodes per loop burns the budget three times faster than a count of model calls implies.
+
+---
+
+## When a graph is the wrong shape
+
+A graph buys loops and durable state. It costs a state schema that now needs maintaining, a checkpoint table, and a mental model between the code and the behaviour. Reach for one when the run has to:
+
+- loop until a condition holds, with the count unknown in advance
+- branch on what the model returned, then revisit an earlier step
+- pause for a person, or outlive the process that started it
+- fan out to a number of branches only known at run time
+
+If none of those apply, the job is a pipeline, and [LCEL](/ai/agents/agent-frameworks/langchain/runnables-lcel) expresses it in one line with less to go wrong. This is also the honest answer to "why not use LangGraph for everything": most of the time the shape is a line.
+
+---
+
+## Common mistakes
+
+- **Returning the whole state from a node.** Return the change; the reducer applies it.
+- **A node that mutates its input.** The state object is shared, and a mutation is invisible to the reducers, so it breaks resume and time travel.
+- **Side effects in a node that a later step can trigger twice.** Retries and replays re-run nodes.
+- **No ceiling beyond `recursion_limit`.** That limit raises; when the answer should be "I could not finish, here is what I have", route on a counter in state.
+- **Reading the graph as Python control flow.** It is a schedule. The order nodes run is decided by edges at run time, which is exactly why `print` debugging stops working.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What are the three parts of a graph, and what does each one return?">
+
+    State is a typed schema shared by the run. A node is a function taking state and returning a partial update. An edge decides what runs next: a plain edge names the target, a conditional edge runs a function that returns a route name.
+
+  </Accordion>
+  <Accordion title="2. What is a super-step?">
+
+    One round of node execution, including branches that run in parallel, followed by a single merge of their writes through the reducers. Checkpoints are written at super-step boundaries, so that is the granularity of resume and replay.
+
+  </Accordion>
+  <Accordion title="3. Why does a node return an update instead of the state?">
+
+    Because merging is the runtime's job. Returning a full state would bypass the reducers, so an append key would replace instead of append, and parallel branches would clobber each other.
+
+  </Accordion>
+  <Accordion title={<>4. What does <code>compile()</code> check, and what does it not?</>}>
+
+    It validates the structure: node names, edge targets, reachability. It cannot validate what a conditional edge will return at run time, so an unmapped route string is a run-time failure, not a build-time one.
+
+  </Accordion>
+  <Accordion title="5. Which stream modes exist, and what is each for?">
+
+    `values` for full snapshots, `updates` for per-node changes, `messages` for LLM tokens to a user, `custom` for progress emitted from inside a node, and `debug` for everything. A chat UI usually wants `messages` plus `updates`, which means passing a list.
+
+  </Accordion>
+  <Accordion title="6. Does recursion_limit count model calls?">
+
+    No, it counts steps. A loop of three nodes consumes three per iteration, so a budget of 25 is roughly eight iterations. Size it against the shape of the graph, not the intended number of tool calls.
+
+  </Accordion>
+  <Accordion title="7. What happens to writes from nodes running in the same super-step?">
+
+    They merge at the end of the step through each key's reducer. None of them sees the others, which is why a key that two branches write needs an append or merge reducer rather than a plain type.
+
+  </Accordion>
+  <Accordion title="8. When is LangGraph the wrong tool?">
+
+    When the work is a fixed sequence with no loop, no pause, and no state beyond the call. A pipeline expresses that in one line, and a graph adds a schema, a checkpoint store, and a scheduling model to reason about.
+
+  </Accordion>
+  <Accordion title="9. A node raises an exception halfway through a run. What is the state?">
+
+    Whatever the last completed super-step wrote. The failed step's partial update never lands, which is what makes resume useful: re-entry happens at the boundary rather than at the start.
+
+  </Accordion>
+  <Accordion title="10. How is a compiled graph inspected?">
+
+    Inspect the drawable graph object, which renders the nodes and edges as a diagram. Read it before debugging a loop, because the schedule is defined by edges and not by the order the nodes were declared.
+
+  </Accordion>
+</Accordions>

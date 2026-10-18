@@ -1,0 +1,199 @@
+---
+title: Prompts and Datasets
+description: 'Version prompts outside the deploy cycle, pin what production runs, and turn failing traces into the eval set that gates merges.'
+---
+
+Two artifacts decide most of an LLM application's quality: the prompt text that reaches the model, and the examples the application is tested against. LangSmith keeps both as versioned objects that can be queried, promoted, and joined to experiments, instead of a string in a module and a spreadsheet nobody trusts.
+
+---
+
+## Why a prompt belongs in the hub
+
+A prompt in source control is reviewable, typed, and diffable, and it should stay there as the default. The hub earns its place on top of that for three things source control cannot do:
+
+- **Change it without a deploy.** A wording fix at 2pm on a Friday should not need a build.
+- **Pin a release.** Production reports commit `a91f2c` as the version in use, and that string is on every trace.
+- **Roll back by retagging.** The revert is a pointer move, not a code change and not a redeploy.
+
+The pattern that keeps both honest: the hub is the source of truth at run time, and the repo holds the most recently promoted version, so a diff of the two is the audit trail.
+
+---
+
+## Push, pull, promote
+
+```python title="push_prompt.py"
+from langchain_core.prompts import ChatPromptTemplate
+from langsmith import Client
+
+client = Client()
+
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system",
+         "You classify support tickets. Reply with exactly one word: "
+         "billing, bug, or other. Never invent a category."),
+        ("human", "{text}"),
+    ]
+)
+
+handle = client.push_prompt("triage-prompt", object=prompt)
+print(handle)     # owner/triage-prompt:abc1234
+```
+
+```python title="pull_prompt.py"
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.output_parsers import StrOutputParser
+
+prompt = client.pull_prompt("triage-prompt:production")   # tag or commit sha
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+
+chain = prompt | model | StrOutputParser()
+print(chain.invoke({"text": "charged twice this month"},
+                   {"metadata": {"prompt_version": "production"}}))
+```
+
+The handle is `owner/name:ref`, where the ref is a commit sha or a tag such as `production`. Every commit is immutable, so a sha is a safe pin and a tag is a moving pointer the team controls. Promoting means re-tagging, and that single fact is what makes rollback cheap.
+
+Two operational rules:
+
+- **Pull at startup, not per request.** A hub round trip inside the hot path adds latency and turns a LangSmith outage into a service outage.
+- **Keep a bundled default.** If the pull fails, fall back to the copy in the image and log it loudly. A service that cannot start without a third-party API is a service that cannot survive one.
+
+```python title="safe_pull.py"
+from langchain_core.prompts import ChatPromptTemplate
+
+FALLBACK = ChatPromptTemplate.from_messages(
+    [("system", "Reply with exactly one word: billing, bug, or other."),
+     ("human", "{text}")]
+)
+
+
+def load_prompt() -> ChatPromptTemplate:
+    try:
+        return client.pull_prompt("triage-prompt:production")
+    except Exception:
+        return FALLBACK
+```
+
+---
+
+## Datasets: the eval set nobody wrote
+
+A hand-written eval set tests the cases someone imagined. Production traces contain the ones nobody imagined, which is why the highest-value dataset work is harvesting.
+
+```python title="dataset.py"
+from langsmith import Client
+
+client = Client()
+
+ds = client.create_dataset(
+    "triage-golden",
+    description="Tickets with a human-confirmed category.",
+)
+
+client.create_examples(
+    dataset_id=ds.id,
+    examples=[
+        {"inputs": {"text": "charged twice this month"}, "outputs": {"category": "billing"}},
+        {"inputs": {"text": "login returns 500 after SSO"}, "outputs": {"category": "bug"}},
+        {"inputs": {"text": "who is the CEO"}, "outputs": {"category": "other"}},
+    ],
+)
+```
+
+| Field     | Meaning                                                                |
+| :-------- | :--------------------------------------------------------------------- |
+| `inputs`  | What goes into the application, keyed the way the code expects         |
+| `outputs` | The reference answer, if there is one; empty for open-ended tasks      |
+| metadata  | Where the example came from, who labeled it, and which run produced it |
+
+Three ways examples arrive: written by hand for the categories that have to be right, created from filtered traces when a run carries a negative feedback score, and generated at volume from a template to test the shape of the input rather than the edge cases.
+
+The last one is useful and dangerous. Synthetic examples test coverage; they do not represent real users, and a score that climbs on generated data can hide a regression on real traffic.
+
+---
+
+## The loop the two objects create
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Ship a prompt commit"] --> B["Serve traffic, traced"]
+    B --> C["Filter bad runs<br/>feedback, metadata, errors"]
+    C --> D["Add them to a dataset"]
+    D --> E["Evaluate the next version<br/>against that dataset"]
+    E -->|better| A
+`}
+/>
+
+Every stage is one of the objects from lesson 1: a prompt commit, a trace, a dataset, an experiment. The loop is worth describing in an interview precisely because it is a loop, and most candidates describe a pipeline that ends at "deployed".
+
+Where the loop breaks in practice is the reference answer. Someone has to decide what correct means, and that is the part no platform supplies. Annotation queues exist for exactly this, and lesson 5 covers the routing that fills them.
+
+---
+
+## Common mistakes
+
+- **Pulling the prompt per request.** Latency in the hot path, plus a new dependency in the availability story.
+- **No fallback prompt.** Then a hub incident is a product incident.
+- **A dataset with ten examples, all written by the person who wrote the prompt.** Such a set only confirms what its author already believes.
+- **Silently editing the prompt in production.** Commit, tag, and let the trace record the version, or the experiments compare nothing.
+- **One dataset forever.** It rots. Split it, name the splits, and retire examples once the behaviour is fixed and covered elsewhere.
+- **Treating a dataset as a test suite.** It is data. The assertions live in the evaluator, which is lesson 4.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Why version prompts in a hub when they already live in git?">
+
+    For the three things git does not provide at run time: change without a deploy, an immutable commit that can be pinned and seen on every trace, and a rollback that is a retag rather than a release.
+
+  </Accordion>
+  <Accordion title="2. What is a prompt handle?">
+
+    `owner/name:ref`, where the ref is a commit sha or a tag. Pull by sha for a pinned release, by tag for a version that moves.
+
+  </Accordion>
+  <Accordion title="3. How is a prompt rolled back?">
+
+    Move the `production` tag to the previous commit. No deploy, and the traces from the bad period still carry the sha that caused them.
+
+  </Accordion>
+  <Accordion title="4. Where should the pull happen?">
+
+    At startup or on a schedule, never per request. Keep a bundled fallback so a hub outage degrades to the last known prompt instead of failing traffic.
+
+  </Accordion>
+  <Accordion title="5. What goes in a dataset example?">
+
+    Inputs keyed the way the application expects, the reference output if one exists, and metadata recording where it came from and who labeled it.
+
+  </Accordion>
+  <Accordion title="6. What makes a dataset worth anything?">
+
+    Harvest it from production. Filter traces by negative feedback, error, or a metadata flag, review them, and add the confirmed cases. Hand-written sets cover what was imagined; traces cover what happened.
+
+  </Accordion>
+  <Accordion title="7. When are synthetic examples useful, and when are they a trap?">
+
+    Useful for coverage and volume, for instance testing every documented category. A trap as the only signal, because they encode the generator's assumptions and a score that improves on them can hide a regression on real inputs.
+
+  </Accordion>
+  <Accordion title="8. A prompt changed and the eval score moved 2 points. Is that meaningful?">
+
+    Depends on the set size and the variance. On 40 examples, 2 points is noise; on 400, it is a signal worth investigating. Report the count with the number, and run the same experiment twice if the model is non-deterministic.
+
+  </Accordion>
+  <Accordion title="9. What is the minimum loop worth building in week one?">
+
+    Traced runs with a prompt version in metadata, one feedback signal from users, and a small golden dataset to evaluate every candidate prompt against. Everything else is refinement.
+
+  </Accordion>
+  <Accordion title="10. What keeps dataset and prompt changes from confusing each other?">
+
+    One experiment per changed variable, and both ids recorded in the experiment metadata. If a run changed the prompt and added examples, the comparison answers nothing.
+
+  </Accordion>
+</Accordions>

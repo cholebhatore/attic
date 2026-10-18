@@ -1,0 +1,298 @@
+---
+title: Runnables and LCEL
+description: 'The Runnable interface, the pipe operator, parallel branches, retries and fallbacks, async calls, and streaming tokens.'
+---
+
+Everything built so far takes an input and returns an output: a prompt template, a model, a parser. LangChain makes that shape into a protocol called `Runnable`, and the protocol is what allows `prompt | model | parser` while batching, streaming, async, retries, and tracing come free on the whole pipeline.
+
+This lesson is about that one idea and the handful of objects built on top of it.
+
+---
+
+## The interface
+
+| Method    | Input          | Output             | Use                                       |
+| :-------- | :------------- | :----------------- | :---------------------------------------- |
+| `invoke`  | one input      | one output         | A single request                          |
+| `batch`   | list of inputs | list of outputs    | Offline runs, backfills, eval sets        |
+| `stream`  | one input      | iterator of chunks | Typing out an answer to a user            |
+| `ainvoke` | one input      | awaitable output   | Inside an async web handler               |
+| `abatch`  | list of inputs | awaitable list     | Concurrent work without threads           |
+| `astream` | one input      | async iterator     | Server-sent events from an async endpoint |
+
+Every stage of a chain implements these, so a chain built from three runnables is itself a runnable. That recursion is the whole trick.
+
+```python title="chain.py"
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+prompt = ChatPromptTemplate.from_messages(
+    [("system", "Classify the ticket in one word: billing, bug, or other."),
+     ("human", "{text}")]
+)
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+
+chain = prompt | model | StrOutputParser()
+
+print(chain.invoke({"text": "I was charged twice this month"}))   # billing
+print(chain.batch([{"text": "login throws 500"}, {"text": "hello?"}]))  # ['bug', 'other']
+```
+
+`chain.batch` is not a hand-written loop. It runs the pipeline per item, concurrently by default, and returns results in input order.
+
+---
+
+## What the pipe does
+
+`a | b` means "call `b` with the output of `a`". The types have to line up, and the shapes that come up most often are:
+
+```
+dict  →  prompt     →  list[messages]
+list[messages]  →  model   →  AIMessage
+AIMessage  →  StrOutputParser  →  str
+str  →  callable  →  anything
+```
+
+A plain Python function slots in at any point: the pipe wraps callables automatically, and `RunnableLambda(fn)` is the explicit form when the extra methods are needed.
+
+```python title="lambdas.py"
+from langchain_core.runnables import RunnableLambda
+
+def clean(text: str) -> str:
+    return " ".join(text.split())          # collapse whitespace, str -> str
+
+chain = prompt | model | StrOutputParser() | RunnableLambda(clean)
+```
+
+---
+
+## Parallel branches and merging
+
+A pipeline is linear. Two lookups that could run at once need a branch, and `RunnableParallel` is the object that runs a dict of runnables against the same input and returns a dict of results.
+
+```python title="parallel.py"
+from langchain_core.runnables import RunnableParallel
+
+branches = RunnableParallel(
+    {
+        "summary": summarize_prompt | model | StrOutputParser(),
+        "entities": entity_prompt | model | StrOutputParser(),
+        "sentiment": sentiment_prompt | model | StrOutputParser(),
+    }
+)
+
+out = branches.invoke({"doc": report})
+print(out.keys())   # dict_keys(['summary', 'entities', 'sentiment'])
+```
+
+The wall time is the slowest branch, not the sum. This is the shape of every "extract three things at once" pattern, and it is why the dict keys matter: the next stage reads them by name.
+
+`RunnablePassthrough` solves the other half, which is keeping the original input while a derived key is added.
+
+```python title="passthrough.py"
+from langchain_core.runnables import RunnablePassthrough
+
+chain = (
+    RunnableParallel(
+        {
+            "question": RunnablePassthrough(),          # pass the input straight through
+            "context": retriever | join_docs,           # derive a new value
+        }
+    )
+    | build_prompt
+    | model
+    | StrOutputParser()
+)
+
+answer = chain.invoke("What does thread_id do?")   # str, question is a plain string
+```
+
+That is a complete RAG chain in six lines, and lesson 6 takes it apart.
+
+---
+
+## Retries, fallbacks, and timeouts
+
+Provider calls fail in two ways: transiently, where trying again works, and permanently, where a different model is needed.
+
+```python title="resilience.py"
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+primary = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0, timeout=20)
+backup = ChatGoogleGenerativeAI(model="gemini-2.5-flash-lite", temperature=0)
+strict = ChatGoogleGenerativeAI(model="gemini-2.5-pro", temperature=0)
+
+robust = (
+    primary
+    .with_retry(retry_if_exception_type=(TimeoutError,), stop_after_attempt=3)
+    .with_fallbacks([backup], exception_key="error")
+    .with_timeout(45.0)              # the whole escalated call, capped
+)
+
+chain = prompt | robust | StrOutputParser()
+```
+
+| Wrapper                 | Effect                                                           |
+| :---------------------- | :--------------------------------------------------------------- |
+| `with_retry(...)`       | Re-runs the same runnable on listed exceptions, with backoff     |
+| `with_fallbacks([...])` | Moves to the next runnable when one fails                        |
+| `with_timeout(seconds)` | Raises when a single call takes too long                         |
+| `with_logging()`        | Logs each step, useful when a chain returns something surprising |
+
+Put the cheap, fast model first and the careful one behind it when latency matters more than the tail. The order is the routing policy, and it is worth writing down because it decides the bill.
+
+---
+
+## Async and streaming
+
+In a web handler, blocking is the bug. The async twins are not optional there.
+
+```python title="async_stream.py"
+import asyncio
+
+async def answer(question: str):
+    result = await chain.ainvoke({"text": question})
+    return result
+
+
+async def stream(question: str):
+    async for chunk in chain.astream({"text": question}):
+        print(chunk, end="", flush=True)   # chunk is str, one token-ish piece at a time
+
+
+asyncio.run(answer("What is a super-step?"))
+asyncio.run(stream("What is a super-step?"))
+```
+
+Streaming works because the parser knows how to handle pieces: `StrOutputParser` concatenates as it goes, which is why a custom parser has to implement the streaming protocol too or the chain loses that ability.
+
+`astream_events` is the finer-grained version. It yields an event per step, so a UI can show "retrieving", then "generating", then tokens.
+
+---
+
+## Configuration and tracing
+
+Every runnable takes a config dict on the call. This is how per-request information reaches the trace.
+
+```python title="config.py"
+config = {
+    "max_concurrency": 5,
+    "recursion_limit": 25,
+    "configurable": {"tenant": "acme", "feature": "ticket-triage"},
+    "tags": ["triage", "paid-tier"],
+    "metadata": {"user_id": "u_8821", "experiment": "prompt-v7"},
+}
+
+chain.invoke({"text": ticket}, config)
+```
+
+| Key               | Who reads it                                                    |
+| :---------------- | :-------------------------------------------------------------- |
+| `max_concurrency` | The runner, for batch and parallel fan-out                      |
+| `recursion_limit` | The graph runtime, as the loop guard                            |
+| `configurable`    | Application code, and fields exposed with `configurable_fields` |
+| `tags`            | Filtering in a trace UI, and routing policy                     |
+| `metadata`        | Whatever the trace needs attached: user, experiment, version    |
+
+`configurable_fields` promotes a constructor argument into something a caller can override per request, which is how one deployed chain runs several models or prompts without rebuilding:
+
+```python title="configurable_fields.py"
+routed = (
+    ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    .configurable_fields(
+        model="model",              # constructor attribute -> config key
+        temperature="temperature",
+    )
+)
+
+routed.invoke("hi", {"configurable": {"model": "gemini-2.5-pro", "temperature": 0.7}})
+```
+
+Pass the same config to every stage and the whole run lands in one trace, which is what makes lesson 7's observability section work at all.
+
+---
+
+## When LCEL stops being the right tool
+
+A pipe is a directed acyclic graph built once, run once, and thrown away. The moment any of the following is needed, the pipeline is the wrong shape:
+
+- Loop until a condition holds, with an unknown number of passes
+- Branch on what the model returned, then come back to an earlier step
+- Stop mid-run, wait for a human, resume later
+- Keep state that outlives the call
+
+That is [LangGraph](/ai/agents/agent-frameworks/langgraph), and the hand-off is natural because a graph node can be any runnable already built.
+
+---
+
+## Common mistakes
+
+- **Calling `invoke` inside an async handler.** It blocks the event loop, so the concurrency limit becomes one. Use `ainvoke`.
+- **Expecting a `RunnableParallel` to return a string.** It returns a dict keyed by branch name, and the next stage must accept that.
+- **Streaming into a parser that cannot stream.** The chain builds fine and fails at run time, or silently loses the token-by-token behaviour.
+- **Unbounded `max_concurrency` on a batch.** A batch like that meets the free tier's rate limit within seconds, and the 429 gets read as a bug in the model.
+- **Falling back without recording it.** A fallback that fires silently turns an outage into a quiet quality regression. Log which model answered.
+- **A chain of twelve lambdas.** Composition is a tool, not a goal; if the pipeline is unreadable, write a function.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What is a Runnable?">
+
+    An interface with `invoke`, `batch`, `stream` and their async twins. Prompt templates, models, parsers, retrievers and plain functions wrapped as runnables all implement it, so any of them can be piped into any other and the result is itself a runnable.
+
+  </Accordion>
+  <Accordion title="2. What does the pipe operator actually do?">
+
+    `a | b` calls `b` with the output of `a`. Type the stages so the shapes line up, and the result is a single object that can be invoked, batched, streamed, retried, and traced without extra code.
+
+  </Accordion>
+  <Accordion title="3. How are three extractions run in parallel?">
+
+    `RunnableParallel({...})` with one runnable per key. All branches get the same input, the result is a dict, and wall time is the slowest branch.
+
+  </Accordion>
+  <Accordion title={<>4. What is <code>RunnablePassthrough</code> for?</>}>
+
+    Forwarding the input unchanged, usually inside a `RunnableParallel`, so one branch keeps the original question while another derives context. `.assign(...)` does the same while adding computed keys.
+
+  </Accordion>
+  <Accordion title={<>5. Difference between <code>with_retry</code> and <code>with_fallbacks</code>?</>}>
+
+    Retry runs the same runnable again on listed exceptions with backoff, which fixes transient faults. Fallbacks switch to a different runnable, which fixes capacity, latency, or a model that cannot do the task.
+
+  </Accordion>
+  <Accordion title="6. How does streaming work through a chain?">
+
+    Each stage implements a transform over chunks, so tokens pass through the parser as they arrive. A custom parser that does not implement it breaks streaming for the whole chain.
+
+  </Accordion>
+  <Accordion title="7. Why are the async methods required in a web handler?">
+
+    `invoke` blocks the event loop, so one worker serves one request at a time no matter what the server config says. `ainvoke` and `astream` yield control while the provider thinks.
+
+  </Accordion>
+  <Accordion title="8. How does the model choice become a runtime parameter instead of a code change?">
+
+    `configurable_fields` promotes constructor arguments into config keys, so a caller passes `{"configurable": {"model": ...}}` per request. For whole sub-chains, `configurable_alternatives` does the same.
+
+  </Accordion>
+  <Accordion title="9. Where do tags and metadata end up?">
+
+    On the run, and therefore on every trace record for it. Tags filter and route; metadata carries the per-request facts a debug session needs: user id, prompt version, experiment arm.
+
+  </Accordion>
+  <Accordion title="10. When is LCEL the wrong tool?">
+
+    When control flow is not fixed at composition time: loops, retries that change the prompt, human pauses, or state that must outlive the call. That is a graph, and each node can still be the runnable already built.
+
+  </Accordion>
+  <Accordion title="11. A batch job is 429-ing. Name three fixes in order of preference.">
+
+    Lower `max_concurrency`, add `with_retry` on the rate-limit exception with backoff, and move the long tail to a queue or an off-peak run. Raising the provider quota is the fourth fix, not the first.
+
+  </Accordion>
+</Accordions>

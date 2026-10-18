@@ -1,0 +1,169 @@
+---
+title: Persistence and Checkpointing
+description: 'Checkpointers, thread ids, resuming a dead run, reading history, forking from an old step, and the retention bill that follows.'
+---
+
+A graph without a checkpointer is a function call: it either finishes or it does not, and if it does not, the work is gone. A graph with one writes a snapshot of state at the end of every super-step, keyed by thread, and that single mechanism is what buys resume, replay, time travel, and conversation memory.
+
+---
+
+## What gets stored
+
+Each snapshot holds the state values, which node runs next, the pending tasks, and metadata: step number, source, timestamps. The write happens at the super-step boundary, so the granularity of everything below is one step, not one line.
+
+```python title="compile_store.py"
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.postgres import PostgresSaver
+
+app = g.compile(checkpointer=MemorySaver())            # tests only
+
+pool = PostgresSaver.from_conn_string("postgresql://...")
+pool.setup()                                            # creates the checkpoint tables
+app = g.compile(checkpointer=pool)                      # production
+```
+
+| Checkpointer        | Backend        | Use                                             |
+| :------------------ | :------------- | :---------------------------------------------- |
+| `MemorySaver`       | Process memory | Tests and single-process demos. Gone on restart |
+| `SqliteSaver`       | A file         | Local tools, low concurrency                    |
+| `PostgresSaver`     | Postgres       | Production default; queryable, survives deploys |
+| Redis / third-party | Cache store    | High write throughput, short retention          |
+
+The checkpointer is passed at compile time, not per call. That is why the same compiled graph serves one thread or ten thousand.
+
+---
+
+## Threads: the identifier that makes it a conversation
+
+```python title="thread.py"
+config = {"configurable": {"thread_id": "incident-4821"}}
+
+app.invoke({"messages": [HumanMessage("Error rate spiked at 14:02")]}, config)
+app.invoke({"messages": [HumanMessage("It is still climbing")]}, config)   # sees the first turn
+```
+
+The caller resends no history, because the second call reads the thread's stored state and appends to it. The thread id is also the key every other persistence feature uses, so choosing it is a design decision: per conversation, per ticket, per incident, per user session.
+
+One thread is one running context. Two users chatting at once need two ids, and a tenant boundary that lives only in the prompt is not a boundary; put it in the id, and in the state that is not shared.
+
+---
+
+## Resuming, inspecting, and forking
+
+```python title="resume.py"
+# The process died mid-run. Same thread, no new input: continue from the last snapshot.
+out = app.invoke(None, config)
+
+# What has this thread done?
+for snap in app.get_state_history(config):
+    print(snap.next, snap.created_at, len(snap.values["messages"]))
+
+# Fork from an earlier step with one field corrected.
+fork = app.update_state(config, {"attempts": 0}, as_node="think")
+app.invoke(None, config)      # re-runs forward from there
+```
+
+| Call                                        | Meaning                                                          |
+| :------------------------------------------ | :--------------------------------------------------------------- |
+| `invoke(None, config)`                      | Continue this thread from its last checkpoint                    |
+| `get_state(config)`                         | The current snapshot: values, next node, metadata                |
+| `get_state_history(config)`                 | Every past snapshot, newest first                                |
+| `update_state(config, values, as_node=...)` | Write state as if that node had produced it, creating a new fork |
+| a `checkpoint_id` in config                 | Run from that exact historical state                             |
+
+Time travel is the same storage pointed backwards, and it is the debugging tool for agents. A 40-step run failed on step 9: read the history, fork from step 6 with the field that misled it corrected, and watch step 7 again in seconds instead of reproducing the whole trajectory blind.
+
+---
+
+## Retention, the part nobody plans
+
+A long-lived thread writes one snapshot per step, and each snapshot carries the state, which for an agent usually means the message list. That is quadratic growth in the worst case: double the steps, four times the rows and roughly four times the bytes.
+
+What to decide before shipping:
+
+- **Which threads are finished**, and a job that prunes or archives them.
+- **How long history is useful.** Debugging wants weeks; an audit trail may want years in cheaper storage.
+- **What goes in state at all.** Store a document id, not the document, or every step re-saves the corpus.
+- **Whether the checkpoint database is backed up**, because for a stateful agent it _is_ the application state.
+
+---
+
+## Failure modes
+
+| Symptom                                  | Cause                                              | Fix                                                     |
+| :--------------------------------------- | :------------------------------------------------- | :------------------------------------------------------ |
+| The agent has no memory between turns    | A new `thread_id` per request                      | Derive the id from the conversation, not the request    |
+| Two users see each other's context       | A shared or guessed thread id                      | Namespace the id per tenant and session                 |
+| Resume replays a step with a side effect | The effect ran before the step's checkpoint landed | Move side effects to their own node, after the boundary |
+| The checkpoint table grows without bound | No pruning, fat state                              | Prune finished threads; keep references in state        |
+| Deploys wipe running jobs                | `MemorySaver` in production                        | Postgres, and a graceful drain on shutdown              |
+| A schema change breaks old threads       | State keys changed under a persisted graph         | Version the graph, or migrate the state deliberately    |
+
+That last row is the one that arrives late. A checkpoint is a serialized snapshot of a schema someone owns, so renaming a state key is a migration, not a refactor.
+
+---
+
+## Common mistakes
+
+- **Treating the checkpointer as memory for the user.** It stores one thread's run state. Cross-thread facts are [Agent Memory](/ai/agents/agent-memory), a separate store.
+- **`MemorySaver` behind more than one worker.** Each process has its own copy, and a thread that lands on two workers gets two realities.
+- **Resuming with input where `None` belonged.** Passing a payload starts a new turn on that thread instead of continuing the interrupted one.
+- **No plan for a node that already did something.** A side effect before the boundary runs twice on resume; put it after, or make it idempotent.
+- **Waiting for an incident to ask who can read the checkpoint data.** It contains prompts, tool output, and user text.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What does a checkpointer actually store?">
+
+    State values, which node runs next, pending tasks, and metadata such as step number and timestamp, written at the end of every super-step and keyed by thread.
+
+  </Accordion>
+  <Accordion title="2. How is a crashed run resumed?">
+
+    Invoke with `None` and the same `thread_id`. `None` means continue from the thread's last checkpoint rather than start a new turn.
+
+  </Accordion>
+  <Accordion title="3. What is a thread id, and how is it chosen?">
+
+    The key that groups checkpoints into one continuing context. Choose it at the boundary where continuity is meaningful: a conversation, a ticket, an incident. It is also the isolation boundary, so tenancy belongs in the id.
+
+  </Accordion>
+  <Accordion title="4. How does time travel work?">
+
+    Read `get_state_history`, then `update_state` with `as_node` to write a corrected value onto an older snapshot, or pass a `checkpoint_id` to run from it. The mechanism is the same storage, just entered at a different point.
+
+  </Accordion>
+  <Accordion title="5. Why is checkpoint storage quadratic?">
+
+    One snapshot per step, each carrying the whole state, and an agent's state usually carries the transcript. Steps double, bytes roughly quadruple.
+
+  </Accordion>
+  <Accordion title="6. Which checkpointer in production, and why?">
+
+    Postgres. It survives restarts and deploys, it is queryable for debugging, it handles concurrent writers, and it is infrastructure the team already runs. Memory is for tests, and SQLite is for a local tool.
+
+  </Accordion>
+  <Accordion title="7. A node sends an email, then the process crashes before the next checkpoint. What happens on resume?">
+
+    The email sends again. The step's writes were never checkpointed, so resume re-enters that node. Either make the effect idempotent or move it into a node of its own, where the boundary is explicit.
+
+  </Accordion>
+  <Accordion title="8. A state key is renamed and shipped. What broke?">
+
+    Every in-flight thread still holds the old schema. Reads of the new key come back empty, so the run takes a branch that should be impossible. Version the graph or migrate the state.
+
+  </Accordion>
+  <Accordion title="9. Does the checkpointer replace conversation history in the product database?">
+
+    It can, and that is usually a mistake. Checkpoints are execution state for a runtime, with a schema the runtime is free to change. Product history is for querying, exporting, and retaining on a policy.
+
+  </Accordion>
+  <Accordion title="10. A 40-step run went wrong at step 9. How is it debugged?">
+
+    Pull the history, find the step where the state first diverged from what was expected, fork there with one field corrected, and re-run forward. Without checkpoints, debugging means reproducing the whole run and hoping it fails the same way.
+
+  </Accordion>
+</Accordions>

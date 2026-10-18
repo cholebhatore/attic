@@ -1,0 +1,206 @@
+---
+title: Human in the Loop
+description: 'Pause a run for approval, wait an hour or a day, resume from any process, and avoid the node-restart trap that bites first.'
+---
+
+Some steps should not happen because a model decided so. Dropping a table, refunding a customer, sending an email to a journalist: the correct design is a run that stops, writes its state down, and waits for a person.
+
+LangGraph offers two ways to do that, and they solve different problems.
+
+| Mechanism                                              | Semantics                                                | Use for                                          |
+| :----------------------------------------------------- | :------------------------------------------------------- | :----------------------------------------------- |
+| `interrupt(payload)` inside a node                     | Suspend, persist, wait indefinitely, resume with a value | Approval gates, editing arguments, clarification |
+| `interrupt_before` / `interrupt_after` at compile time | Halt at named nodes, state readable from outside         | Audit trails, step-by-step review of a whole run |
+
+---
+
+## An approval gate
+
+```python title="interrupt.py"
+from langgraph.types import Command, interrupt
+
+
+def execute(state: State) -> dict:
+    call = state["messages"][-1].tool_calls[0]
+    if call["name"] in DESTRUCTIVE:
+        decision = interrupt({               # state is checkpointed right here
+            "tool": call["name"],
+            "args": call["args"],
+            "reason": "drops a production table",
+        })
+        if not decision["approved"]:
+            return {"messages": [tool_refused(call)]}
+    return {"messages": [run_tool(call)]}
+
+
+# A different process, an hour later, after a human clicked Approve.
+result = app.invoke(Command(resume={"approved": True}), config)
+```
+
+`interrupt()` is neither an exception nor a callback. The node stops, the graph's state is written to the checkpointer, and the process is free to exit. `Command(resume=...)` re-enters that thread with the value `interrupt()` appears to return. That is what lets an approval survive a deploy, an on-call handover, and a reviewer who answers the next morning.
+
+The payload is a design decision. A reviewer needs the action, the arguments, and why the agent wants it, in the shape the UI can render.
+
+---
+
+## What the caller sees while it is paused
+
+```python title="pending.py"
+out = app.invoke(inputs, config)             # returns at the interrupt
+
+snap = app.get_state(config)
+print(snap.next)                             # ('execute',)  the node still pending
+print(snap.tasks[0].interrupts[0].value)     # the payload that was raised
+
+# Stream it so a UI can render the prompt as it happens.
+for chunk in app.stream(inputs, config, stream_mode="updates"):
+    if "__interrupt__" in chunk:
+        show_approval_dialog(chunk["__interrupt__"][0].value)
+```
+
+An interrupted run is not an error and not a timeout. It is a thread with a pending next node, and any worker that knows the thread id can read it, list it, and resume it. That is why the checkpointer in [Persistence](/ai/agents/agent-frameworks/langgraph/persistence) has to be a database: the process that asks for approval is rarely the one that gets it.
+
+---
+
+## Editing, clarifying, and saying no
+
+The resume value is arbitrary data, so the same primitive covers three different product features.
+
+```python title="resume_shapes.py"
+# Approve as proposed
+app.invoke(Command(resume={"approved": True}), config)
+
+# Approve with changed arguments: the tool runs with what the human typed
+app.invoke(Command(resume={"approved": True, "args": {"table": "staging.users"}}), config)
+
+# Answer a question the agent asked mid-run
+app.invoke(Command(resume="The refund limit is 200 USD per customer"), config)
+```
+
+The second one is the pattern that makes review useful. Approve-or-reject gives a binary, and humans reject good proposals because the details were slightly wrong. Let them edit the arguments, then run.
+
+---
+
+## Static breakpoints
+
+For review of a whole run rather than one decision, halt at named nodes instead.
+
+```python title="breakpoint.py"
+app = g.compile(checkpointer=pool, interrupt_before=["execute"], interrupt_after=["think"])
+
+app.invoke(inputs, config)              # stops before execute
+print(app.get_state(config).values)     # inspect from outside
+app.invoke(None, config)                # continue, unchanged
+```
+
+This is a debugger's view: the run stops at a fixed point for inspection, and the choice is to continue or to rewrite state with `update_state`. It is not an approval workflow, because nothing forces a human answer into the graph's data.
+
+---
+
+## The trap: the node restarts
+
+`interrupt()` resumes by running the node again from its first line, with the checkpointed state. Everything before the interrupt call executes a second time.
+
+```python title="trap.py"
+def bad(state: State):
+    charge_card(state["amount"])              # runs again on resume
+    if interrupt({"confirm": state["amount"]})["approved"]:
+        ship_order(state)
+
+
+def good(state: State):
+    if interrupt({"confirm": state["amount"]})["approved"]:
+        return {"next_action": "charge"}      # only records the decision
+    return {"next_action": "abort"}
+
+# charge_card is its own node, after the gate
+```
+
+Three rules keep this from biting: put side effects after the interrupt and never before it; prefer making the gated action its own node; and make effects idempotent anyway, because resume, retry, and replay can all run a step twice.
+
+---
+
+## The one-liner version
+
+[LangChain](/ai/agents/agent-frameworks/langchain/tools-and-agents) ships this as middleware, so a `create_agent` run gets gates without graph authoring.
+
+```python title="middleware_gate.py"
+from langchain.agents import create_agent
+from langchain.agents.middleware import HumanInTheLoopMiddleware
+
+agent = create_agent(
+    model="google_genai:gemini-2.5-flash",
+    tools=[search_web, delete_record],
+    middleware=[HumanInTheLoopMiddleware(interrupt_on={"delete_record": True})],
+)
+```
+
+Underneath it is the `interrupt()` above, attached to the tool node. Knowing which is underneath matters the first time a gate has to do something the middleware does not, such as editing arguments or asking a free-text question.
+
+---
+
+## Common mistakes
+
+- **An approval gate with no timeout policy.** A pending thread is a held lock on a real-world action; decide what happens after a day.
+- **A payload that shows the decision but not the evidence.** Reviewers approve what they cannot read, which is worse than no gate.
+- **Side effects before the interrupt.** Covered above, and it is the first bug everyone ships.
+- **`MemorySaver` behind an approval flow.** The person who resumes is a different process, possibly a different day.
+- **Treating every tool call as needing review.** Then people click Approve without reading, and the gate becomes theatre. Gate the irreversible ones.
+- **No record of who approved.** The resume value should carry the reviewer's identity, not just the boolean.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>1. Contrast <code>interrupt()</code> with <code>interrupt_before</code>.</>}>
+
+    `interrupt(payload)` is raised inside a node, suspends the run, and resumes with a value delivered by `Command(resume=...)`; it is for a decision the graph needs in order to continue. `interrupt_before` and `interrupt_after` are compile-time node lists that halt at fixed points so state can be inspected externally; they suit review and debugging, not approval, because nothing injects a human answer into the run.
+
+  </Accordion>
+  <Accordion title="2. Is an interrupt an exception?">
+
+    No. The node stops, state is checkpointed, and the call returns with the thread holding a pending next node. The process may exit, and any worker can resume it later.
+
+  </Accordion>
+  <Accordion title="3. How does a different process resume a paused run?">
+
+    With the same thread id and a checkpointer both processes can reach. That is why a paused approval flow needs a database rather than in-memory state.
+
+  </Accordion>
+  <Accordion title="4. Which code re-runs after a resume, and why does it matter?">
+
+    Everything in the node before the `interrupt()` call, because the node restarts rather than continuing. Side effects go after the interrupt, or in their own node, and should be idempotent regardless.
+
+  </Accordion>
+  <Accordion title="5. How can a reviewer change what the agent proposed?">
+
+    Resume with data, not a boolean: pass edited arguments in the resume value and have the node use them. Approve-or-reject forces a human to reject work that only needed a small correction.
+
+  </Accordion>
+  <Accordion title="6. How does a UI know a run is waiting?">
+
+    Either stream with `updates` and watch for the interrupt event, or read `get_state` and check `next` and the task's interrupt payload. Both are driven by the checkpoint, so they work from any worker.
+
+  </Accordion>
+  <Accordion title="7. Which tools should be gated?">
+
+    The irreversible or externally visible ones: writes, payments, deletions, sends. Read-only tools gated anyway train reviewers to click without reading, which removes the control the design assumed.
+
+  </Accordion>
+  <Accordion title="8. What does an approval gate do to the latency numbers?">
+
+    It makes wall-clock latency meaningless for those runs, so measure two things: model and tool time, and time-to-decision. A p95 that includes a sleeping human is not a performance metric.
+
+  </Accordion>
+  <Accordion title="9. How is the same pause built without LangGraph?">
+
+    Serialize the state at the gate, write a row saying which step is pending, return, and on approval load the state and continue the loop by hand. That is what a checkpointer plus `interrupt()` is, minus the days of work and the edge cases.
+
+  </Accordion>
+  <Accordion title="10. A pending approval never gets answered. What breaks?">
+
+    Whatever the agent had locked or reserved, plus the user waiting on it. Design the expiry: a timeout that cancels the action, an escalation to a second reviewer, and an audit entry either way.
+
+  </Accordion>
+</Accordions>

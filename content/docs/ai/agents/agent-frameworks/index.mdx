@@ -1,0 +1,186 @@
+---
+title: Overview
+description: 'The 2026 framework map: pipe chains against stateful graphs, what each layer hides, how to choose, and what no framework provides.'
+---
+
+A framework is a loop the adopting team did not write, plus the state, retries, and serialization that make the loop survive production. That is the whole value proposition, and it is also the whole risk: the abstraction is someone else's opinion about what an agent needs.
+
+The field sorted itself into two layers. **Runtimes** own execution: state, checkpointing, replay, resume. **Abstractions** sit on a runtime and ship a prebuilt agent with sensible defaults. LangChain and LangGraph are the clearest example of that split, and the 1.0 releases made it explicit: LangChain 1.0's `create_agent` is a thin layer on the LangGraph runtime.
+
+---
+
+## Pages in this section
+
+<Cards>
+  <Card
+    icon={<Package />}
+    title="LangChain"
+    description="Seven lessons from first API call to deployed service: models and prompts, structured output, runnables, tools and agents, retrieval, production."
+    href="/ai/agents/agent-frameworks/langchain"
+  />
+  <Card
+    icon={<GitBranch />}
+    title="LangGraph"
+    description="Five lessons on the runtime: the graph itself, state and reducers, control flow, checkpointing and resume, and pausing for approval."
+    href="/ai/agents/agent-frameworks/langgraph"
+  />
+  <Card
+    icon={<Cloud />}
+    title="LangSmith"
+    description="Five lessons on the evidence layer: tracing, prompt and dataset management, evaluations that gate a merge, and production monitoring."
+    href="/ai/agents/agent-frameworks/langsmith"
+  />
+</Cards>
+
+---
+
+## The two shapes
+
+LangChain's original model was a pipeline. In the expression language, a chain is composed with the pipe operator:
+
+```python title="chain.py"
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_anthropic import ChatAnthropic
+from langchain_core.output_parsers import StrOutputParser
+
+prompt = ChatPromptTemplate.from_messages(
+    [("system", "You summarize incident reports in 3 bullets."),
+     ("user", "{report}")]
+)
+model = ChatAnthropic(model="claude-sonnet-4-5", max_tokens=512)
+
+chain = prompt | model | StrOutputParser()
+bullets = chain.invoke({"report": raw_text})  # str
+```
+
+`prompt | model | StrOutputParser()` is the whole architecture: `Prompt | LLM | Parser`. Each piece is a `Runnable` with the same four methods, `invoke`, `batch`, `stream`, and their async twins, so composition works because every stage has an identical interface. Data flows left to right, once, and the chain terminates.
+
+A graph drops both the linearity and the single pass.
+
+|                           | Chain (LCEL)                         | Graph (LangGraph)                                  |
+| :------------------------ | :----------------------------------- | :------------------------------------------------- |
+| Topology                  | Directed acyclic, left to right      | Cyclic; edges may point backward                   |
+| State                     | Passed as the value between stages   | Accumulates in a typed object every node can read  |
+| Control                   | Fixed at composition time            | Conditional edges chosen at run time               |
+| Termination               | End of the pipeline                  | A node routes to `END`, or a recursion limit trips |
+| Persistence               | None; a failure means starting over  | Checkpointer writes state at every super-step      |
+| Pause for a human         | Not expressible                      | `interrupt()` inside a node, resume later          |
+| Who decides the next step | The developer, when writing the code | The model, at run time                             |
+
+The last row is the difference that matters for agents. A workflow is control flow written into the code with an LLM inside it. An agent is control flow the model wrote at run time, which means the graph has to be able to visit the same node twice.
+
+---
+
+## Why pipelines break on agents
+
+Each failure below is a chain that cannot express the loop, not a chain that is merely awkward.
+
+| Requirement          | What it looks like                                       | Why `A                                     | B   | C` cannot do it |
+| :------------------- | :------------------------------------------------------- | :----------------------------------------- | --- | --------------- |
+| Iterate until done   | Retrieve, judge sufficiency, re-query, retrieve again    | The pipeline length is fixed when composed |
+| Act on tool results  | Call a tool, feed the output back, decide again          | Feedback needs an edge to an earlier node  |
+| Budget a run         | Stop at 25 steps or 2 USD                                | No notion of a step count                  |
+| Recover from failure | Retry with a modified prompt after a bad parse           | Parser errors propagate, they do not route |
+| Resume a long job    | Rebuild after a deploy, from step 9                      | Nothing is stored between runs             |
+| Wait for approval    | Hold before a destructive action until a human signs off | No suspension semantics                    |
+| Parallel fan-out     | One subtask per document, unknown count                  | Static structure, no dynamic dispatch      |
+
+Anthropic's _Building Effective Agents_ (December 2024) made the same argument from the other direction: most production needs are met by composable workflows of five patterns, and an agent loop should be written directly where the loop is genuinely required, because a framework's agent abstraction hides the loop the owning team is still answerable for.
+
+---
+
+## The rest of the field
+
+| Framework                             | Core abstraction                                                                                    | Origin and status                                                                      | Reach for it when                                                       |
+| :------------------------------------ | :-------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------- | :---------------------------------------------------------------------- |
+| **OpenAI Agents SDK**                 | Agent, handoffs, guardrails, sessions; tracing built in                                             | March 2025, the production successor to the experimental Swarm                         | OpenAI-first, and handoffs are the intended topology                    |
+| **Google ADK**                        | Hierarchical agents, `LlmAgent`, workflow agents, tools                                             | April 2025, launched alongside the A2A protocol                                        | Multi-agent on GCP, or peer-to-peer across vendors                      |
+| **Pydantic AI**                       | Typed `Agent`, validated structured output, dependency injection                                    | From the Pydantic team                                                                 | Output shape is contractual and Python typing carries the design        |
+| **CrewAI**                            | Role/goal/backstory agents grouped into a Crew with sequential or hierarchical process              | Independent of LangChain                                                               | Role-shaped teams and fast prototypes of a fixed collaborative pipeline |
+| **Microsoft Agent Framework**         | Graph-based agents, workflows, resume and affinity; Azure AI Foundry integration                    | Public preview 1 October 2025, 1.0 on 3 April 2026; merges AutoGen and Semantic Kernel | .NET/Azure shops, or a converged AutoGen codebase                       |
+| **Claude Agent SDK**                  | The harness extracted from Claude Code: loop, file and shell tools, subagents, MCP, hooks, sessions | September 2025, renamed from the Claude Code SDK                                       | Building a coding or file-operating agent rather than a chat one        |
+| **Smolagents**                        | Code-as-action: the agent writes Python as its tool calls instead of JSON                           | Hugging Face, December 2024                                                            | Small action space, open-weight models, minimal abstraction             |
+| **LlamaIndex Workflows**              | Event-driven steps with typed events, not a graph definition                                        | Successor to the older query engines                                                   | The agent is retrieval-shaped and indexing is the hard part             |
+| **MCP servers + a hand-written loop** | The ~150-line controller in [The Agent Loop](/ai/agents/agent-loop)                                 | Always available                                                                       | One model, a dozen tools, no checkpointing need                         |
+
+`A2A` is a protocol, not a framework, and it now sits beside MCP under the Agentic AI Foundation, whose hosted projects are MCP, A2A, goose, AGENTS.md, agentgateway and Agent Router. Frameworks adopt these; they do not compete with them.
+
+---
+
+## Choosing
+
+| Constraint                                                       | Choice                    |
+| :--------------------------------------------------------------- | :------------------------ |
+| Need durable execution, resume, or time travel                   | LangGraph                 |
+| Need an agent today, on OpenAI, with tracing                     | OpenAI Agents SDK         |
+| Need approval gates and standard block types, no graph authoring | LangChain `create_agent`  |
+| Typed I/O matters more than orchestration features               | Pydantic AI               |
+| .NET or Azure AI Foundry                                         | Microsoft Agent Framework |
+| The agent operates on files and a shell                          | Claude Agent SDK          |
+| Single model, few tools, no long jobs                            | Own loop                  |
+
+Ordering by abstraction depth from least to most: smolagents, own loop, Pydantic AI, OpenAI Agents SDK, LangChain, LangGraph, CrewAI. Deeper is not better; it is just more of someone else's semantics between the prompt and the behavior.
+
+---
+
+## What no framework provides
+
+These are the reasons a framework adoption fails after the demo, and none of them are in scope for any of them.
+
+| Gap                                  | Who owns it                        | Where covered                                                |
+| :----------------------------------- | :--------------------------------- | :----------------------------------------------------------- |
+| Whether the agent works              | The eval harness                   | [Evaluation Metrics and Benchmarks](/ai/agents/eval-metrics) |
+| What is in the context window        | Context engineering                | [Context Budgeting](/ai/rag/context-budgeting)               |
+| Cost per run                         | Budgets, caching, model routing    | Phase 10 inference pages                                     |
+| Prompt injection through tool output | Host policy and confirmation gates | [Agent Security](/ai/agents/agent-security)                  |
+| Tool description quality             | Whoever writes the schema          | [Function Calling](/ai/agents/function-calling)              |
+| Latency at p99                       | Serving and batching               | [Serving Engines](/ai/inference/serving-engines)             |
+
+A framework supplies the loop and the state. It supplies no evidence that the loop produces correct answers, which is why [Human and Judge Evaluation](/ai/agents/judge-and-human-eval) is the phase that follows this one rather than a footnote in it.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Describe the classic LangChain chain and why an agent outgrows it.">
+
+    `Prompt | LLM | Parser`, composed with the pipe operator over objects that all implement the `Runnable` interface, so data flows left to right once and terminates. An agent needs a cycle: call a tool, feed the result back, decide again. A pipeline's length is fixed at composition time, so the loop cannot be expressed.
+
+  </Accordion>
+  <Accordion title="2. What is the difference between a runtime and an abstraction layer?">
+
+    The runtime owns execution: state, scheduling, checkpointing, resume. The abstraction sits on it and ships defaults: a prebuilt agent, middleware hooks, typed content blocks. LangGraph is the runtime, LangChain 1.0 is the abstraction, and knowing which layer a bug lives in is what makes the framework debuggable.
+
+  </Accordion>
+  <Accordion title="3. Is a workflow or an agent the right primitive here?">
+
+    If the steps can be enumerated, use a workflow: deterministic, cheaper, testable. Use an agent when the number and identity of steps depends on what the model finds. Anthropic's _Building Effective Agents_ argues most needs are composable workflows of five patterns.
+
+  </Accordion>
+  <Accordion title="4. Name the AAIF-hosted projects and what the foundation changed for MCP.">
+
+    Model Context Protocol, Agent2Agent, goose, AGENTS.md, agentgateway and Agent Router. MCP was donated to it by Anthropic on 9 December 2025, moving governance from a single vendor to a Linux Foundation directed fund co-founded with Block and OpenAI.
+
+  </Accordion>
+  <Accordion title="5. Which framework fits a file-and-shell coding agent, and why?">
+
+    The Claude Agent SDK, because it is the harness extracted from Claude Code: the loop plus filesystem and shell tools, subagents, MCP, hooks and sessions are already built. Writing that from scratch is re-implementing a coding agent's hardest half.
+
+  </Accordion>
+  <Accordion title="6. When is building the loop by hand the right call?">
+
+    One model, a dozen or fewer tools, no need for durable execution or resume, and a team that will read the controller. Around 150 lines plus the guards in the agent-loop pattern; a framework earns its abstraction once checkpointing, streaming, or parallel dispatch enter the requirements.
+
+  </Accordion>
+  <Accordion title="7. What does a framework not solve?">
+
+    Evidence the agent is correct (evals), what goes into the context window, cost per run, prompt-injection defense through tool output, tool description quality, and p99 latency. Those are owned by the eval harness, by context engineering, by policy, and by the serving layer.
+
+  </Accordion>
+  <Accordion title="8. An interviewer asks: is adopting LangChain the right move? What is a senior answer?">
+
+    Name the layer actually needed. If the requirement is a loop with tools and no durable state, the answer is a hand-written controller. If it is resume, approval gates and replay, the answer is a runtime with a checkpointer. Then say what gets traded away: debuggability through the stack, and the version churn of a fast-moving dependency.
+
+  </Accordion>
+</Accordions>

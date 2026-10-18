@@ -1,0 +1,126 @@
+---
+title: What LangSmith Is
+description: 'The object model behind the platform, what tracing buys an agent, and the honest list of things it does not do.'
+---
+
+A chat request has one model call, so a log line is enough. An agent run has a retrieval, three tool calls, a retry, and a final answer, and the interesting question is never "what happened" but "which step made this wrong, on which version of the prompt, at what cost". That is a tree, and a tree needs a store that answers queries.
+
+LangSmith is that store, plus the tools around it: versioned prompts, datasets, experiments, dashboards, and alerts. It is a commercial product, hosted as SaaS with self-hosting for enterprise, and it is framework-agnostic, though it takes the least work on LangChain and LangGraph because those emit the right events already.
+
+---
+
+## The objects
+
+| Object            | What it is                                                           | Typical use                                        |
+| :---------------- | :------------------------------------------------------------------- | :------------------------------------------------- |
+| Run               | One unit of work: a model call, a tool, a node, or a plain function  | Seeing latency, tokens, input, output per step     |
+| Trace             | The tree of runs under one root, joined by parent and child          | Following one request end to end                   |
+| Thread            | Runs grouped by a conversation or session id                         | Replaying a multi-turn agent conversation          |
+| Project           | The bucket traces land in, usually one per service or environment    | Filtering, dashboards, access control              |
+| Prompt            | A versioned template with commits and tags such as `production`      | Shipping a prompt change without shipping code     |
+| Dataset           | A named set of examples: inputs, and optional expected outputs       | What an experiment is run against                  |
+| Experiment        | One run of the application over a dataset, with scores               | Comparing two versions of anything                 |
+| Feedback          | A score attached to a run, from a user, a judge, or application code | Turning "that was wrong" into a queryable number   |
+| Rule / automation | A trigger plus an action on incoming runs                            | Route bad answers into a dataset or a review queue |
+| Annotation queue  | A worklist of runs for humans to label                               | The review part of a feedback loop                 |
+
+Two of these are worth internalizing before any hands-on work with the product. A **run** is a span, so the usual rules of distributed tracing apply, including the one that unlinked spans are useless. A **thread** is the agent equivalent of a session, and an application that does not pass a stable thread id cannot reconstruct multi-turn behaviour after the fact.
+
+---
+
+## What tracing buys an agent
+
+- **Attribution.** A wrong answer is a retrieval miss, a bad tool result, a truncated context, or a model that hallucinated. Only one of those is fixable by editing the prompt, and the trace says which.
+- **Cost per step.** Token counts arrive per run, so the expensive stage is visible instead of being a monthly invoice surprise.
+- **Regression evidence.** An experiment over a dataset is the difference between "the new prompt feels better" and "it fixed 11 of 40 failures and broke 2".
+- **A corpus.** Production traces are where the eval set comes from, because they contain the inputs users actually send.
+
+---
+
+## What it does not do
+
+| Not its job                       | Who owns it                                                                                 |
+| :-------------------------------- | :------------------------------------------------------------------------------------------ |
+| Deciding what "good" means        | The team, starting with the labeled set built in week one                                   |
+| Guardrails and policy enforcement | Runtime rails and confirmation gates, see [Guardrails](/ai/agents/observability-guardrails) |
+| Model hosting or routing          | The model provider, or a gateway in front of it                                             |
+| Long-term product memory          | The application database; traces are observability data, not a system of record             |
+| Keeping prompt text inside a VPC  | Field masking, or a self-hosted deployment                                                  |
+
+The second one is the interview trap. LangSmith records that a destructive tool ran; it does not stop it. Detection and prevention are different products, and a plan that names only the first is a postmortem waiting to happen.
+
+---
+
+## Choosing it against the alternatives
+
+The comparison is on [Observability and Guardrails](/ai/agents/observability-guardrails); the short version is that LangSmith is the least work on a stack that is already LangChain or LangGraph, Langfuse is the pick when prompts must not leave the infrastructure and open source is a requirement, and Phoenix fits a team already running OpenTelemetry that wants LLM spans in the same pipeline as service spans.
+
+On lock-in, the exposure is smaller than it looks. The instrumentation surface is environment variables plus a decorator, the ingest path includes OTLP, and the trace data is exportable through the client. What does not port is the muscle memory around the UI, the dashboards, and the annotation workflow, which is the part teams actually miss when they move.
+
+---
+
+## Common mistakes
+
+- **Tracing only in staging.** The failures worth studying are in production, and a project with no traffic answers no questions.
+- **One project for everything.** Dev, staging, and production traces mixed together make a dashboard unreadable.
+- **No thread id.** Multi-turn agent behaviour becomes a pile of unrelated runs.
+- **Treating the trace list as the eval.** Browsing traces is debugging. Evaluation is a dataset plus a score.
+- **Logging raw user content without a policy.** Traces hold prompts and tool output, which is the sensitive part of the system.
+- **Adopting the tool before defining the metric.** The result is observability with nothing to observe a change against.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What is the difference between a run and a trace?">
+
+    A run is one unit of work, a model call, a tool, or a node, with its own inputs, outputs, latency, and tokens. A trace is the tree of runs under one root for a single request. Debugging means finding the right node in the tree, which is why parent-child linkage is the whole value.
+
+  </Accordion>
+  <Accordion title="2. Why does an agent need tracing more than a normal service?">
+
+    Because the behaviour is not in the code. The same function can take different paths depending on what the model returned, so the only faithful record of what happened is the sequence of calls with their payloads.
+
+  </Accordion>
+  <Accordion title="3. What is a thread, and what happens without one?">
+
+    The id that groups runs into one conversation. Without it there are traces per request but no way to reconstruct the multi-turn state an agent was actually working from, which is where most agent bugs live.
+
+  </Accordion>
+  <Accordion title="4. Dataset against experiment?">
+
+    A dataset supplies the inputs and the references to test against. An experiment is one execution of the application over that dataset, with scores attached. Comparing experiments is how the claim "this change helped" gets tested.
+
+  </Accordion>
+  <Accordion title="5. Does LangSmith enforce guardrails?">
+
+    No. It records what ran, including a destructive tool call that should have been blocked. Enforcement belongs in the execution loop: permission checks, confirmation gates, and middleware that refuses the call, with the trace as the evidence afterwards.
+
+  </Accordion>
+  <Accordion title="6. When is it the wrong pick?">
+
+    When prompt text cannot leave the network and self-hosting is not on the table, which points at Langfuse. Or when an OpenTelemetry pipeline is already running and LLM spans belong beside service spans in it, which points at Phoenix.
+
+  </Accordion>
+  <Accordion title="7. What is the lock-in risk, and what limits it?">
+
+    The UI, dashboards, and annotation workflow are the sticky parts, not the data. The risk stays small when instrumentation goes through a thin decorator and environment config rather than vendor calls scattered through business logic, and when datasets stay exportable.
+
+  </Accordion>
+  <Accordion title="8. A user reports a wrong answer from last Tuesday. Which record answers it?">
+
+    The trace for that run, filtered by thread and user id from the request logs. The rendered prompt, the retrieved passages, the tool outputs, and the model version are all in it, which is exactly what a trace holds and a log file does not.
+
+  </Accordion>
+  <Accordion title="9. What goes in first on a new project?">
+
+    Tracing with a stable thread id and a metadata contract: user, tenant, prompt version, model. Everything later, from cost per tenant to a regression gate, depends on those fields being on the runs from day one.
+
+  </Accordion>
+  <Accordion title="10. What does a week of traces make possible that was not possible before?">
+
+    Build an eval set from real failures, see which stage actually costs money, and answer "did yesterday's change make anything worse" with a number instead of a vibe.
+
+  </Accordion>
+</Accordions>

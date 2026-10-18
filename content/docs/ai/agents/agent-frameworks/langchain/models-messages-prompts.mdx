@@ -1,0 +1,220 @@
+---
+title: Models, Messages and Prompts
+description: 'Set up a project with uv, call a chat model, use the four message roles, and keep prompts out of source with ChatPromptTemplate.'
+---
+
+Three objects carry everything in LangChain. A **chat model** turns messages into a reply. A **message** is one turn of a conversation with a role attached. A **prompt template** turns application variables into the messages a model should see. With those three, the rest of the framework is arrangement.
+
+---
+
+## Set up the project
+
+`uv` manages the Python environment and the lock file. The full walkthrough is in [Package Management with uv](/ai/python/package-management); here are the commands every lesson in this series assumes.
+
+```bash title="terminal"
+uv init fact-check && cd fact-check
+uv add langchain langchain-google-genai python-dotenv
+uv add --dev pytest ruff
+```
+
+The key comes from [Google AI Studio](https://aistudio.google.com/apikey), which has a free tier. Put it in a `.env` file at the project root and never in source:
+
+```bash title=".env"
+GOOGLE_API_KEY=your_key_here
+```
+
+```python title="main.py"
+from dotenv import load_dotenv
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+load_dotenv()
+
+model = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+
+msg = model.invoke("Explain RAG in two sentences.")
+print(msg.content)  # str, the generated text
+```
+
+`model.invoke(...)` is the call that blocks until the reply arrives. The model runs on Google's servers; LangChain built the request, sent it, and parsed the response into an `AIMessage`.
+
+Run it with `uv run main.py`, which uses the project environment without a virtualenv activated by hand.
+
+---
+
+## Chat models and the settings that matter
+
+| Argument            | What it does                                           | Notes                                                                                                 |
+| :------------------ | :----------------------------------------------------- | :---------------------------------------------------------------------------------------------------- |
+| `model`             | Which model to call                                    | A string, so it is easy to move into config or an env var                                             |
+| `temperature`       | Sampling variability, where the model supports it      | 0 for extraction and classification, higher for prose                                                 |
+| `max_output_tokens` | Cap on the reply length                                | The cheapest guard against a runaway bill                                                             |
+| `timeout`           | Seconds to wait for the provider                       | A timeout belongs on every model call; without one, the request queue inherits someone else's latency |
+| `max_retries`       | Retries the integration performs on transient failures | Know the number before adding an outer retry loop                                                     |
+| `api_key`           | Overrides the environment lookup                       | Only for multi-tenant code; otherwise let the env var work                                            |
+
+Two facts worth holding on to. A chat model object is cheap to construct and safe to reuse, so build it once at import time, not inside a request handler. And `temperature=0` reduces randomness; it does not promise a byte-identical reply across days, which is what decides how prompt tests get written.
+
+---
+
+## Messages: the four roles
+
+Instead of one long string, a chat model takes a list of turns, each tagged with who produced it.
+
+| Class           | Role      | Written by | Typical content                                    |
+| :-------------- | :-------- | :--------- | :------------------------------------------------- |
+| `SystemMessage` | system    | The app    | Behaviour and constraints: "You are a terse tutor" |
+| `HumanMessage`  | user      | The user   | The request                                        |
+| `AIMessage`     | assistant | The model  | The reply, plus any `tool_calls`                   |
+| `ToolMessage`   | tool      | App code   | The result of a tool the model asked for           |
+
+```python title="messages.py"
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+messages = [
+    SystemMessage(content="You are a concise Python programming tutor."),
+    HumanMessage(content="Explain Python decorators."),
+    AIMessage(content="A decorator wraps a function to change its behaviour."),
+    HumanMessage(content="Show the shortest example."),
+]
+
+reply = model.invoke(messages)  # AIMessage
+print(reply.content)
+```
+
+That list is a conversation. The model has no memory between calls, so multi-turn chat means the application stores the history and resends it every time. The cost grows with the transcript, which is what [Context Budgeting](/ai/rag/context-budgeting) is about.
+
+Why bother with roles instead of one concatenated string? Three reasons. The model treats instructions and user text differently when they are labelled, which is the first line of defence against injection. The history becomes a list that can be trimmed, summarized, or replayed. And tool calling only works when the assistant's request and the tool's answer are separate, typed turns.
+
+---
+
+## Prompt templates
+
+Hardcoding a prompt in a module breaks the moment the input varies. A template keeps the structure in one place and takes the variables as arguments.
+
+```python title="prompts.py"
+from langchain_core.prompts import ChatPromptTemplate
+
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a software engineering tutor. Explain concepts with practical examples."),
+        ("human", "Explain {technology} to a {level} developer."),
+    ]
+)
+
+variables = {"technology": "LangGraph", "level": "beginner"}
+messages = prompt.invoke(variables)  # list of messages, no model call yet
+print(len(messages))                 # 2
+
+reply = model.invoke(messages)
+print(reply.content)
+```
+
+The `{technology}` and `{level}` slots are filled from the dict passed in. `input_variables` on the template states what a caller must supply, and a missing key raises there instead of producing a half-empty prompt.
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Application variables<br/>technology, level"] --> B["ChatPromptTemplate<br/>prompt.invoke()"]
+    B --> C["Message list"]
+    C --> D["model.invoke()"]
+    D --> E["AIMessage"]
+`}
+/>
+
+The split in that diagram is the most useful single idea on this page: **`prompt.invoke()` formats, `model.invoke()` calls**. A rendered prompt can be printed, diffed, and unit-tested without spending a token or waiting on a network.
+
+### Reusable pieces
+
+| Tool                   | What it solves                                                    |
+| :--------------------- | :---------------------------------------------------------------- |
+| `MessagesPlaceholder`  | A named slot for a list of history messages                       |
+| `partial_variables`    | Fill a variable once at construction, e.g. today's date           |
+| `("ai", "...")` tuples | Seed a few-shot example inside the template                       |
+| `input_variables`      | The contract a caller must satisfy, checked before any model call |
+
+```python title="with_history.py"
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", "You are a helpful assistant."),
+        MessagesPlaceholder("chat_history"),   # list of messages, supplied per call
+        ("human", "{question}"),
+    ]
+)
+
+messages = prompt.invoke({"chat_history": prior_turns, "question": "And thread_id?"})
+```
+
+---
+
+## Common mistakes
+
+- **One giant string.** Concatenating instructions and user text loses the role boundary, and the model starts treating user text as instructions.
+- **Forgetting the history.** Each call is stateless. Prior turns that are not resent are genuinely unknown to the model.
+- **`str.format` on a template that contains user text.** A user who types `{technology}` breaks the rendering. Use the template variables, and pass user content as its own value.
+- **Testing on live calls.** Because formatting and calling are separate, prompt tests should assert on the rendered messages. Save the network for the integration test run on purpose.
+- **Assuming `temperature=0` is deterministic.** It is stable enough for extraction, not for exact-match assertions across days.
+- **Rebuilding the model per request.** Construct it once; it holds configuration, not conversation state.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Name the three core objects and what each one is for.">
+
+    A chat model turns messages into a reply over the provider API. A message is one labelled turn: system, user, assistant, or tool. A prompt template turns application variables into the message list a model should see.
+
+  </Accordion>
+  <Accordion title={<>2. What is the difference between <code>prompt.invoke()</code> and <code>model.invoke()</code>?</>}>
+
+    `prompt.invoke(variables)` returns a formatted list of messages and makes no network call. `model.invoke(messages)` sends those messages to the provider and returns an `AIMessage`. The separation is what makes prompts testable and versionable on their own.
+
+  </Accordion>
+  <Accordion title="3. Why use message roles instead of one prompt string?">
+
+    Roles tell the model which text is instruction and which is user input, which is both a behaviour signal and the first defence against injection. They also produce a structured history that can be trimmed or replayed, and they are mandatory for tool calling.
+
+  </Accordion>
+  <Accordion title="4. Does the model remember the previous turn?">
+
+    No. Chat APIs are stateless. The application keeps the transcript and resends it, so the prompt grows every turn and the whole history gets paid for again on every call.
+
+  </Accordion>
+  <Accordion title={<>5. Which message types exist and when does a <code>ToolMessage</code> appear?</>}>
+
+    `SystemMessage`, `HumanMessage`, `AIMessage`, and `ToolMessage`. The last one appears when the assistant asks for a tool: application code runs it and appends the result as a `ToolMessage` carrying the matching `tool_call_id`, then calls the model again.
+
+  </Accordion>
+  <Accordion title="6. How is conversation history added to a template?">
+
+    Put a `MessagesPlaceholder("chat_history")` in the message list and pass a list of messages for that key at invoke time. It keeps the template declarative and the trimming policy in application code.
+
+  </Accordion>
+  <Accordion title="7. What breaks if a template is called with a missing variable?">
+
+    It raises before any model call, which is the useful behaviour: a clear local failure instead of a paid request with an empty section in the prompt.
+
+  </Accordion>
+  <Accordion title="8. Which model settings are fixed before serving traffic?">
+
+    `temperature` per task type, `max_output_tokens` as a cost and latency cap, `timeout` so a slow provider cannot hold a worker, and the retry count, which says how many attempts one user request makes.
+
+  </Accordion>
+  <Accordion title="9. A user says the assistant ignored the instructions in the first message. What gets checked?">
+
+    Whether the instruction is actually in this call's messages, since nothing persists between calls; whether it is a system message rather than buried in user text; and whether a long transcript has pushed it far from the end, where models weight it less.
+
+  </Accordion>
+  <Accordion title="10. How is a prompt unit-tested without calling a model?">
+
+    Invoke the template with representative variables and assert on the rendered messages: count, roles, and the substrings that must be present. No network, no cost, and the test fails in milliseconds.
+
+  </Accordion>
+  <Accordion title={<>11. Why is <code>temperature=0</code> not enough for a reproducible test?</>}>
+
+    Sampling at zero makes the greedy path likely, not guaranteed across model versions, batch sizes, or provider-side changes. Pin the model version where reproducibility matters, and assert on structure rather than exact wording.
+
+  </Accordion>
+</Accordions>

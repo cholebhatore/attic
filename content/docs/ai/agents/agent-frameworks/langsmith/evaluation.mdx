@@ -1,0 +1,264 @@
+---
+title: Evaluation
+description: 'evaluate() with a target and evaluators, code checks against judge models, comparing experiments, and a threshold that fails the build.'
+---
+
+An evaluation is a function that says whether an output is acceptable, run over a dataset, with the results stored where tomorrow's number lands next to today's. Everything else in this lesson is plumbing around that sentence.
+
+What an evaluation buys is the ability to answer "did this change help" without anyone's opinion. What it does not buy is a definition of good, and that definition stays a human decision.
+
+---
+
+## The shape of it
+
+```python
+evaluate(
+    target,                    # the application, called per example
+    data,                      # a dataset name or a list of examples
+    evaluators,                # scored per example
+    summary_evaluators,        # scored once over the whole run
+    metadata, experiment_prefix, max_concurrency,
+)
+```
+
+```python title="evaluate_basic.py"
+from langsmith.evaluation import evaluate
+
+from app import chain          # the LCEL chain from the LangChain lessons
+
+
+def target(inputs: dict) -> dict:
+    """One example in, outputs out. This is the application."""
+    return {"category": chain.invoke(inputs)}
+
+
+def correct_category(examples, outputs, **kwargs) -> float:
+    """Exact match against the reference label."""
+    return float(outputs["category"] == examples["outputs"]["category"])
+
+
+result = evaluate(
+    target=target,
+    data="triage-golden",                     # a dataset name
+    evaluators=[correct_category],
+    metadata={"prompt_version": "production", "model": "gemini-2.5-flash"},
+    experiment_prefix="triage",
+)
+print(result.error_rate)                       # fraction of examples that raised
+```
+
+| Piece             | Signature                                        | Runs                |
+| :---------------- | :----------------------------------------------- | :------------------ |
+| Target            | `(inputs) -> outputs`, or `(example) -> outputs` | Once per example    |
+| Example evaluator | `(inputs, outputs, reference) -> dict or score   | Once per example    |
+| Summary evaluator | `(runs) -> score`                                | Once per experiment |
+
+The distinction that trips people up: an evaluator scores one example, a summary evaluator scores the experiment. Accuracy is a summary statistic made of per-example scores.
+
+---
+
+## Code evaluators first
+
+Before any model judges anything, run the checks that are free, deterministic, and fast.
+
+```python title="code_evaluators.py"
+import json
+import re
+
+
+def is_one_word(inputs, outputs, reference, **kwargs) -> float:
+    return float(re.fullmatch(r"[a-z]+", outputs["category"].strip().lower()) is not None)
+
+
+def valid_json(inputs, outputs, reference, **kwargs) -> float:
+    try:
+        json.loads(outputs["raw"])
+        return 1.0
+    except json.JSONDecodeError:
+        return 0.0
+
+
+def cites_a_source(inputs, outputs, reference, **kwargs) -> float:
+    return float(bool(re.search(r"\[\d+\]", outputs["answer"])))
+```
+
+These catch format drift, which is the failure mode that eats a week because every downstream check assumes the field exists. A schema violation is not a quality regression, and it should not be scored by a model.
+
+---
+
+## A judge model, written by hand
+
+When the output is prose, the check is a model call. That is affordable and it is not ground truth, so make the contract explicit.
+
+```python title="judge.py"
+from langsmith.evaluation import EvaluationResult
+from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import BaseModel, Field
+
+
+class Judgement(BaseModel):
+    correct: bool = Field(description="Does the answer match the reference facts?")
+    grounded: bool = Field(description="Is every claim supported by the provided context?")
+    reason: str
+
+
+judge = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0).with_structured_output(
+    Judgement
+)
+
+
+def groundedness(inputs, outputs, reference, **kwargs) -> EvaluationResult:
+    verdict = judge.invoke(
+        f"Question: {inputs['question']}\n"
+        f"Reference answer: {reference['answer']}\n"
+        f"Candidate answer: {outputs['answer']}\n\n"
+        "Score the candidate. Correct means factually matching the reference. "
+        "Grounded means no unsupported claims."
+    )
+    return EvaluationResult(
+        key="grounded",
+        score=float(verdict.grounded),
+        comment=verdict.reason,
+    )
+```
+
+Four rules make a judge usable rather than decorative:
+
+- **Binary or bounded.** A 1-to-10 score is a mood. Pass or fail, plus a reason.
+- **One question per judge.** Groundedness and correctness are different, and a judge asked for both reports one.
+- **Give it the reference** where one exists. Judging an answer against nothing measures fluency.
+- **Calibrate it.** Score 30 examples by hand, run the judge, and report the agreement. A judge nobody has calibrated is a random number generator with good grammar.
+
+Judges cost money and add variance, so they belong in the nightly run and in the review loop, not in the per-commit gate.
+
+---
+
+## Agents need two scores
+
+An agent run has an outcome and a path. Scoring only the outcome hides the expensive, fragile way it got there.
+
+| What is scored             | How                                                                |
+| :------------------------- | :----------------------------------------------------------------- |
+| Task success               | The final answer, or the world state after the run                 |
+| Trajectory validity        | Did it call the right tools, in a legal order, without repeats?    |
+| Steps and tokens to finish | Counts from the trace; a regression here is a cost regression      |
+| Tool-call correctness      | Exact match on name and arguments for the cases where one is right |
+| Escalation behaviour       | Whether it stopped and asked when it should have                   |
+
+The trajectory checks are cheap to write and they catch the failure that outcome scoring misses: the agent got the right answer by trying nine things, and next month it will try ten and hit the limit.
+
+---
+
+## Comparing experiments
+
+Every `evaluate()` call creates an experiment. Select two in the UI for a per-example diff: what improved, what regressed, and the score deltas side by side. That view is the whole point, because aggregate numbers hide exactly the case that matters, which is a fix that broke two other things.
+
+Read a comparison in this order: the aggregate delta, then the count of examples that changed direction in either way, then the individual regressions. A +3 percent average with 12 flipped answers is not an improvement; it is a trade.
+
+---
+
+## The gate
+
+```python title="test_eval.py"
+import pytest
+from langsmith.evaluation import evaluate
+
+
+@pytest.mark.eval
+def test_triage_accuracy_does_not_regress():
+    res = evaluate(
+        target=target,
+        data="triage-golden",
+        evaluators=[correct_category, is_one_word],
+        max_concurrency=5,
+    )
+    accuracy = res.metrics["feedback:correct_category"]["mean"]
+    assert accuracy >= 0.92, f"accuracy fell to {accuracy:.2f}"
+```
+
+Two tiers, because they have different jobs:
+
+| Tier       | Runs                    | Content                                              |
+| :--------- | :---------------------- | :--------------------------------------------------- |
+| Per commit | Seconds, no judge       | Format and schema checks, exact match on a small set |
+| Nightly    | Minutes, judges allowed | Full dataset, LLM-as-judge, trajectory metrics       |
+
+A gate that takes twenty minutes does not get run on every commit; it gets skipped, and then it is not a gate. Keep the fast tier honest by adding a case whenever production turns up a new failure, which is the loop from the previous lesson.
+
+---
+
+## Common mistakes
+
+- **Evaluating on the examples the prompt was tuned on.** That is training, and the number means nothing.
+- **One aggregate number with no count.** 90 percent of ten is noise; 90 percent of five hundred is a result.
+- **A judge with no calibration against human labels.**
+- **Scoring the answer and ignoring the path,** then being surprised when the path gets longer every month.
+- **A flaky gate everyone reruns.** Fix the flake or drop the check; a bypassed gate is worse than none.
+- **Evaluating the model when the system changed.** Retrieval moved, and the prompt score moved with it. Version every stage the pipeline exposes.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What are the parts of an evaluation run?">
+
+    A target, which is the application called once per example; evaluators, which score each example against inputs, outputs, and reference; summary evaluators, which score the whole experiment; and the dataset that ties them together. The result is an experiment that can be compared against another.
+
+  </Accordion>
+  <Accordion title="2. Evaluator against summary evaluator?">
+
+    An evaluator runs per example and returns a score for that row. A summary evaluator runs once over all the runs, which is where an aggregate like mean accuracy or cost per task belongs.
+
+  </Accordion>
+  <Accordion title="3. Why start with code checks?">
+
+    They are free, deterministic, and they catch format drift, which is the failure that breaks every downstream assumption. A model judge should never be the first line of defence against a missing field.
+
+  </Accordion>
+  <Accordion title="4. What makes an LLM judge trustworthy?">
+
+    One question per judge, binary or bounded output with a reason, the reference answer when one exists, and calibration against a hand-labeled set with the agreement rate reported.
+
+  </Accordion>
+  <Accordion title="5. What does an agent trajectory score that outcome scoring misses?">
+
+    Whether the run took the expensive, fragile route: tool calls in a legal order, no repeats, steps and tokens within budget. A correct answer via nine attempts is a regression waiting to trip the limit.
+
+  </Accordion>
+  <Accordion title="6. An experiment shows +3 percent average. Ship it?">
+
+    Not yet. Look at how many examples changed direction. A gain built on twelve flipped answers and fifteen fixed ones is a trade, and the trade needs a decision from whoever owns those failures.
+
+  </Accordion>
+  <Accordion title="7. What keeps a gate fast enough that people run it?">
+
+    Two tiers. Per-commit runs schema checks and exact match on a small set in seconds; nightly runs the full dataset with judges. Anything that takes twenty minutes gets skipped, and a skipped gate is worse than an absent one.
+
+  </Accordion>
+  <Accordion title="8. Where does the eval set come from?">
+
+    Production. Filter traces by negative feedback or error, review, and add confirmed cases. Hand-written examples cover what was imagined; harvested ones cover what actually happened.
+
+  </Accordion>
+  <Accordion title="9. What is the most common way an eval lies?">
+
+    Tuning on the test set. Iterate the prompt against 40 examples and the result is 40 special cases. Split, and keep a set nobody edits prompts against.
+
+  </Accordion>
+  <Accordion title="10. How is a change to retrieval evaluated when the prompt did not move?">
+
+    Score the stages separately: recall on the retriever alone against labeled passages, then end-to-end accuracy. If only the retrieval metric moved, the retrieval team owns the regression.
+
+  </Accordion>
+  <Accordion title="11. A dataset example is now obsolete. What happens to it?">
+
+    Retire it deliberately and record why. Deleting cases to keep a number green is how an eval suite becomes theatre, so the removal should be as reviewable as an addition.
+
+  </Accordion>
+  <Accordion title="12. What number goes to an executive alongside accuracy?">
+
+    Cost per successful task. Accuracy alone gets bought; accuracy per dollar is the version that survives a budget conversation.
+
+  </Accordion>
+</Accordions>

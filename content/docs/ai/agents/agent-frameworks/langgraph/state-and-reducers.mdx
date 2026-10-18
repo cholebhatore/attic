@@ -1,0 +1,199 @@
+---
+title: State and Reducers
+description: 'The state schema is the graph API. Typed keys, append against overwrite, add_messages, custom reducers, and how a node writes.'
+---
+
+In a chain, the value flowing between stages is the state. In a graph, state is a named object every node can read and partially write, and it outlives the step that produced it. Get the schema right and the rest of the graph is wiring. Get it wrong and the runtime fights back all day.
+
+---
+
+## Declaring state
+
+```python title="state.py"
+from typing import Annotated, TypedDict
+from operator import add
+
+
+class State(TypedDict):
+    messages: Annotated[list, add]          # append on every write
+    attempts: int                            # last write wins
+    findings: Annotated[list, add]
+    draft: str | None                        # overwritten by whoever writes last
+```
+
+`TypedDict` is the common form: keys are declared, values are plain Python. A Pydantic model works as a schema too and buys validation and defaults, at the cost of a rebuild on every update. Either way the rule is the same: **a node may only write keys that exist in the schema**. An undeclared key raises, which is the good outcome; the bad outcome is a key that should have been declared and was not, silently dropped.
+
+| Schema form    | What it buys                         | What it costs                          |
+| :------------- | :----------------------------------- | :------------------------------------- |
+| `TypedDict`    | Fast, plain dicts everywhere         | No validation, no defaults             |
+| Pydantic model | Field validation, defaults, coercion | Object rebuild per step, slower merges |
+
+---
+
+## Reducers: what a write means
+
+Every key carries its own merge rule. When a node returns `{"messages": [m]}`, something has to decide whether that replaces the list or adds to it, and that something is the reducer: the current value plus the update, producing the new value.
+
+```python title="reducers.py"
+from functools import reduce
+from operator import add
+from typing import Annotated, TypedDict
+
+
+def merge_dicts(current: dict, update: dict) -> dict:
+    return {**current, **update}
+
+
+def keep_max(current: int, update: int) -> int:
+    return max(current, update)
+
+
+class State(TypedDict):
+    messages: Annotated[list, add]              # list concat
+    scores: Annotated[dict, merge_dicts]        # a hand-written function
+    cost_usd: Annotated[float, keep_max]        # monotonic counter
+    answer: str                                  # no annotation -> overwrite
+```
+
+| Declaration            | Merge rule                        | Right for                               |
+| :--------------------- | :-------------------------------- | :-------------------------------------- |
+| no annotation          | Replace                           | Plain counters, any single-writer field |
+| `Annotated[list, add]` | Concatenate                       | Trajectories, findings, evidence        |
+| custom function        | Whatever that function defines    | Dict merge, max, dedupe, set union      |
+| `add_messages` (below) | Append, with id-aware replacement | Message lists a model will read back    |
+
+A reducer is not a nicety. Two branches writing the same un-annotated key in one super-step is a race whose outcome cannot be predicted from the code, and it will look like a model bug when it happens.
+
+---
+
+## <code>add_messages</code> instead of plain append
+
+Message lists have a dedicated reducer, and it is usually the right one for the transcript key.
+
+```python title="messages_state.py"
+from typing import Annotated, TypedDict
+
+from langgraph.graph.message import add_messages
+
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+```
+
+Plain `operator.add` concatenates, so a re-run step appends a duplicate message and an edited one lives in the list twice. `add_messages` matches on message id: a new id appends, an existing id replaces, and deletions are honoured. That is what makes replay, editing a past message, and resuming a interrupted turn behave.
+
+---
+
+## What a node returns
+
+```python title="node_updates.py"
+def think(state: State):
+    resp = model.invoke(state["messages"])
+    return {"messages": [resp], "attempts": state["attempts"] + 1}   # partial update
+
+
+def finish(state: State):
+    return {"answer": summarise(state["messages"])}                  # one key is enough
+
+
+def noop(state: State):
+    return None                                                       # or {} : read-only step
+```
+
+Three rules cover it. Return a dict of the keys that changed, not the whole state. Return `None` or `{}` for a step that only observes. Never mutate the state a node receives, because the runtime cannot see a mutation, and the mutation will not be in the checkpoint that later gets replayed.
+
+A node can also say where to go next, which folds routing and updating into one return:
+
+```python title="command.py"
+from langgraph.types import Command
+
+
+def check(state: State) -> Command:
+    if state["attempts"] >= 25:
+        return Command(goto="give_up", update={"findings": ["budget exhausted"]})
+    return Command(goto="act")
+```
+
+`Command(goto=..., update=...)` writes state and routes in one step. Use it when the decision and the bookkeeping belong together; use a plain conditional edge when routing is a separate concern worth reading off the graph definition.
+
+---
+
+## Reading state, and what is not in it
+
+A node signature receives the whole state unless it declares fewer keys, and it receives only what previous **completed** super-steps wrote. Two things are deliberately not in state:
+
+- **The current step's other branches.** Parallel writes merge at the end of the step, so nothing in a step can see a sibling's output.
+- **Anything across threads.** State belongs to one `thread_id`. Long-lived facts that should follow the user between conversations belong in a separate store object passed to `compile(store=...)`, which is [Agent Memory](/ai/agents/agent-memory) rather than persistence.
+
+```python title="inspect_state.py"
+snapshot = app.get_state(config)
+print(snapshot.values["attempts"])   # current values
+print(snapshot.next)                 # which node runs on the next resume
+```
+
+---
+
+## Common mistakes
+
+- **One giant `messages` key used as a scratchpad.** Put counters, budgets, and intermediate results in their own keys; otherwise finding out what a run did means parsing the transcript.
+- **A list key with no reducer.** The second write silently drops the first, and the failure looks like the model forgetting.
+- **Reducers with side effects.** A reducer runs during merge, sometimes more than once on replay. Keep it a pure function of two values.
+- **Storing the whole document corpus in state.** Every super-step is checkpointed, so a fat state is a fat write on every step. Keep references, fetch when needed.
+- **Assuming state is the conversation.** It is a typed bag. The transcript is one key inside it, and mixing them is why some agent graphs are unreadable.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Why does every key need a declared merge rule?">
+
+    Because more than one branch can write the same key in one super-step. Without a reducer the runtime cannot know whether to replace or append, and the result is a race that looks like a model failure.
+
+  </Accordion>
+  <Accordion title={<>2. What is the difference between <code>Annotated[list, add]</code> and a bare <code>list</code> key?</>}>
+
+    The annotated one concatenates on every write, so nodes append findings. The bare one overwrites, so the last node to write the key wins and everything earlier is gone.
+
+  </Accordion>
+  <Accordion title={<>3. When is <code>add_messages</code> the right reducer rather than plain append?</>}>
+
+    For the transcript. It matches on message id, so re-running a step replaces the message instead of duplicating it, which is what editing a past turn, replaying, and resuming an interrupted run all depend on.
+
+  </Accordion>
+  <Accordion title="4. What happens if a node returns the full state?">
+
+    The reducers still apply, so an append key gets the whole list concatenated onto itself. Return only what changed.
+
+  </Accordion>
+  <Accordion title="5. Can a node write a key that is not in the schema?">
+
+    No. It raises. Declare the key, or put the value in a key that is already declared.
+
+  </Accordion>
+  <Accordion title={<>6. What does <code>Command(goto=..., update=...)</code> buy over a conditional edge?</>}>
+
+    It routes and updates in one return, so the decision and its bookkeeping sit in the same place. The cost is that the graph definition stops carrying the whole routing story.
+
+  </Accordion>
+  <Accordion title="7. Why must a reducer be pure?">
+
+    It runs at merge time, and replay or resume can run it again. A reducer that writes to a database or calls a model turns a deterministic merge into a side effect no one can reason about.
+
+  </Accordion>
+  <Accordion title={<>8. Two nodes in the same step both append to <code>findings</code>. What is the result?</>}>
+
+    Both appends survive, merged once at the end of the super-step, in the order the runtime applied them. Neither node saw the other's write while it ran.
+
+  </Accordion>
+  <Accordion title="9. State against store: where does a user preference belong?">
+
+    In the store. State is scoped to one thread and one run; anything that should outlive the conversation or cross threads is memory, and belongs in the store object passed at compile time.
+
+  </Accordion>
+  <Accordion title="10. The graph is slow and the checkpoint table is huge. What went into state?">
+
+    Probably a document or an image. Each super-step snapshots the whole state, so large payloads multiply by step count. Keep identifiers in state and fetch the payload inside the node that needs it.
+
+  </Accordion>
+</Accordions>

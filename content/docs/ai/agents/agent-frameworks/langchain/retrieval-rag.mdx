@@ -1,0 +1,301 @@
+---
+title: Retrieval and RAG
+description: 'Loaders, splitters, embeddings, vector stores and retrievers as LangChain objects, plus the retrieval chain built from lesson 4 pieces.'
+---
+
+Retrieval answers one question: which parts of the corpus belong in the prompt for this query. LangChain supplies an object for each stage and one interface, `Runnable`, that lets them compose. The ideas behind the stages, why chunking is shaped the way it is, what a good embedding distance means, are covered in [Phase 9](/ai/rag), and this lesson stays on the plumbing.
+
+---
+
+## The pipeline, and the object for each stage
+
+| Stage            | LangChain object                             | Concept page                                                           |
+| :--------------- | :------------------------------------------- | :--------------------------------------------------------------------- |
+| Read the source  | `TextLoader`, `PyPDFLoader`, `WebBaseLoader` | [Chunking Strategies](/ai/rag/chunking)                                |
+| Cut into pieces  | `RecursiveCharacterTextSplitter`             | [Chunking Strategies](/ai/rag/chunking)                                |
+| Vectorize        | `GoogleGenerativeAIEmbeddings`               | [Embeddings](/ai/rag/embeddings)                                       |
+| Store and search | `InMemoryVectorStore`, `Chroma`, `PGVector`  | [Vector Databases and ANN](/ai/rag/vector-databases)                   |
+| Query shape      | `retriever.invoke(query)`                    | [Query Transformation](/ai/rag/query-transformation)                   |
+| Order the hits   | a reranker, or hybrid fusion                 | [Hybrid Search](/ai/rag/hybrid-search), [Reranking](/ai/rag/reranking) |
+| Assemble         | a prompt template plus a character budget    | [Context Budgeting](/ai/rag/context-budgeting)                         |
+
+The object that carries text through the first half is a `Document`: page content plus a metadata dict.
+
+```python title="documents.py"
+from langchain_core.documents import Document
+
+doc = Document(page_content="Restart the queue before draining.",
+               metadata={"source": "runbook-7.md", "section": "incident", "acl": "ops"})
+print(len(doc.page_content), doc.metadata["source"])
+```
+
+Metadata is not optional. It is what allows filtering by tenant, citing a source, and dropping a stale document without re-embedding anything.
+
+---
+
+## Loaders
+
+Most loaders live in `langchain-community` and need their own extra dependency, so `uv add langchain-community pypdf beautifulsoup4`.
+
+```python title="loaders.py"
+from langchain_community.document_loaders import (
+    DirectoryLoader,
+    PyPDFLoader,
+    TextLoader,
+    WebBaseLoader,
+)
+
+one_file = TextLoader("runbook-7.md", metadata={"source": "runbook-7.md"}).load()
+pdf = PyPDFLoader("contract.pdf").load()          # one Document per page
+web = WebBaseLoader("https://example.com/post").load()
+
+corpus = DirectoryLoader("docs/", glob="**/*.md", loader_cls=TextLoader).load()
+print(len(corpus))
+```
+
+A loader returns a list of `Document` objects with `source` filled in where it can. Loading is offline work: run it in a job, not in a request handler.
+
+---
+
+## Splitters
+
+```python title="split.py"
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter,
+)
+
+headers = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "h1"), ("##", "h2")])
+sections = headers.split_text(markdown_text)      # metadata carries h1 and h2
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=800,        # characters, not tokens
+    chunk_overlap=120,
+    separators=["\n\n", "\n", ". ", " ", ""],
+    keep_separator=True,
+)
+chunks = splitter.split_documents(sections)       # list[Document]
+print(len(chunks), chunks[0].page_content[:60])
+```
+
+`RecursiveCharacterTextSplitter` tries the biggest separator first and only splits further when a piece is still too large, so paragraphs survive and sentences break last. That ordering is why it is the default that works.
+
+Two numbers to decide on purpose:
+
+| Setting         | Too small                                         | Too large                                         |
+| :-------------- | :------------------------------------------------ | :------------------------------------------------ |
+| `chunk_size`    | Context is severed, every hit needs its neighbour | The query dilutes into noise and the budget burns |
+| `chunk_overlap` | Nothing, it is cheap insurance                    | Near-duplicate hits crowd out the useful ones     |
+
+Structure-aware splitting beats size-based splitting whenever the source has structure, which is why the header splitter runs first above. The arithmetic on tokens per chunk and how many fit in a window is in [Context Budgeting](/ai/rag/context-budgeting).
+
+---
+
+## Embeddings
+
+An embeddings object turns text into vectors, with separate methods for the two sides of the query.
+
+```python title="embed.py"
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+
+passages = embeddings.embed_documents([c.page_content for c in chunks])   # list[list[float]], 768 dims
+query = embeddings.embed_query("how do I restart the queue?")             # list[float], 768
+
+print(len(passages), len(passages[0]), len(query))
+```
+
+The split matters. Some models expect a task prefix or a different instruction on the query side, and `embed_query` is where the integration applies it. Embedding a query with the passage recipe is a silent quality loss that looks like a bad index.
+
+Changing the embedding model means re-embedding everything. Vectors from two models share no geometry, so an index built with one cannot be queried with another. The migration pattern is in [Embeddings](/ai/rag/embeddings).
+
+---
+
+## Vector stores and retrievers
+
+A vector store owns the index and the search. A retriever is the same thing narrowed to one interface: text in, documents out.
+
+```python title="store.py"
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_chroma import Chroma
+
+store = InMemoryVectorStore(embeddings)
+store.add_documents(chunks)                      # embeds on the way in
+
+persistent = Chroma.from_documents(
+    chunks, embeddings,
+    collection_name="runbooks",
+    persist_directory="./chroma",
+)
+
+hits = store.similarity_search_with_relevance_scores(
+    "how do I restart the queue?", k=6, filter={"section": "incident"}
+)
+print(hits[0][1])                                # float score, comparable inside one store only
+```
+
+`as_retriever()` turns either of them into the composable object:
+
+```python title="retriever.py"
+retriever = store.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": 5, "fetch_k": 20, "lambda_mult": 0.5},
+)
+
+docs = retriever.invoke("how do I restart the queue?")   # list[Document]
+print([d.metadata["source"] for d in docs])
+```
+
+| `search_type`            | What it optimizes                            | When                                  |
+| :----------------------- | :------------------------------------------- | :------------------------------------ |
+| `similarity`             | Closest vectors                              | The default, and usually right        |
+| `mmr`                    | Relevance minus redundancy                   | The corpus repeats itself             |
+| `max_marginal_relevance` | Same family, different naming in some stores | Read the store's docs before assuming |
+
+The honest limitation: the retriever interface hides what each backend can do. Hybrid keyword-plus-vector search, metadata filters with complex logic, and reranking are unevenly supported across stores, so check the integration rather than the abstraction. [Hybrid Search](/ai/rag/hybrid-search) covers what a good retrieval setup looks like when no interface constrains it.
+
+---
+
+## The retrieval chain
+
+Everything from lesson 4 assembles into a working RAG pipeline. No helper function required, and none of the legacy chain classes.
+
+```python title="rag_chain.py"
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+
+def join_docs(docs) -> str:
+    return "\n\n".join(
+        f"[{i + 1}] {d.metadata.get('source', '?')}\n{d.page_content}"
+        for i, d in enumerate(docs)
+    )
+
+
+prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system",
+         "Answer only from the context. Cite sources by number. "
+         "If the context does not answer, say so.\n\n{context}"),
+        ("human", "{question}"),
+    ]
+)
+
+rag = (
+    RunnableParallel(
+        {
+            "question": RunnablePassthrough(),
+            "context": retriever | join_docs,
+        }
+    )
+    | prompt
+    | model.bind(max_output_tokens=512)
+    | StrOutputParser()
+)
+
+answer = rag.invoke("How do I restart the queue during an incident?")
+print(answer)
+```
+
+The citation numbers are the cheap, high-value part. An answer that names which chunk it came from is debuggable; one that does not means a pass back through the whole pipeline.
+
+### The retriever as a tool
+
+Wrap the same retriever and give it to `create_agent`, and the model decides when to look things up and can query several times per task. That is the difference between a pipeline and [Self-RAG and Agentic RAG](/ai/rag/agentic-rag).
+
+```python title="retriever_tool.py"
+from langchain_core.tools import tool
+
+
+@tool
+def search_runbooks(query: str) -> str:
+    """Search internal runbooks for the procedure that answers query."""
+    docs = retriever.invoke(query)
+    return join_docs(docs)
+```
+
+---
+
+## What is not here
+
+LangChain supplies the plumbing for retrieval, not the retrieval quality. The parts that decide whether the system works are outside the framework: a labeled set of queries with known-good passages, a recall metric on the retriever alone, and a gate that runs on every change. That is [RAG and Agent Evaluation](/ai/agents/rag-and-agent-eval) and [Production RAG Debugging](/ai/rag/production-debugging).
+
+---
+
+## Common mistakes
+
+- **Embedding at index time and not at query time**, or the reverse. Both sides need vectors from the same model.
+- **`chunk_size` read as tokens.** It is characters unless the splitter is token-based, and the two differ by roughly four to one for English text.
+- **No metadata.** Without it there is no tenant filter, no citation, and no way to expire a document.
+- **A large `k` as a fix for weak retrieval.** More passages means more dilution and a bigger bill; fix the index or the query instead.
+- **Relevance scores compared across stores.** Scores are backend-specific; only their ordering inside one store means anything.
+- **Retrieval inside the request path for a corpus that changes nightly.** Index offline, query online.
+- **Assuming the vector-store abstraction exposes hybrid search.** Many do not, and the failure is silent.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Name the stages of a RAG pipeline and the LangChain object for each.">
+
+    Load with a document loader, split with a text splitter, embed with an embeddings class, store in a vector store, retrieve through a retriever, assemble into a prompt template, generate with a chat model, and parse the answer. Each stage is a runnable, so they pipe together.
+
+  </Accordion>
+  <Accordion title="2. What is a Document?">
+
+    `page_content` plus a `metadata` dict. Metadata is what allows filtering by tenant, citing a source, and deleting a stale document from the index without touching the text.
+
+  </Accordion>
+  <Accordion title="3. How does RecursiveCharacterTextSplitter decide where to cut?">
+
+    It tries separators in the order given, largest first, so paragraphs survive and sentences break only when needed. `chunk_size` is characters, and `chunk_overlap` keeps a boundary from severing meaning.
+
+  </Accordion>
+  <Accordion title={<>4. Why are <code>embed_documents</code> and <code>embed_query</code> separate methods?</>}>
+
+    Because the two sides are not always encoded identically. Asymmetric models expect a task instruction on the query, and the integration applies it in `embed_query`. Using the passage recipe for a query quietly degrades recall.
+
+  </Accordion>
+  <Accordion title="5. The embedding model gets swapped. What else has to change?">
+
+    The whole index. Vectors from different models are not comparable, so re-embed into a new collection and cut over with a blue-green switch rather than mixing geometries.
+
+  </Accordion>
+  <Accordion title={<>6. What does <code>as_retriever</code> add over the store itself?</>}>
+
+    A runnable with one job: text in, documents out. That makes it composable inside a chain, wrappable as a tool, and swappable for another backend without touching the prompt.
+
+  </Accordion>
+  <Accordion title="7. When is MMR the better choice than plain similarity?">
+
+    When the corpus repeats itself and the top hits are near-duplicates. MMR trades a little relevance for diversity by penalizing passages close to what it already selected.
+
+  </Accordion>
+  <Accordion title="8. Write the RAG chain in one line of LCEL and explain the shape.">
+
+    `RunnableParallel({"question": RunnablePassthrough(), "context": retriever | join_docs}) | prompt | model | StrOutputParser()`. The parallel step fetches context and keeps the question, the template receives both, and the parser turns the reply into a string.
+
+  </Accordion>
+  <Accordion title="9. How does a pipeline become agentic RAG?">
+
+    Expose the retriever as a tool and hand it to `create_agent`. The model then decides whether to search, what to search for, and whether a second query is needed, which buys multi-hop at the cost of a loop that has to be bounded.
+
+  </Accordion>
+  <Accordion title="10. Answers are correct but cite the wrong document. Where is the bug?">
+
+    In assembly, not retrieval. Either the citation numbering does not survive the join, or the model is guessing. Put the source label adjacent to each passage, ask for the numbers actually emitted, and validate them in code.
+
+  </Accordion>
+  <Accordion title="11. What does the framework not do for retrieval quality?">
+
+    Nothing that matters. Chunking policy, embedding choice, hybrid fusion, reranking, and the labeled eval set that says whether recall improved are all decisions the interface leaves outside itself.
+
+  </Accordion>
+  <Accordion title="12. Retrieval adds 400ms to every request. What gets checked first?">
+
+    Whether embedding the query is a network call that could be cached, whether the store round trip is one query or several, and whether far more passages are fetched than are kept. Then measure the reranker separately, because it is usually the expensive stage.
+
+  </Accordion>
+</Accordions>
