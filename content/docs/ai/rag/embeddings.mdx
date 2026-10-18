@@ -102,6 +102,42 @@ Fine-tuning is usually worth it once you have a few thousand query-document pair
 
 ---
 
+## Changing the model
+
+Vector spaces do not transfer. Not between models, and usually not between versions of the same model: the dimensions mean different things, so a query embedded with model B compared against a corpus embedded with model A returns confident nonsense. There is no migration script and no conversion layer, only a re-embed of the whole corpus.
+
+So the operation is a rebuild, and the safe shape of a rebuild is the same everywhere:
+
+```text
+day 0   index_a                     serving, model a
+day 1   index_a + index_b           building b in a separate namespace, no traffic
+day 3   eval on golden set          b wins  ->  flip the route
+day 4   index_b                     serving, index_a kept until the flip is confirmed
+day 5   index_a deleted             only after b is known good
+```
+
+| Requirement                 | Why                                                                    |
+| :-------------------------- | :--------------------------------------------------------------------- |
+| `embedding_model` per chunk | The only way to know which space a vector lives in                     |
+| Separate namespace          | Mixing two spaces in one index is worse than either alone              |
+| Eval before the flip        | Recall can drop on your corpus while rising on the leaderboard         |
+| Delayed teardown            | A rollback after deletion means a full re-embed at incident speed      |
+| Chunking config pinned      | A model change plus a chunk change tells you nothing about which moved |
+
+The same rule covers changes that are not model changes. Matryoshka truncation, int8 or binary quantization, and any re-normalization all alter the comparison space, so each is its own rebuild-and-compare rather than a config tweak.
+
+---
+
+## Beyond text
+
+Both retrieval and storage assume the indexed unit is text. Two representations drop that assumption.
+
+**Image and text in one space.** CLIP-style models map an image and a caption into the same vector space, so a query finds a diagram or a screenshot with no OCR step. The trade is precision: these models are coarse on prose and strong on visual gestalt, which makes them good for galleries and poor for documents.
+
+**Pages as multi-vector.** ColPali (Faysse et al., arXiv:2407.01449) renders a document page to an image, embeds it with a vision-language model into one vector per patch, and scores it with the same MaxSim late interaction that ColBERT uses over text (see [Reranking](/ai/rag/reranking)). The parser disappears: a scanned table, a two-column layout and an annotated chart are all just pixels, and the layout problems that consume an ingestion pipeline never arise. The price is storage, tens of thousands of vectors per page, which is why it runs behind a first-stage filter and usually with heavy quantization.
+
+---
+
 ## Contextual retrieval
 
 Anthropic's technique (September 2024) addresses the failure that chunking creates: an isolated chunk loses the document context that made it meaningful. "The company's revenue grew by 3% over the previous quarter" is unembeddable without knowing which company and which quarter.
@@ -153,42 +189,65 @@ Late chunking gets document context into the vector by pooling after a long-cont
 
 ## Interview questions
 
-1. How are embedding models trained?
+<Accordions>
+  <Accordion title="1. How are embedding models trained?">
 
-   Contrastive learning on query-document pairs, with an InfoNCE-style loss that pulls matched pairs together and pushes the query away from negatives. In-batch negatives give free contrast, but hard negatives, which are semantically close yet wrong, carry most of the learning signal.
+    Contrastive learning on query-document pairs, with an InfoNCE-style loss that pulls matched pairs together and pushes the query away from negatives. In-batch negatives give free contrast, but hard negatives, which are semantically close yet wrong, carry most of the learning signal.
 
-2. What is query-document asymmetry and why does it matter?
+  </Accordion>
+  <Accordion title="2. What is query-document asymmetry and why does it matter?">
 
-   Queries are short and interrogative; documents are long and declarative. Models like E5 and BGE require a prefix such as `"query: "` or `"passage: "` so the model knows which side it is encoding. Getting it backwards produces valid vectors and a silent 10 to 20 point recall drop. It is the most common embedding bug.
+    Queries are short and interrogative; documents are long and declarative. Models like E5 and BGE require a prefix such as `"query: "` or `"passage: "` so the model knows which side it is encoding. Getting it backwards produces valid vectors and a silent 10 to 20 point recall drop. It is the most common embedding bug.
 
-3. What is Matryoshka representation learning?
+  </Accordion>
+  <Accordion title="3. What is Matryoshka representation learning?">
 
-   Training the model so the first `d'` dimensions of a `d`-dimensional vector form a usable embedding on their own (Kusupati et al., arXiv:2205.13147). Truncating 3,072 dimensions to 256 cuts storage by 12x for a few points of accuracy. You must renormalize after truncating or the cosine scale shifts and results reorder.
+    Training the model so the first `d'` dimensions of a `d`-dimensional vector form a usable embedding on their own (Kusupati et al., arXiv:2205.13147). Truncating 3,072 dimensions to 256 cuts storage by 12x for a few points of accuracy. You must renormalize after truncating or the cosine scale shifts and results reorder.
 
-4. When do cosine, dot product, and L2 give different rankings?
+  </Accordion>
+  <Accordion title="4. When do cosine, dot product, and L2 give different rankings?">
 
-   Only when the vectors are not unit norm. For normalized vectors, `L2^2 = 2 - 2*cos`, so all three rank identically and an inner-product index is a valid cosine index. Store normalized vectors and the distinction disappears.
+    Only when the vectors are not unit norm. For normalized vectors, `L2^2 = 2 - 2*cos`, so all three rank identically and an inner-product index is a valid cosine index. Store normalized vectors and the distinction disappears.
 
-5. How much storage does a million 1,536-dimensional vectors take?
+  </Accordion>
+  <Accordion title="5. How much storage does a million 1,536-dimensional vectors take?">
 
-   `1e6 * 1536 * 4` bytes = 5.7 GiB in fp32. Int8 scalar quantization brings it to about 1.4 GiB and one-bit binary quantization to 192 MB, at the cost of recall that a reranker usually recovers.
+    `1e6 * 1536 * 4` bytes = 5.7 GiB in fp32. Int8 scalar quantization brings it to about 1.4 GiB and one-bit binary quantization to 192 MB, at the cost of recall that a reranker usually recovers.
 
-6. Should you pick the top model on MTEB?
+  </Accordion>
+  <Accordion title="6. Should you pick the top model on MTEB?">
 
-   No. MTEB's retrieval tasks skew toward short Wikipedia-style passages and the top of the leaderboard moves by a point or two between releases. Two models within three points there can differ by fifteen on your corpus. Evaluate on fifty of your own queries with labelled relevant documents.
+    No. MTEB's retrieval tasks skew toward short Wikipedia-style passages and the top of the leaderboard moves by a point or two between releases. Two models within three points there can differ by fifteen on your corpus. Evaluate on fifty of your own queries with labelled relevant documents.
 
-7. What problem does contextual retrieval solve?
+  </Accordion>
+  <Accordion title="7. What problem does contextual retrieval solve?">
 
-   Chunking isolates text from the document context that makes it meaningful. Anthropic prepends a short LLM-generated situating header to each chunk before embedding and before BM25 indexing, so both the dense and sparse representations carry that context.
+    Chunking isolates text from the document context that makes it meaningful. Anthropic prepends a short LLM-generated situating header to each chunk before embedding and before BM25 indexing, so both the dense and sparse representations carry that context.
 
-8. Quote the contextual retrieval numbers.
+  </Accordion>
+  <Accordion title="8. Quote the contextual retrieval numbers.">
 
-   On a 200-document knowledge base measuring whether the relevant chunk lands in the top 20: embeddings alone fail 5.7% of the time, contextual embeddings 3.7% (a 35% reduction), contextual embeddings plus contextual BM25 2.9% (49%), and adding reranking 1.9% (67%).
+    On a 200-document knowledge base measuring whether the relevant chunk lands in the top 20: embeddings alone fail 5.7% of the time, contextual embeddings 3.7% (a 35% reduction), contextual embeddings plus contextual BM25 2.9% (49%), and adding reranking 1.9% (67%).
 
-9. Why is contextual retrieval cheap despite being one LLM call per chunk?
+  </Accordion>
+  <Accordion title="9. Why is contextual retrieval cheap despite being one LLM call per chunk?">
 
-   Prompt caching. The whole document is the cacheable prefix and only the chunk varies between calls, so Anthropic reports about $1.02 per million document tokens. The header is generated once at index time, making it a capital cost rather than an operating one.
+    Prompt caching. The whole document is the cacheable prefix and only the chunk varies between calls, so Anthropic reports about $1.02 per million document tokens. The header is generated once at index time, making it a capital cost rather than an operating one.
 
-10. How does contextual retrieval differ from late chunking?
+  </Accordion>
+  <Accordion title="10. How does contextual retrieval differ from late chunking?">
 
     Late chunking embeds the whole document with a long-context model and pools the token embeddings per chunk boundary, so context enters the vector through the transformer. Contextual retrieval generates text and prepends it, so context enters through the input. The second works with any embedding model and any BM25 index and is inspectable; the first adds no storage and costs less at index time.
+
+  </Accordion>
+  <Accordion title="11. You want to swap the embedding model. What does the migration look like?">
+
+    There is no conversion. Vector spaces do not transfer across models or usually across versions, so the entire corpus must be re-embedded. Build the new index in a separate namespace beside the old one, score both on the golden set, flip the route only when the new one wins, and keep the old index until the switch is confirmed. A half-migrated index scores some chunks in the right space and some in the wrong one, which is not merely worse ranking but meaningless ranking.
+
+  </Accordion>
+  <Accordion title="12. What changes when you embed page images instead of extracted text?">
+
+    ColPali (arXiv:2407.01449) renders each page to an image, embeds it with a vision-language model as one vector per patch, and scores with ColBERT-style MaxSim. The ingestion pipeline's hardest problems, column order, scanned tables, figures, equations, stop being problems because nothing is parsed. Storage is the objection: tens of thousands of vectors per page, so it needs a cheap first-stage filter and quantization in front of it.
+
+  </Accordion>
+</Accordions>

@@ -1,6 +1,6 @@
 ---
 title: Query Transformation
-description: 'HyDE, query decomposition, step-back prompting, multi-query retrieval, and routing: turning a user question into the query your index can answer.'
+description: 'HyDE, decomposition, step-back prompting, multi-query, self-query, routing: turning a user question into the query your index can answer.'
 ---
 
 Users do not write retrieval queries. They write "why did it break again", "compare the two options", and "what's the limit". These are short, anaphoric, multi-part, and phrased nothing like the documents they should match.
@@ -9,7 +9,7 @@ Query transformation is the stage that turns one into the other. It costs an ext
 
 ---
 
-## The five techniques
+## The six techniques
 
 | Technique     | Transformation                                      | Extra calls | Best when                                          |
 | :------------ | :-------------------------------------------------- | :---------- | :------------------------------------------------- |
@@ -18,6 +18,7 @@ Query transformation is the stage that turns one into the other. It costs an ext
 | HyDE          | Generate a hypothetical answer, embed that          | 1           | Zero-shot, no relevance labels, conceptual queries |
 | Decomposition | Split a multi-part question into sub-queries        | 1 plus k    | Comparison, multi-hop, compound questions          |
 | Step-back     | Abstract to the underlying principle, retrieve both | 1           | Specific instances of a general rule               |
+| Self-query    | Pull dates, owners and types out into filters       | 1           | Questions whose meaning is a constraint            |
 
 Routing is orthogonal: classify the query and dispatch it to a different index, a different tool, or no retrieval at all.
 
@@ -156,6 +157,37 @@ A small fine-tuned classifier, or a single structured-output LLM call, costs a f
 
 ---
 
+## Self-query
+
+Some questions carry almost no lexical content and all of their meaning in constraints. "Refund policies from the legal team in the last quarter" needs a small search term and two filters, and dense similarity handles neither well: every refund document looks alike, and the date and team constraints are exact-match predicates a vector cannot enforce.
+
+Self-querying has an LLM read the question against the schema you expose and emit the structured part:
+
+```text
+schema given to the model
+  team            string   one of legal, finance, support
+  doc_type        string
+  effective_date  date
+  status          string
+
+query   "refund policies from the legal team in the last quarter"
+
+output  search_term: "refund policy"
+        filter: team == "legal"
+                and effective_date >= start_of_previous_quarter
+                and effective_date <  start_of_current_quarter
+```
+
+Three rules separate this from a clever prompt injection.
+
+- Expose only fields that exist, with their types and permitted values. A model that is not told the schema invents one, and an invented field name is either an error or a silently empty result set.
+- Validate the emitted filter before it reaches the index: parse it, check every field against the schema, reject anything that is not on the allowlist.
+- Keep the free-text term. The filter narrows the corpus, and similarity still has to rank whatever survives. Never let the model emit an `acl` predicate; permissions come from the session, not from the question.
+
+LangChain ships this as `SelfQueryRetriever`. The mechanism matters more than the class: it is the cheapest way to answer date-scoped, owner-scoped and version-scoped questions that vector similarity gets wrong no matter how good the embedding is.
+
+---
+
 ## Choosing
 
 | Symptom                                              | Try                        |
@@ -166,6 +198,7 @@ A small fine-tuned classifier, or a single structured-output LLM call, costs a f
 | Comparison and compound questions                    | Decomposition              |
 | Specific instances of a documented rule              | Step-back                  |
 | Multi-hop, where the second hop depends on the first | IRCoT                      |
+| The question is really a date or an owner            | Self-query                 |
 | Some queries waste a retrieval entirely              | Routing                    |
 | Everything, and you have budget for one change       | Rewriting plus multi-query |
 
@@ -175,46 +208,65 @@ Stacking all of them is a real pattern and a real latency problem. Four techniqu
 
 ## Interview questions
 
-1. Why transform the query at all?
+<Accordions>
+  <Accordion title="1. Why transform the query at all?">
 
-   Users write short, anaphoric, multi-part questions phrased unlike the corpus, and a perfect retriever pointed at the wrong query returns the wrong documents perfectly. Transformation costs one small LLM call and typically returns more than any index change.
+    Users write short, anaphoric, multi-part questions phrased unlike the corpus, and a perfect retriever pointed at the wrong query returns the wrong documents perfectly. Transformation costs one small LLM call and typically returns more than any index change.
 
-2. What are the two jobs of query rewriting?
+  </Accordion>
+  <Accordion title="2. What are the two jobs of query rewriting?">
 
-   Anaphora resolution, replacing "it" and "that" with the entity from conversation history, and vocabulary alignment, swapping the user's phrasing for the corpus's. The rewriter must restate the question rather than answer it, since invented facts drive retrieval toward documents matching those facts.
+    Anaphora resolution, replacing "it" and "that" with the entity from conversation history, and vocabulary alignment, swapping the user's phrasing for the corpus's. The rewriter must restate the question rather than answer it, since invented facts drive retrieval toward documents matching those facts.
 
-3. How does multi-query retrieval work and what does it cost?
+  </Accordion>
+  <Accordion title="3. How does multi-query retrieval work and what does it cost?">
 
-   Generate several paraphrases, retrieve for each, and fuse the lists with RRF. It works because one phrasing lands at one point in the embedding space and the correct chunk may be nearest a differently-worded point. The cost is `n + 1` retrieval round trips, so generate variants in one small-model call and batch the searches.
+    Generate several paraphrases, retrieve for each, and fuse the lists with RRF. It works because one phrasing lands at one point in the embedding space and the correct chunk may be nearest a differently-worded point. The cost is `n + 1` retrieval round trips, so generate variants in one small-model call and batch the searches.
 
-4. Explain HyDE and why it works.
+  </Accordion>
+  <Accordion title="4. Explain HyDE and why it works.">
 
-   Hypothetical Document Embeddings (Gao et al., arXiv:2212.10496) prompt an LLM to write a passage that would answer the query, then embed that passage instead of the query. The index contains documents, so document-shaped text lands in a dense region of the embedding space while a five-word question lands in a sparse one. It reports zero-shot dense retrieval without relevance labels beating zero-shot baselines.
+    Hypothetical Document Embeddings (Gao et al., arXiv:2212.10496) prompt an LLM to write a passage that would answer the query, then embed that passage instead of the query. The index contains documents, so document-shaped text lands in a dense region of the embedding space while a five-word question lands in a sparse one. It reports zero-shot dense retrieval without relevance labels beating zero-shot baselines.
 
-5. When does HyDE fail?
+  </Accordion>
+  <Accordion title="5. When does HyDE fail?">
 
-   When the model has no knowledge of the domain. The hypothetical document then invents plausible specifics, and those specifics steer retrieval toward documents sharing the invented terms. It is strong on general conceptual queries and weak on proprietary internal vocabularies.
+    When the model has no knowledge of the domain. The hypothetical document then invents plausible specifics, and those specifics steer retrieval toward documents sharing the invented terms. It is strong on general conceptual queries and weak on proprietary internal vocabularies.
 
-6. How does Query2doc differ from HyDE?
+  </Accordion>
+  <Accordion title="6. How does Query2doc differ from HyDE?">
 
-   It generates a pseudo-document and concatenates it with the original query for BM25 rather than replacing the query for dense search (Wang et al., arXiv:2303.07678). Keeping the original terms makes it more reliable, since a bad generation adds noise instead of removing signal.
+    It generates a pseudo-document and concatenates it with the original query for BM25 rather than replacing the query for dense search (Wang et al., arXiv:2303.07678). Keeping the original terms makes it more reliable, since a bad generation adds noise instead of removing signal.
 
-7. What is query decomposition and when is it required?
+  </Accordion>
+  <Accordion title="7. What is query decomposition and when is it required?">
 
-   Splitting a compound question into sub-queries, retrieving each, and composing one context. It is required for comparisons and multi-hop questions, which have no single nearest neighbour. Keep the original query in the composition prompt so the sub-answers are checked against what was asked.
+    Splitting a compound question into sub-queries, retrieving each, and composing one context. It is required for comparisons and multi-hop questions, which have no single nearest neighbour. Keep the original query in the composition prompt so the sub-answers are checked against what was asked.
 
-8. What is the difference between least-to-most prompting and IRCoT?
+  </Accordion>
+  <Accordion title="8. What is the difference between least-to-most prompting and IRCoT?">
 
-   Least-to-most (Zhou et al., arXiv:2205.10625) orders sub-questions by difficulty and feeds each answer into the next, but the sub-questions are all known upfront. IRCoT (Trivedi et al., arXiv:2212.10509) interleaves retrieval and reasoning, deciding the next step from what the previous retrieval returned, which is what genuine multi-hop needs.
+    Least-to-most (Zhou et al., arXiv:2205.10625) orders sub-questions by difficulty and feeds each answer into the next, but the sub-questions are all known upfront. IRCoT (Trivedi et al., arXiv:2212.10509) interleaves retrieval and reasoning, deciding the next step from what the previous retrieval returned, which is what genuine multi-hop needs.
 
-9. What is step-back prompting?
+  </Accordion>
+  <Accordion title="9. What is step-back prompting?">
 
-   Abstracting a specific question to the general principle behind it and retrieving on both (Zheng et al., arXiv:2310.06117). A specific physics problem embeds near other problems with the same numbers; the abstracted version embeds near the derivation that answers it. Reports gains on MMLU physics and TimeQA.
+    Abstracting a specific question to the general principle behind it and retrieving on both (Zheng et al., arXiv:2310.06117). A specific physics problem embeds near other problems with the same numbers; the abstracted version embeds near the derivation that answers it. Reports gains on MMLU physics and TimeQA.
 
-10. What is query routing and why is it worth the extra call?
+  </Accordion>
+  <Accordion title="10. What is query routing and why is it worth the extra call?">
 
     Classifying the query and dispatching it to the right treatment: no retrieval for small talk, dense plus sparse for factual lookup, decomposition for comparisons, Text-to-SQL for structured data, and a tool call for actionable requests. It costs milliseconds to a few hundred and saves a full retrieval on the queries that do not need one. It is also where per-source permissions are enforced before any search runs.
 
-11. Should you stack every transformation?
+  </Accordion>
+  <Accordion title="11. What is self-query retrieval and what makes it safe?">
+
+    The LLM reads the question against the metadata schema you expose and emits the structured part: a short search term plus filters on date, team, document type. It is safe only when the model sees the real fields and their permitted values, the emitted filter is validated against that schema before it reaches the index, and the free-text term is kept so similarity still ranks what survives. Never let the model write the `acl` predicate; permissions come from the session.
+
+  </Accordion>
+  <Accordion title="12. Should you stack every transformation?">
 
     Rarely. Four techniques at 400 ms each add 1.6 s before the first retrieval starts. Measure marginal gain per technique on your own eval set and keep only what earns its latency. Rewriting plus multi-query is the usual starting point.
+
+  </Accordion>
+</Accordions>

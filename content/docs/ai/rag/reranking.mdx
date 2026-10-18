@@ -158,50 +158,65 @@ with `lambda` around 0.7. See [Production Debugging](/ai/rag/production-debuggin
 
 ## Interview questions
 
-1. Why does a pipeline need a reranker if retrieval already scores relevance?
+<Accordions>
+  <Accordion title="1. Why does a pipeline need a reranker if retrieval already scores relevance?">
 
-   Retrieval must score a query against millions of chunks, so it scores them independently with a dot product and the query and document never attend to each other. A reranker scores a hundred candidates jointly with full cross-attention. The division of labour is recall first on a huge set, precision second on a small one.
+    Retrieval must score a query against millions of chunks, so it scores them independently with a dot product and the query and document never attend to each other. A reranker scores a hundred candidates jointly with full cross-attention. The division of labour is recall first on a huge set, precision second on a small one.
 
-2. What is the difference between a bi-encoder and a cross-encoder?
+  </Accordion>
+  <Accordion title="2. What is the difference between a bi-encoder and a cross-encoder?">
 
-   A bi-encoder encodes the query and the document separately and scores with a dot product, so document vectors can be precomputed and indexed. A cross-encoder concatenates query and document and runs one forward pass, producing a score at the `[CLS]` token. Nothing is precomputable, which is why it can only run on a small candidate set.
+    A bi-encoder encodes the query and the document separately and scores with a dot product, so document vectors can be precomputed and indexed. A cross-encoder concatenates query and document and runs one forward pass, producing a score at the `[CLS]` token. Nothing is precomputable, which is why it can only run on a small candidate set.
 
-3. Why are cross-encoders more accurate?
+  </Accordion>
+  <Accordion title="3. Why are cross-encoders more accurate?">
 
-   Term matching becomes contextual. A bi-encoder must fix the meaning of "bank" before it sees the query. A cross-encoder reads the query and the candidate together, so the same surface form resolves differently per candidate.
+    Term matching becomes contextual. A bi-encoder must fix the meaning of "bank" before it sees the query. A cross-encoder reads the query and the candidate together, so the same surface form resolves differently per candidate.
 
-4. What is a reasonable candidate count and what does it cost?
+  </Accordion>
+  <Accordion title="4. What is a reasonable candidate count and what does it cost?">
 
-   About 100. On one modern GPU with 512-token chunks, a 24-layer reranker over 100 candidates takes roughly 150 to 400 ms and typically moves nDCG@10 by 10 to 20 points. Two hundred candidates doubles the latency for a smaller gain.
+    About 100. On one modern GPU with 512-token chunks, a 24-layer reranker over 100 candidates takes roughly 150 to 400 ms and typically moves nDCG@10 by 10 to 20 points. Two hundred candidates doubles the latency for a smaller gain.
 
-5. How does LLM listwise reranking differ, and what is its main problem?
+  </Accordion>
+  <Accordion title="5. How does LLM listwise reranking differ, and what is its main problem?">
 
-   It gives the model the whole candidate list and asks for a permutation rather than scoring pairs independently, so candidates are compared against each other. RankGPT (arXiv:2304.09542) uses a sliding window to keep the list manageable. The main problem is position bias: the model systematically favours candidates near the start of the input list, so you shuffle and average or take a consensus over permutations.
+    It gives the model the whole candidate list and asks for a permutation rather than scoring pairs independently, so candidates are compared against each other. RankGPT (arXiv:2304.09542) uses a sliding window to keep the list manageable. The main problem is position bias: the model systematically favours candidates near the start of the input list, so you shuffle and average or take a consensus over permutations.
 
-6. What is permutation distillation?
+  </Accordion>
+  <Accordion title="6. What is permutation distillation?">
 
-   Training a small specialized reranker to reproduce GPT-4's listwise rankings, from RankGPT. It moves the quality of an LLM reranker into a model cheap enough to run on every query.
+    Training a small specialized reranker to reproduce GPT-4's listwise rankings, from RankGPT. It moves the quality of an LLM reranker into a model cheap enough to run on every query.
 
-7. Write the ColBERT scoring function and name it.
+  </Accordion>
+  <Accordion title="7. Write the ColBERT scoring function and name it.">
 
-   `S(q, d) = sum over i in |q| of max over j in |d| of (E_q_i . E_d_j^T)`. It is MaxSim, or late interaction: a maximum over document token positions, then a sum over query token positions. Queries and documents are encoded into per-token matrices independently, so the document side is still precomputable.
+    `S(q, d) = sum over i in |q| of max over j in |d| of (E_q_i . E_d_j^T)`. It is MaxSim, or late interaction: a maximum over document token positions, then a sum over query token positions. Queries and documents are encoded into per-token matrices independently, so the document side is still precomputable.
 
-8. What does the `max` in MaxSim buy you?
+  </Accordion>
+  <Accordion title={<>8. What does the <code>max</code> in MaxSim buy you?</>}>
 
-   Exact token-level matching inside a dense representation. "Which port does the API use" matches the document token "port" specifically instead of diluting into an averaged sentence vector. It recovers much of what BM25 gives you without leaving the embedding space.
+    Exact token-level matching inside a dense representation. "Which port does the API use" matches the document token "port" specifically instead of diluting into an averaged sentence vector. It recovers much of what BM25 gives you without leaving the embedding space.
 
-9. What is the storage cost of ColBERT and how is it mitigated?
+  </Accordion>
+  <Accordion title="9. What is the storage cost of ColBERT and how is it mitigated?">
 
-   A 300-token chunk needs 300 vectors instead of one, so the index runs one to two orders of magnitude larger. ColBERTv2 (arXiv:2112.01488) stores a centroid id plus a one-to-two-bit residual per dimension and trains on denoised supervision. PLAID (arXiv:2205.09707) scores against centroids first and only computes full MaxSim on survivors.
+    A 300-token chunk needs 300 vectors instead of one, so the index runs one to two orders of magnitude larger. ColBERTv2 (arXiv:2112.01488) stores a centroid id plus a one-to-two-bit residual per dimension and trains on denoised supervision. PLAID (arXiv:2205.09707) scores against centroids first and only computes full MaxSim on survivors.
 
-10. Can ColBERT be a first-stage retriever?
+  </Accordion>
+  <Accordion title="10. Can ColBERT be a first-stage retriever?">
 
     Yes, unlike a cross-encoder, because the document side is precomputed and indexed. In practice it is often used as the reranker over hybrid candidates, where it matches a cross-encoder at much lower latency since encoding already happened at index time.
 
-11. Reranker scores are not probabilities. How do you still use them as a gate?
+  </Accordion>
+  <Accordion title="11. Reranker scores are not probabilities. How do you still use them as a gate?">
 
     With a relative cutoff rather than an absolute one. If the best score is below a floor, or the top score is not clearly separated from the rest of the list, return "not found" instead of generating. It is uncalibrated across queries but reliable within one, which is enough for the decision.
 
-12. Why apply MMR after reranking?
+  </Accordion>
+  <Accordion title="12. Why apply MMR after reranking?">
 
     A reranker optimizes relevance, so the top five can be five near-duplicate chunks from the same section, wasting budget and reinforcing one source. `MMR(d) = lambda * rel(d) - (1 - lambda) * max_s sim(d, s)` with `lambda` around 0.7 penalizes similarity to already-selected chunks and restores diversity.
+
+  </Accordion>
+</Accordions>

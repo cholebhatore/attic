@@ -170,6 +170,32 @@ Retrieval operates on propositions, which are maximally embeddable because each 
 
 ---
 
+## Multi-question indexing
+
+Propositions restate what a chunk says. This restates what a chunk answers: an LLM writes the three to five questions the chunk can serve, only the questions get embedded, and every one of them points back at the same chunk.
+
+```text
+chunk  ->  LLM  ->  "What is the retry limit for the ingest worker?"
+                    "Which queue does the ingest worker consume from?"
+                    "How do I restart ingestion after an outage?"   <- embedded
+                                   |
+                                   +--> stored pointer -> raw chunk  <- sent to the LLM
+```
+
+It works because a user's question and the question a document answers are the same kind of text, while a user's question and a runbook paragraph are not. Much of what gets blamed on a weak embedding model is this mismatch: the index holds answers and the query is a question.
+
+| Property      | Value                                                           |
+| :------------ | :-------------------------------------------------------------- |
+| Retrieval     | Strong on question-shaped queries, weak on bare keyword lookups |
+| Index cost    | One LLM call per chunk, the same bill as contextual retrieval   |
+| Index size    | Several vectors per chunk instead of one                        |
+| Deduplication | Required; many generated questions resolve to one chunk         |
+| Failure mode  | A generated question the chunk cannot actually answer           |
+
+LlamaIndex ships the pattern as `MultiVectorRetriever`, whose docstore strategy decides whether a match returns the generated question, the source chunk, or both. Keep the questions as chunk metadata regardless: they are a readable audit trail of what the index believes each chunk is for, and they make a bad retrieval explainable.
+
+---
+
 ## Late chunking
 
 A different route to the same problem. Günther et al., arXiv:2409.04701: run the whole document through a long-context embedding model first, then mean-pool the token embeddings within each chunk boundary.
@@ -180,6 +206,29 @@ late     : embed(document) -> pool per chunk boundary
 ```
 
 The second gives every chunk vector the document's context at no extra retrieval cost, because the pooling happens after the transformer rather than before. It requires a long-context embedding model, such as jina-embeddings-v2 or v3 with 8,192 tokens. Contextual Retrieval achieves a similar effect with an LLM instead; see [Embeddings](/ai/rag/embeddings).
+
+---
+
+## RAPTOR
+
+Sarthi et al., arXiv:2401.18059. Chunk the document, embed the chunks, soft-cluster them with a Gaussian mixture, summarize each cluster, embed the summaries, and cluster again. Repeat until a cluster stops splitting. The corpus ends up as a tree with passages at the leaves and a whole-corpus overview at the root.
+
+```text
+level 2    [ corpus overview ]
+level 1    [ section summary ]      [ section summary ]
+level 0    [ chunk ] [ chunk ] [ chunk ] [ chunk ]        <- leaves
+```
+
+Index every level rather than only the leaves. A question about one clause matches a leaf; "what are the recurring themes across these policies?" matches a level-1 node that no single chunk could have answered and that flat retrieval has no way to produce.
+
+| Retrieval strategy | How it works                                          | When it wins                             |
+| :----------------- | :---------------------------------------------------- | :--------------------------------------- |
+| Collapsed tree     | One flat index over every node, take top-k across all | The simpler default, usually competitive |
+| Tree traversal     | Top-k at the root, then descend inside selected nodes | Questions that need breadth then depth   |
+
+The paper reports roughly 20 points of absolute accuracy over a chunk-only retrieval baseline on its question-answering suites, which include a corpus built for long fiction where the answer is a property of the whole document.
+
+The costs are the ones GraphRAG has. Indexing calls the LLM once per node at every level, so a corpus rebuild is expensive, and an inserted document changes clusters, which changes summaries, which invalidates part of the tree above it. Small, stable corpora with synthesis questions are where it pays; a corpus that updates hourly is where it does not.
 
 ---
 
@@ -199,46 +248,71 @@ The second gives every chunk vector the document's context at no extra retrieval
 
 `section_path` is the highest-value one relative to its cost. Prepending it to the text before embedding gives the vector the document structure, which is most of what contextual retrieval adds with an LLM call.
 
+Two of these are decided at ingest and cannot be fixed afterwards without a rebuild. `acl` should be required rather than defaulted, so a chunk with no permission set fails the document instead of shipping it publicly; [Production Debugging](/ai/rag/production-debugging) works through why post-filtering is not a substitute. And personal data should be redacted before it is embedded, because an embedded value is retrievable by anyone whose query happens to land near it, and no amount of prompt-level policy unsays a chunk that made it into context.
+
 ---
 
 ## Interview questions
 
-1. Why is chunking irreversible?
+<Accordions>
+  <Accordion title="1. Why is chunking irreversible?">
 
-   Retrieval operates on the chunk boundaries you created at index time. If a fact was split across two chunks, neither vector represents it well, and no embedding model, reranker, or prompt can recover it at query time. Changing the chunking means re-indexing the corpus.
+    Retrieval operates on the chunk boundaries you created at index time. If a fact was split across two chunks, neither vector represents it well, and no embedding model, reranker, or prompt can recover it at query time. Changing the chunking means re-indexing the corpus.
 
-2. What is the core granularity tradeoff?
+  </Accordion>
+  <Accordion title="2. What is the core granularity tradeoff?">
 
-   Small chunks embed precisely and retrieve well but reach the model without surrounding context. Large chunks carry context but average several topics into one vector, which retrieves poorly. Parent-child chunking is the standard resolution: index small, return large.
+    Small chunks embed precisely and retrieve well but reach the model without surrounding context. Large chunks carry context but average several topics into one vector, which retrieves poorly. Parent-child chunking is the standard resolution: index small, return large.
 
-3. What overlap fraction should you use and what does it cost?
+  </Accordion>
+  <Accordion title="3. What overlap fraction should you use and what does it cost?">
 
-   Ten to twenty percent. At 512 tokens with 64 overlap, storage grows by `k/(k-o)` = 1.14x. The benefit is that facts straddling a boundary are retrievable; the cost is that duplicated sentences can both rank in the top-k and waste budget. Above about 20% the duplication cost exceeds the boundary benefit.
+    Ten to twenty percent. At 512 tokens with 64 overlap, storage grows by `k/(k-o)` = 1.14x. The benefit is that facts straddling a boundary are retrievable; the cost is that duplicated sentences can both rank in the top-k and waste budget. Above about 20% the duplication cost exceeds the boundary benefit.
 
-4. How does recursive character chunking work?
+  </Accordion>
+  <Accordion title="4. How does recursive character chunking work?">
 
-   It tries separators in order of decreasing structural strength, typically paragraph, line, sentence, clause, word, character, and only falls through to the next when a piece is still above the size limit. A single piece too large for any separator recurses with the remaining list.
+    It tries separators in order of decreasing structural strength, typically paragraph, line, sentence, clause, word, character, and only falls through to the next when a piece is still above the size limit. A single piece too large for any separator recurses with the remaining list.
 
-5. When is semantic chunking worth the extra embedding cost?
+  </Accordion>
+  <Accordion title="5. When is semantic chunking worth the extra embedding cost?">
 
-   When the corpus has genuine topic shifts within documents, such as multi-topic reports or long web pages. It costs one embedding call per sentence at index time and underperforms on homogeneous text, where it either produces one enormous chunk or fragments arbitrarily.
+    When the corpus has genuine topic shifts within documents, such as multi-topic reports or long web pages. It costs one embedding call per sentence at index time and underperforms on homogeneous text, where it either produces one enormous chunk or fragments arbitrarily.
 
-6. What is parent-child chunking and what step do people forget?
+  </Accordion>
+  <Accordion title="6. What is parent-child chunking and what step do people forget?">
 
-   Index small child chunks for precise retrieval, then expand a hit to its larger parent before sending it to the model. The forgotten step is deduplication: if three children of one parent rank in the top ten, send that parent once and use the remaining slots for other parents.
+    Index small child chunks for precise retrieval, then expand a hit to its larger parent before sending it to the model. The forgotten step is deduplication: if three children of one parent rank in the top ten, send that parent once and use the remaining slots for other parents.
 
-7. What is the sentence window variant?
+  </Accordion>
+  <Accordion title="7. What is the sentence window variant?">
 
-   Retrieve a single sentence, then expand to `k` sentences on either side. It gives the finest retrieval granularity with a controllable context width and is a good default for narrative text, where the answer is usually one sentence and the surrounding two carry the qualification.
+    Retrieve a single sentence, then expand to `k` sentences on either side. It gives the finest retrieval granularity with a controllable context width and is a good default for narrative text, where the answer is usually one sentence and the surrounding two carry the qualification.
 
-8. What is proposition chunking and why is it expensive?
+  </Accordion>
+  <Accordion title="8. What is proposition chunking and why is it expensive?">
 
-   Chen et al. (arXiv:2312.06648) use a model to decompose passages into self-contained factual statements with pronouns resolved and context inlined. Each proposition contains exactly one idea, which is maximally embeddable. The cost is one LLM call per chunk at index time.
+    Chen et al. (arXiv:2312.06648) use a model to decompose passages into self-contained factual statements with pronouns resolved and context inlined. Each proposition contains exactly one idea, which is maximally embeddable. The cost is one LLM call per chunk at index time.
 
-9. What is late chunking?
+  </Accordion>
+  <Accordion title="9. What is late chunking?">
 
-   From arXiv:2409.04701: embed the whole document with a long-context model, then mean-pool the token embeddings within each chunk boundary. Each chunk vector inherits the document's context because pooling happens after the transformer. It needs a long-context embedding model and costs nothing extra at query time.
+    From arXiv:2409.04701: embed the whole document with a long-context model, then mean-pool the token embeddings within each chunk boundary. Each chunk vector inherits the document's context because pooling happens after the transformer. It needs a long-context embedding model and costs nothing extra at query time.
 
-10. Which metadata field gives the most retrieval value per unit of effort?
+  </Accordion>
+  <Accordion title="10. Which metadata field gives the most retrieval value per unit of effort?">
 
     `section_path`, the chain of headings above the chunk. Prepending it to the text before embedding injects document structure into the vector, which captures much of what contextual retrieval achieves with a per-chunk LLM call. `acl` is the one you cannot ship without.
+
+  </Accordion>
+  <Accordion title="11. What is multi-question indexing and what does it buy?">
+
+    An LLM writes the questions each chunk can answer, only those questions are embedded, and every vector points back at the original chunk. It works because a user query and a generated question are the same kind of text, while a query and a runbook paragraph are not. The cost is several vectors per chunk and a deduplication step at retrieval, since three of them can match the same document.
+
+  </Accordion>
+  <Accordion title="12. What is RAPTOR and when is it the wrong choice?">
+
+    Recursive clustering and summarization: embed chunks, soft-cluster them, summarize each cluster, embed the summaries, and repeat, then index every level of the resulting tree so both detail questions and corpus-wide synthesis questions have something to hit (arXiv:2401.18059). It is the wrong choice for a corpus that updates frequently, because an inserted document changes its cluster, which changes the summary, which invalidates the nodes above it.
+
+  </Accordion>
+</Accordions>
