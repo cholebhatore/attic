@@ -27,6 +27,26 @@ const config = {
         destination: '/archive/architecture',
         permanent: true,
       },
+      {
+        source: '/tracker',
+        destination: '/ai/curriculum',
+        permanent: false,
+      },
+      {
+        source: '/curriculum',
+        destination: '/ai/curriculum',
+        permanent: false,
+      },
+      {
+        source: '/ai-tracker',
+        destination: '/ai/curriculum',
+        permanent: false,
+      },
+      {
+        source: '/ai-engineering-tracker',
+        destination: '/ai/curriculum',
+        permanent: false,
+      },
     ];
   },
 };

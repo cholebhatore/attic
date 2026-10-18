@@ -1457,6 +1457,7 @@ function generateHTML() {
       background: var(--surface);
       border: 1px solid var(--border);
       color: var(--text-muted);
+      text-decoration: none;
       transition: var(--transition);
       user-select: none;
     }
@@ -2166,9 +2167,15 @@ function generateHTML() {
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>
           </svg>
-          AI Engineering Tracker
+          AI Engineering Curriculum
         </div>
         <div class="nav-actions">
+          <a href="/ai" target="_top" class="btn-secondary" title="Return to documentation">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m15 18-6-6 6-6"/>
+            </svg>
+            Docs
+          </a>
           <button class="btn-secondary" id="btn-export" title="Copy text summary to clipboard">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>
@@ -2332,7 +2339,7 @@ function generateHTML() {
                           ${
                             topic.url
                               ? `
-                            <a href="https://atticintic.vercel.app${topic.url}" target="_blank" rel="noopener noreferrer" class="doc-link-btn" onclick="event.stopPropagation();" title="Open documentation on atticintic.vercel.app">
+                            <a href="${topic.url}" target="_blank" rel="noopener noreferrer" class="doc-link-btn" onclick="event.stopPropagation();" title="Open documentation">
                               Read Page
                               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                                 <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
@@ -2766,6 +2773,13 @@ function generateHTML() {
 // Generate file
 const htmlContent = generateHTML();
 const rootPath = path.join(__dirname, '..', 'ai-engineering-toc.html');
+const publicPath = path.join(__dirname, '..', 'public', 'ai-curriculum.html');
+const legacyPublicPath = path.join(__dirname, '..', 'public', 'ai-engineering-tracker.html');
+const trackerPublicPath = path.join(__dirname, '..', 'public', 'tracker.html');
 
 fs.writeFileSync(rootPath, htmlContent, 'utf8');
+fs.writeFileSync(publicPath, htmlContent, 'utf8');
+fs.writeFileSync(legacyPublicPath, htmlContent, 'utf8');
+fs.writeFileSync(trackerPublicPath, htmlContent, 'utf8');
 console.log('Successfully created:', rootPath);
+console.log('Successfully created:', publicPath);
