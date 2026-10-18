@@ -1,0 +1,355 @@
+---
+title: Model Context Protocol
+description: 'The host-client-server triad, tools, resources and prompts, transports, authorization, and every spec revision from 2024-11-05 to 2026-07-28.'
+---
+
+MCP answers a question that function calling does not. Function calling is how a model asks for a tool. MCP is how an application finds out which tools exist, what their schemas are, and how to invoke them, without that plumbing being written once per model provider and once per integration.
+
+Anthropic released it in November 2024 and donated it to the newly formed Agentic AI Foundation under the Linux Foundation on 9 December 2025, co-founding that foundation with Block and OpenAI. OpenAI adopted MCP in March 2025, Google shipped it in Gemini and announced the Agent Development Kit with the companion A2A protocol in April 2025, and by 2026 every serious agent host speaks it. The analogy the launch post used was a USB-C port for AI: one connector, any peripheral.
+
+<Callout type="info">
+  ### Why the N times M problem is the whole argument
+
+Without a protocol, M hosts (Claude Desktop, Cursor, an internal chat app, a CI bot) each integrate N tool providers (Jira, Postgres, Sentry, a file store, a browser). That is M x N adapters, and every one of them breaks when either side changes shape. MCP moves the work to M + N: each host implements a client once, each provider implements a server once. This is the only reason MCP exists. Nothing it does is impossible with hand-written function definitions.
+
+</Callout>
+
+---
+
+## Function calling against MCP
+
+They are not alternatives. A working agent uses both, in this order.
+
+|                 | Function calling                               | MCP                                                   |
+| :-------------- | :--------------------------------------------- | :---------------------------------------------------- |
+| Answers         | "I want to call `search` with these arguments" | "Here is what `search` is, and here is how to run it" |
+| Lives in        | The model provider's API                       | Your application, between the host and the tool       |
+| Scope           | One model, one turn                            | Any model, any host, one server process               |
+| Schema author   | The developer writing the request              | The server, discovered at runtime                     |
+| Discovery       | None; you already knew the tool                | `tools/list`, optionally with change notifications    |
+| Execution       | Your code, wherever you put it                 | The server process, over JSON-RPC                     |
+| Argument format | Provider-specific wire shape                   | JSON-RPC 2.0 `tools/call`                             |
+| Transport       | HTTPS to an inference endpoint                 | stdio or Streamable HTTP                              |
+
+The sequence inside one turn:
+
+```text
+1. host  -> server : initialize (protocol version, capability exchange)
+2. host  -> server : tools/list
+3. host             : merge server tools into the model request's tool array
+4. host  -> model   : messages.create with tools
+5. model -> host    : tool_use block, name + JSON input
+6. host  -> server : tools/call with that name and input
+7. server -> host   : content blocks (text, image, resource)
+8. host             : tool_result into the next model request
+```
+
+Step 3 is the seam. The host translates an MCP tool descriptor into the provider's function-calling schema, so `inputSchema` becomes `input_schema` for Anthropic or `parameters` for OpenAI. Everything left of that seam is portable; everything right of it is provider code. See [Function Calling](/ai/agents/function-calling) for the per-provider shapes.
+
+---
+
+## The three roles
+
+| Role       | What it is                                                     | How many                | Owns                                                   |
+| :--------- | :------------------------------------------------------------- | :---------------------- | :----------------------------------------------------- |
+| **Host**   | The LLM application: Claude Desktop, Cursor, an in-house agent | 1 per user session      | Policy, consent UI, the model, the budget              |
+| **Client** | The protocol connector inside the host, holding one session    | Exactly 1 per server    | The JSON-RPC conversation, credentials for that server |
+| **Server** | A lightweight process exposing capabilities                    | 1 per capability domain | Tools, resources, prompts, and their execution         |
+
+The 1-to-1 pairing of client and server is a deliberate constraint, stated in the specification rather than left to taste. It keeps state negotiation simple, makes the permission boundary exactly one server wide, and means a compromised server cannot silently proxy to a second one behind the client's back.
+
+<Mermaid
+  chart={`
+flowchart LR
+    subgraph HOST["Host application"]
+        direction TB
+        M["Model"]
+        P["Policy and consent UI"]
+        C1["MCP client"]
+        C2["MCP client"]
+    end
+    S1["Server - Postgres"]
+    S2["Server - Sentry"]
+    DB[("Data")]
+    API[["Third-party API"]]
+    M --> P
+    P --> C1
+    P --> C2
+    C1 -->|one to one| S1
+    C2 -->|one to one| S2
+    S1 --> DB
+    S2 --> API
+`}
+/>
+
+Two consequences worth internalising. First, the client is not the model: the model never speaks MCP. It emits a tool call, and the host decides which client carries it. Second, a host with ten connected servers holds ten clients and ten independent authorizations, which is why least-privilege scoping is per-server and not per-app.
+
+---
+
+## Server primitives
+
+A server declares which of these it supports during capability negotiation, and can flag each list as dynamically changing.
+
+| Primitive     | Nature                             | Invocation                              | Control                                | Typical use                                   |
+| :------------ | :--------------------------------- | :-------------------------------------- | :------------------------------------- | :-------------------------------------------- |
+| **Tools**     | Model-controlled, can mutate state | `tools/call`                            | The model chooses                      | Query a database, open a ticket, deploy       |
+| **Resources** | Application-controlled, read-only  | `resources/read`, `resources/subscribe` | The host or user chooses               | Files, schemas, records, a paginated URI list |
+| **Prompts**   | User-controlled                    | `prompts/get`                           | The user chooses, e.g. a slash command | Templated, parameterised instruction blocks   |
+
+The three-way split on _who triggers it_ is the design, not incidental wording. A resource is data you decide to put in context. A tool is an action the model decides to take. A prompt is a template the human selected.
+
+`resources/list` returning URIs is what makes resources usable by a host with no bespoke UI: a file tree, a table of schemas, a list of dashboards. Content comes back as text or base64 blobs with a declared MIME type, and `resources/templates/list` exposes RFC 6570 URI templates so the host can construct valid URIs instead of guessing them.
+
+**Annotations** (added 2025-06-18) let a server label a tool with hints: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. A host can use these to gate parallel execution or auto-approve read-only calls. Treat them as claims, not guarantees, because a malicious server is free to label a delete endpoint read-only. Confirmation decisions belong in host policy keyed on the tool's actual identity, not on a hint the server volunteered.
+
+---
+
+## Client primitives
+
+The direction most integrators miss: the server can call the host.
+
+| Primitive                | What the server asks for                    | Status                             |
+| :----------------------- | :------------------------------------------ | :--------------------------------- |
+| `sampling/createMessage` | "Run this completion for me, on your model" | Deprecated in 2026-07-28           |
+| `elicitation/create`     | "Ask the user this structured question"     | Current; URL mode added 2025-11-25 |
+| `roots/list`             | "What filesystem scope should I respect?"   | Deprecated in 2026-07-28           |
+
+Elicitation is the one to know. It is how a server requests a missing argument mid-execution with a JSON Schema the host renders as a form, and since 2025-06-18 a server can ask for structured input rather than one free-text string. `url` mode (2025-11-25) hands the user a browser to complete an out-of-band flow, which is how servers do interactive auth without embedding a credential form.
+
+Sampling was the most ambitious primitive: a server borrowing the host's model for inference. It never got broad adoption, and the 2026-07-28 revision deprecated it along with roots and logging. If you are evaluating a tutorial that leans on sampling, check the revision it was written against.
+
+---
+
+## Lifecycle
+
+Every session runs the same handshake, and every capability the peer has is decided here.
+
+```text
+initialize          -> protocolVersion, capabilities, clientInfo
+notifications       -> initialized
+(normal operation)  -> tools/list, tools/call, resources/read, ...
+(goodbye)           -> transport close
+```
+
+Three rules fall out of it. The client declares its capabilities and the server declares its own, so a server cannot assume it may elicit. The protocol version is negotiated, not assumed, which is how one host binary talks to servers written against 2025-03-26 and 2026-07-28 at once. And no request other than `initialize` may precede initialization.
+
+Before 2026-07-28 a session had an identity: `Mcp-Session-Id` in a response header, and the server could push notifications onto a long-lived stream. The 2026-07-28 revision removed sessions to make the core stateless, added `server/discover`, and introduced **Multi Round-Trip Requests** (MRTR) so an interaction that needs input from the caller is expressed as a repeatable request/response exchange rather than state held on a server. That is a deployment story: a stateless core means any instance behind a load balancer can serve any request, and you no longer need sticky routing or shared session storage to scale a remote MCP server.
+
+---
+
+## Transports
+
+| Transport           | Shape                                                                                      | Use when                              | Notes                                                                                                    |
+| :------------------ | :----------------------------------------------------------------------------------------- | :------------------------------------ | :------------------------------------------------------------------------------------------------------- |
+| **stdio**           | Spawn the server as a subprocess; newline-delimited JSON on stdin, responses on stdout     | Local tool, same machine, single user | The default for desktop hosts. Stdout must carry protocol messages only; SDKs log to stderr              |
+| **Streamable HTTP** | One HTTP endpoint; `POST` for requests, optional `Accept: text/event-stream` for streaming | Remote or shared server               | Carries `Mcp-Session-Id` in pre-2026 revisions; Origin validated with 403 on a mismatch since 2025-11-25 |
+| HTTP + SSE (legacy) | Two endpoints, a permanent SSE GET stream                                                  | Nothing                               | Deprecated, superseded by Streamable HTTP in 2025-03-26                                                  |
+
+stdio is simpler than it looks and has one trap: any library that prints to stdout corrupts the stream. A stray `print()` in a tool implementation is an unparseable frame on the wire.
+
+Streamable HTTP replaced the original dual-endpoint design because the old one needed a long-lived connection that serverless and load-balanced deployments could not hold. One endpoint that either returns plain JSON or upgrades to a stream per call is much easier to run behind ordinary infrastructure.
+
+---
+
+## Authorization
+
+Remote servers need real auth, and the protocol's answer moved fast. The 2025-06-18 revision classified MCP servers as **OAuth 2.1 resource servers**, made RFC 8707 resource indicators the way a token gets bound to an audience, and turned the security best-practices document into mandatory requirements.
+
+The attacks this closes are specific:
+
+| Attack              | Mechanism                                                                                                                                           | Defense                                                                                                               |
+| :------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------- |
+| **Token theft**     | A malicious server impersonates an honest one to capture the bearer token sent to it                                                                | Audience binding via RFC 8707: the token is only valid for the resource it names                                      |
+| **Confused deputy** | A multi-tenant server accepts a token, then uses its own static credentials to fetch the caller's data, so tenant A's request reads tenant B's rows | Validate that the token's audience and subject match the upstream call; never substitute the server's own credentials |
+| **Mix-up**          | An authorization server issues a token for the wrong client during dynamic registration                                                             | RFC 9207 issuer validation, required in 2026-07-28                                                                    |
+| **Session hijack**  | Guess or replay a session id                                                                                                                        | Origin checks (403 on mismatch since 2025-11-25), credential binding                                                  |
+
+The confused deputy case is the one that bites in practice, because it is not a protocol bug and not a code vulnerability. It is what happens when the authorization on the MCP hop and the authorization on the backend hop are treated as the same check. They are not, and the server sits in the middle holding both.
+
+Dynamic client registration is deprecated in favour of **Client ID Metadata Documents** (CIMD, introduced 2025-11-25), where a client publishes its metadata at an HTTPS URL it controls and presents that URL as its identifier. It also means an MCP host with many servers no longer needs a registration round per server.
+
+---
+
+## The revision history
+
+`2024-11-05` is the initial revision. Each later one is dated, and a peer declares which it speaks.
+
+| Revision       | What it added or changed                                                                                                                                                                                                                                                                                                      |
+| :------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **2024-11-05** | Initial spec. JSON-RPC 2.0, tools, resources, prompts, stdio and HTTP+SSE transports, OAuth as an optional extension                                                                                                                                                                                                          |
+| **2025-03-26** | HTTP server authorization, Streamable HTTP replacing HTTP+SSE, `annotations` and structured MIME fields on resources                                                                                                                                                                                                          |
+| **2025-06-18** | Structured tool output, OAuth 2.1 plus RFC 8707 resource indicators as mandatory for HTTP servers, elicitation, tool annotations, removal of JSON-RPC batching, security requirements made mandatory                                                                                                                          |
+| **2025-11-25** | OIDC discovery, icons on tools and resources, incremental scope consent, URL elicitation, sampling with tools, CIMD, experimental tasks, JSON Schema 2020-12, 403 on invalid Origin; governance formalized with working groups and SDK tiering                                                                                |
+| **2026-07-28** | Largest revision since launch: stateless core with sessions removed, `server/discover`, Multi Round-Trip Requests, header-based routing, OpenTelemetry trace context, deterministic tool ordering, cacheable results. Deprecates roots, sampling, logging, SSE subscriptions, HTTP+SSE, and OAuth dynamic client registration |
+
+Two things to say about this in an interview. First, the churn is itself the argument for version negotiation: hosts must handle servers written against any revision. Second, the direction is unmistakable. 2024 was a desktop protocol with optional auth. 2026 is a web-scale, stateless, observably-traced protocol with mandatory OAuth and formal governance. That is the shape of any protocol that got used more than it was designed.
+
+---
+
+## Writing a server
+
+Python, using the official SDK's high-level surface. The `FastMCP` helper came from Jeremy Lowin's standalone project, was donated, and is now the ergonomic layer of the official `mcp` package.
+
+```python
+from mcp.server.fastmcp import FastMCP, Context
+from mcp.types import ToolAnnotations
+
+mcp = FastMCP("ticket-triage")
+
+@mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False),
+)
+def list_open_tickets(team: str, limit: int = 25) -> list[dict]:
+    """Return open tickets for one team, newest first.
+
+    Args:
+        team: Team slug, e.g. "payments".
+        limit: Maximum tickets, 1..100.
+    """
+    rows = store.query(
+        "SELECT id, title, priority FROM tickets "
+        "WHERE team = %s AND state = 'open' "
+        "ORDER BY created_at DESC LIMIT %s",
+        (team, max(1, min(limit, 100))),
+    )
+    return [dict(r) for r in rows]  # list[dict], one entry per ticket
+
+
+@mcp.resource("tickets://team/{team}/open")
+def open_tickets_resource(team: str) -> str:
+    """Live view of a team's queue, readable without a tool call."""
+    return render_text_table(list_open_tickets(team))
+
+
+@mcp.prompt()
+def triage(team: str) -> str:
+    """Slash-command template the user selects."""
+    return (
+        f"Triage {team}'s open queue. Group by priority, "
+        "flag anything customer-facing older than 3 days."
+    )
+
+
+if __name__ == "__main__":
+    mcp.run()  # stdio; mcp.run(transport="streamable-http") for remote
+```
+
+The tool `description` is the routing signal the model reads, exactly as in plain function calling. A docstring that describes the table rather than the job produces a model that calls it wrong. Everything in the weak-versus-strong description table in [Function Calling](/ai/agents/function-calling) applies here and is more consequential, because on MCP the description was written by someone you have never met.
+
+What the example does not do is the actual work of a production server: authenticate the caller (the token's subject, not the client's), scope the query to that subject, enforce a row and byte ceiling on the result, and return a structured error rather than a stack trace.
+
+---
+
+## The rest of the field
+
+MCP is not the only protocol, and picking between them is a question about the axis you are on.
+
+|                | MCP                                     | A2A                                           | Vendor tool APIs                             |
+| :------------- | :-------------------------------------- | :-------------------------------------------- | :------------------------------------------- |
+| Connects       | Agent to tools and data                 | Agent to agent                                | Agent to one platform's tools                |
+| Peer           | Capability provider                     | A peer with its own reasoning                 | The vendor's own service                     |
+| Unit exchanged | Tool call, resource, prompt             | Task, with artifacts and lifecycle state      | Function call                                |
+| Governance     | Agentic AI Foundation, Linux Foundation | Linux Foundation (contributed 2025)           | Single vendor                                |
+| Use when       | One agent, many integrations            | Two or more autonomous systems negotiate work | One provider, few tools, no portability need |
+
+A2A answers the question MCP deliberately left out. MCP connects a model to tools; it says nothing about two agents talking. They compose: an agent can consume MCP servers and expose itself as an A2A peer.
+
+---
+
+## What goes wrong
+
+| Failure                          | Symptom                                                                               | Fix                                                                                                           |
+| :------------------------------- | :------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------------------------------------ |
+| Tool-count explosion             | 200 tools across 12 servers, routing accuracy collapses, tokens burned on definitions | Curate per-agent tool allow-lists; see [Agent Anatomy](/ai/agents/agent-anatomy) on skills as the alternative |
+| Trusted-marketplace servers      | A server's `description` contains instructions that steer the model                   | Treat server metadata as untrusted input; [Agent Security](/ai/agents/agent-security)                         |
+| Prompt injection via tool output | Retrieved content from a server carries hidden instructions                           | Provenance-tag observations, never execute instructions from a result                                         |
+| Over-privileged server           | A read-only assistant can delete rows because the server exposes `delete_record`      | One server per capability domain, credentials scoped at the backend                                           |
+| Confused deputy                  | Cross-tenant reads under a legitimate login                                           | Audience-bound tokens, subject propagated to the upstream call                                                |
+| Version skew                     | `initialize` succeeds, then `tools/call` fails on schema shape                        | Negotiate the version, gate features on capabilities                                                          |
+| Schema-on-error                  | Malformed arguments return a 500 the model cannot learn from                          | Return input validation as a tool execution error the model sees                                              |
+| stdout pollution                 | Intermittent unparseable frames from a stdio server                                   | Log to stderr, never stdout                                                                                   |
+| Unbounded results                | One `tools/call` returns 4 MB, blows the context                                      | Enforce truncation and pagination server-side                                                                 |
+
+The last two are the least glamorous and the most common. An MCP server is a network service with a language model as its caller, and the model can only recover from an error it is shown.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What does MCP add over function calling?">
+
+    Function calling is the model's way of requesting a tool invocation inside one provider's API. MCP is the protocol by which a host discovers which tools exist, learns their schemas, and invokes them, so a tool provider writes one server instead of one adapter per host and per model.
+
+  </Accordion>
+  <Accordion title="2. Name the three MCP roles and the constraint between two of them.">
+
+    Host (the LLM application), client (the protocol connector inside it), server (the process exposing capabilities). Each client pairs with exactly one server, which keeps state negotiation simple and makes the permission boundary one server wide.
+
+  </Accordion>
+  <Accordion title="3. Distinguish the three server primitives by who controls them.">
+
+    Tools are model-controlled and may mutate state. Resources are application-controlled and read-only. Prompts are user-controlled templates, typically surfaced as a slash command.
+
+  </Accordion>
+  <Accordion title="4. What is the N-by-M argument for MCP?">
+
+    M hosts integrating N providers is M x N adapters without a protocol and M + N with one, because each host implements a client once and each provider a server once.
+
+  </Accordion>
+  <Accordion title="5. What are MCP annotations and why can a host not trust them?">
+
+    Hints on a tool such as `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`, added in 2025-06-18. A server can label anything read-only, so gating decisions must key on the tool's real identity in host policy, not on the server's self-report.
+
+  </Accordion>
+  <Accordion title="6. Which direction do client primitives run, and give two examples.">
+
+    Server to host. Elicitation asks the host to prompt the user for structured input mid-execution; sampling let a server borrow the host's model for a completion. Roots asked for the filesystem scope to respect. Sampling and roots were deprecated in 2026-07-28.
+
+  </Accordion>
+  <Accordion title="7. What happened to sessions in the protocol, and why does it matter for deployment?">
+
+    The 2026-07-28 revision removed sessions and made the core stateless, replacing held state with Multi Round-Trip Requests and `server/discover`. Without session state, any instance behind a load balancer can answer any request, so remote servers need neither sticky routing nor shared session storage.
+
+  </Accordion>
+  <Accordion title="8. Which transports exist and what replaced HTTP+SSE?">
+
+    stdio (newline-delimited JSON over a subprocess) and Streamable HTTP (one endpoint, POST for requests, optional SSE per call). Streamable HTTP arrived in 2025-03-26 and replaced the two-endpoint HTTP+SSE transport from 2024-11-05 because long-lived streams do not survive serverless and load-balanced hosting.
+
+  </Accordion>
+  <Accordion title="9. Explain the confused deputy problem in an MCP server.">
+
+    A multi-tenant server authenticates the caller, then makes the upstream API call with its own static credentials. Every request then runs with the server's full privileges, so one tenant can read another's data. The fix is validating the token's audience and subject and propagating that subject to the backend instead of substituting server credentials.
+
+  </Accordion>
+  <Accordion title="10. How does MCP bind tokens to an audience, and which attack does that block?">
+
+    It classifies servers as OAuth 2.1 resource servers and requires RFC 8707 resource indicators, so a token names the resource it is valid for. That blocks token theft by a malicious server that impersonates an honest one to capture a bearer token.
+
+  </Accordion>
+  <Accordion title="11. What is elicitation and what is its URL mode?">
+
+    A server-initiated request for structured user input, described by a JSON Schema the host renders. URL mode, added in 2025-11-25, instead hands the user a browser URL for an out-of-band flow, which suits interactive authorization without a server embedding a credential form.
+
+  </Accordion>
+  <Accordion title="12. A host has twelve servers attached and tool routing has become unreliable. What do you do?">
+
+    Cut the tool surface: per-agent allow-lists so each agent sees only the tools it can use for its job, move reference knowledge out of tools into skills or resources, and enforce result-size ceilings. More tools is a routing problem before it is a cost problem.
+
+  </Accordion>
+  <Accordion title="13. Which MCP spec revisions should you be able to name, and by what change?">
+
+    2024-11-05 initial. 2025-03-26 Streamable HTTP and authorization. 2025-06-18 OAuth 2.1 with resource indicators, elicitation, structured output, annotations. 2025-11-25 icons, URL elicitation, CIMD, tasks, formal governance. 2026-07-28 stateless core, MRTR, deprecations of roots, sampling and logging.
+
+  </Accordion>
+  <Accordion title="14. Who governs MCP now, and why is that relevant to adopting it?">
+
+    The Agentic AI Foundation under the Linux Foundation, to which Anthropic donated the protocol on 9 December 2025 while co-founding it with Block and OpenAI. Vendor-neutral governance plus adoption by competing labs is the durability argument.
+
+  </Accordion>
+  <Accordion title="15. MCP versus A2A: which do you need?">
+
+    MCP connects an agent to tools and data. A2A connects agents to each other, exchanging tasks with artifacts and lifecycle state. Use MCP for integrations, A2A when peers negotiate work autonomously, and both when an agent consumes tools and exposes itself as a peer.
+
+  </Accordion>
+</Accordions>

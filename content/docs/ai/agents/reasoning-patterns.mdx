@@ -1,0 +1,234 @@
+---
+title: Reasoning Patterns
+description: 'ReAct, Plan-and-Execute, and Reflexion, plus self-refine, tree search, and the evidence on when self-critique helps.'
+---
+
+A loop tells the agent when to act. A reasoning pattern tells it how to decide what to do next. Three patterns cover almost everything in production, and the choice between them is mostly about when the plan gets made and who checks the work.
+
+---
+
+## The three
+
+| Pattern              | When the plan is made                       | Feedback source                                            | Cost                                            |
+| :------------------- | :------------------------------------------ | :--------------------------------------------------------- | :---------------------------------------------- |
+| **ReAct**            | One step at a time, interleaved with acting | The environment, via observations                          | Low per step, high step count                   |
+| **Plan-and-Execute** | Up front, then executed                     | The plan, plus optional replanning                         | Fewer model calls, brittle if the plan is wrong |
+| **Reflexion**        | Any of the above                            | A critique of a completed attempt, stored for the next try | Multiplies by the number of attempts            |
+
+They compose. The standard production shape is Plan-and-Execute on the outside, ReAct inside each step, and Reflexion around the whole attempt when a verifier exists.
+
+---
+
+## ReAct
+
+From _ReAct: Synergizing Reasoning and Acting in Language Models_ (Yao et al., arXiv:2210.03629). The idea is to interleave a reasoning trace with an action, so the reasoning is grounded in observations rather than running free.
+
+The original format is text:
+
+```text
+Question: Which magazine was started first, Arthur or the Saturday Evening Post?
+
+Thought 1: I need to find the founding year of each magazine.
+Action 1: search["Arthur magazine founding year"]
+Observation 1: Arthur was founded in 1845.
+
+Thought 2: Now I need the founding year of the Saturday Evening Post.
+Action 2: search["Saturday Evening Post founding year"]
+Observation 2: The Saturday Evening Post was founded in 1897.
+
+Thought 3: 1845 is earlier than 1897.
+Action 3: finish["Arthur"]
+```
+
+The paper's contribution was showing that reasoning-only chains hallucinate facts they could have looked up, and acting-only chains flounder without a plan. Interleaving fixed both: the trace gives the action a reason, and the observation gives the next thought a fact.
+
+### ReAct now
+
+Explicit `Thought / Action / Observation` text parsing is legacy. Function calling replaced it: the reasoning happens in the model's output or in a reasoning block, the action is a structured tool call, and the observation is a tool result. What survives is the _interleaving_, which is now just what an agent loop does by default.
+
+|                      | Text-format ReAct (2022) | Function-calling agent (now)      |
+| :------------------- | :----------------------- | :-------------------------------- |
+| Action syntax        | Parsed from prose        | Structured, schema-enforced       |
+| Parse failures       | Common                   | Rare, grammar-constrained         |
+| Reasoning visibility | Always in the transcript | Optional; may be a separate block |
+| Parallel actions     | Not expressible          | Native                            |
+
+The one thing worth preserving from the text format is a written rationale before each action. Even with structured calls, asking for a one-line reason in the same turn makes the trajectory legible when you debug it, and reduces actions the model cannot justify.
+
+---
+
+## Plan-and-Execute
+
+Make the whole plan first, then execute it, optionally replanning when a step fails.
+
+```text
+Plan:
+  1. Find the Q3 revenue figure in the finance report.
+  2. Find the Q3 headcount in the HR system.
+  3. Compute revenue per employee.
+  4. Compare against the Q2 figure from the same two sources.
+  5. Write the summary.
+
+Execute step 1...
+```
+
+Variants in the literature:
+
+| Method                                             | Idea                                                                                                               |
+| :------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------- |
+| **Plan-and-Solve** (Wang et al., arXiv:2305.04091) | Prompt the model to devise a plan before solving, as a zero-shot alternative to chain-of-thought                   |
+| **ReWOO** (Xu et al., arXiv:2305.18323)            | Plan all tool calls up front, then execute them without interleaving reasoning, which cuts token use substantially |
+| **LLM+P** (Liu et al., arXiv:2304.11477)           | The LLM writes a PDDL problem file and a classical planner solves it                                               |
+
+ReWOO's cost argument is the practical one. ReAct re-sends the whole transcript every step; a plan that fixes all tool calls up front lets you send the plan once and execute in parallel. On tasks where the plan is knowable, that is most of the saving.
+
+### The trade
+
+|                     | ReAct             | Plan-and-Execute                        |
+| :------------------ | :---------------- | :-------------------------------------- |
+| Model calls         | One per step      | One for the plan, fewer for execution   |
+| Adapts to surprises | Yes, every step   | Only if replanning is implemented       |
+| Wasted work         | Low               | High if step 2 invalidates steps 3 to 9 |
+| Parallelizable      | Rarely            | Often                                   |
+| Debuggability       | Read the trace    | Read the plan, then the trace           |
+| Best for            | Exploratory tasks | Tasks with a knowable decomposition     |
+
+Replanning is what makes Plan-and-Execute viable on real tasks. Without it, the first unexpected observation poisons the rest of the plan. The usual shape is: execute until a step fails or returns something the plan did not anticipate, then call the planner again with the partial results, rather than restarting from scratch.
+
+---
+
+## Reflexion
+
+From _Reflexion: Language Agents with Verbal Reinforcement Learning_ (Shinn et al., arXiv:2303.11366). The agent attempts a task, gets feedback, writes a verbal critique of what went wrong, stores that critique in episodic memory, and tries again with it in context.
+
+Three components:
+
+| Component           | Role                                                          |
+| :------------------ | :------------------------------------------------------------ |
+| **Actor**           | Produces the trajectory                                       |
+| **Evaluator**       | Scores the attempt, ideally from an external signal           |
+| **Self-Reflection** | Turns the score and the trajectory into a short verbal lesson |
+
+The lesson is written to memory and prepended to the next attempt. Nothing about the weights changes, which is why the paper calls it verbal reinforcement learning: the gradient is replaced by prose.
+
+The reported headline result is 91 percent pass@1 on HumanEval with GPT-4, against 80.1 percent for the same model without reflection.
+
+### The condition that makes it work
+
+Reflexion needs a signal. In the paper's experiments the signal is external and reliable: unit tests for code, an exact-match answer for question answering, a task success flag for decision making.
+
+_Huang et al., arXiv:2401.16755_ (_Large Language Models Cannot Self-Correct Reasoning Yet_) is the necessary counterpoint. When the model grades its own reasoning with no external signal, self-correction reliably fails to improve accuracy and often degrades it, because the model talks itself out of correct answers.
+
+| Feedback source                                    | Does reflection help?        |
+| :------------------------------------------------- | :--------------------------- |
+| Unit tests, compiler, type checker                 | Yes, strongly                |
+| Exact match against a known answer                 | Yes                          |
+| A separate verifier model with ground truth access | Yes                          |
+| A judge model grading plausibility                 | Sometimes, and it can invert |
+| The same model re-reading its own reasoning        | No, often harmful            |
+
+The interview-relevant summary: Reflexion is a loop around an evaluator, not a loop around the model. If you cannot name the evaluator, you do not have Reflexion.
+
+---
+
+## Related patterns
+
+| Pattern              | Mechanism                                                                           | Paper                           |
+| :------------------- | :---------------------------------------------------------------------------------- | :------------------------------ |
+| **Self-Refine**      | Generate, critique, revise in one model, iteratively                                | Madaan et al., arXiv:2303.17651 |
+| **CRITIC**           | Critique against external tool output rather than introspection                     | Gou et al., arXiv:2305.11738    |
+| **Tree of Thoughts** | Explore multiple branches with lookahead and backtracking                           | Yao et al., arXiv:2305.10601    |
+| **LATS**             | Monte Carlo tree search over agent actions, using environment feedback as the value | Zhou et al., arXiv:2310.04406   |
+| **Voyager**          | Build a growing skill library in an open-ended environment                          | Wang et al., arXiv:2305.16291   |
+
+CRITIC is Self-Refine done correctly for tool-use settings: the critique is grounded in a tool result, which puts it on the "helps" side of the table above.
+
+Tree search is a different axis. ReAct and Plan-and-Execute both commit to one trajectory; ToT and LATS explore several and pick. That costs a multiple of the tokens and is worth it only when a single attempt is likely to fail and a verifier can rank attempts. Test-time compute scaling makes this trade more common, see [RLVR and Reasoning](/ai/reinforcement-learning/rlvr-and-reasoning).
+
+---
+
+## Choosing
+
+| Situation                               | Pattern                                            |
+| :-------------------------------------- | :------------------------------------------------- |
+| Steps depend on previous results        | ReAct                                              |
+| Decomposition is knowable in advance    | Plan-and-Execute                                   |
+| Tool calls are independent and numerous | Plan-and-Execute with parallel execution           |
+| A cheap reliable verifier exists        | Add Reflexion                                      |
+| No verifier, but the task is hard       | Tree search or best-of-n with a judge, and measure |
+| No verifier and no budget for search    | ReAct, and do not add self-critique                |
+| Long-running open-ended task            | Plan-and-Execute plus a skill library              |
+
+The default is ReAct. Move to Plan-and-Execute when you can see the decomposition and the token bill hurts. Add Reflexion only when you can point at the evaluator.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What does ReAct interleave, and why?">
+
+    A reasoning trace with an action. Reasoning-only chains hallucinate facts they could have looked up, and acting-only chains flounder without a plan; the observation grounds the next thought in a fact.
+
+  </Accordion>
+  <Accordion title="2. Where does ReAct come from?">
+
+    Yao et al., arXiv:2210.03629, evaluated on question answering, fact verification, and interactive decision tasks.
+
+  </Accordion>
+  <Accordion title="3. What replaced the text-format Thought/Action/Observation parsing?">
+
+    Function calling. Actions are structured tool calls with schema enforcement, and observations are tool results. The interleaving survives; the prose parsing does not.
+
+  </Accordion>
+  <Accordion title="4. Why keep a written rationale per action even with structured tool calls?">
+
+    It makes the trajectory legible when debugging and reduces actions the model cannot justify.
+
+  </Accordion>
+  <Accordion title="5. What is the main advantage of Plan-and-Execute over ReAct?">
+
+    Fewer model calls and parallelizable execution. ReWOO (arXiv:2305.18323) fixes all tool calls up front so the transcript is not re-sent every step.
+
+  </Accordion>
+  <Accordion title="6. What is the main risk of Plan-and-Execute, and the fix?">
+
+    A wrong plan wastes every downstream step. The fix is replanning on unexpected observations, using partial results rather than restarting.
+
+  </Accordion>
+  <Accordion title="7. Name Reflexion's three components.">
+
+    The Actor produces the trajectory, the Evaluator scores it, and the Self-Reflection module turns the score and trajectory into a verbal lesson stored in episodic memory.
+
+  </Accordion>
+  <Accordion title="8. Why is Reflexion called verbal reinforcement learning?">
+
+    Because the weight update is replaced by prose. The lesson from a failed attempt is written to memory and prepended to the next attempt; no gradient is involved.
+
+  </Accordion>
+  <Accordion title="9. What result is Reflexion known for on HumanEval?">
+
+    91 percent pass@1 with GPT-4, against 80.1 percent for the same model without reflection (arXiv:2303.11366).
+
+  </Accordion>
+  <Accordion title="10. Under what condition does self-correction fail?">
+
+    When there is no external signal. Huang et al., arXiv:2401.16755 show that models grading their own reasoning do not reliably improve and often talk themselves out of correct answers.
+
+  </Accordion>
+  <Accordion title="11. What distinguishes CRITIC from Self-Refine?">
+
+    CRITIC grounds the critique in external tool output instead of introspection, which puts it on the side of the feedback table where reflection helps.
+
+  </Accordion>
+  <Accordion title="12. When is tree search over agent actions worth its cost?">
+
+    When a single attempt is likely to fail and a verifier can rank attempts. ToT (arXiv:2305.10601) and LATS (arXiv:2310.04406) explore multiple trajectories and pay a multiple of the tokens.
+
+  </Accordion>
+  <Accordion title="13. What is the default recommendation?">
+
+    ReAct. Move to Plan-and-Execute when the decomposition is visible and the token bill hurts, and add Reflexion only when you can name the evaluator.
+
+  </Accordion>
+</Accordions>

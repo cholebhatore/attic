@@ -1,0 +1,283 @@
+---
+title: Multi-Agent Topologies
+description: 'Supervisor and orchestrator-worker patterns, handoffs, parallel sub-agents, deterministic routing, and the context that makes them work.'
+---
+
+A single agent with good tools usually beats a team of agents with mediocre ones. Multi-agent systems earn their complexity when one context window is not enough, when subtasks want different prompts or different models, or when work must run concurrently.
+
+The reason to split is context. Every extra observation, tool result, and intermediate attempt occupies the same window as the reasoning, so an agent doing five subtasks carries four subtasks' noise while working on the fifth. A sub-agent gets a clean window scoped to one task and returns only the distilled result.
+
+---
+
+## The topologies
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph SUP["Supervisor"]
+        direction TB
+        S1["Supervisor"] --> W1["Worker A"]
+        S1 --> W2["Worker B"]
+        S1 --> W3["Worker C"]
+    end
+    subgraph HIE["Hierarchical"]
+        direction TB
+        M["Manager"] --> T1["Team lead"]
+        M --> T2["Team lead"]
+        T1 --> P1["Specialist"]
+        T1 --> P2["Specialist"]
+    end
+    subgraph SWM["Swarm"]
+        direction TB
+        H1["Agent 1"] -->|handoff| H2["Agent 2"]
+        H2 -->|handoff| H3["Agent 3"]
+        H3 -->|handoff| H1
+    end
+    subgraph PAR["Parallel"]
+        direction TB
+        F["Fan out"] --> R1["Researcher 1"]
+        F --> R2["Researcher 2"]
+        F --> R3["Researcher 3"]
+        R1 --> AGG["Aggregate"]
+        R2 --> AGG
+        R3 --> AGG
+    end
+`}
+/>
+
+| Topology                | Control                                                         | Best for                                       | Main cost                             |
+| :---------------------- | :-------------------------------------------------------------- | :--------------------------------------------- | :------------------------------------ |
+| **Single agent**        | Model picks tools each step                                     | Most tasks                                     | Context grows with every step         |
+| **Supervisor**          | Central router dispatches to workers                            | Distinct skills, shared goal                   | Supervisor becomes the bottleneck     |
+| **Orchestrator-worker** | Orchestrator decomposes, workers execute, orchestrator combines | Variable-width tasks such as research          | Coordination overhead and duplication |
+| **Hierarchical**        | Supervisor of supervisors                                       | Large domains with clear teams                 | Latency stacks per level              |
+| **Handoff / swarm**     | Peer agents transfer control directly                           | Conversational routing, such as support triage | No global view; loops between peers   |
+| **Parallel sub-agents** | Same prompt, independent subtasks, then aggregate               | Wide read-only search                          | Cost multiplies by fan-out            |
+| **Pipeline**            | Fixed sequence of stages                                        | Known workflows                                | Not adaptive                          |
+
+The pipeline is worth naming because it is the right answer more often than teams expect. If the stages are known in advance, code should sequence them, not a model.
+
+---
+
+## Supervisor
+
+One agent owns the conversation and dispatches work. Workers see only what the supervisor hands them, return a result, and hold no authority over the next step.
+
+```python
+def supervisor(messages):
+    while True:
+        step = model.decide(messages, tools=WORKER_TOOLS + [FINISH])
+        if step.name == "finish":
+            return step.input["answer"]
+        result = run_worker(step.input["worker"], step.input["task"])
+        messages.append(tool_result(step.id, result))
+```
+
+Three design decisions matter:
+
+| Decision             | Options                                             | Trade                                                                                |
+| :------------------- | :-------------------------------------------------- | :----------------------------------------------------------------------------------- |
+| What the worker sees | Full history, or only the task string               | Full history costs tokens and re-introduces the noise you split to remove            |
+| What returns         | Final answer only, or the whole trajectory          | Trajectory returns are how context leaks back into the supervisor                    |
+| Worker state         | Stateless per call, or persistent across dispatches | Persistent lets a worker accumulate context, which is often what you wanted to avoid |
+
+The most common failure is a worker that returns its entire trace, including every failed tool call, into the supervisor's window. The split bought nothing. Workers should return a short answer plus the evidence that supports it, and the supervisor should treat that as a tool result.
+
+---
+
+## Orchestrator-worker
+
+Anthropic's multi-agent research system ([published 13 June 2025](https://www.anthropic.com/engineering/multi-agent-research-system)) is the reference implementation of this shape for open-ended search. Three roles: a **lead agent** that plans and delegates, **subagents** that each search a scoped subquestion in their own context window, and a **CitationAgent** that walks the findings to attach sources. Subagents run concurrently, and the lead agent iterates on the plan with what came back.
+
+Their reported numbers, which are the ones to quote in an interview:
+
+- The multi-agent system outperformed single-agent Claude Opus 4 by **90.2 percent** on their internal research eval
+- Parallel subagent execution **cut research time by up to 90 percent** for complex queries, because breadth-first search serializes badly
+- Token cost: agents use about **4x** the tokens of a chat interaction, and multi-agent systems about **15x**
+
+The last figure is the whole design conversation. Multi-agent costs fifteen times a chat on every run, so it pays only where separate windows and parallelism buy more than that. The same post names the corresponding anti-pattern directly: spawning 50 subagents for a query that needed one.
+
+| Task shape                                  | Single or multi?                                      |
+| :------------------------------------------ | :---------------------------------------------------- |
+| Narrow lookup, few steps                    | Single                                                |
+| Breadth-first: "survey these eight sources" | Multi, parallel subagents                             |
+| Deep, sequential, tightly coupled reasoning | Single; splitting loses the thread                    |
+| Mixed skills: search, then code, then write | Multi, with a specialist per skill                    |
+| Anything with a hard latency budget         | Single, unless the subtasks are genuinely independent |
+
+A further finding from that system worth keeping: the lead agent needs to give subagents task objectives that are specific enough to prevent duplicated work, because overlapping subagents each search the same ground and the aggregate is no better for it.
+
+---
+
+## Handoffs
+
+Peer-to-peer transfer of control, with no central router. Popularized by OpenAI's Agents SDK, where a handoff is expressed as a tool call whose effect is changing which agent responds next.
+
+```python
+@tool
+def transfer_to_billing() -> Agent:
+    """Transfer this conversation to the billing agent. Use for invoices, charges, and refunds."""
+    return billing_agent
+
+triage_agent.handoffs = [transfer_to_billing, transfer_to_technical]
+```
+
+|                     | Supervisor                      | Handoff                             |
+| :------------------ | :------------------------------ | :---------------------------------- |
+| Global view         | Yes, held by the router         | Distributed, and often lost         |
+| Adding a specialist | Edit the router                 | Edit whichever peers can reach it   |
+| Loop risk           | Low                             | Real: two agents can bounce control |
+| Latency             | Every hop returns to the router | Direct                              |
+| Good for            | Task decomposition              | Conversational triage               |
+
+Handoffs need the same guardrail as any loop: a cap on transfers, and a detector for A-to-B-to-A cycles. With no supervisor holding state, nobody notices the bounce unless you instrument for it.
+
+---
+
+## Parallel sub-agents
+
+The cheapest multi-agent win, because it changes only one thing: several workers run at once on independent subtasks, then a reducer combines them.
+
+```python
+subtasks = planner(task)                        # 1 call
+results  = await gather(*(run(w, s) for s in subtasks))   # N in parallel
+answer   = reducer(task, results)               # 1 call
+```
+
+| Concern               | Handling                                                                          |
+| :-------------------- | :-------------------------------------------------------------------------------- |
+| Duplicate work        | Make the decomposition disjoint, or accept overlap and dedup at reduce            |
+| Contradictory results | The reducer must rank and reconcile, not concatenate                              |
+| Partial failure       | Return what succeeded and mark the gaps, rather than failing the run              |
+| Cost                  | Bound `N` explicitly; an unplanned fan-out over 40 sources is a bill              |
+| Ordering              | Only matters if the reducer is order-sensitive or the subtasks share a rate limit |
+
+Parallelism works for reads and falls apart for writes. Independent agents editing the same artifact will conflict, and no amount of prompt design fixes the race. Writes stay sequential, or need a lock.
+
+---
+
+## Deterministic routing
+
+Not everything needs a model deciding. Routing on a rule is faster, cheaper, and testable.
+
+| Route                          | Mechanism                                                                  |
+| :----------------------------- | :------------------------------------------------------------------------- |
+| By task type from a classifier | One cheap model call, or the model's own structured output                 |
+| By explicit user selection     | A dropdown, a slash command, a channel                                     |
+| By metadata                    | Tenant, plan, language, document type                                      |
+| By content match               | Regex or file extension on the input                                       |
+| By model choice                | Cheap model for simple requests, escalated when a confidence signal is low |
+
+The escalation pattern is worth naming: run the cheap model first, and hand off to the expensive one when a checkable signal says it struggled. Signals that work include a self-reported confidence field that is genuinely calibrated, a validator rejecting the output, or a retrieval score below threshold. Signals that do not work include asking the model whether it is confident.
+
+Anthropic's routing guidance in [_Building Effective Agents_](https://www.anthropic.com/research/building-effective-agents) makes the general point: if the categories are known in advance, classify first and route, rather than giving one agent every tool and hoping it picks well.
+
+---
+
+## Shared state
+
+How agents communicate is a design choice with real consequences.
+
+| Mechanism         | Description                                | Risk                                         |
+| :---------------- | :----------------------------------------- | :------------------------------------------- |
+| Message passing   | Return text from worker to caller          | Lossy; the worker's evidence may not survive |
+| Shared scratchpad | A common store both read and write         | Race conditions, no ownership                |
+| Typed schema      | The worker must return a defined structure | Requires a schema per task type              |
+| Graph state       | Framework-managed keys merged per step     | Coupling to the framework                    |
+| Filesystem        | Agents coordinate through files            | Auditable, and slow                          |
+
+Typed returns are the single biggest reliability improvement. A worker that returns free prose forces the supervisor to parse it, which is a second place for errors to appear. A worker that returns `{findings, sources, confidence}` can be validated, logged, and diffed.
+
+| Shared-state rule                     | Why                                                                 |
+| :------------------------------------ | :------------------------------------------------------------------ |
+| One writer per key                    | Two agents writing the same key produces a merge you did not design |
+| Every hop gets an id                  | Without it you cannot trace which worker produced a wrong claim     |
+| Reads are cheap, writes are journaled | Debugging needs the history, not the final value                    |
+
+---
+
+## When not to
+
+Reasons to stay with one agent:
+
+| Reason                  | Note                                                                                 |
+| :---------------------- | :----------------------------------------------------------------------------------- |
+| Latency                 | Each hop is at least one model call plus its tool work                               |
+| Cost                    | Multi-agent runs at about 15x the tokens of a chat, so a wrong topology is expensive |
+| Coordination bugs       | Ambiguous delegation produces duplicated or skipped work                             |
+| Debugging surface       | Tracing across agents is much harder than across steps                               |
+| You can name the stages | Then write them as a pipeline in code                                                |
+
+A frequent pattern in production incidents: a supervisor that delegates vaguely ("research this topic") gets back work that does not answer the actual question, and cannot correct it because it never saw the subtask's evidence. The fix is usually a more specific delegation and a typed return, not another agent.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What is the primary reason to split an agent into multiple agents?">
+
+    Context isolation. Each sub-agent gets a clean window scoped to one task and returns only the distilled result, instead of carrying the noise of every other subtask.
+
+  </Accordion>
+  <Accordion title="2. Describe the supervisor pattern and its main failure mode.">
+
+    A central router dispatches to stateless workers and owns the conversation. The common failure is a worker returning its full trace, which re-imports the noise the split was meant to remove.
+
+  </Accordion>
+  <Accordion title="3. Orchestrator-worker against supervisor: what differs?">
+
+    The orchestrator explicitly decomposes the task into variable-width subtasks and later combines results, whereas a supervisor routes step by step. Orchestrator-worker suits parallel, breadth-first work.
+
+  </Accordion>
+  <Accordion title="4. What is a handoff and where does it break down?">
+
+    Direct peer transfer of control, expressed as a tool call that changes which agent responds. It breaks down on loops, since with no router holding state two agents can bounce control and nobody notices unless you cap transfers.
+
+  </Accordion>
+  <Accordion title="5. Why do parallel sub-agents work for reads but not writes?">
+
+    Independent readers cannot conflict. Independent writers editing the same artifact will race, and that is not fixable by prompting.
+
+  </Accordion>
+  <Accordion title="6. Give four ways to route deterministically.">
+
+    Classifier output, explicit user selection, metadata such as tenant or language, and content match such as a regex or file extension.
+
+  </Accordion>
+  <Accordion title="7. What is the escalation pattern and which signal does not work?">
+
+    Run a cheap model first, then hand to an expensive one when a checkable signal indicates struggle. Asking the model whether it is confident is the signal that does not work.
+
+  </Accordion>
+  <Accordion title="8. Why is a typed return better than free prose from a worker?">
+
+    Free prose forces the supervisor to parse it, adding a second error site. A typed structure can be validated, logged, and diffed, and it preserves the evidence the claim rests on.
+
+  </Accordion>
+  <Accordion title="9. When is a pipeline the right topology?">
+
+    When the stages are known in advance. Code should sequence them rather than a model, which removes a whole class of coordination bugs.
+
+  </Accordion>
+  <Accordion title="10. What does multi-agent cost in tokens?">
+
+    Far more than a single agent. Anthropic reports agents using about 4x the tokens of a chat and multi-agent systems about 15x, so the topology only pays when separate windows and parallelism buy more than that.
+
+  </Accordion>
+  <Accordion title="11. How do you prevent duplicated work in parallel sub-agents?">
+
+    Make the decomposition disjoint, or accept overlap and deduplicate at the reduce step.
+
+  </Accordion>
+  <Accordion title="12. What must a reducer do beyond concatenation?">
+
+    Rank and reconcile. Parallel sub-agents produce overlapping and sometimes contradictory findings, and concatenating them passes the contradiction to the user.
+
+  </Accordion>
+  <Accordion title="13. What does a filesystem-as-shared-state design buy you?">
+
+    Auditability. Every agent's write is a file with a timestamp and a diff, at the cost of slower access and manual locking.
+
+  </Accordion>
+</Accordions>

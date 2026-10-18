@@ -1,0 +1,353 @@
+---
+title: Function Calling
+description: 'How a model requests a tool: schema design, the description as routing signal, parallel calls, strict mode, streaming, and error handling.'
+---
+
+Function calling is the mechanism by which a model says _I want this function run with these arguments_, and nothing more. The model never executes anything. It produces structured text that your runtime interprets as a request, then your code decides whether to honor it.
+
+Every agent framework, MCP included, sits on top of this. It is worth knowing the raw API shape before the abstractions, because when a tool call goes wrong in production the framework will not tell you which of the three possible layers broke.
+
+---
+
+## The two formats
+
+### Anthropic Messages API
+
+```python
+import anthropic, json
+
+client = anthropic.Anthropic()
+
+tools = [{
+    "name": "get_weather",
+    "description": "Get current conditions for a single city. Use for weather questions only.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "city": {"type": "string", "description": "City name, e.g. 'Berlin'"},
+            "units": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+        },
+        "required": ["city"],
+    },
+}]
+
+resp = client.messages.create(
+    model="claude-sonnet-4-5", max_tokens=1024,
+    tools=tools, messages=[{"role": "user", "content": "Weather in Tokyo?"}],
+)
+
+# resp.stop_reason == "tool_use"; resp.content is a list of blocks
+for block in resp.content:
+    if block.type == "tool_use":
+        print(block.id, block.name, block.input)   # dict, already parsed
+```
+
+Continuing the conversation requires two appended messages: the assistant turn echoed back, then a user message holding the result.
+
+```python
+messages.append({"role": "assistant", "content": resp.content})
+messages.append({
+    "role": "user",
+    "content": [{"type": "tool_result", "tool_use_id": tu.id,
+                 "content": json.dumps(payload)}],
+})
+```
+
+### OpenAI Chat Completions
+
+```python
+from openai import OpenAI
+import json
+
+client = OpenAI()
+
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get current conditions for a single city.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "city": {"type": "string"},
+                "units": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+            },
+            "required": ["city", "units"],
+        },
+        "strict": True,
+    },
+}]
+
+resp = client.chat.completions.create(
+    model="gpt-4.1", tools=tools,
+    messages=[{"role": "user", "content": "Weather in Tokyo?"}],
+)
+
+msg = resp.choices[0].message
+for tc in msg.tool_calls:
+    print(tc.id, tc.function.name, json.loads(tc.function.arguments))
+```
+
+Echoing back is the same idea with different keys: append `msg` itself, then `{"role": "tool", "tool_call_id": tc.id, "content": json.dumps(payload)}` for each call.
+
+|                | Anthropic                           | OpenAI                          |
+| :------------- | :---------------------------------- | :------------------------------ |
+| Schema field   | `input_schema`                      | `function.parameters`           |
+| Wrapper        | none                                | `{"type": "function", ...}`     |
+| Stop signal    | `stop_reason == "tool_use"`         | `finish_reason == "tool_calls"` |
+| Arguments      | parsed `dict`                       | JSON **string** you must parse  |
+| Result carrier | `user` message, `tool_result` block | dedicated `tool` role           |
+| Block id       | `tool_use_id`                       | `tool_call_id`                  |
+
+The string-versus-dict difference is the one that bites during migration. A handler that assumes a dict throws on every OpenAI response, and one that calls `json.loads` throws on every Anthropic response.
+
+<Callout type="warn">
+  ### Never forward unvalidated arguments to an executor
+
+The model produced that JSON, not your user. It can name a tool that does not exist, omit a required field, put a string where a number belongs, or ask for `limit=1000000`. Validate the name against the registry and the arguments against the schema before anything runs, and treat validation failure as a normal outcome with a defined path back to the model.
+
+</Callout>
+
+---
+
+## The description is the routing signal
+
+With 20 tools available, the model picks one by reading 20 short strings and matching the request against them. The description is that match. The name contributes too, but the description does the work.
+
+| Weak                                   | Strong                                                                                                                 | Why                                                |
+| :------------------------------------- | :--------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------- |
+| `"search"`                             | `"Search the internal policy documents. Use for rules, compliance, and process questions. Does not return code."`      | Names the corpus, the trigger, and the boundary    |
+| `"A tool that does things with files"` | `"Read a text file from the workspace and return its full contents. Cannot read directories or binary files."`         | Tells the model what a successful call looks like  |
+| `"Fetch data"`                         | `"Fetch order status by order ID. Returns shipped, cancelled, or pending. Requires an order ID in the form ORD-XXXX."` | Gives the value format so arguments come out right |
+
+Three rules that follow from how the model reads the text:
+
+- Describe when to use it, not what it does internally. Implementation detail is noise; trigger conditions are signal.
+- State exclusions when two tools overlap. Ambiguity between `search_docs` and `search_web` produces wrong selection more reliably than a missing parameter.
+- Put format constraints in the description where the schema cannot express them. JSON Schema has no natural way to say "order IDs look like `ORD-1234`", so the model needs the sentence.
+
+The `name` matters for a subtler reason: it appears in the schema, in the model output, and in your logs. Names that collide with other tools, or that read like the model's own generated tokens, produce selection errors that are miserable to debug.
+
+---
+
+## Parallel calls
+
+A model can emit several calls in one turn, which turns one round trip into several tools at once.
+
+```json
+{
+  "stop_reason": "tool_use",
+  "content": [
+    { "type": "tool_use", "id": "tu_1", "name": "get_weather", "input": { "city": "Tokyo" } },
+    { "type": "tool_use", "id": "tu_2", "name": "get_weather", "input": { "city": "Berlin" } }
+  ]
+}
+```
+
+Every id needs a matching tool result in the next message. Returning results for only some of them leaves the transcript unbalanced, and the next request is rejected by the API rather than silently tolerated.
+
+| Setting          | Anthropic                                                         | OpenAI                       |
+| :--------------- | :---------------------------------------------------------------- | :--------------------------- |
+| Allow by default | yes                                                               | yes                          |
+| Disable          | `tool_choice: {"type": "any", "disable_parallel_tool_use": true}` | `parallel_tool_calls: false` |
+
+Parallelism helps wall clock and hurts ordering. Two calls that both write state, issued together, will race. The practical rule from [The Agent Loop](/ai/agents/agent-loop): run independent reads concurrently, keep writes sequential.
+
+---
+
+## Tool choice
+
+Sometimes you want the model to answer, sometimes you want it to call a specific tool, and sometimes you want the call to be the only acceptable output.
+
+| Intent              | Anthropic                         | OpenAI                                              |
+| :------------------ | :-------------------------------- | :-------------------------------------------------- |
+| Model decides       | `{"type": "auto"}`                | `"auto"`                                            |
+| Never call          | `{"type": "none"}`                | `"none"`                                            |
+| Must call something | `{"type": "any"}`                 | `"required"`                                        |
+| Must call this one  | `{"type": "tool", "name": "..."}` | `{"type": "function", "function": {"name": "..."}}` |
+
+Forcing a specific tool is the cheapest way to make an agent step deterministic. Extract-then-format pipelines usually want the second call forced rather than hoped for, because the failure mode of an unprompted tool call is a fluent answer that skipped the database.
+
+The trap: forcing a tool on every turn produces a loop where the model calls it again after seeing the result, because it was told to. Force on step one, switch to `auto` afterward.
+
+---
+
+## Strict mode and schema-constrained generation
+
+Models produce near-valid JSON, and near is not valid. Strict mode closes that gap.
+
+OpenAI's structured outputs requires all of:
+
+- `strict: true` on the function
+- `additionalProperties: false` on every object
+- every property listed in `required`, with optionality expressed as a union type such as `["string", "null"]`
+- every property given a `description`
+
+That last requirement is the tell: the schema is being used as a generation constraint, and a field with no description gives the grammar nothing to work with.
+
+Under the hood this is grammar-constrained decoding, the same machinery behind JSON-schema output in [Serving Engines Compared](/ai/inference/serving-engines). At each decode step the runtime computes which tokens remain legal under the schema and masks the rest, so the output is valid by construction rather than by luck. The prompt-side treatment is in [Schema enforcement in Context Engineering](/ai/rag/context-engineering).
+
+The consequence for latency: constrained decoding changes the output distribution, and a masked step costs extra runtime work. On long JSON payloads it is usually a good trade. On prose it is not worth doing.
+
+---
+
+## Streaming tool calls
+
+Tool arguments arrive as fragments and must be accumulated before parsing.
+
+| Provider  | Event carrying arguments | Shape                                                               |
+| :-------- | :----------------------- | :------------------------------------------------------------------ |
+| Anthropic | `input_json_delta`       | `partial_json` string per event, terminated by `content_block_stop` |
+| OpenAI    | `delta.tool_calls`       | `function.arguments` fragments, distinguished by `index`            |
+
+```python
+# OpenAI streaming accumulation
+calls = {}
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    for tc in delta.tool_calls or []:
+        slot = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+        slot["id"] |= tc.id or ""
+        slot["name"] |= tc.function.name or ""
+        slot["args"] |= tc.function.arguments or ""
+
+for slot in calls.values():
+    payload = json.loads(slot["args"])      # parse once, at the end
+```
+
+Two mistakes worth naming. Parsing partial JSON per token gives you a syntax error on every chunk after the first. And ignoring `index` interleaves two parallel calls into one unusable string, which is exactly the failure that looks like a model bug in your logs.
+
+With streaming plus strict mode, the model has committed to a valid JSON prefix before any argument is complete. If you want to reject a call, do it after accumulation, not mid-stream.
+
+---
+
+## Returning results
+
+The result becomes the model's next observation, so its shape is part of the prompt design.
+
+| Practice                               | Reason                                                                                                          |
+| :------------------------------------- | :-------------------------------------------------------------------------------------------------------------- |
+| Return JSON, not prose reprs           | A Python repr with `dtype: torch.float32` noise wastes tokens and invites parse errors                          |
+| Return the smallest thing that answers | A 40 KB array to ask for a mean is a context budget problem, see [Context Budgeting](/ai/rag/context-budgeting) |
+| Truncate with a visible marker         | Silent truncation reads as a malformed result and gets retried                                                  |
+| Include a status field                 | `{"ok": false, "error": "..."}` beats a bare exception string                                                   |
+| Keep error text actionable             | "city not found: Tokto" tells the model to fix the argument                                                     |
+| Never paste untrusted content raw      | Wrap it and label it as data, see [Agent Security](/ai/agents/agent-security)                                   |
+
+The last row is the security-relevant one. A tool result is the main channel by which outside text reaches the model, and a retrieved page or an email body is a prompt-injection vector whether you intended that or not.
+
+---
+
+## Structured output against function calling
+
+Same machinery, different question. Structured output asks for data as the answer; function calling asks for data as a request to act.
+
+|                  | Function calling                    | Structured output                             |
+| :--------------- | :---------------------------------- | :-------------------------------------------- |
+| Purpose          | Request an action                   | Shape the final answer                        |
+| Typical response | tool call, then more turns          | content, one turn                             |
+| Tool loop        | runs                                | does not                                      |
+| Good for         | retrieval, writes, external effects | extraction, classification, routing decisions |
+
+The overlap is where people get confused. You can define one tool whose only purpose is to be the output schema, and forcing it gives you a reliable typed answer from a chat-completions endpoint. Some providers expose this directly as a `response_format` or a structured-output parameter, which is the same grammar-constrained decoding under a different name.
+
+---
+
+## Testing tool selection
+
+Tool selection is a classifier: context in, tool name and arguments out. Evaluate it as one.
+
+| Metric                     | Definition                                                  |
+| :------------------------- | :---------------------------------------------------------- |
+| Selection accuracy         | correct tool chosen, over cases with exactly one right tool |
+| Argument validity          | arguments parse and satisfy the schema                      |
+| Argument correctness       | values match the expected payload, not merely the type      |
+| Precision on no-call cases | correctly declining to call anything                        |
+| Recall                     | calling at all when a call was required                     |
+
+No-call cases matter disproportionately. An agent that fires `search_web` on a question the database already answers produces a confident wrong answer with a citation from the wrong source, which is worse than no citation.
+
+Full treatment on [RAG and Agent Evaluation](/ai/agents/rag-and-agent-eval).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={'1. What does the model do when it "calls a function"?'}>
+
+    It emits structured text naming a function and arguments. Execution happens in your runtime. The model has no ability to run anything.
+
+  </Accordion>
+  <Accordion title={<>2. Why is the <code>description</code> field described as the routing signal?</>}>
+
+    With many tools available the model selects by matching the request against the set of descriptions. It is also where you state exclusions and value formats that the schema cannot express.
+
+  </Accordion>
+  <Accordion title="3. Anthropic returns arguments as a parsed dict. What does OpenAI return, and why does it matter?">
+
+    A JSON string in `function.arguments`, which you must parse. A migration that assumes one format throws on every response from the other.
+
+  </Accordion>
+  <Accordion title="4. What must you do with every id in a parallel tool-call turn?">
+
+    Return a result for each. Partial results leave the transcript unbalanced and the next request is rejected by the API.
+
+  </Accordion>
+  <Accordion title="5. How do you keep parallel calls safe?">
+
+    Run independent reads concurrently, keep writes sequential. Two writes issued in the same turn race, since the model assumed a single ordered sequence.
+
+  </Accordion>
+  <Accordion title="6. Which schema constraints does strict mode require?">
+
+    `strict: true`, `additionalProperties: false` on every object, all properties in `required` with optionality expressed as a type union, and a description on every property.
+
+  </Accordion>
+  <Accordion title="7. Why does strict mode require descriptions on every property?">
+
+    Because the schema is used as a generation grammar. A field with no description gives the constraint nothing semantic to condition on.
+
+  </Accordion>
+  <Accordion title="8. What is happening under the hood in constrained decoding?">
+
+    At each decode step the runtime computes the set of still-legal tokens under the grammar and masks the rest, so output is valid by construction.
+
+  </Accordion>
+  <Accordion title="9. How do you accumulate streamed tool arguments, and what are the two common mistakes?">
+
+    Buffer fragments and parse once at the end. Mistakes: parsing partial JSON per chunk, and ignoring `index`, which interleaves two parallel calls into one unusable string.
+
+  </Accordion>
+  <Accordion title={<>10. When would you force a specific tool instead of using <code>auto</code>?</>}>
+
+    When a step must be deterministic, such as the second call in an extract-then-format pipeline. The failure mode of an unprompted tool call is a fluent answer that skipped the data.
+
+  </Accordion>
+  <Accordion title="11. What is the trap in forcing a tool on every turn?">
+
+    The model calls it again after seeing the result because it was told to call something. Force on the first step, then switch to auto.
+
+  </Accordion>
+  <Accordion title="12. Function calling against structured output: same or different?">
+
+    Same machinery, different intent. Function calling emits a request to act and continues the loop; structured output shapes the final answer in one turn.
+
+  </Accordion>
+  <Accordion title="13. Which tool-selection metrics do you report?">
+
+    Selection accuracy, argument validity, argument correctness, recall, and precision on no-call cases.
+
+  </Accordion>
+  <Accordion title="14. Why do no-call cases deserve their own metric?">
+
+    Because spuriously firing a search tool on a question the database already answers yields a confident wrong answer with a citation from the wrong source.
+
+  </Accordion>
+  <Accordion title="15. What should a tool result never be?">
+
+    Raw untrusted content. It is the main channel for outside text to reach the model, so it needs wrapping and labeling as data.
+
+  </Accordion>
+</Accordions>

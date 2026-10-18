@@ -1,0 +1,293 @@
+---
+title: Evaluation Metrics and Benchmarks
+description: 'BLEU, ROUGE, BERTScore, perplexity and exact match, then MMLU, GSM8K, HumanEval and SWE-bench as fixed benchmarks and what each hides.'
+---
+
+The first two of the four evaluation pillars are automatic reference metrics and standard benchmarks. Both are cheap, both are reproducible, and both are routinely misread. They answer "did this output resemble the expected output" and "did this model score on a fixed suite", which are not the questions an agent team usually has.
+
+Know them anyway, because they are the baseline everything else is compared against, and because most shipped dashboards still lead with them.
+
+---
+
+## Pillar 1: automatic reference metrics
+
+Given a candidate output and one or more references, score the overlap.
+
+| Metric        | Measures                            | Oriented to       | Needs                  |
+| :------------ | :---------------------------------- | :---------------- | :--------------------- |
+| `BLEU`        | n-gram precision with clipping      | Precision         | Reference(s)           |
+| `ROUGE-N`     | n-gram recall                       | Recall            | Reference(s)           |
+| `ROUGE-L`     | Longest common subsequence          | Both              | Reference              |
+| `BERTScore`   | Embedding similarity token-to-token | Semantic match    | Reference + an encoder |
+| `Perplexity`  | Mean negative log-likelihood        | Language modeling | No reference           |
+| `Exact match` | String equality after normalization | Extraction, QA    | Reference              |
+
+### BLEU
+
+From Papineni et al., ACL 2002. Built for machine translation.
+
+```text
+BLEU_n = BP x exp( sum_{k=1..n} w_k x ln p_k )
+
+p_k  = clipped n-gram precision  = matched n-grams / total candidate n-grams
+BP   = min(1, exp(1 - ref_len / cand_len))
+w_k  = 1/n for the standard equal-weight form
+```
+
+Two details carry most of the misunderstandings.
+
+**Clipping.** An n-gram counted in a candidate is credited at most as many times as it appears in the reference. Without clipping, repeating "the" a hundred times scores absurdly. Clipping is what makes BLEU a precision measure rather than a gaming measure.
+
+**The brevity penalty.** Precision alone rewards a two-word candidate, so `BP` punishes candidates shorter than the reference. There is no symmetric penalty for candidates far longer, which is why BLEU tolerates padding and ROUGE does not.
+
+BLEU is corpus-level in its original formulation. Sentence-level BLEU is noisy and correlates poorly with human judgment on its own; most of its validity comes from averaging over thousands of sentences.
+
+### ROUGE
+
+From Lin, 2004 (the Workshop at ACL meeting on text summarization). Built for summarization, where the question is whether the summary covered the content, so recall is the natural orientation.
+
+```text
+ROUGE-N = sum over references of matched n-grams / total n-grams in reference
+
+ROUGE-L:  let L = LCS(candidate, reference)
+          R_lcs = L / len(reference)
+          P_lcs = L / len(candidate)
+          F_lcs = (1 + beta^2) x P_lcs x R_lcs / (R_lcs + beta^2 x P_lcs)
+```
+
+`beta` weights recall against precision; the default in the reference implementation emphasizes recall, which is the point for summarization.
+
+ROUGE variants worth knowing by name: `ROUGE-1` and `ROUGE-2` for unigram and bigram recall, `ROUGE-L` for the subsequence form, `ROUGE-W` for a weighted LCS that rewards consecutive runs, and `ROUGE-S` for skip-bigram pairs.
+
+### BLEU against ROUGE
+
+|                       | BLEU              | ROUGE                             |
+| :-------------------- | :---------------- | :-------------------------------- |
+| Origin                | Translation       | Summarization                     |
+| Primary orientation   | Precision         | Recall                            |
+| Short candidate       | Penalized by `BP` | Naturally low recall              |
+| Long padded candidate | Barely penalized  | Precision drops, recall saturates |
+| Paraphrase            | Scores near zero  | Scores near zero                  |
+
+That last row is the shared limitation, and the reason the field moved on. Both are surface-form measures. A fluent correct answer phrased differently from the reference scores badly on both, and a fluent wrong answer that reuses the reference's words scores well.
+
+### BERTScore
+
+Zhang, Kishore et al., arXiv:1904.09675 (ICLR 2020). Replaces hard n-gram matching with soft matching over contextual embeddings.
+
+```text
+R_BERT = sum over reference tokens i of  max over candidate tokens j of  cos(x_i, y_j)  / len(reference)
+
+P_BERT = the same with the roles swapped
+F_BERT = geometric mean of P_BERT and R_BERT
+```
+
+The important refinement is baseline rescaling. Cosine similarity between any two vectors from the same encoder is never near zero, so raw scores cluster high and barely move. The paper rescores each similarity against the self-similarity of the token with its own IDF-weighted average, which restores spread and correlation with human judgment.
+
+|                           | N-gram metrics | BERTScore        |
+| :------------------------ | :------------- | :--------------- |
+| Paraphrase-tolerant       | no             | yes              |
+| Explainable per-token     | yes            | weaker           |
+| Depends on a model choice | no             | strongly         |
+| Cost                      | trivial        | one encoder pass |
+| Catches factual error     | no             | no               |
+
+BERTScore inherits the encoder's blind spots. It measures semantic proximity, not truth, which is why groundedness needs its own metric, covered in [RAG and Agent Evaluation](/ai/agents/rag-and-agent-eval).
+
+### Perplexity
+
+`PPL = exp( -(1/N) x sum_i ln p(x_i given x_<i) )`, the exponential of average negative log-likelihood over the sequence.
+
+Lower means the model assigned higher probability to the text. It is the only metric here that needs no reference, which makes it useful for unsupervised sanity checks and misleading for almost everything else.
+
+A model can have low perplexity on fluent text and be confidently wrong on facts. Perplexity also breaks across tokenizers: two models with different vocabularies score the same sentence on different numbers of tokens, so comparing perplexity across models of different generations measures tokenization as much as modeling.
+
+### Exact match and F1
+
+Normalization, then string comparison. Standard in extractive QA, where the answer is a span.
+
+```python
+def normalize(s: str) -> str:
+    s = re.sub(r"[^\w\s]", "", s.lower())
+    return " ".join(s.split())
+
+def em(pred, gold) -> float:
+    return float(normalize(pred) == normalize(gold))
+
+def f1(pred, gold) -> float:
+    p, g = Counter(normalize(pred).split()), Counter(normalize(gold).split())
+    common = sum((p & g).values())
+    if common == 0:
+        return 0.0
+    precision, recall = common / sum(p.values()), common / sum(g.values())
+    return 2 * precision * recall / (precision + recall)
+```
+
+The word-overlap `F1` is the SQuAD convention. It credits partial credit that exact match refuses, which matters when a model answers "Paris, France" against the gold "Paris". Both are appropriate for extraction and both are inappropriate for generation, where a correct answer sharing no words with the reference is entirely possible.
+
+---
+
+## Pillar 2: standard benchmarks
+
+A fixed task set, a fixed metric, comparable across models over time.
+
+| Benchmark                                     | Domain                              | Metric                       | Size                               |
+| :-------------------------------------------- | :---------------------------------- | :--------------------------- | :--------------------------------- |
+| [MMLU](https://arxiv.org/abs/2009.03300)      | Multiple-choice across 57 subjects  | Accuracy                     | ~14,000 test questions             |
+| [GSM8K](https://arxiv.org/abs/2110.14168)     | Grade-school math word problems     | Final-answer accuracy        | 8.5K total, 7.5K train / 1.3K test |
+| [HumanEval](https://arxiv.org/abs/2107.03374) | Function synthesis from a docstring | `pass@k` on unit tests       | 164 problems                       |
+| [SWE-bench](https://arxiv.org/abs/2310.06770) | Real GitHub issue to merged patch   | Resolved rate, tests passing | 2,294 instances                    |
+
+### MMLU
+
+Massive Multitask Language Understanding, Hendrycks et al., arXiv:2009.03300. Four-way multiple choice over 57 subjects from elementary physics to professional law.
+
+What it hides: answer-letter bias, sensitivity to prompt format and few-shot ordering, and an accuracy ceiling that frontier models have passed. Once models exceed roughly 85 to 90 percent, differences between models are inside the noise of a handful of items. Follow-ups such as MMLU-Pro reduce the guessing advantage by moving to ten options and adding harder reasoning.
+
+### GSM8K
+
+Cobbe et al., arXiv:2110.14168. 8,500 natural-language arithmetic problems requiring two to eight steps of grade-school reasoning, with the answer an integer.
+
+Two properties make it influential. The scoring is a final-number match, which is unambiguous and cheap, and the answers are exactly checkable, which is what makes it usable as a verifiable reward for reinforcement learning. That is why GSM8K shows up in [RLVR and Reasoning](/ai/reinforcement-learning/rlvr-and-reasoning) as well as here.
+
+Its weakness is narrowness. It is a suite of one reasoning type, and improvements on it do not transfer to general mathematics.
+
+### HumanEval
+
+From the Codex paper, Chen et al., arXiv:2107.03374. 164 hand-written Python problems, each with a signature, a docstring, and unit tests.
+
+The metric is `pass@k`: the probability that at least one of `k` samples passes all tests. The paper gives an unbiased estimator, which matters because the naive "count how many of k passed" is biased when `k` approaches the total samples available.
+
+| Variant      | What changed                                                           |
+| :----------- | :--------------------------------------------------------------------- |
+| `pass@1`     | One sample                                                             |
+| `pass@k`     | k samples, any accepted; measures a model plus sampling                |
+| [HumanEval+] | Augmented tests that resist solutions passing on a lucky input         |
+| MBPP         | 974 problems written from natural-language descriptions, crowd-sourced |
+
+HumanEval measures isolated function synthesis. It does not measure a codebase, a build, or a test suite, which is the gap SWE-bench was built to close.
+
+### SWE-bench
+
+Jimenez et al., arXiv:2310.06770. Instances built from real GitHub issues and the pull request that resolved them, across 12 Python repositories. The model receives the issue text and the repository, produces a patch, and is graded by whether the repository's tests pass, split into fail-to-pass and pass-to-pass checks.
+
+```text
+Resolved = the patch turns the failing tests green AND breaks none of the previously passing ones
+```
+
+That second clause is what makes it honest. A patch that fixes the issue by deleting a test is not a fix.
+
+| Variant                | Response to                                                                                                                  |
+| :--------------------- | :--------------------------------------------------------------------------------------------------------------------------- |
+| SWE-bench Lite         | A 300-instance subset for cheaper runs                                                                                       |
+| SWE-bench Verified     | 500 instances human-reviewed for solvability, commissioned after analysis found a share of tasks were ambiguous or unfixable |
+| SWE-bench Multilingual | Non-Python repositories                                                                                                      |
+| SWE-bench Pro          | Harder, contamination-controlled instances                                                                                   |
+
+The contamination story matters for interview purposes. With a suite drawn from public repositories, parts of it are in pretraining data, and a resolved rate is partly a memory score. Agentic scaffolding also moves the number more than the model does, so a headline rate describes a system, not a model.
+
+### Reading a benchmark number
+
+| Question to ask                        | Why                                                    |
+| :------------------------------------- | :----------------------------------------------------- |
+| Is it contaminated by the eval?        | Public task sets leak into pretraining corpora         |
+| What was the scaffold?                 | Agentic scores confound model and harness              |
+| How many items, and what is the noise? | A one-point gap on 164 problems is not a result        |
+| Was the prompt format fixed?           | Multiple-choice accuracy swings on letter and ordering |
+| Is it saturated?                       | Near-ceiling suites stop discriminating between models |
+
+The last two are the reason teams move to internal, held-out, task-shaped evaluations: once a public benchmark saturates, it stops telling you anything about your own users' queries.
+
+<Callout type="warn">
+  ### A single number is not an evaluation
+
+Every metric above collapses a distribution to a scalar. Report the count of items, the variance across seeds, and the confidence interval. The standard error of an accuracy estimate is `sqrt(p(1-p)/n)`, which at `p = 0.5` and `n = 164` is about 3.9 percentage points. A two-point difference between two models on HumanEval is therefore inside the noise, and a gap that small should never drive a model choice.
+
+</Callout>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What are the four evaluation pillars?">
+
+    Automatic reference metrics, standard benchmarks, human evaluation, and LLM-as-a-judge. The first two are cheap and reproducible; the second two are closer to what users experience.
+
+  </Accordion>
+  <Accordion title="2. Write out the BLEU formula and name its two special terms.">
+
+    `BLEU_n = BP x exp(sum_k w_k ln p_k)`, where `p_k` is clipped n-gram precision and `BP = min(1, exp(1 - ref_len/cand_len))` is the brevity penalty.
+
+  </Accordion>
+  <Accordion title="3. Why does BLEU clip n-gram counts?">
+
+    Without clipping, repeating a common n-gram inflates precision without bound. Clipping credits a candidate n-gram at most as often as it appears in the reference.
+
+  </Accordion>
+  <Accordion title="4. Why does BLEU tolerate a padded candidate but not a short one?">
+
+    The brevity penalty is one-sided. It fires only when the candidate is shorter than the reference, so length-padding costs almost nothing.
+
+  </Accordion>
+  <Accordion title="5. BLEU against ROUGE: which is precision and which is recall, and why?">
+
+    BLEU divides matched n-grams by candidate length because translation asks "is what I produced correct". ROUGE divides by reference length because summarization asks "did I cover the source".
+
+  </Accordion>
+  <Accordion title="6. What is ROUGE-L built on?">
+
+    The longest common subsequence between candidate and reference, with recall, precision, and an F-measure parameterized by `beta` that weights recall higher by default.
+
+  </Accordion>
+  <Accordion title="7. What problem does BERTScore baseline rescaling solve?">
+
+    Cosine similarities between tokens from one encoder never approach zero, so raw scores are compressed and barely move. Rescaling against IDF-weighted self-similarity restores spread and correlation with human judgment.
+
+  </Accordion>
+  <Accordion title="8. What does BERTScore still fail to catch?">
+
+    Factual error. It measures semantic proximity, not truth, so a fluent wrong answer with the right vocabulary scores well.
+
+  </Accordion>
+  <Accordion title="9. Define perplexity and name its cross-model comparison problem.">
+
+    The exponential of average negative log-likelihood over the sequence. Different tokenizers put different token counts on the same text, so comparing across models of different generations partly measures tokenization.
+
+  </Accordion>
+  <Accordion title="10. Why does SQuAD-style scoring use both exact match and word-overlap F1?">
+
+    Exact match is strict string equality after normalization; F1 gives partial credit for token overlap. "Paris, France" against the gold "Paris" scores zero on exact match and nonzero on F1.
+
+  </Accordion>
+  <Accordion title={<>11. What is <code>pass@k</code> and why is the estimator nontrivial?</>}>
+
+    The probability that at least one of `k` samples passes all tests. The naive count-of-passes is biased as `k` approaches the number of samples you drew, so the Codex paper gives an unbiased estimator.
+
+  </Accordion>
+  <Accordion title="12. Name GSM8K's two properties that made it influential.">
+
+    Answers are integers matched exactly, so scoring is unambiguous, and answers are verifiable, which made it usable as a reward signal for reinforcement learning.
+
+  </Accordion>
+  <Accordion title="13. What does SWE-bench check besides fixing the issue?">
+
+    That previously passing tests still pass. Without the pass-to-pass clause, a patch that deletes a failing test would count as resolved.
+
+  </Accordion>
+  <Accordion title="14. Why does SWE-bench Verified exist?">
+
+    Human review found a share of original instances ambiguous or unsolvable as written. Verified is a 500-instance subset checked for solvability.
+
+  </Accordion>
+  <Accordion title="15. How does scaffold choice confound an agentic benchmark score?">
+
+    The score describes a system, model plus harness plus tools. A better prompt or a code execution tool moves the number without any change to the model, so cross-paper comparisons are frequently apples to oranges.
+
+  </Accordion>
+  <Accordion title="16. Give three questions to ask before trusting a reported benchmark number.">
+
+    Is it contaminated by pretraining, how large is the item count and its noise, and has the suite saturated so the gap is within the confidence interval?
+
+  </Accordion>
+</Accordions>

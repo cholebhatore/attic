@@ -1,0 +1,286 @@
+---
+title: Agent Anatomy
+description: 'The five components of an agent: the model, the system prompt and Agent Skills, tool definitions, memory, and the controller loop.'
+---
+
+A chatbot returns text. An agent returns text _and_ requests actions, then reads the results of those actions and decides what to do next. The difference is not the model. It is who controls the loop: in a workflow the code decides the next step, in an agent the model does.
+
+Phase 9 covered assembling context for one call. This phase covers what happens when that call is one turn in a loop that runs for minutes, spends real money, and can execute code.
+
+---
+
+## The five components
+
+Every agent framework, whatever it is called, is these five things plus glue.
+
+| #   | Component                                | Role                                                                   | Lives where                             |
+| :-- | :--------------------------------------- | :--------------------------------------------------------------------- | :-------------------------------------- |
+| 1   | **Brain** (LLM)                          | Recommends the next action or returns a final answer                   | The model API                           |
+| 2   | **Instructions** (system prompt, skills) | Role, constraints, procedures                                          | Context, every step                     |
+| 3   | **Hands** (tools)                        | External actions the model can request                                 | Context as schemas, executed outside it |
+| 4   | **Memory**                               | State that survives a step or a session                                | Context, plus external stores           |
+| 5   | **Loop** (runtime)                       | Calls the model, executes tools, appends results, decides when to stop | Your code                               |
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph CTX["Resident in context"]
+        direction TB
+        I["Instructions and skills"]
+        H["Tool definitions"]
+        S["Trajectory"]
+    end
+    B["Brain - the LLM"]
+    A["Action"]
+    E["Environment"]
+    O["Observation"]
+    L["Long-term memory"]
+    I --> B
+    H --> B
+    S --> B
+    B --> A
+    A --> E
+    E --> O
+    O --> S
+    O --> L
+    L --> S
+`}
+/>
+
+Components 2, 3 and the short-term half of 4 are all just tokens in the same context window. That is the single most useful thing to internalize: there is no separate "skill store" or "tool memory" the model consults. Everything it knows at decision time was serialized into one prompt.
+
+---
+
+## The brain
+
+The model does one thing per step: read the context and emit either a tool call or a final answer. It has no persistent state of its own between calls. Any continuity you observe came from tokens you put back in.
+
+What varies between models for agent work:
+
+| Property                                 | Why it matters for agents                                                                                                    |
+| :--------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------- |
+| Tool-call reliability                    | A model that emits malformed arguments or invents tool names stalls the loop                                                 |
+| Instruction adherence under long context | Trajectories grow; [length degradation](/ai/rag/context-engineering) means the system prompt competes with 50 observations   |
+| Reasoning depth                          | Multi-step planning benefits from test-time compute, see [RLVR and Reasoning](/ai/reinforcement-learning/rlvr-and-reasoning) |
+| Latency per step                         | An agent makes dozens of calls; a 2 s model on a 20-step task is 40 s before any tool runs                                   |
+| Cost per step                            | The trajectory is re-sent every step, so cost grows quadratically with step count unless caching applies                     |
+
+That last row is the one teams miss. Step `n` re-sends all `n-1` prior observations, so total input tokens across a `T`-step task is roughly `T x context_size / 2`, not `T x context_size` and definitely not `context_size`. Prompt caching from [Context Budgeting](/ai/rag/context-budgeting) turns that quadratic cost into something close to linear, which is why agent runtimes order their context so aggressively.
+
+<Callout type="info">
+  ### Reasoning models changed the loop shape
+
+Models trained with reinforcement learning on verifiable rewards emit long internal reasoning before acting. In an agent loop that reasoning is usually _not_ returned to you, or is returned as a separate block you must pass back on the next turn. Passing it back preserves multi-step coherence; dropping it makes the model re-derive its plan every step. Check whether your provider requires reasoning blocks to be echoed during tool use.
+
+</Callout>
+
+---
+
+## The instructions
+
+The system prompt carries the role, the constraints, and the output contract. Three practical rules:
+
+- Put stable text first. The role and constraints never change between steps, so they belong at the front where a prompt cache can hold them.
+- State constraints as observable behavior, not as adjectives. "Return at most three results" is enforceable; "be concise" is not.
+- Repeat the critical instruction near the end as well as the start. Long trajectories push the system prompt far from the decision point, and the lost-in-the-middle curve says that costs you.
+
+### Agent Skills
+
+A skill is a folder of instructions the model loads on demand instead of carrying always. The mechanism is progressive disclosure, and it exists because procedures are long and context is expensive.
+
+| Tier | What is loaded                                                     | Typical cost                              |
+| :--- | :----------------------------------------------------------------- | :---------------------------------------- |
+| 1    | Skill `name` and one-line `description`, for every available skill | Tens of tokens each                       |
+| 2    | The full body of one skill, read when the task matches             | Hundreds to a few thousand tokens         |
+| 3    | Bundled resources: reference docs, scripts, templates              | Unbounded; scripts run without being read |
+
+Tier 1 is what stays resident. With 20 skills that is maybe 600 tokens of routing signal. Tier 2 loads only for the skill in use, so a 3,000-token procedure costs nothing on the 19 tasks that do not use it.
+
+A skill body is Markdown with YAML frontmatter:
+
+```yaml
+---
+name: pdf-extraction
+description: Extract tables and text from scanned PDFs. Use when the input is a PDF and the task needs layout preserved.
+---
+# PDF extraction
+
+## Steps
+1. Run scripts/parse.py on the input path.
+2. If the table has merged cells, read references/tables.md.
+3. Return Markdown, not raw text.
+```
+
+The `description` field is the routing signal, exactly like a tool description. If it says what the skill _is_ rather than when to _use_ it, the model will not load it at the right moment.
+
+### Skills against the alternatives
+
+| Mechanism     | Adds                | Cost when unused             | Changes behavior of    |
+| :------------ | :------------------ | :--------------------------- | :--------------------- |
+| System prompt | Always-on rules     | Full cost, every step        | All tasks              |
+| Agent skill   | On-demand procedure | One line of description      | Tasks that match       |
+| RAG           | On-demand facts     | Retrieval latency and tokens | Tasks that retrieve    |
+| Fine-tuning   | Weights             | Training run                 | All tasks, permanently |
+
+Skills and RAG both load content on demand. The difference is what they load: a skill loads _procedure_ (how to do this), retrieval loads _facts_ (what is true). A skill can tell the agent to retrieve.
+
+---
+
+## The hands
+
+A tool is a function the model can request. The definition has three parts and only one of them is code.
+
+```json
+{
+  "name": "search_documents",
+  "description": "Search the internal document store. Use for policy questions and anything about internal process. Returns at most 10 results with titles and snippets.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "query": { "type": "string", "description": "Natural language search query" },
+      "limit": { "type": "integer", "minimum": 1, "maximum": 10, "default": 5 }
+    },
+    "required": ["query"]
+  }
+}
+```
+
+- `name` — short, snake_case, unambiguous. The model types this string; a typo-prone name causes failed calls.
+- `description` — the routing signal. This is the field that decides whether the tool gets used at all, and whether it gets used for the right queries. Write when to use it and when not to.
+- `input_schema` — strict JSON Schema. The runtime enforces it, and many engines compile it into a grammar so the model cannot emit invalid arguments, see [Serving Engines Compared](/ai/inference/serving-engines).
+
+Tool _definitions_ live in context. Tool _execution_ happens outside it, in your process, with whatever privileges that process has. That gap is where agent security lives, and it is the reason a tool description is not a permission.
+
+The two dominant wire formats differ enough to trip people up:
+
+|             | Anthropic Messages API                    | OpenAI Chat Completions                   |
+| :---------- | :---------------------------------------- | :---------------------------------------- |
+| Schema key  | `input_schema`                            | `parameters`, nested under `function`     |
+| Wrapper     | None                                      | `{"type": "function", "function": {...}}` |
+| Stop signal | `stop_reason == "tool_use"`               | `finish_reason == "tool_calls"`           |
+| Arguments   | Parsed JSON object                        | JSON **string**, you parse it             |
+| Result role | `user` message with a `tool_result` block | Separate `tool` role message              |
+
+Full treatment, including parallel calls and error handling, is on [Function Calling](/ai/agents/function-calling).
+
+---
+
+## The memory
+
+Short-term memory is the trajectory: the assistant turns, the tool calls, and the observations, all in the context window. It is exact, it is expensive, and it dies when the window fills.
+
+Long-term memory is anything persisted outside the window and read back later. The taxonomy comes from cognitive science and is now standard vocabulary in agent frameworks:
+
+| Type           | Holds                | Example                                      | Typical store                   |
+| :------------- | :------------------- | :------------------------------------------- | :------------------------------ |
+| **Episodic**   | Events with a time   | "User rejected the 3-table join on 14 March" | Vector DB over event log        |
+| **Semantic**   | Facts without a time | "The user prefers UTC"                       | Key-value, relational, or graph |
+| **Procedural** | How to do things     | A refined skill or a learned macro           | Skill files, prompt library     |
+
+Procedural memory is the one that overlaps skills: a skill that gets edited after a failed run _is_ procedural memory being written.
+
+Details, write policies, and the failure modes are on [Agent Memory](/ai/agents/agent-memory).
+
+---
+
+## The loop
+
+`Think -> Act -> Observe -> Repeat`, with a budget and a stop condition. The stop condition is the part that gets skipped in tutorials and causes the incidents in production.
+
+```python
+for step in range(max_iterations):
+    response = call_model(messages, tools)
+    if response.stop_reason != "tool_use":
+        return response.text
+    for call in response.tool_calls:
+        result = execute(call)
+        messages.append(tool_result(call.id, result))
+return give_up(max_iterations)
+```
+
+Nine lines, and every production problem in [The Agent Loop](/ai/agents/agent-loop) is a line missing from this sketch: no budget check inside the loop, no repeated-call detection, no cap on observation size, no cost ceiling, no path for a tool that raises.
+
+---
+
+## Agent against workflow
+
+Anthropic's [_Building Effective Agents_](https://www.anthropic.com/research/building-effective-agents) draws the line that interviewers usually mean:
+
+|                     | Workflow                            | Agent                                                           |
+| :------------------ | :---------------------------------- | :-------------------------------------------------------------- |
+| Control flow        | Predefined in code                  | Chosen by the model at runtime                                  |
+| Step count          | Known in advance                    | Unknown in advance                                              |
+| Predictability      | High                                | Lower                                                           |
+| Cost predictability | High                                | Lower                                                           |
+| Good for            | Tasks decomposable into fixed steps | Open-ended tasks where the path depends on intermediate results |
+
+The recommendation in that post is to use the simplest thing that works, and to prefer workflows where the steps are knowable. An agent is the right call when you cannot write the branching in advance, when the task length varies with the input, or when the environment returns results that change the plan.
+
+A retrieval-augmented agent that decides whether to search is covered in [Self-RAG and Agentic RAG](/ai/rag/agentic-rag). This phase generalizes past retrieval to arbitrary tools.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What distinguishes an agent from a workflow?">
+
+    Control flow. In a workflow the code decides the next step from a fixed set of paths; in an agent the model decides at runtime. Everything else, including tool use, can appear in both.
+
+  </Accordion>
+  <Accordion title="2. Name the five components of an agent.">
+
+    The brain (the LLM), the instructions (system prompt and skills), the hands (tools), memory (short-term trajectory and long-term stores), and the loop (the runtime controller).
+
+  </Accordion>
+  <Accordion title="3. Where do tool definitions live at decision time?">
+
+    Serialized into the context window as JSON schemas, alongside the system prompt and the trajectory. The model never queries a tool registry; it reads descriptions from its prompt and emits a name.
+
+  </Accordion>
+  <Accordion title={<>4. Why is the tool <code>description</code> called the routing signal?</>}>
+
+    Because it is the only text the model uses to decide whether to call that tool and with what arguments. The implementation is invisible to the model, so a vague description produces wrong tool selection regardless of how good the code is.
+
+  </Accordion>
+  <Accordion title="5. What is an Agent Skill and what problem does it solve?">
+
+    A folder of instructions with a short description kept in context and a full procedure loaded on demand. It solves the cost of carrying many long procedures in every prompt, by paying one line per skill until one is needed.
+
+  </Accordion>
+  <Accordion title="6. Contrast a skill with retrieval.">
+
+    A skill loads procedure, meaning how to do something. Retrieval loads facts, meaning what is true. Both are on-demand context; a skill can instruct the agent to retrieve.
+
+  </Accordion>
+  <Accordion title="7. What are the three long-term memory types?">
+
+    Episodic (events with a time), semantic (facts without a time), and procedural (how to do things). Procedural memory and skills are the same substrate.
+
+  </Accordion>
+  <Accordion title="8. Why does agent cost grow faster than step count?">
+
+    Each step re-sends the whole trajectory, so total input tokens over `T` steps is roughly `T` times the average context rather than `T` times a fixed prompt. Prompt caching and compaction are the two standard answers.
+
+  </Accordion>
+  <Accordion title={<>9. Anthropic's <code>input_schema</code> corresponds to which field in the OpenAI format?</>}>
+
+    `parameters`, nested inside a `{"type": "function", "function": ...}` wrapper. OpenAI also returns arguments as a JSON string that you must parse, where Anthropic returns a parsed object.
+
+  </Accordion>
+  <Accordion title="10. When should you choose a workflow over an agent?">
+
+    When the steps are knowable in advance. Workflows are cheaper, more predictable, and easier to evaluate. Agents earn their cost only when the path depends on intermediate results or the task length varies with the input.
+
+  </Accordion>
+  <Accordion title="11. What is missing from a nine-line agent loop that production requires?">
+
+    A step budget enforced inside the loop, repeated-call detection, a size cap on observations, a cost ceiling, and error handling for tools that raise.
+
+  </Accordion>
+  <Accordion title="12. Why must reasoning blocks sometimes be echoed back during tool use?">
+
+    Because the reasoning is the model's working plan. Dropping it between steps forces the model to re-derive the plan from the transcript each turn, which loses coherence across long tool sequences.
+
+  </Accordion>
+</Accordions>

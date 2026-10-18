@@ -1,0 +1,345 @@
+---
+title: RAG and Agent Evaluation
+description: 'Retrieval and generation metrics, trajectory scoring for agents, and running both as CI gates with RAGAS and DeepEval.'
+---
+
+An end-to-end score tells you the agent got it wrong. It does not tell you whether retrieval missed, the model ignored good context, or the tool call had the wrong argument. Component-level metrics exist to make that attribution cheap, because the fix for each of those three failures lives in a different file.
+
+Two families of metrics, then. **Retrieval-augmented** metrics score a question, the contexts pulled for it, and the answer written from them. **Trajectory** metrics score the sequence of tool calls an agent took, independent of whether the final sentence was nice.
+
+---
+
+## The four retrieval dimensions
+
+The name "RAG triad" comes from DeepEval, which scores contextual relevancy, groundedness, and answer relevancy. RAGAS splits retrieval into precision and recall, giving four numbers. Four is the more useful decomposition, because precision and recall fail differently.
+
+| Metric                          | Question it answers                                | Needs reference               | Measures                     |
+| :------------------------------ | :------------------------------------------------- | :---------------------------- | :--------------------------- |
+| **Context precision**           | Were the top chunks the useful ones?               | Yes (or judge-ranked without) | Ranking quality of retrieval |
+| **Context recall**              | Was everything needed retrieved?                   | Yes                           | Coverage of retrieval        |
+| **Faithfulness** / groundedness | Is every claim supported by the retrieved context? | No                            | Whether the model invented   |
+| **Answer relevance**            | Does the answer address the question?              | No                            | Whether the model answered   |
+
+The axes combine into diagnoses, which is the reason to keep all four rather than blending them.
+
+| Precision | Recall | Diagnosis                                                                     |
+| :-------- | :----- | :---------------------------------------------------------------------------- |
+| High      | High   | Retrieval is fine; look at the prompt or the model                            |
+| High      | Low    | Retrieval is accurate but incomplete. Chunking, query rewriting, or top-k     |
+| Low       | High   | Everything needed is present, buried in noise. Reranking or a metadata filter |
+| Low       | Low    | The index or the embedding model. Nothing downstream can recover              |
+
+The generation-side pair reads the same way. Low faithfulness with high retrieval scores means the model is not attending to the context: check truncation, competing instructions, or a prompt that does not require citation. High faithfulness with low answer relevance means it is correct, sourced, and answering the wrong question.
+
+### How each is computed
+
+All four are LLM-judged in current RAGAS and DeepEval, which means each has a hidden judge prompt and a per-metric token cost.
+
+```text
+context precision   : for each retrieved chunk i, judge "is chunk i relevant to
+                      answering this question, given the reference answer?"
+                      => precision@k averaged over ranks, weighted so that
+                      relevant chunks higher up score better
+
+context recall      : decompose the reference answer into claim sentences,
+                      count how many are attributable to the retrieved contexts
+                      => recalled_claims / total_reference_claims
+
+faithfulness        : decompose the ANSWER into claims, judge each as
+                      supported / unsupported by the retrieved contexts
+                      => supported_claims / total_claims
+
+answer relevance    : generate N synthetic questions from the answer, embed them,
+                      average cosine similarity to the original question
+                      => 1.0 when the answer implies it answered exactly that
+```
+
+Two details that make these metrics defensible. Faithfulness divides by the claims the answer made, so a terse refusal scores high on faithfulness and low on everything else, and no metric should be read alone. Answer relevance is a proxy trick: it never asks the judge "is this relevant", it reverse-engineers what question the answer appears to address, which sidesteps the judge's preference for confident prose.
+
+`NoiseSensitivity` (RAGAS) completes the set: it measures how much the answer degrades when irrelevant but plausible context is injected. It is the metric that catches "the model followed the poisoned chunk".
+
+---
+
+## The reference problem
+
+Every retrieval-recall metric needs a ground truth, and ground truth is the expensive part of a RAG eval.
+
+| Approach                            | Costs           | Breaks when                                               |
+| :---------------------------------- | :-------------- | :-------------------------------------------------------- |
+| Human-written reference answers     | Money, and slow | The corpus changes and references go stale                |
+| Reference-free judging              | Cheap           | Judge cannot know what it would have needed to retrieve   |
+| Synthetic generation from documents | Fast, scales    | You are evaluating against what your own chunker produced |
+| Weak labels from production traffic | Free, realistic | Selection bias toward questions users happened to ask     |
+
+RAGAS ships a testset generator that walks a document corpus, extracts concept chains, and produces questions of typed difficulty (`Simple`, `Specific`, `Reasoning`, `MultiContext`) plus their reference answers. Use it to bootstrap coverage, never as the source of your release gate: a synthetic set inherits your chunking assumptions, so a pipeline optimized against it can pass its own eval while failing real users.
+
+The working split is both. A small hand-checked set (50 to 150 pairs, sampled from real queries, with the gold chunks named) is the release gate. A large synthetic set is the regression net that catches broad drift.
+
+---
+
+## RAGAS
+
+```python
+from ragas import evaluate, EvaluationDataset
+from ragas.samples import SingleTurnSample
+from ragas.metrics import (
+    Faithfulness,
+    ResponseRelevancy,
+    ContextPrecisionWithReference,
+    ContextRecallWithReference,
+    NoiseSensitivity,
+)
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from langchain_anthropic import ChatAnthropic
+from langchain_openai import OpenAIEmbeddings
+
+samples = EvaluationDataset(samples=[
+    SingleTurnSample(
+        user_input="Which payment gateway handles EUR settlement?",
+        retrieved_contexts=[c.page_content for c in retrieved_docs],
+        response=agent_answer,
+        reference="Stripe handles EUR settlement for the EU entity.",
+    ),
+    # ... the rest of the golden set
+])
+
+result = evaluate(
+    samples,
+    metrics=[Faithfulness(), ResponseRelevancy(),
+             ContextPrecisionWithReference(), ContextRecallWithReference(),
+             NoiseSensitivity()],
+    llm=LangchainLLMWrapper(ChatAnthropic(model="claude-sonnet-4-5")),
+    embeddings=LangchainEmbeddingsWrapper(OpenAIEmbeddings(model="text-embedding-3-small")),
+)
+df = result.to_pandas()          # one row per sample, one column per metric
+```
+
+The metric class names move between releases, and the retrieval metrics come in reference and reference-free variants (`ContextPrecisionWithReference` against `ContextPrecisionLLM`). Pin the version and check which variant you are calling, because a reference-free precision number is not comparable to a reference-based one.
+
+`answer_relevancy` requires embeddings, which is why the call signature forces you to supply an embedding model. Everything else is a judge call. On a 200-sample set with five LLM-judged metrics you are paying for roughly 1,000 judge calls per run, plus embedding cost on the relevance metric. That is the budget conversation to have before the first run, not after.
+
+### Agent metrics
+
+| RAGAS metric                                          | Judging                                      | Inputs                                        |
+| :---------------------------------------------------- | :------------------------------------------- | :-------------------------------------------- |
+| `AgentGoalAccuracyWithReference` / `WithoutReference` | LLM                                          | `input` and the terminal state                |
+| `TopicAdherence`                                      | LLM                                          | `user_input`, `reference_topics`, `traces`    |
+| `ToolCallAccuracy`                                    | Deterministic schema check, LLM on arguments | `user_input`, `reference_tool_calls`          |
+| `ToolCallF1`                                          | Deterministic                                | `reference_tool_calls`, `executed_tool_calls` |
+
+`ToolCallF1` is the only one that costs nothing and is therefore the one to run on every commit. Set precision and recall on the multiset of expected calls and you get both the wrong-tool and the missing-tool failure modes in one number.
+
+---
+
+## DeepEval
+
+DeepEval is pytest-shaped, which is the reason it gets used: evals land in the same CI job as unit tests and fail a build on a threshold.
+
+```python
+# test_rag.py
+import pytest
+from deepeval import assert_test
+from deepeval.test_case import LLMTestCase, ToolCall
+from deepeval.metrics import (
+    FaithfulnessMetric,
+    AnswerRelevancyMetric,
+    ContextualPrecisionMetric,
+    ContextualRecallMetric,
+    GEval,
+    TaskCompletionMetric,
+    ToolCorrectnessMetric,
+)
+
+@pytest.mark.parametrize("q,ctx,ans,gold", GOLDEN)
+def test_pipeline(q, ctx, ans, gold):
+    case = LLMTestCase(
+        input=q,
+        actual_output=ans,
+        retrieval_context=ctx,
+        expected_output=gold,
+        tools_called=[ToolCall(name="search", input_parameters={"q": q})],
+    )
+    assert_test(case, [
+        FaithfulnessMetric(threshold=0.7),
+        ContextualRecallMetric(threshold=0.8),
+        ContextualPrecisionMetric(threshold=0.75),
+        AnswerRelevancyMetric(threshold=0.7),
+    ])
+
+correctness = GEval(
+    name="Correctness",
+    criteria="Whether the answer states the right amount and currency, "
+             "ignoring wording differences.",
+    evaluation_params=["input", "actual_output", "expected_output"],
+    threshold=0.8,
+)
+```
+
+```text
+deepeval test run test_rag.py            # gates the build
+```
+
+The `threshold=` on every metric is the point of the framework: a metric without a threshold is a number on a dashboard, and a metric with a threshold is a test. `GEval` is the escape hatch for criteria your four standard metrics do not cover, written as natural-language rubric plus a list of params to judge over. `DagMetric` is the other escape hatch and the better one for anything with strict logic: a decision graph of check nodes, where each node is a small single-question judge call and the edges are deterministic, so "if unsafe, stop; else if ungrounded, fail" is expressible without asking a model to hold the whole rubric in one prompt.
+
+Agent-side names to know: `TaskCompletionMetric` judges whether the stated goal was achieved from the trace, `ToolCorrectnessMetric` compares tools called against expected ones.
+
+|                 | RAGAS                                                             | DeepEval                                           |
+| :-------------- | :---------------------------------------------------------------- | :------------------------------------------------- |
+| Shape           | Dataset and metric objects, run in a notebook or a job            | pytest assertions with thresholds                  |
+| Best at         | Retrieval diagnostics, distribution inspection, testset synthesis | Release gating, custom criteria, CI cost tracking  |
+| Judge control   | Wrap any LangChain chat model                                     | Own model, or the hosted Confident AI backend      |
+| Tracing         | Not a tracing product                                             | `@observe` plus a `deepeval` integration for spans |
+| Typical pairing | Analysis                                                          | Enforcement                                        |
+
+They are not rivals. Most teams synthesize and diagnose with RAGAS and gate with DeepEval, because the gate wants assertion semantics and the diagnosis wants a dataframe.
+
+---
+
+## Trajectory evaluation
+
+The four dimensions, with how to compute each.
+
+| Dimension                   | Definition                                 | Computation                                                                         | Notes                                                                                                                                                  |
+| :-------------------------- | :----------------------------------------- | :---------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Tool selection accuracy** | The right tool for each step               | Exact match on tool name, plus set/multiset F1 against a reference trajectory       | Also measure precision on _not_ calling: a model that fires a search tool on every turn looks good until you score calls that should not have happened |
+| **Argument validity**       | Schema-conformant and semantically correct | Deterministic: JSON Schema validation, enum and range checks. Then judge the values | Schema failures are free to detect and should be a hard gate, not a score                                                                              |
+| **Step efficiency**         | Steps taken against a reference or floor   | `reference_steps / actual_steps`, plus duplicate-call and no-progress counts        | Pairs with a cost-weighted version: sum of tokens and tool latency, not just a count                                                                   |
+| **Task completion**         | Goal achieved                              | Terminal-state assertion, else LLM judge on the final state                         | The only metric that cannot be gamed by a fluent answer                                                                                                |
+
+Terminal-state assertion beats text comparison for task completion, and this is the single biggest quality jump in an agent eval suite.
+
+```python
+def grade(case, final_state) -> dict:
+    """Assert the world the agent was supposed to change, not its prose."""
+    return {
+        "goal": final_state["ticket"]["id"] == case.expected_ticket,
+        "assigned": final_state["ticket"]["assignee"] == case.expected_owner,
+        "no_dupes": len(final_state["calls"]) == len({
+            (c["name"], json.dumps(c["args"], sort_keys=True))
+            for c in final_state["calls"]
+        }),
+        "steps_ok": len(final_state["calls"]) <= case.max_steps,
+        "usd_ok": final_state["spend"] <= case.budget_usd,
+        "no_write_without_confirm": all(
+            c["confirmed"] for c in final_state["calls"] if c["destructive"]
+        ),
+    }
+```
+
+For agent runs, report pass@k, not a single pass rate: the same task on the same model can succeed on attempt 3 of 5. pass@1 is the reliability number for a production user; pass@k with k around 5 is the capability number for deciding whether the task is reachable at all. The gap between them is the size of your planning and tool-description problem, and it is the number to show when someone proposes a bigger model.
+
+Weight metrics by what they catch. A suite that reports one blended score hides a regression, because a rise in answer quality can cancel a fall in step efficiency. Keep them separate, gate on the ones that are safety or contract issues, and trend the rest.
+
+---
+
+## Running it as a gate
+
+| When                                               | Run                                                                                      | Cost                        |
+| :------------------------------------------------- | :--------------------------------------------------------------------------------------- | :-------------------------- |
+| Every commit                                       | Schema validity, tool-call F1, duplicate-call count, exact-match on the 20 hardest cases | Free or near-free, no judge |
+| Every PR that touches prompts, tools, or retrieval | Full golden set with judged metrics                                                      | 200 samples x 4 judge calls |
+| Nightly                                            | Golden set plus large synthetic set, all metrics, both models if A/B                     | Thousands of calls          |
+| Weekly                                             | Sampled production traces, human annotation queue                                        | Human time                  |
+| On a model or provider swap                        | Everything, plus latency and cost distributions                                          | A day of budget             |
+
+A gate that is not enforced is documentation. The mechanical version: metrics land in the CI log, thresholds fail the job, and the run is written to the trace store so a failure links to the trajectory that caused it.
+
+---
+
+## What ruins an eval suite
+
+| Mistake                                               | Effect                                                                          | Fix                                                                                              |
+| :---------------------------------------------------- | :------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------- |
+| Judge and subject are the same model                  | Self-preference inflates scores                                                 | Judge with a different family; see [Human and Judge Evaluation](/ai/agents/judge-and-human-eval) |
+| Golden set never rotates                              | Silent overfitting to 100 questions, and stale references after a corpus update | Refresh from new production traffic every few weeks, retire leaked items                         |
+| Retrieval recall scored without the gold chunks named | You measure the judge's knowledge, not your retriever                           | Annotate which chunks answer each question                                                       |
+| Only end-to-end scores                                | Regressions found but not attributed                                            | Keep component metrics alongside                                                                 |
+| One blended number                                    | Offsets hide failures                                                           | Report per-dimension, gate per-dimension                                                         |
+| Evals run against a live external API                 | Flaky and rate-limited, so people disable them                                  | Fixtures or a recorded mock for the tool layer                                                   |
+| Metric gaming                                         | Answers tuned to the judge rubric, worse for users                              | Audit against human labels periodically                                                          |
+| Judge prompt drift                                    | Score moves with no code change                                                 | Version judge prompts with the metric and pin the judge model                                    |
+
+The judge-model pinning one is the most common cause of an unexplainable score change. A judge upgrade changes every metric in your suite at once, and if the judge model is whatever the default is, your dashboard is measuring the provider's release notes.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Name the four RAG metrics and what each measures.">
+
+    Context precision (were the top chunks the useful ones, ranking quality), context recall (was everything needed retrieved, coverage), faithfulness or groundedness (is every claim in the answer supported by retrieved context), answer relevance (does the answer address the question).
+
+  </Accordion>
+  <Accordion title="2. Why is the triad sometimes four metrics?">
+
+    DeepEval's RAG triad is contextual relevancy, groundedness and answer relevancy. RAGAS splits retrieval quality into precision and recall because they fail differently: complete-but-noisy and accurate-but-incomplete need different fixes.
+
+  </Accordion>
+  <Accordion title="3. Your context precision is low but recall is high. What is wrong?">
+
+    Retrieval returns everything required plus irrelevant material, so the answer is competing with noise. Add a reranker, tighten the metadata filter, or reduce top-k.
+
+  </Accordion>
+  <Accordion title="4. How does RAGAS compute faithfulness?">
+
+    Decompose the answer into individual claims, judge each claim as supported or unsupported by the retrieved contexts, and report supported divided by total. Because the denominator is the claims the answer made, a terse refusal can score well, which is why it must be read with answer relevance.
+
+  </Accordion>
+  <Accordion title="5. How does answer relevancy avoid asking a judge whether the answer is relevant?">
+
+    It generates a fixed number of synthetic questions from the answer, embeds them, and averages cosine similarity to the original question. A perfectly relevant answer implies its own question, so the score approaches 1.
+
+  </Accordion>
+  <Accordion title="6. What does noise sensitivity measure?">
+
+    How much the answer degrades when irrelevant but plausible context is present. It is the metric that detects a model following a poisoned or off-topic retrieved chunk.
+
+  </Accordion>
+  <Accordion title="7. What are the four ways to get reference answers and their trade-off?">
+
+    Human-authored (accurate, slow, goes stale), reference-free judging (cheap, but the judge cannot know what retrieval would have needed), synthetic generation from the corpus (scales, but inherits your chunking assumptions), weak labels from production traffic (realistic, but selection-biased).
+
+  </Accordion>
+  <Accordion title="8. Which metrics are safe to run on every commit?">
+
+    The deterministic ones: JSON Schema validity on arguments, tool-call precision/recall or F1 against a reference trajectory, duplicate-call and step-count checks, exact match on a small hard case set. They need no judge, so they cost almost nothing.
+
+  </Accordion>
+  <Accordion title="9. Why is terminal-state assertion better than text comparison for task completion?">
+
+    Because an agent can write a fluent sentence and not do the work. Asserting the world changed, the ticket exists, has the right assignee, no duplicates were created and no destructive call ran unconfirmed, tests the outcome rather than the prose.
+
+  </Accordion>
+  <Accordion title="10. Define step efficiency and why a cost-weighted variant matters.">
+
+    Steps taken against a reference or floor, typically reference steps divided by actual steps. Counting steps is wrong when steps differ hugely in price, so weight by tokens and tool latency instead.
+
+  </Accordion>
+  <Accordion title="11. What is the extra signal in reporting pass@k for agents?">
+
+    Pass@1 is production reliability; pass@k around 5 is capability. The gap between them quantifies how much of the failure is planning, tool descriptions, and variance rather than a missing skill.
+
+  </Accordion>
+  <Accordion title="12. Which DeepEval metric do you use when a rubric has strict logic?">
+
+    `DagMetric`: a decision graph whose nodes are small single-question judge calls wired by deterministic edges, so ordering and stop conditions are code rather than something a model has to hold in one prompt. `GEval` covers softer criteria.
+
+  </Accordion>
+  <Accordion title="13. RAGAS or DeepEval?">
+
+    RAGAS for diagnosis: dataset and metric objects, dataframes, synthetic testset generation. DeepEval for enforcement: pytest assertions with per-metric thresholds that fail a build, plus `GEval` and `DagMetric` for custom criteria. Teams commonly use both.
+
+  </Accordion>
+  <Accordion title="14. Your judged scores dropped 6 points with no code change. Most likely cause?">
+
+    Judge drift: the judge model or its default prompt changed under you. Pin the judge model and version the judge prompt with the metric so provider releases cannot move your dashboard.
+
+  </Accordion>
+  <Accordion title="15. How do you keep a golden set from going stale?">
+
+    Rotate in new items from real traffic every few weeks, retire items that leaked into prompts or fine-tuning data, re-annotate gold chunks whenever the corpus or chunking changes, and keep a small hand-checked gate set separate from a large synthetic regression set.
+
+  </Accordion>
+</Accordions>

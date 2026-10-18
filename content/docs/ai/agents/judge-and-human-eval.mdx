@@ -1,0 +1,259 @@
+---
+title: Human and Judge Evaluation
+description: 'Likert scales, pairwise battles and Bradley-Terry ratings, error annotation, and LLM-as-a-judge with its position, verbosity and self-preference biases.'
+---
+
+Reference metrics need a reference and benchmarks need a fixed task list. Most real quality questions have neither: which answer is better, is this tone right, did the agent do the thing the user meant. Pillars three and four exist for those questions. Human evaluation is the ground truth and the slowest. LLM-as-a-judge is the scalable approximation, and its error modes are well documented enough to design around.
+
+---
+
+## Pillar 3: human evaluation
+
+| Method                  | Asks                     | Output                        | Weakness                                    |
+| :---------------------- | :----------------------- | :---------------------------- | :------------------------------------------ |
+| **Likert scale**        | Rate one answer 1 to 5   | Absolute score                | Anchors drift between raters and over time  |
+| **Pairwise comparison** | Which of two is better   | Win rate, then a ranking      | Does not say how good, only which is better |
+| **Error annotation**    | What is wrong, and where | Span-level labels by category | Slow, and needs a written taxonomy          |
+
+### Likert scales
+
+Cheap to run, and the least reliable of the three. Three problems recur.
+
+Anchoring: one rater's 4 is another's 3. Mitigate with worked anchors, meaning actual examples of a 1, a 3, and a 5, shipped with the instructions, rather than adjective descriptions of them.
+
+Central tendency: raters avoid the extremes, so the distribution bunches at 3 and 4 and the metric loses resolution exactly where models differ.
+
+Drift: the same rubric scores differently in March than in September, because the raters' sense of normal moved. Absolute scores from two different time windows are not comparable, which matters for regression dashboards that span a year.
+
+Likert is fine for a triage signal and a poor choice for a release gate.
+
+### Pairwise comparison
+
+Two anonymous answers, pick the better one or call a tie. The comparison is easier than absolute rating because raters are better at relative than absolute judgments, and it removes the anchoring problem entirely.
+
+[Chatbot Arena](https://www.lmsys.org/blog/2023-05-03-arena/) launched in May 2023 on exactly this: anonymous, randomized head-to-head battles between two models, with the identities hidden until after the vote. Crowdsourced pairwise votes, tens of thousands of them per model, aggregated into a leaderboard.
+
+| Detail                            | Note                                                          |
+| :-------------------------------- | :------------------------------------------------------------ |
+| Anonymity until after voting      | Removes brand bias, which otherwise dominates the vote        |
+| Randomized pairing                | Keeps the comparison balanced across models                   |
+| Metadata filters                  | Category, language, and system-filtering for a cleaner signal |
+| Model identity revealed post-vote | Preserves the label while enabling attribution                |
+
+### Bradley-Terry
+
+The Arena first used an online Elo update, then [transitioned to a Bradley-Terry model in December 2023](https://www.lmsys.org/blog/2023-12-07-leaderboard/). The change matters more than it sounds.
+
+```text
+online Elo:      R_A' = R_A + K x (S - E),   updated per match, order-dependent
+Bradley-Terry:   P(A beats B) = exp(s_A) / (exp(s_A) + exp(s_B))
+                 = 1 / (1 + exp(-(s_A - s_B)))
+```
+
+BT fits one score per model by maximum likelihood over all matches at once, so the ranking does not depend on the order votes arrived and it uses every match rather than only recent ones. Ties are handled with a draw term, and the Arena reports confidence intervals from bootstrap resampling.
+
+|                 | Online Elo   | Bradley-Terry                  |
+| :-------------- | :----------- | :----------------------------- |
+| Update          | Per match    | Global fit                     |
+| Order dependent | Yes          | No                             |
+| Handles ties    | Approximated | Explicit draw parameter        |
+| Uncertainty     | Ad hoc       | Bootstrap confidence intervals |
+| Recompute cost  | Trivial      | Higher, but offline anyway     |
+
+A related, more recent point: the leaderboard has a documented vote-printing problem, where a small number of heavily-voted models get inflated rankings because of how sampling of battles works ([arXiv:2501.17858](https://arxiv.org/abs/2501.17858)). Whenever you read a leaderboard position, check whether the comparison is head-to-head with your model of interest, not just two ranks.
+
+### Error annotation
+
+Instead of a score, raters mark spans and assign categories: ungrounded claim, missed instruction, wrong tool argument, unsafe content, broken formatting.
+
+Slower per example, and vastly more actionable. A 3.8 average tells you something is wrong; an annotation showing that 40 percent of failures are missing citations tells you what to fix.
+
+The measurement that makes annotation usable is inter-annotator agreement.
+
+| Statistic              | Use when                                                           |
+| :--------------------- | :----------------------------------------------------------------- |
+| Cohen's `kappa`        | Two raters, categorical labels                                     |
+| Fleiss' `kappa`        | More than two raters                                               |
+| Krippendorff's `alpha` | Any number of raters, missing data, and ordinal or interval scales |
+
+```text
+kappa = (p_o - p_e) / (1 - p_e)
+```
+
+Observed agreement minus chance agreement, over the maximum improvable gap. Below roughly 0.4 the taxonomy is underspecified and the labels will not support a metric; the fix is a sharper category definition, not more raters. Agreement around 0.6 to 0.75 is the usual target for a usable annotation scheme.
+
+---
+
+## Pillar 4: LLM-as-a-judge
+
+Use a strong model to grade another model's output. The validating result comes from MT-Bench and Chatbot Arena (Zheng et al., arXiv:2306.05685): on 80 multi-turn questions with 3,300 expert pairwise preferences across six models, GPT-4 judgments agreed with the human majority vote at over 80 percent, which is at the level of human-to-human agreement.
+
+That parity claim is the reason the technique is used everywhere, and the over-80-percent figure is the number to quote in an interview.
+
+### Three judging modes
+
+| Mode             | Input                               | Good for                           | Risk                               |
+| :--------------- | :---------------------------------- | :--------------------------------- | :--------------------------------- |
+| Single-answer    | One output plus a rubric            | Regression gates, absolute scoring | Scale drift; the judge is generous |
+| Pairwise         | Two outputs, pick one               | Model comparison                   | Position bias, handled by swapping |
+| Reference-guided | Output plus gold answer plus rubric | Extraction, code, factual QA       | Penalizes valid paraphrase         |
+
+Judge prompts work best with an explicit rubric, a required verdict field, and reasoning asked for _before_ the verdict rather than after, so the justification is produced rather than reverse-engineered from a snap conclusion.
+
+### The biases
+
+The MT-Bench paper names four, and each has a documented mitigation.
+
+| Bias                | Behavior                                      | Mitigation                                                                               |
+| :------------------ | :-------------------------------------------- | :--------------------------------------------------------------------------------------- |
+| **Position**        | Prefers one slot regardless of content        | Judge both orderings; accept only consistent verdicts, otherwise call a tie              |
+| **Verbosity**       | Prefers longer answers                        | Length-normalize, cap output length, or write a rubric that explicitly penalizes padding |
+| **Self-preference** | Prefers output from itself or a related model | Judge with a model from a different family than any under test                           |
+| **Limited ability** | Cannot reliably grade the hardest reasoning   | Do not use a judge where a verifier exists; use tests or exact match                     |
+
+Swap-order evaluation deserves the attention, because it is cheap and it changes results:
+
+```python
+def judge_pair(question, a, b, judge) -> str:
+    first  = judge(question, a, b)    # a in slot 1
+    second = judge(question, b, a)    # a in slot 2
+
+    if first == second == "A":
+        return "a"
+    if first == second == "B":
+        return "b"
+    return "tie"                       # order-sensitive: the judge had no real preference
+```
+
+Running a pairwise judge once costs one call; running it properly costs two and produces a tie class you did not ask for. Those ties are the information: they are where the disagreement between the two orderings shows up.
+
+<Callout type="warn">
+  ### Validate the judge before trusting the dashboard
+
+Measure judge-human agreement on a sample you annotate yourself, and report the agreement rate with its confidence interval. A judge that agrees with humans 60 percent of the time on your distribution will drive your whole optimization loop 40 percent of the time in the wrong direction, and nothing in the dashboard will show it. Publish the agreement number next to the metric it produces.
+
+</Callout>
+
+### Judge economics
+
+| Approach                   | Cost per example      | Latency            | Reproducibility               |
+| :------------------------- | :-------------------- | :----------------- | :---------------------------- |
+| Automatic reference metric | Negligible            | Milliseconds       | Exact                         |
+| Judge, single-answer       | One model call        | Around a second    | High at temperature 0         |
+| Judge, swap-order pairwise | Two model calls       | Around two seconds | High at temperature 0         |
+| Human pairwise             | Minutes of rater time | Days at scale      | Requires agreement statistics |
+
+The usual production shape is a judge running on every eval case for scale, with a human-annotated subset re-sample run periodically to confirm the judge has not drifted from the human labels. Pin the judge to temperature 0 and version its prompt, because changing the judge silently changes the metric, and a score movement after a prompt edit describes the judge, not the model.
+
+---
+
+## Judge against the alternatives
+
+| Situation                                                         | Use                                                                    |
+| :---------------------------------------------------------------- | :--------------------------------------------------------------------- |
+| A deterministic check exists: tests, exact match, schema validity | That check, never a judge                                              |
+| Comparing two models on open-ended quality                        | Swap-order pairwise judge, validated against human labels              |
+| Tone, style, brand conformance                                    | Judge with a written rubric and worked anchors                         |
+| Safety and policy violations                                      | A dedicated classifier or guardrail, plus a judge for recall           |
+| New capability with no rubric yet                                 | Human error annotation first, then write the rubric from what it found |
+| Anything you intend to ship a decision on                         | Both a judge and a human subset, with the agreement rate reported      |
+
+The order in the last two rows is the one teams get backwards. The rubric comes out of annotating failures by hand, not out of a design session before you have seen any.
+
+---
+
+## Common design mistakes
+
+| Mistake                                       | Consequence                                                        |
+| :-------------------------------------------- | :----------------------------------------------------------------- |
+| Judging the winner by average judge score     | Compresses a distribution into a scalar and hides bimodality       |
+| Judge prompt edited without a version bump    | The metric changes and no one knows why the score moved            |
+| The same model family judging its own outputs | Self-preference inflates your model systematically                 |
+| No tie class in pairwise judging              | Noise gets reported as a preference                                |
+| An eval set built from cases you wrote        | Measures your intuitions about failures, not the real distribution |
+| One run per case                              | Sampling variance read as a model difference                       |
+| Reporting the metric without the item count   | No way to judge whether the gap exceeds the noise                  |
+
+Build the eval set from production traces, weight it by how often each category occurs, and add every incident you ship a fix for. An eval set that grows out of real failures is the durable artifact; a synthetic 200-row spreadsheet measures nothing you care about.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Name the three human evaluation methods and the main weakness of each.">
+
+    Likert scales, where anchoring and drift make absolute scores incomparable; pairwise comparison, which gives ordering but no absolute quality; and error annotation, which is slow but localizes the failure.
+
+  </Accordion>
+  <Accordion title="2. Why is pairwise generally more reliable than Likert?">
+
+    Relative judgments are easier than absolute ones, and pairwise removes inter-rater anchoring entirely, since there is no scale to disagree about.
+
+  </Accordion>
+  <Accordion title="3. What did Chatbot Arena switch from, and why does it matter?">
+
+    From online Elo to a Bradley-Terry model, in December 2023. BT fits all matches by maximum likelihood, so the ranking is order-independent, uses the full history, models ties explicitly, and supports bootstrap confidence intervals.
+
+  </Accordion>
+  <Accordion title="4. Write the Bradley-Terry win probability.">
+
+    `P(A beats B) = exp(s_A) / (exp(s_A) + exp(s_B))`, equivalently `1 / (1 + exp(-(s_A - s_B)))`.
+
+  </Accordion>
+  <Accordion title="5. What is the headline LLM-as-a-judge result and its source?">
+
+    MT-Bench and Chatbot Arena (Zheng et al., arXiv:2306.05685): GPT-4 judge agreement with human majority exceeded 80 percent across 3,300 expert pairwise preferences on 80 questions, at human-to-human parity.
+
+  </Accordion>
+  <Accordion title="6. What is position bias and how do you mitigate it?">
+
+    The judge prefers one slot regardless of content. Judge both orderings and accept the verdict only when consistent; otherwise declare a tie.
+
+  </Accordion>
+  <Accordion title="7. What is verbosity bias, and two fixes?">
+
+    A preference for longer answers even when uninformative. Fix by length normalization, capping generation length, or a rubric that explicitly penalizes padding.
+
+  </Accordion>
+  <Accordion title="8. What is self-preference bias and what control removes it?">
+
+    A judge favoring output from its own model family. Judge with a model from a different family from any model under test.
+
+  </Accordion>
+  <Accordion title="9. Which bias has no reliable mitigation?">
+
+    Limited grading ability on hard reasoning. Where a verifier exists, use it; a judge cannot substitute for a test.
+
+  </Accordion>
+  <Accordion title="10. How would you measure whether your judge is trustworthy?">
+
+    Annotate a sample by hand, compute judge-human agreement with a confidence interval, and report that number next to the metric. Re-sample periodically to catch drift.
+
+  </Accordion>
+  <Accordion title="11. What does Cohen's kappa measure and what value is usable?">
+
+    Agreement beyond chance between two raters. Below about 0.4 the taxonomy is underspecified; roughly 0.6 to 0.75 is the target for a scheme that can support a metric.
+
+  </Accordion>
+  <Accordion title="12. What is the failure mode of editing a judge prompt mid-project?">
+
+    The metric changes silently. A score movement after the edit describes the judge, so version judge prompts the way you version code.
+
+  </Accordion>
+  <Accordion title="13. Why does asking for reasoning before the verdict help?">
+
+    It makes the justification produced rather than reverse-engineered from a snap judgment, and gives you something to audit when a verdict looks wrong.
+
+  </Accordion>
+  <Accordion title="14. Where does an eval rubric come from?">
+
+    From annotating real failures by hand first. Rubrics written before anyone has looked at failures describe assumptions rather than observed errors.
+
+  </Accordion>
+  <Accordion title="15. What is vote printing, and why care about it when reading a leaderboard?">
+
+    A documented ranking artifact where battle sampling inflates certain models' positions. Read head-to-head win rates against your model of interest rather than two rank numbers.
+
+  </Accordion>
+</Accordions>

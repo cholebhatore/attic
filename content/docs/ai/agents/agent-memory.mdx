@@ -1,0 +1,232 @@
+---
+title: Agent Memory
+description: 'Short-term trajectory against long-term stores, the episodic-semantic-procedural taxonomy, write and recall policies, and the failure modes.'
+---
+
+Without memory an agent is a stateless function that happens to run in a loop. Memory is what lets step 14 know what step 3 learned, what lets today's session know what the user said last month, and what lets a repeated mistake stop happening.
+
+It is also the component with the least standardization. Tools have a schema. The loop has a control structure. Memory is a design choice you make per application, and most of the interesting engineering is in deciding what _not_ to keep.
+
+---
+
+## Two horizons
+
+|           | Short-term                                      | Long-term                                 |
+| :-------- | :---------------------------------------------- | :---------------------------------------- |
+| Substrate | The context window                              | An external store                         |
+| Contents  | The trajectory: turns, tool calls, observations | Distilled facts, events, procedures       |
+| Exactness | Verbatim                                        | Lossy, summarized                         |
+| Lifetime  | One run, or until compaction                    | Indefinite                                |
+| Cost      | Tokens, every step, re-sent                     | A retrieval call when read                |
+| Failure   | Window overflow                                 | Stale, contradictory, or poisoned records |
+
+Short-term memory is not a separate system you build. It is the message list. Everything in [The Agent Loop](/ai/agents/agent-loop) about observation management and compaction is short-term memory engineering, and the tiering options are laid out in [Context Budgeting](/ai/rag/context-budgeting).
+
+Long-term memory is the part with real design decisions.
+
+---
+
+## The three long-term types
+
+The taxonomy is borrowed from cognitive science, where Tulving's 1972 split between episodic and semantic memory is the original distinction. Agent frameworks adopted it, and CoALA (_Cognitive Architectures for Language Agents_, Sumers et al., arXiv:2309.02427) formalized it for LLM agents.
+
+| Type           | Holds                 | Write trigger                                     | Example                                                                        | Typical store                   |
+| :------------- | :-------------------- | :------------------------------------------------ | :----------------------------------------------------------------------------- | :------------------------------ |
+| **Episodic**   | Events, with a time   | After each task, or on notable outcomes           | "On 14 March the user rejected the three-table join and asked for two queries" | Vector DB over an event log     |
+| **Semantic**   | Facts, without a time | When a fact is stated or inferred                 | "The user reports in UTC"                                                      | Key-value, relational, or graph |
+| **Procedural** | How to do things      | After a correction or a successful novel sequence | A refined skill file, or a saved macro                                         | Markdown files, prompt library  |
+
+The boundaries blur in practice. "The user prefers concise answers" is semantic as a fact and procedural once it changes how you write. What matters is that the three have different write triggers and different staleness profiles: episodes never go stale because they are records of what happened, facts go stale when the world changes, and procedures go stale when the tools change.
+
+Procedural memory and [Agent Skills](/ai/agents/agent-anatomy) are the same substrate. Editing a skill after a failed run is writing procedural memory.
+
+---
+
+## Where it lives
+
+| Store      | Good for                                        | Weak at                                  | Example                  |
+| :--------- | :---------------------------------------------- | :--------------------------------------- | :----------------------- |
+| Vector DB  | Semantic recall over many records, fuzzy match  | Exact lookup, recency ordering, negation | Qdrant, Chroma, pgvector |
+| Relational | Structured facts, joins, transactions, deletion | Free-text recall                         | Postgres                 |
+| Key-value  | Direct facts with known keys, fast reads        | Anything needing search                  | Redis, DynamoDB          |
+| Graph      | Relationships, multi-hop, temporal edges        | Simple lookups; expensive to build       | Neo4j, Graphiti          |
+| Filesystem | Procedures, human-readable and editable         | Recall at scale                          | Markdown skill files     |
+
+The common production answer is two stores: a vector index for recall and a relational table for the facts that need exact reads, foreign keys, or a hard delete when a user exercises a right to erasure. A single vector store makes deletion and audit awkward, which is a compliance problem before it is a technical one.
+
+Filtering matters more than similarity. Every read should be scoped by `user_id` at minimum, and by `kind` and a recency window usually. Unscoped recall is how one user's preferences end up in another user's prompt.
+
+---
+
+## Writing
+
+Three policies, and the choice is mostly about latency and cost.
+
+| Policy     | When it runs                                | Cost                       | Quality                        |
+| :--------- | :------------------------------------------ | :------------------------- | :----------------------------- |
+| Hot path   | Inline, before returning to the user        | Adds latency to every turn | High, the context is fresh     |
+| Background | After the session ends, as a batch job      | None user-visible          | Higher, sees the whole session |
+| Explicit   | Only when the model calls a `remember` tool | One extra tool call        | Depends on the model noticing  |
+
+Explicit writes are what most frameworks ship, because they are cheap and the model is usually good at recognizing "remember that I prefer UTC." They miss everything the model did not think to record. Background extraction catches more and costs a summarization pass per session.
+
+### The deduplication problem
+
+Naive insertion grows the store monotonically, and within a few weeks most retrievals return five near-copies of the same fact. That wastes context and, worse, makes a stale record look authoritative by repetition.
+
+```python
+def write(self, text: str, kind: str, user_id: str) -> str:
+    vec = self.embed(text)
+    scope = {"user_id": user_id, "kind": kind}
+
+    for hit in self.store.search(vec, k=3, filter=scope):
+        if hit.score > 0.92:                       # near-duplicate: supersede, do not insert
+            self.store.update(hit.id, {
+                "text": text, "vector": vec,
+                "updated_at": time.time(),
+                "revision": hit.payload.get("revision", 0) + 1,
+                "superseded": [hit.id],
+            })
+            return hit.id
+
+    return self.store.insert({
+        "text": text, "kind": kind, "user_id": user_id,
+        "vector": vec, "created_at": time.time(), "revision": 0,
+    })
+```
+
+Superseding keeps one live record and an audit trail. Contradiction is harder than similarity: "the user prefers UTC" and "the user prefers local time" are not close in embedding space but cannot both be live. Systems that handle this use an entailment check, where a model judges whether a new record contradicts an existing one, or a keyed schema where a fact has exactly one slot.
+
+---
+
+## Reading
+
+| Strategy      | Mechanism                                                              | Fit                                           |
+| :------------ | :--------------------------------------------------------------------- | :-------------------------------------------- |
+| Always-on     | Inject a fixed block, such as a user profile, into every system prompt | Few, high-value facts                         |
+| Retrieved     | Embed the current query, inject top-k                                  | Large stores, relevance varies per turn       |
+| Tool-mediated | Expose `recall` as a tool the model calls when it wants                | The model knows when it lacks information     |
+| Structured    | Look up by key before the run starts                                   | Known required context, such as tenant config |
+
+Always-on gives the best return per token when the fact set is small, because it cannot be missed. A user profile of 200 tokens injected every turn beats a retrieval system that occasionally fails to fire.
+
+Tool-mediated recall is the one that degrades in the least visible way. The model has to realize it does not know something before it searches for it, and models are poorly calibrated about their own gaps. If a fact matters, inject it rather than hoping the agent asks.
+
+---
+
+## Reflection and consolidation
+
+Recording raw events gives you a log, not memory. Consolidation turns events into facts.
+
+The pattern comes from _Generative Agents_ (Park et al., arXiv:2304.03442), which scored each memory by recency, importance, and relevance, then periodically asked the model to synthesize higher-level observations from clusters of related events. Those synthesized reflections were written back as memories themselves, so the store accumulated abstractions over time rather than only raw episodes.
+
+Two operations worth separating:
+
+- **Consolidation** — merge duplicates, resolve contradictions, promote repeated episodes into a semantic fact. Runs on a schedule.
+- **Decay** — lower the retrieval weight of records that have not been hit, or archive them past a retention window. Runs continuously.
+
+Without decay, a store that has been running for a year retrieves records that were true then and are false now, and nothing in the retrieval ranking knows the difference.
+
+---
+
+## Existing systems
+
+| System                                               | Core idea                                                                                                               |
+| :--------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------- |
+| **MemGPT / Letta** (Packer et al., arXiv:2310.08560) | Treat the context window as main memory and an external store as disk, with the model issuing its own paging operations |
+| **Generative Agents** (arXiv:2304.03442)             | Memory stream with recency-importance-relevance scoring and periodic reflection                                         |
+| **A-MEM** (arXiv:2502.12110)                         | Agents build and reorganize their own memory graph, linking and updating notes as new ones arrive                       |
+| **HippoRAG** (arXiv:2405.14831)                      | Hippocampal-index-inspired: an entity graph plus personalized PageRank for multi-hop recall                             |
+| **Mem0**                                             | Extraction and update pipeline over a vector store, with a managed API                                                  |
+| **Zep / Graphiti**                                   | Temporal knowledge graph; facts carry valid-from and valid-to so stale records are filtered by time, not similarity     |
+| **LangMem**                                          | Memory tools and background consolidation built on the LangGraph store                                                  |
+
+The temporal-edge idea in Graphiti deserves attention, because it solves staleness structurally. A fact stored as `(user, timezone, UTC, valid_from=2026-01)` is never wrong; it simply stops matching a query for the present.
+
+---
+
+## Failure modes
+
+| Failure                 | Cause                               | Mitigation                                                                                         |
+| :---------------------- | :---------------------------------- | :------------------------------------------------------------------------------------------------- |
+| Stale recall            | No decay, no timestamps             | Valid-from/valid-to edges, recency weighting                                                       |
+| Contradictory records   | Similarity dedup misses negation    | Entailment check, or a keyed one-slot-per-fact schema                                              |
+| Duplicate flooding      | Insert without supersede            | The dedup path above; cap records per key                                                          |
+| Poisoned memory         | Untrusted content written as a fact | Treat recalled text as data, never as instruction; see [Agent Security](/ai/agents/agent-security) |
+| Cross-user leak         | Unscoped retrieval                  | Filter by `user_id` on every read, and test it                                                     |
+| Unbounded growth        | No retention policy                 | Archive window plus decay                                                                          |
+| Recall that never fires | Tool-mediated only                  | Inject high-value facts always-on                                                                  |
+
+Poisoned memory is the one that compounds. An instruction hidden in a web page that gets summarized into long-term memory will be re-injected into every future prompt, with the provenance stripped. Write paths that accept content the agent did not author need the same scrutiny as any other untrusted input.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Contrast short-term and long-term agent memory.">
+
+    Short-term is the trajectory in the context window: verbatim, expensive because it is re-sent every step, and bounded by the window. Long-term is an external store holding distilled content, read on demand, surviving across sessions.
+
+  </Accordion>
+  <Accordion title="2. Name the three long-term memory types and give an example of each.">
+
+    Episodic, events with a time ("the user rejected the join on 14 March"); semantic, facts without a time ("the user reports in UTC"); procedural, how to do things (a refined skill file).
+
+  </Accordion>
+  <Accordion title="3. Where does the episodic-semantic split come from?">
+
+    Cognitive science. Tulving's 1972 work established the distinction, and CoALA (arXiv:2309.02427) formalized it for language agents.
+
+  </Accordion>
+  <Accordion title="4. Why do production systems often use two stores rather than one?">
+
+    A vector index gives fuzzy recall but makes exact lookup, joins, and hard deletion awkward. A relational table covers those, and a right-to-erasure request needs a real delete with an audit trail.
+
+  </Accordion>
+  <Accordion title="5. What is the deduplication problem in memory writes?">
+
+    Naive insertion grows the store monotonically, so retrievals return near-copies. That wastes context and makes stale records look authoritative by repetition. The fix is to supersede on high similarity instead of inserting.
+
+  </Accordion>
+  <Accordion title="6. Why is contradiction harder than similarity for memory writes?">
+
+    Because contradicting statements are not close in embedding space. "Prefers UTC" and "prefers local time" will not collide on a cosine threshold, so you need an entailment check or a keyed schema with one slot per fact.
+
+  </Accordion>
+  <Accordion title="7. Compare always-on injection with tool-mediated recall.">
+
+    Always-on cannot be missed and is the right choice for a small high-value fact set. Tool-mediated scales to large stores but depends on the model realizing it lacks information, which models are poorly calibrated about.
+
+  </Accordion>
+  <Accordion title="8. What is reflection in the Generative Agents sense?">
+
+    Periodically synthesizing higher-level observations from clusters of related events, scored by recency, importance, and relevance, then writing those abstractions back as memories.
+
+  </Accordion>
+  <Accordion title="9. Why does a memory store need decay and not just deduplication?">
+
+    Because a year-old store retrieves records that were true then and false now, and similarity ranking cannot tell the difference. Decay lowers the weight of unused records or archives them past a retention window.
+
+  </Accordion>
+  <Accordion title="10. How does a temporal knowledge graph solve staleness?">
+
+    Facts carry valid-from and valid-to, so a superseded record stops matching queries about the present rather than being deleted or outranked. Zep's Graphiti is built this way.
+
+  </Accordion>
+  <Accordion title="11. What is poisoned memory and why does it compound?">
+
+    Untrusted content, such as an instruction hidden in a retrieved web page, that gets summarized into long-term memory. It compounds because it is re-injected into every later prompt with its provenance stripped.
+
+  </Accordion>
+  <Accordion title="12. What is the relationship between procedural memory and Agent Skills?">
+
+    They are the same substrate. A skill file edited after a failed run is procedural memory being written, and loading a skill is procedural memory being read.
+
+  </Accordion>
+  <Accordion title="13. Name the memory-paging idea in MemGPT.">
+
+    Treat the context window as main memory and the external store as disk, with the model issuing its own page-in and page-out operations (arXiv:2310.08560).
+
+  </Accordion>
+</Accordions>

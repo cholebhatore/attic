@@ -1,0 +1,338 @@
+---
+title: The Agent Loop
+description: 'Loop engineering: the Think-Act-Observe cycle, step budgets, stopping conditions, stuck-action detectors, and the explicit FINISH tool.'
+---
+
+The model is the least interesting part of an agent runtime. Everything that decides whether the agent finishes, how much it costs, and whether it spins forever is the loop around it. "Loop engineering" is the name for treating that loop as the thing you design, rather than as a `while True` you wrote once.
+
+---
+
+## Think, Act, Observe
+
+One iteration has three phases, and each has a different failure mode.
+
+| Phase       | What happens                                  | Where it fails                                                    |
+| :---------- | :-------------------------------------------- | :---------------------------------------------------------------- |
+| **Think**   | The model reads the full context and decides  | Runs out of window; loses the system prompt to length degradation |
+| **Act**     | The runtime executes the requested tool calls | Tool raises, times out, costs money, or has side effects          |
+| **Observe** | Results are appended to the trajectory        | Observation is 400 KB of JSON and eats the budget                 |
+
+<Mermaid
+  chart={`
+flowchart LR
+    T["Think - model reads context"] --> D{"Tool call?"}
+    D -->|no| F["Return final answer"]
+    D -->|finish tool| F
+    D -->|yes| G{"Budget or stuck?"}
+    G -->|tripped| B["Bail with reason"]
+    G -->|clear| A["Act - execute tools"]
+    A --> O["Observe - append results"]
+    O --> T
+`}
+/>
+
+The cycle is `Think -> Act -> Observe -> Repeat`. Nothing in it is inherently bounded, which is the entire problem: the two exit decisions, the branch and the budget check, are the only things that stop it.
+
+---
+
+## Stopping conditions
+
+A loop needs several, checked in order, because any single one can be defeated.
+
+| Condition                   | Detects                     | Typical value                  |
+| :-------------------------- | :-------------------------- | :----------------------------- |
+| No tool call returned       | The model chose to answer   | Natural stop                   |
+| Explicit `finish` tool call | The model declared done     | Preferred, machine-checkable   |
+| `max_iterations`            | Runaway loops               | 15 to 50 steps                 |
+| Token or cost ceiling       | Expensive runs              | Per-task budget in dollars     |
+| Wall-clock timeout          | Hung tools                  | 60 s per tool, 10 min per task |
+| Repeated-state detector     | Oscillation and retry loops | 2 to 3 identical calls         |
+| Guardrail trip              | Policy violation            | Immediate halt                 |
+| Human interrupt             | Operator decision           | Async                          |
+
+The step budget and the cost ceiling are not redundant. A loop can be well under 25 steps and still have spent $40 because one tool returned 200,000 tokens. Check both.
+
+---
+
+## Step budgets
+
+Budgets do two jobs. They bound cost, and they change model behavior, because a budget stated in the prompt makes the model plan instead of explore.
+
+Telling the model "you have at most 8 tool calls" measurably reduces aimless search compared with an unstated limit that the runtime enforces silently. The silent version is discovered only when the run is killed, which produces a truncated answer with no explanation.
+
+Budget sizing:
+
+| Task shape                         | Reasonable budget              |
+| :--------------------------------- | :----------------------------- |
+| Single lookup with formatting      | 2 to 3                         |
+| Multi-step retrieval and synthesis | 6 to 12                        |
+| Code change with test verification | 15 to 40                       |
+| Open-ended research                | 40+, with compaction mandatory |
+
+Budgets also compose badly with cascading error. If each step independently succeeds with probability `p`, an `n`-step task succeeds with `p^n`:
+
+| `p` per step | 5 steps | 10 steps | 20 steps |
+| :----------- | :------ | :------- | :------- |
+| 0.95         | 0.77    | 0.60     | 0.36     |
+| 0.98         | 0.90    | 0.82     | 0.67     |
+| 0.99         | 0.95    | 0.90     | 0.82     |
+
+Derivation and the mitigations are in [Prompt Chaining](/ai/rag/prompt-chaining). The loop-level implication is that shortening the path is worth more than improving any single step, which is why deterministic routing beats letting the model wander.
+
+---
+
+## Why loops go infinite
+
+Five causes, in the order they appear in incident reports.
+
+| Cause                           | Symptom                                        | Fix                                                                |
+| :------------------------------ | :--------------------------------------------- | :----------------------------------------------------------------- |
+| Tool keeps failing identically  | Same call, same error, forever                 | Cap identical calls, surface the error text to the model           |
+| Error message is not actionable | `error: 500` gives the model nothing to change | Return the exception type, the argument that caused it, and a hint |
+| Two tools undo each other       | `write_file` then `revert_file`, alternating   | Detect oscillation, not just duplicates                            |
+| Observation too large           | The model loses the original task              | Truncate at ingest, summarize old observations                     |
+| No progress signal              | The model cannot tell it is stuck              | Give it a scratchpad and ask for a progress statement each step    |
+
+The second row deserves emphasis. Most "the agent looped" incidents are really "the agent was told something failed and given no information about why." A tool that returns `error: invalid input` will be retried with the same input.
+
+---
+
+## Stuck-action detectors
+
+Four detectors, cheapest first.
+
+```python
+def call_key(name, args):
+    return (name, json.dumps(args, sort_keys=True, default=str))
+
+class StuckDetector:
+    def __init__(self, repeat_limit=3, window=6):
+        self.repeat_limit = repeat_limit
+        self.window = window
+        self.history = []          # list of call_key
+        self.counts = Counter()    # call_key -> occurrences
+
+    def observe(self, key) -> str | None:
+        self.history.append(key)
+        self.counts[key] += 1
+
+        if self.counts[key] >= self.repeat_limit:
+            return "identical call repeated"
+
+        recent = self.history[-self.window:]
+        if len(set(recent)) <= 2 and len(recent) == self.window:
+            return "oscillating between two calls"
+
+        if len(recent) == self.window and recent[:3] == recent[3:6]:
+            return "repeating a three-step cycle"
+
+        return None
+```
+
+| Detector                         | Catches                              | Misses                                        |
+| :------------------------------- | :----------------------------------- | :-------------------------------------------- |
+| Exact-duplicate counter          | Retry loops with identical arguments | The same failing call with a tweaked argument |
+| Low-distinct-ratio over a window | Oscillation between two tools        | Slow drift                                    |
+| Subsequence match                | Cyclic behavior of period 3          | Long periods                                  |
+| Progress metric                  | Any loop, in principle               | Requires you to define progress               |
+
+The first three are structural and cheap. The fourth is the only one that catches a loop where every call is different and nothing is being achieved, and it needs a task-specific signal: files changed, tests passing, distance to a goal, or a model-graded "did the last step help?"
+
+A blocked call should return an observation, not raise. `Blocked: you have called search_documents with this exact query three times and it returned nothing. Try different terms, or call finish with status blocked.` That message gives the model an exit.
+
+---
+
+## The explicit FINISH tool
+
+The natural stop is "the model returned no tool call." It works, and it is ambiguous: the same signal means _done_, _gave up_, _confused_, and _ran out of output tokens_.
+
+A terminal tool disambiguates:
+
+```json
+{
+  "name": "finish",
+  "description": "End the run. Call this when the task is complete, when it is blocked, or when you need information only the user has. Do not call it before attempting the task.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "status": { "enum": ["complete", "blocked", "needs_input"] },
+      "answer": { "type": "string", "description": "The result, or what is blocking" },
+      "steps_used": { "type": "integer" }
+    },
+    "required": ["status", "answer"]
+  }
+}
+```
+
+Three benefits: the status is machine-readable so you can route blocked runs to a human; the answer is schema-constrained so downstream parsing is reliable; and premature termination becomes a measurable rate rather than a vibe.
+
+The cost is that a model can call `finish` immediately. Guard it by requiring at least one tool call before `finish` is accepted, and by validating the answer against the task before trusting the status.
+
+---
+
+## Observation management
+
+Observations accumulate faster than anything else in the trajectory, and they are the tokens worth the least per byte once they are old.
+
+| Technique               | Mechanism                                              | Trade                                              |
+| :---------------------- | :----------------------------------------------------- | :------------------------------------------------- |
+| Truncate at ingest      | Cap each observation at N characters                   | Silent loss; always say the output was truncated   |
+| Structured extract      | Parse the tool result, keep only needed fields         | Requires per-tool code                             |
+| Age-based summarization | Replace observations older than K steps with a summary | Extra model call; lossy                            |
+| External scratchpad     | Write big results to a file, keep the path in context  | Model must read it back                            |
+| Full compaction         | Summarize the whole trajectory at a threshold          | See [Context Budgeting](/ai/rag/context-budgeting) |
+
+Truncation must be visible. An observation that ends mid-JSON with no marker will be interpreted as a malformed response and retried, which is a loop cause. Append `[truncated: 41,208 of 48,331 characters]` and the model adapts, usually by narrowing the query.
+
+---
+
+## Parallel tool calls
+
+When the model returns several tool calls in one turn, executing them sequentially wastes wall-clock time on independent work.
+
+```python
+if len(calls) > 1 and all(is_read_only(c.name) for c in calls):
+    results = await asyncio.gather(*(run(c) for c in calls))
+else:
+    results = [await run(c) for c in calls]   # writes stay ordered
+```
+
+Read-only calls are safe to parallelize. Anything with side effects must stay ordered, because the model assumed a sequence when it emitted them, and reordering can produce a state it never predicted.
+
+All results must be appended, in the order the calls were emitted, each matched by its tool-use id. Dropping one breaks the transcript and most providers reject the next request outright.
+
+---
+
+## Checkpointing
+
+A loop that dies at step 19 of 25 should not restart from step 1. Persist the message list plus the step counter after every observation, keyed by run id.
+
+| Checkpoint granularity | Recovery cost              | Storage                          |
+| :--------------------- | :------------------------- | :------------------------------- |
+| None                   | Full replay                | Zero                             |
+| Per step               | One step of replay         | The whole trajectory, many times |
+| Per milestone          | Replay since the milestone | Small                            |
+
+Per-step checkpointing is what makes human-in-the-loop approval possible: pause, wait for a human, resume. Frameworks implement this as durable state, covered in [Agent Frameworks](/ai/agents/agent-frameworks).
+
+---
+
+## A loop with the guards in place
+
+```python
+MAX_STEPS = 25
+MAX_USD = 2.00
+OBS_CHARS = 4000
+
+def run_agent(task: str, tools: list, executor) -> tuple[str, dict]:
+    messages = [{"role": "user", "content": task}]
+    stuck = StuckDetector(repeat_limit=3, window=6)
+    spent = 0.0
+
+    for step in range(MAX_STEPS):
+        resp = client.messages.create(
+            model=MODEL, max_tokens=4096, system=SYSTEM,
+            tools=tools, messages=messages,
+        )
+        spent += price(resp.usage)
+        if spent > MAX_USD:
+            return bail("cost ceiling reached", messages, spent)
+
+        messages.append({"role": "assistant", "content": resp.content})
+        calls = [b for b in resp.content if b.type == "tool_use"]
+        if not calls:
+            return text_of(resp.content), {"steps": step + 1, "usd": spent}
+
+        for c in calls:
+            if c.name == "finish":
+                return c.input["answer"], {"status": c.input["status"], "steps": step + 1}
+
+            verdict = stuck.observe(call_key(c.name, c.input))
+            if verdict:
+                messages.append(tool_result(c.id, f"Blocked: {verdict}. Change approach or call finish with status blocked."))
+                continue
+            try:
+                out = executor(c.name, c.input)
+            except Exception as e:
+                out = f"error: {type(e).__name__}: {e}. Fix the arguments or try another tool."
+            messages.append(tool_result(c.id, truncate(out, OBS_CHARS)))
+
+    return bail("step budget exhausted", messages, spent)
+
+
+def tool_result(tool_use_id: str, content: str) -> dict:
+    return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": content}]}
+
+
+def truncate(s: str, n: int) -> str:
+    return s if len(s) <= n else s[:n] + f" [truncated: kept {n} of {len(s)} characters]"
+```
+
+Four guards, each answering one incident class: budget for cost, ceiling for spend, detector for oscillation, truncation for window exhaustion. The error path returns text instead of raising, because the model can only adapt to what it can read.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Name the three phases of one agent loop iteration.">
+
+    Think (the model reads context and decides), Act (the runtime executes the tool calls), Observe (results are appended to the trajectory).
+
+  </Accordion>
+  <Accordion title="2. Why are both a step budget and a cost ceiling needed?">
+
+    They bound different things. A run can stay under 25 steps and still be expensive if one observation is 200,000 tokens, and a run can be cheap and still loop for 500 steps on a small tool.
+
+  </Accordion>
+  <Accordion title="3. What is the most common real cause of an infinite agent loop?">
+
+    A tool failing with a non-actionable error message. The model retries the identical call because nothing in the observation told it what to change.
+
+  </Accordion>
+  <Accordion title="4. How does an exact-duplicate detector work and what does it miss?">
+
+    Hash the tool name with its canonically serialized arguments and count occurrences, blocking at a threshold. It misses the same failing call made with slightly different arguments, and slow drift.
+
+  </Accordion>
+  <Accordion title="5. Why return a blocked-call message instead of raising an exception?">
+
+    Because the model can only adapt to text it can read. Raising ends the run; a message telling the model the call was blocked and to change approach lets it recover.
+
+  </Accordion>
+  <Accordion title={<>6. What is the advantage of an explicit <code>finish</code> tool over "no tool call returned"?</>}>
+
+    It disambiguates completion from giving up, confusion, and output-token exhaustion, and it returns a machine-readable status plus a schema-constrained answer.
+
+  </Accordion>
+  <Accordion title={<>7. How do you stop a model calling <code>finish</code> immediately?</>}>
+
+    Require at least one real tool call before accepting it, and validate the answer against the task. Premature finish then becomes a metric you can track.
+
+  </Accordion>
+  <Accordion title="8. Why must observation truncation be visible in the text?">
+
+    An observation ending mid-JSON looks like a malformed tool response, which the model retries. A marker stating how much was dropped lets it narrow the query instead.
+
+  </Accordion>
+  <Accordion title="9. When is it safe to execute tool calls in parallel?">
+
+    When every call in the turn is read-only. Calls with side effects must stay in emission order because the model assumed a sequence when it produced them.
+
+  </Accordion>
+  <Accordion title="10. If each step succeeds with probability 0.95, what is the success rate of a 20-step task?">
+
+    `0.95^20 = 0.36`. The loop-level lesson is that shortening the path beats improving any single step.
+
+  </Accordion>
+  <Accordion title="11. What does per-step checkpointing enable besides crash recovery?">
+
+    Human-in-the-loop approval. Pause before a destructive action, wait for a decision, then resume from the exact state.
+
+  </Accordion>
+  <Accordion title="12. Why does stating the step budget inside the prompt help?">
+
+    It makes the model plan rather than explore. A silently enforced limit is only discovered when the run is killed, producing a truncated answer with no explanation.
+
+  </Accordion>
+</Accordions>

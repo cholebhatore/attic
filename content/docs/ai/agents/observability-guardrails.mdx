@@ -1,0 +1,403 @@
+---
+title: Observability and Guardrails
+description: 'Trace instrumentation with LangSmith, Langfuse and Phoenix, plus runtime rails for PII, toxicity, and grounding.'
+---
+
+A chat model fails in one place: the sentence it returns. An agent fails across a trajectory, and the visible symptom is usually several steps away from the cause. That makes instrumentation the prerequisite for everything else in this phase. You cannot evaluate, budget, debug, or guard a loop you cannot see inside.
+
+Guardrails are the other half of the same work. Tracing tells you what the agent did after the fact; a rail stops a class of thing from happening at run time. Both sit in the same place in the stack, around the model calls and around the tool executions.
+
+---
+
+## Vocabulary
+
+Agent observability borrows the shape of distributed tracing and adds two problems it never had: content is a first-class payload, and the unit of work spans many requests.
+
+| Term                 | Meaning in an agent                                                                                |
+| :------------------- | :------------------------------------------------------------------------------------------------- |
+| **Trace**            | One end-to-end agent run, from user turn to final answer                                           |
+| **Span**             | One unit of work: a model call, a tool execution, a retrieval, a guardrail check                   |
+| **Parent span**      | The step that dispatched this one, which is how a subagent nests                                   |
+| **Session / thread** | Many traces sharing one conversation or one durable graph thread                                   |
+| **Generation**       | A span that calls an LLM, with prompt, completion, tokens, and params                              |
+| **Event / log**      | A timestamped note inside a span, e.g. a retry or a stuck-detector trip                            |
+| **Score**            | A numeric or categorical judgement attached to a trace or span, from a metric, a judge, or a human |
+| **Cost**             | Derived from token counts and a price table, attributed per span and rolled up per trace           |
+
+The `score` concept is what separates LLM observability from APM. A score is the join between your eval run and your production trace, and it is why platforms let you attach one to any span rather than only to the root.
+
+---
+
+## What to put on every span
+
+Anything missing here is a question you cannot ask three months from now.
+
+| Attribute                                           | Why it earns the storage                                             |
+| :-------------------------------------------------- | :------------------------------------------------------------------- |
+| `trace_id`, `parent_span_id`, `step_index`          | Reconstructs the trajectory; step index makes loop analysis possible |
+| `session_id` / `thread_id`                          | Groups traces into a conversation or a resumed durable run           |
+| Model name, temperature, max tokens, tool list hash | Attribute a regression to a config change instead of mood            |
+| Prompt and completion text                          | The only way to debug a routing failure; also your PII liability     |
+| Input, output, cached, and reasoning token counts   | Cost and cache-hit analysis; reasoning tokens are billed as output   |
+| Time to first token and total latency               | Streaming UX versus batch cost are different problems                |
+| Tool name, arguments, result, status, duration      | Argument validity and tool-failure attribution                       |
+| Retrieved chunk ids and scores                      | Answers "was it in the context at all" without re-running retrieval  |
+| `finish_reason` / `stop_reason`                     | Truncation and budget exhaustion show up here first                  |
+| Error class and whether it was retried              | Distinguishes a transient 429 from a schema bug                      |
+| Guardrail verdicts and which rail produced them     | You must be able to audit a block, not just log it                   |
+| Judge scores from online evaluation                 | Turns the trace store into an eval dataset                           |
+
+Propagate `traceparent` (W3C Trace Context) through HTTP tool calls so a remote MCP server's spans land in the same trace as your agent's. If you emit OpenTelemetry, use the GenAI semantic conventions for the model attributes, and everything that speaks OTLP can ingest your traces, including vendor tools that claim otherwise.
+
+---
+
+## The platforms
+
+| Platform          | Licence                                            | Strengths                                                                                                                                                                                                                                             | Watch out                                                                       |
+| :---------------- | :------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------ |
+| **LangSmith**     | Commercial SaaS, self-host for enterprise          | Deepest LangChain and LangGraph integration: runs, threads, and graph steps appear without instrumentation. Datasets, experiments, annotation queues, automations, alerts, OTLP ingest                                                                | Prompt and completion text leaves your VPC unless you self-host or mask fields  |
+| **Langfuse**      | Open-source core, self-hostable; cloud offering    | Traces, observations, scores, prompt versioning and playground, datasets and experiments, custom evals, cost tracking. v3 (6 December 2024) moved high-volume trace, observation and score storage to ClickHouse with Postgres for transactional data | Self-hosting v3 means running ClickHouse plus a worker queue, not one container |
+| **Arize Phoenix** | Open source, OTel-native, plus Arize AX commercial | Auto-instrumentation for the common SDKs, open-tracing format by default, embedding and drift analysis, an evals library that shares metric ideas with RAGAS                                                                                          | Younger project surface: fewer admin and workflow features than the two above   |
+| Others            | Mixed                                              | Helicone (proxy-first, one base-URL change), Weights & Weave, Vertex AI / Cloud Monitoring integrations, OpenAI's own dashboard                                                                                                                       | Proxy-based capture sees requests, not your internal steps                      |
+
+How to choose quickly: on LangChain or LangGraph, LangSmith is the least work because the graph steps are already instrumented. Off-framework, or if prompts must not leave your infrastructure, Langfuse self-hosted. If you already run OTel and want LLM spans inside the same pipeline as your service spans, Phoenix.
+
+---
+
+## Instrumenting your own loop
+
+With a decorator per model call and per tool execution, the flat loop becomes a tree without restructuring it.
+
+```python
+from opentelemetry import trace
+
+tracer = trace.get_tracer("agent")
+
+def call_model(messages, tools, step):
+    with tracer.start_as_current_span("llm.generation") as sp:
+        sp.set_attribute("agent.step_index", step)
+        sp.set_attribute("gen_ai.request.model", MODEL)
+        resp = client.messages.create(
+            model=MODEL, max_tokens=4096, tools=tools, messages=messages
+        )
+        sp.set_attribute("gen_ai.usage.input_tokens", resp.usage.input_tokens)
+        sp.set_attribute("gen_ai.usage.output_tokens", resp.usage.output_tokens)
+        sp.set_attribute("gen_ai.response.stop_reason", resp.stop_reason)
+        return resp
+
+
+def execute(tool_name, args, tool_use_id):
+    with tracer.start_as_current_span(f"tool.{tool_name}") as sp:
+        sp.set_attribute("tool.args", json.dumps(args)[:2000])
+        try:
+            out = registry[tool_name](**args)
+            sp.set_attribute("tool.status", "ok")
+        except Exception as e:
+            sp.set_attribute("tool.status", "error")
+            sp.record_exception(e)
+            out = f"error: {type(e).__name__}"
+        sp.set_attribute("tool.result_chars", len(str(out)))
+        return out
+```
+
+Same idea with Langfuse's `@observe`, which infers the span name from the function and nests by call stack:
+
+```python
+from langfuse.decorators import observe, langfuse_context
+
+@observe()                      # inner spans nest under the outer trace
+def run_agent(task: str) -> str: ...
+
+langfuse_context.update_current_trace(
+    session_id=thread_id, tags=["triage"], release=GIT_SHA,
+)
+```
+
+Log the retrieval as its own span with chunk ids and scores. It is the single most useful non-model span in a RAG-agent trace, because "the answer was wrong" and "the answer was never in the context" look identical from the outside.
+
+<Callout type="warn">
+  ### The prompt is payload, and payload has obligations
+
+Tracing prompt and completion text turns your observability store into the least-governed copy of every document the agent has touched. Decide before you ship: whether content is stored at all, whether it is redacted on the way in, retention per environment, and who can read a trace. A vendor tool with full prompt capture and no field masking is a data-residency incident waiting for an auditor.
+
+</Callout>
+
+---
+
+## From traces to evals
+
+The loop that makes observability pay for itself.
+
+```text
+production traces
+  -> stratified sample (by route, by tool mix, by outcome, plus failures)
+  -> annotation queue for humans, or an online judge on a percentage
+  -> scores written back onto the trace
+  -> promote the labelled traces into a dataset
+  -> dataset runs as a regression gate on every change
+```
+
+Sampling by failure is the high-yield move: filter on `stop_reason == "max_tokens"`, on tool errors, on step counts above the 95th percentile, on guardrail blocks, or on a judge's low groundedness score, and you get a queue of things likely to be interesting instead of a random sample of success.
+
+Automations close the loop: a rule that routes any trace matching a filter into a dataset or annotation queue, and an online judge run on a small percentage so regression is detected between releases rather than at one.
+
+---
+
+## Debugging order
+
+| Symptom                    | First thing to look at                              | Then                                                                        |
+| :------------------------- | :-------------------------------------------------- | :-------------------------------------------------------------------------- |
+| Wrong final answer         | Was the needed text in a retrieval span at all      | Prompt order and truncation                                                 |
+| Refuses to act             | Guardrail verdict spans, and which rail             | System prompt constraints                                                   |
+| Runs forever               | Step index against the budget, duplicate tool args  | The routing description that invites retry                                  |
+| Ends too early             | `stop_reason`: length versus a hand-written finish  | Max tokens, or a `finish` tool the model treats as optional                 |
+| Expensive                  | Token counts per span, cache reads, retrieval sizes | Context growth per step; see [Context Budgeting](/ai/rag/context-budgeting) |
+| Flaky across runs          | Diff the two traces' tool results                   | Non-deterministic tools, temperature, or a live API                         |
+| Subagent output ignored    | Boundary spans: what crossed back                   | Return contract; see [Multi-Agent Topologies](/ai/agents/multi-agent)       |
+| Works locally, fails in CI | Config attributes on the spans                      | Model alias, provider version, tool list hash                               |
+
+Read the trajectory before you read the answer. A step-by-step trace usually contains the failure at a step the summary does not mention.
+
+---
+
+## Where rails sit
+
+Six interception points, in execution order.
+
+<Mermaid
+  chart={`
+flowchart LR
+    U["User input"] --> R1["1 Input rail"]
+    R1 --> M["Model"]
+    M --> R2["2 Pre-tool rail"]
+    R2 --> X["Tool execution"]
+    X --> R3["3 Post-tool rail"]
+    R3 --> M2["Model reads result"]
+    M2 --> R4["4 Retrieval rail"]
+    R4 --> R5["5 Output rail"]
+    R5 --> O["Reply"]
+    M --> R6["6 Dialog or topic rail"]
+    R6 --> M
+`}
+/>
+
+| Rail        | Fires on                              | Catches                                                                            | Cost paid                                        |
+| :---------- | :------------------------------------ | :--------------------------------------------------------------------------------- | :----------------------------------------------- |
+| 1 Input     | The user message                      | Injection attempts, toxic or off-topic requests, PII the user volunteered          | One small classifier call                        |
+| 2 Pre-tool  | Proposed arguments, before execution  | Out-of-policy actions, dangerous SQL, path traversal, unapproved destructive calls | Deterministic checks, effectively free           |
+| 3 Post-tool | Tool output, before the model sees it | Indirect injection, secrets or PII in results, oversized payloads                  | A scan of every result                           |
+| 4 Retrieval | Retrieved chunks                      | Content from untrusted sources, prompt-injection payloads in documents             | Scan at index time is cheaper than at query time |
+| 5 Output    | The drafted reply                     | Leaked PII, ungrounded claims, toxicity, format violations, missing citations      | One judge call on the reply                      |
+| 6 Dialog    | The conversation state                | Off-topic drift, jailbreak accumulation across turns, refusal-loop escape          | Policy evaluation, usually rules                 |
+
+Rail 2 and rail 3 are the ones most often skipped, and they are where an agent differs from a chatbot. A chat app only needs 1 and 5. An agent that executes has a channel into the environment and a channel back out of it, and both carry attacker-controlled data. See [Agent Security](/ai/agents/agent-security) for why rail 3 is the injection defense that holds.
+
+---
+
+## PII redaction
+
+Two passes, symmetric: inbound so the model never sees an identifier, outbound so nothing reconstructed escapes.
+
+| Technique             | Example                                  | Reversible        | Notes                                                                             |
+| :-------------------- | :--------------------------------------- | :---------------- | :-------------------------------------------------------------------------------- |
+| Masking               | `[REDACTED]`                             | No                | Cheapest, but destroys the model's ability to reason about the value              |
+| Pseudonymisation      | `<EMAIL_1>` with a server-side map       | Yes, at egress    | The right default: the model can still say "the second email is the work address" |
+| Synthetic replacement | A well-formed fake SSN of the same class | No                | Preserves format and reasoning; never send the fake downstream as if real         |
+| Type-preserving token | Deterministic HMAC of the value          | Only with the key | Useful for join keys that must stay stable across turns                           |
+
+Microsoft's **Presidio** is the standard open-source implementation: recognizer types (email, phone, national IDs per locale), NER models plus regex and checksum validators, confidence scores, and a redact or anonymize replace-all option. It handles entities, not context, so add an allow-list for company identifiers that look like phone numbers.
+
+The invariant worth enforcing is that the model should not need the raw value. If a tool genuinely requires it, inject it server-side at execution time from the mapping rather than letting it live in the context window. That also removes the argument from a tool-output rail: identifiers in results must be replaced before the next model call, or the inbound rail is decorative.
+
+---
+
+## Toxicity and safety classification
+
+**Llama Guard** (arXiv:2312.06674) is a fine-tuned classifier that reads a conversation and returns `safe` or `unsafe` plus category codes from a fixed taxonomy, on the same prompt-in-and-label-out contract for both user input and model output. The line has moved to Llama Guard 4 (12B, natively multimodal, released 29 April 2025), which scores text and images together, and **Prompt Guard 2** covers the adjacent job of jailbreak and injection detection in tens of millions of parameters, small enough to run inline on every message.
+
+| Layer               | Tooling                                                               | Characteristic                                           |
+| :------------------ | :-------------------------------------------------------------------- | :------------------------------------------------------- |
+| Regex and blocklist | Yours                                                                 | Free, catches nothing clever                             |
+| Small classifier    | Prompt Guard 2, Llama Guard, DeBERTa toxicity heads                   | Milliseconds, self-hostable, fixed taxonomy              |
+| Cloud moderation    | Azure AI Content Safety, Amazon Bedrock Guardrails, OpenAI Moderation | Managed, policy-configurable, sends content out          |
+| LLM judge           | General model with a rubric                                           | Handles nuance and intent, costs a call and adds latency |
+| Rules in a rail DSL | NeMo Guardrails                                                       | Deterministic topic and flow policy, no model call       |
+
+The taxonomy is the limitation. A safety classifier answers "does this text match a category it was trained on", so it will not notice a policy violation specific to your product, and it will not distinguish an attack from an unusual-but-legitimate request. Measure a false-positive rate on your own traffic before you let a rail block anything, and start in shadow mode.
+
+---
+
+## Grounding checks
+
+The output-rail version of faithfulness, run on live traffic instead of in CI.
+
+```python
+def ground_reply(reply: str, contexts: list[str]) -> Verdict:
+    claims = decompose(reply, llm=JUDGE)          # 1 sentence -> 1..N atomic claims
+    unsupported = [
+        c for c in claims
+        if not entails(any(c in ctx or judge_supports(c, ctx) for ctx in contexts),
+                       judge=JUDGE)
+    ]
+    if not unsupported:
+        return Verdict("grounded")
+    if len(unsupported) / len(claims) > 0.2:
+        return Verdict("rewrite", reason="unsupported claims", claims=unsupported)
+    return Verdict("append_disclaimer", claims=unsupported)
+```
+
+Three implementation choices decide whether this is usable.
+
+| Choice            | Options                                          | Consequence                                                                      |
+| :---------------- | :----------------------------------------------- | :------------------------------------------------------------------------------- |
+| Claim granularity | Sentence-level versus atomic-claim decomposition | Decomposition catches the half-sentence that is invented; costs more judge calls |
+| Support test      | Embedding similarity, NLI model, or LLM judge    | Similarity is fast and wrong on paraphrase; an NLI model is the middle ground    |
+| Failure action    | Block, rewrite, disclaim, or only log            | Logging is the correct first mode; blocking needs a measured false-positive rate |
+
+Citation verification is the cheap approximation. If the prompt requires the model to cite chunk ids per claim, checking that every cited id exists and that the cited span overlaps the claim's entailment catches a large share of fabrication for the cost of string work plus one small model.
+
+The reason to run grounding on live traffic is distributional: your eval set is questions you thought of, production is the ones you did not.
+
+---
+
+## Rail frameworks
+
+**NeMo Guardrails** (NVIDIA) expresses rails as a programmable flow rather than a per-call classifier. `config.yml` lists which flows run at each rail position, and Colang files define what those flows do.
+
+```yaml
+# config.yml
+rails:
+  input:
+    flows:
+      - self check input # LLM-as-classifier screen on the message
+      - mask sensitive entities direct # PII before it reaches the model
+  retrieval:
+    flows:
+      - self check relevance
+  output:
+    flows:
+      - self check hallucination
+      - self check output
+  execution:
+    mode: independent
+```
+
+The key is `flows:` per rail type, and each entry is a flow name from the built-in catalog or one you define yourself. Colang syntax differs between the 1.x line and 2.x, so copy flow bodies from the docs for the version you pinned rather than from memory.
+
+```text
+# config/flows/general/disable_topics.co   (Colang 1.x)
+define user ask about roadmap
+  "What is on the roadmap for next quarter?"
+  "Which features are you planning?"
+
+define flow disallow roadmap
+  user ask about roadmap
+  bot refuse to respond
+    "I can't talk about unreleased plans."
+  stop
+```
+
+A `define user` block names a message type by example utterances, and a `define flow` block says what happens when that type is matched, with `stop` ending the turn. That is topic control expressed as data rather than a classifier, and it is the reason dialog rails exist as a separate type.
+
+The five rail types (input, dialog, retrieval, execution, output) map onto the interception table above, with dialog rails being the distinctive piece: they constrain which flows the conversation may take, which is topic control without a classifier. **Guardrails AI** takes the other shape, a hub of typed validators (`provenance`, `regex`, `pii`, `toxicity`, structured-schema guards) you compose into a guard around the LLM call.
+
+Both add a serial model or classifier hop in the request path. Budget for it: a rail stack of four checks at 300 ms each is 1.2 s added to a reply the user is already waiting on. The standard mitigation is to run the cheap deterministic and small-classifier rails inline and the LLM-judge rails async, so the response is not gated on a judge and a violation still reaches an alert.
+
+---
+
+## Failure modes
+
+| Failure                           | How it looks                                                | Countermeasure                                                            |
+| :-------------------------------- | :---------------------------------------------------------- | :------------------------------------------------------------------------ |
+| Over-blocking                     | Legitimate requests refused; users route around you         | Shadow mode first, measure false positives per rail, then enable blocking |
+| Rail on the wrong channel         | Input scanned, tool output never                            | Rails 2 and 3 on every untrusted result                                   |
+| Redaction breaks reasoning        | Model cannot answer a question about an entity it never saw | Pseudonymise with a reversible map, not mask                              |
+| Blocking at output after the leak | Reply suppressed, but a tool already exfiltrated the data   | Rail the action, not only the text                                        |
+| Guardrail drift                   | Blocks change while your code does not                      | Version rail prompts and pin classifier model IDs                         |
+| No trace for a block              | A user reports a refusal nobody can explain                 | Emit a verdict span with the rail id and reason                           |
+| Judge rails unmonitored           | Groundedness silently drops for a month                     | Alert on the online metric, not only the dashboard                        |
+| Rails as the only defense         | Classifier passes a novel attack                            | Least privilege, confirmation gates, sandboxing; rails are one layer      |
+
+A rail is a filter over text. Privilege scoping, approval gates, and sandboxing constrain what the agent can do even when the filter is wrong, which is the ordering to state in an interview: defense in depth with rails last, not first.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Why does agent observability need traces rather than logs?">
+
+    A run is a tree of model calls, tool executions, and retrievals, and the symptom appears at the root while the cause is a leaf. Traces give you the parent-child structure, per-step timing and cost, and one identifier to filter on; logs give you lines.
+
+  </Accordion>
+  <Accordion title="2. Name five attributes you would require on every generation span.">
+
+    Model name and parameters plus tool-list hash, input, output, cached and reasoning token counts, time to first token and total latency, `stop_reason`, and session or thread id with the step index.
+
+  </Accordion>
+  <Accordion title="3. Why is the retrieval span the most useful non-model span?">
+
+    Because "the answer was wrong" and "the needed text was never in the context" are indistinguishable from the final reply. Chunk ids and scores let you route the bug to the index or the prompt.
+
+  </Accordion>
+  <Accordion title="4. What is a score, and why does it matter?">
+
+    A numeric or categorical judgement attached to a trace or span, from a metric, an LLM judge, or a human. It is the join between evals and production: labelled traces promote into datasets that gate the next release.
+
+  </Accordion>
+  <Accordion title="5. LangSmith, Langfuse, Phoenix: pick each in one line.">
+
+    LangSmith when you are on LangChain or LangGraph and want graph steps instrumented for free. Langfuse when you want an open-source, self-hostable stack with prompt versioning, datasets and experiments, whose v3 stores traces in ClickHouse. Phoenix when you are already emitting OpenTelemetry and want LLM spans in the same pipeline.
+
+  </Accordion>
+  <Accordion title={<>6. What does propagating <code>traceparent</code> buy an agent?</>}>
+
+    It stitches remote spans, an MCP server over HTTP, a vector DB call, a downstream microservice, into your agent's trace, so tool latency and failures are attributed inside one run instead of correlated by timestamp across three systems.
+
+  </Accordion>
+  <Accordion title="7. Name the six rail positions and the two that agents add over chatbots.">
+
+    Input, pre-tool, post-tool, retrieval, output, dialog. Pre-tool and post-tool are the agent-only ones, because an agent has a channel into the environment and a channel back out, both carrying attacker-controlled data.
+
+  </Accordion>
+  <Accordion title="8. Masking versus pseudonymisation for PII: what decides it?">
+
+    Whether the model must reason about the entity. Masking is cheapest but removes the value from the model's world. Pseudonymised placeholders with a server-side map keep reasoning intact and let egress restore the value, so identifiers never need to be in the context at all.
+
+  </Accordion>
+  <Accordion title="9. What is Llama Guard and what is its limitation?">
+
+    A fine-tuned safeguard classifier (arXiv:2312.06674) that reads a conversation and returns safe or unsafe plus category codes; Llama Guard 4 is a 12B natively multimodal version released 29 April 2025. It answers "does this match a trained category", so product-specific policy violations are invisible to it and its false-positive rate on your traffic is unknown until you measure it.
+
+  </Accordion>
+  <Accordion title="10. How do you build a hallucination grounding check, and what are the three design choices?">
+
+    Decompose the reply into atomic claims, test each for entailment against the retrieved contexts, and act on the unsupported fraction. The choices are claim granularity, the support test (embedding similarity, an NLI model, or an LLM judge), and the failure action (log, disclaim, rewrite, block). Start with logging.
+
+  </Accordion>
+  <Accordion title="11. Why does a grounding check cost more than one judge call?">
+
+    Decomposition is a call, and entailment is one judge call per claim per candidate context unless you batch or pre-filter with similarity. That is why citation verification, checking that cited chunk ids exist and overlap the claim, is the common production compromise.
+
+  </Accordion>
+  <Accordion title="12. What are NeMo Guardrails' five rail types?">
+
+    Input, dialog, retrieval, execution and output, declared in a config and written as flows in Colang. Dialog rails are the distinguishing feature: they constrain which conversation flows are permitted, which is topic control without a classifier.
+
+  </Accordion>
+  <Accordion title="13. Your guardrail stack adds 1.2 seconds. What is the fix?">
+
+    Split it by cost: deterministic checks and small classifiers inline, LLM-judge rails async so they alert and score rather than gate the reply. Also evaluate whether a rail is blocking on a measured false-positive rate worth its latency.
+
+  </Accordion>
+  <Accordion title="14. A user says the agent refused a reasonable request and nobody can reproduce it. What was missing?">
+
+    A verdict span. Every rail must emit its id, its inputs, its confidence, and its decision, so a block is an auditable event, not a mystery in the reply text.
+
+  </Accordion>
+  <Accordion title="15. Where do guardrails sit in the defense order, and why?">
+
+    Last, not first. A rail is a text filter and will eventually be wrong, so least-privilege credentials, confirmation gates on destructive actions, and sandboxed execution must hold even when the classifier passes. Rails reduce the volume of bad things reaching those gates.
+
+  </Accordion>
+</Accordions>
