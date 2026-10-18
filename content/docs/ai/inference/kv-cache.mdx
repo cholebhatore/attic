@@ -1,0 +1,238 @@
+---
+title: KV Cache
+description: 'Exact VRAM arithmetic per token, how many sequences fit on a GPU, when KV traffic overtakes weight traffic, and the four ways the cache gets smaller.'
+---
+
+The KV cache is the only state that grows with conversation length. Weights are fixed at load time; the cache grows by a constant number of bytes for every token in every concurrent sequence, and on a long-context workload it becomes the binding constraint on batch size.
+
+---
+
+## What the cache holds
+
+Attention at step `t` needs the key and value vectors of every position `1..t`. Recomputing them means rerunning the projection for all previous tokens, which is quadratic work for a linear result. Caching K and V turns each decode step into one new projection plus a read of the stored tensors.
+
+Two things are not cached. Queries are per-step and discarded after the attention output. The attention output itself is not stored either, since the residual stream carries it forward. What remains is exactly two tensors per layer per token:
+
+```text
+per token, per layer:  K of shape [n_kv_heads, d_head]
+                       V of shape [n_kv_heads, d_head]
+```
+
+The count of KV heads, not query heads, is what appears here. That is the whole point of grouped-query attention, and it is why the formula below multiplies by `n_kv_heads`.
+
+---
+
+## The formula and the per-token constant
+
+```text
+KV bytes = 2 x n_layers x n_kv_heads x d_head x bytes_per_element x seq_len x batch
+```
+
+The factor of 2 is K and V. Everything except `seq_len` and `batch` is a property of the model, so it collapses into one number: bytes of cache per token of context.
+
+The same formula appears under different variable names in different codebases. `n_kv_heads` is `KV_Heads`, `d_head` is `head_dim`, `bytes_per_element` is `Precision_Bytes`, and `batch` is `Batch_Size`. A `transformers` config spells them `num_key_value_heads` and `head_dim`; GGUF metadata spells them `attention.head_count_kv` and `attention.key_length`.
+
+| Model                  | Layers | KV heads      | d_head | Precision | Bytes per token           |
+| :--------------------- | :----- | :------------ | :----- | :-------- | :------------------------ |
+| Llama 2 7B (MHA)       | 32     | 32            | 128    | BF16      | `2*32*32*128*2` = 512 KiB |
+| Llama 3 8B (GQA-8)     | 32     | 8             | 128    | BF16      | `2*32*8*128*2` = 128 KiB  |
+| Qwen2.5-7B (GQA-4)     | 28     | 4             | 128    | BF16      | `2*28*4*128*2` = 56 KiB   |
+| Llama 3 70B (GQA-8)    | 80     | 8             | 128    | BF16      | `2*80*8*128*2` = 320 KiB  |
+| Llama 3.1 405B (GQA-8) | 126    | 8             | 128    | BF16      | `2*126*8*128*2` = 504 KiB |
+| DeepSeek-V3 (MLA)      | 61     | shared latent | 576    | BF16      | `61*576*2` = 68.6 KiB     |
+
+Configs from the published model cards and HF config files. MLA has no factor of 2 because it caches a single latent vector of 512 dimensions plus a 64-dimensional rotary key, and the value is reconstructed from the same latent. The comparison to Llama 2 7B is the cleanest illustration of GQA: same parameter scale, same `d_head`, one quarter the KV heads, one quarter the cache.
+
+At 1M tokens of context the totals are 128 GiB for Llama 3 8B, 320 GiB for Llama 3 70B, and 69 GiB for DeepSeek-V3.
+
+---
+
+## How many sequences fit
+
+The useful question is not how large the cache is but how much room is left after the weights.
+
+```text
+H100 SXM, 80 GB HBM3, Llama 3 8B in BF16
+
+weights            16 GB
+activations, CUDA
+  context, buffers ~4 GB
+remaining for KV   60 GB ~= 56 GiB
+token slots        56 GiB / 128 KiB = 458,752
+
+at 4,096 context   458,752 / 4,096  = 112 concurrent sequences
+at 32,768 context  458,752 / 32,768 =  14 concurrent sequences
+```
+
+Context length divides batch size linearly. Doubling the supported context halves the number of concurrent users, which is the arithmetic behind every long-context pricing decision.
+
+For Llama 3 70B the situation inverts. BF16 weights are about 140 GB, so two H100s are needed just to hold the model, leaving roughly 20 GB across the pair for cache:
+
+```text
+20 GiB / 320 KiB = 65,536 token slots = 16 sequences at 4,096 context
+```
+
+Sixteen concurrent sequences on two H100s is why 70B serving is cache-starved rather than compute-starved, and why FP8 weights plus an FP8 cache are close to mandatory in production.
+
+---
+
+## When the cache outgrows the weights
+
+Decode reads the weights once per step and reads the entire cache once per step. Both compete for the same HBM bandwidth, so there is a crossover. For Llama 3 8B in BF16:
+
+```text
+weight bytes per step      16.0 GB
+KV bytes per token slot    131,072
+crossover                  16.0e9 / 131,072 = 122,070 token slots
+```
+
+Below about 122,000 total tokens of context across the batch, weights dominate decode traffic and the batch-1 ceiling of roughly 209 tokens per second holds. Above it, cache reads dominate and per-token latency grows with context length. At batch 32 that crossover arrives at about 3,800 tokens of context per sequence, which is inside a single ordinary document.
+
+This is the number that makes long-context serving expensive. It is not the quadratic attention cost, which FlashAttention largely absorbs; it is that the cache becomes the largest thing being read.
+
+---
+
+## Reduction 1: architecture
+
+| Scheme | KV heads                     | Cache vs MHA                      | Source                           |
+| :----- | :--------------------------- | :-------------------------------- | :------------------------------- |
+| MHA    | equals query heads           | 1x                                | baseline                         |
+| MQA    | 1                            | `1 / n_heads`                     | Shazeer, arXiv:1911.02150        |
+| GQA-8  | 8                            | `8 / n_heads`                     | Ainslie et al., arXiv:2305.13245 |
+| MLA    | shared latent, 576 per layer | about `1/57` of an equivalent MHA | DeepSeek-V2, arXiv:2405.04434    |
+
+GQA is the production default because MQA loses measurable quality and GQA-8 recovers most of it. MLA goes further by compressing K and V jointly into one latent vector, at the cost of a more complex attention kernel. Both are covered in the attention variants page; the point here is that they are cache-compression techniques that happen to be architectural.
+
+---
+
+## Reduction 2: precision
+
+The cache is read far more than it is written, and it carries no gradient, so it tolerates lower precision than the weights in some regimes and worse in others.
+
+| Cache precision | Bytes per element | Llama 3 8B per token | Typical quality effect                   |
+| :-------------- | :---------------- | :------------------- | :--------------------------------------- |
+| BF16            | 2                 | 128 KiB              | baseline                                 |
+| FP8 E4M3        | 1                 | 64 KiB               | within noise on most benchmarks          |
+| INT8 per-token  | 1                 | 64 KiB               | needs per-token scales, not per-tensor   |
+| INT4            | 0.5               | 32 KiB               | degrades on long-range retrieval         |
+| 2-bit           | 0.25              | 16 KiB               | usable only with asymmetric K/V handling |
+
+Two asymmetries matter. Keys are more sensitive than values, because a key error changes which positions get attended while a value error only perturbs the mixture. And keys have large per-channel outliers, so per-channel quantization suits K while per-token suits V. KIVI exploits exactly that split, quantizing keys per channel and values per token at 2 bits and reporting 2.6x throughput (arXiv:2402.02750). KVQuant reaches 3 bits with non-uniform datatypes and per-channel key quantization (arXiv:2401.18079).
+
+FP8 E4M3 is the safe production choice. It saturates at 448, which is above the range of typical key and value activations, and it halves cache traffic with no measurable quality change on most evaluations.
+
+---
+
+## Reduction 3: token eviction
+
+Eviction drops cache entries for tokens judged unimportant, trading exact attention for a bounded cache.
+
+| Method       | Rule                                                                                                      | Source           |
+| :----------- | :-------------------------------------------------------------------------------------------------------- | :--------------- |
+| StreamingLLM | Keep the first few tokens as attention sinks plus a sliding window of recent tokens                       | arXiv:2309.17453 |
+| Scissorhands | Keep tokens that were frequently attended in past steps                                                   | arXiv:2305.17118 |
+| H2O          | Keep heavy hitters by accumulated attention score plus recent tokens                                      | arXiv:2306.14048 |
+| SnapKV       | Score the prompt by attention from the final window positions, keep the top-k, compress before generation | arXiv:2404.14469 |
+| PyramidKV    | Allocate more cache to lower layers and less to higher ones, following the observed concentration pattern | arXiv:2406.02069 |
+
+The attention sink result is the most durable finding: the first token of a sequence absorbs a large share of attention mass regardless of content, and evicting it collapses the softmax. Four sink tokens plus a 1,000-token window lets a StreamingLLM model run unbounded-length streams with stable perplexity.
+
+Eviction is lossy in a way quantization is not. A quantized cache degrades smoothly; an evicted cache cannot answer a question whose evidence was dropped, and the failure is silent. That makes eviction suitable for streaming and unsuitable for retrieval over a long supplied context.
+
+---
+
+## Reduction 4: storage layout
+
+Layout changes cost nothing in quality, which is why it came first in practice.
+
+- **PagedAttention** stores the cache in fixed-size non-contiguous blocks with a per-sequence block table, the way an OS pages virtual memory. It removes the fragmentation that wasted 60 to 80 percent of cache memory in contiguous allocators, and vLLM reports 2 to 4x throughput over faster baselines (arXiv:2309.06180).
+- **Prefix caching** keeps the cache for shared prompt prefixes across requests, so a system prompt or a repeated document is prefilled once. SGLang's RadixAttention indexes those prefixes in a radix tree for automatic reuse.
+- **CPU offload** moves cold blocks to host RAM over PCIe. It buys capacity at the cost of a transfer on the critical path, and it works only when the offloaded blocks are unlikely to be read again soon.
+
+---
+
+## What the reductions cost
+
+<Callout type="warn">
+  ### Compression changes the failure mode
+
+Every reduction here trades a measurable resource for an unmeasurable one. FP8 cache raises perplexity by less than a point while retrieval over a 100K-token context can lose several. Eviction loses the ability to answer at all when the evidence was dropped. Evaluate a compressed cache on the long-context task you ship, not on a short-benchmark average, because the short benchmarks do not exercise the cache.
+
+</Callout>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Why are queries not cached?">
+
+    Because a query is used once, at the step that produces it, and the attention output is carried forward by the residual stream. Only keys and values are needed by future steps.
+
+  </Accordion>
+  <Accordion title={<>2. Compute the per-token cache for a 32-layer model with 8 KV heads, <code>d_head</code> 128, in BF16.</>}>
+
+    `2 * 32 * 8 * 128 * 2 = 131,072` bytes, or 128 KiB. The factor of 2 is K and V.
+
+  </Accordion>
+  <Accordion title="3. Why does MLA drop the factor of 2?">
+
+    It caches one compressed latent vector of 512 dimensions plus a 64-dimensional rotary key, and reconstructs both K and V from that latent. Per token per layer it stores 576 elements, against 32,768 for a 128-head, 128-dimensional MHA layer.
+
+  </Accordion>
+  <Accordion title="4. How many concurrent 4,096-token sequences does an 8B BF16 model support on one H100?">
+
+    About 112. Sixteen GB of weights and roughly 4 GB of overhead leave 56 GiB, which at 128 KiB per token is 458,752 token slots.
+
+  </Accordion>
+  <Accordion title="5. Why is 70B serving cache-starved rather than compute-starved?">
+
+    BF16 weights need about 140 GB, so two H100s hold the model with roughly 20 GB left. At 320 KiB per token that is 65,536 slots, or 16 sequences at 4K context. The GPUs have arithmetic to spare and no memory to batch with.
+
+  </Accordion>
+  <Accordion title="6. At what total context does the KV cache out-read the weights during decode for an 8B BF16 model?">
+
+    About 122,000 token slots: 16 GB of weights divided by 131,072 bytes per token. At batch 32 that is roughly 3,800 tokens of context per sequence.
+
+  </Accordion>
+  <Accordion title="7. Why do keys need per-channel quantization while values need per-token?">
+
+    Keys carry large outlier channels, so a single per-tensor scale wastes most of the integer range. Values do not have the same channel structure but do vary in magnitude across positions, so per-token scaling fits them. KIVI quantizes keys per channel and values per token at 2 bits.
+
+  </Accordion>
+  <Accordion title="8. Why is a key quantization error worse than a value error of the same size?">
+
+    A key error changes the attention distribution, so the model reads from the wrong positions. A value error only perturbs the weighted mixture that was already correctly selected.
+
+  </Accordion>
+  <Accordion title="9. What is an attention sink?">
+
+    The first few tokens of a sequence absorb a large share of attention mass regardless of their content. Evicting them collapses the softmax, so StreamingLLM keeps four sink tokens alongside a sliding window to run unbounded-length streams.
+
+  </Accordion>
+  <Accordion title="10. When is token eviction the wrong choice?">
+
+    When the long context is supplied evidence rather than conversation history. Eviction fails silently: if the supporting passage was dropped, the model answers from the remainder and there is no signal at generation time that anything is missing.
+
+  </Accordion>
+  <Accordion title="11. What does PagedAttention fix, and what does it cost in quality?">
+
+    Internal and external fragmentation in contiguous cache allocation, which wasted 60 to 80 percent of cache memory. It costs nothing in quality, because the same bytes are stored in non-contiguous blocks behind a per-sequence block table.
+
+  </Accordion>
+  <Accordion title="12. Why does FP8 E4M3 suit the KV cache specifically?">
+
+    Its maximum representable value is 448, above the range of typical key and value activations, so it does not clip. It halves cache traffic and per-token cache size with no measurable quality change on most evaluations.
+
+  </Accordion>
+  <Accordion title="13. Llama 2 7B and Llama 3 8B are similar in size. Why do their caches differ by 4x?">
+
+    Llama 2 7B uses multi-head attention with 32 KV heads at 512 KiB per token. Llama 3 8B uses GQA-8 with 8 KV heads at 128 KiB per token. Same `d_head`, same layer count, a quarter the KV heads.
+
+  </Accordion>
+  <Accordion title="14. A team wants 128K context and high concurrency on 70B. Which reduction should they try first?">
+
+    Layout and precision, since both are near-lossless. FP8 weights free about 70 GB, an FP8 cache halves per-token cost to 160 KiB, and prefix caching removes the repeated system prompt entirely. Eviction is last, because it is the only one that can silently lose the answer.
+
+  </Accordion>
+</Accordions>

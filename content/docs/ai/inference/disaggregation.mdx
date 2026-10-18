@@ -1,0 +1,175 @@
+---
+title: Prefill-Decode Disaggregation
+description: 'Why one GPU pool cannot serve both phases well, the KV transfer arithmetic that decides whether it pays, and DistServe, Splitwise, and Mooncake.'
+---
+
+Colocated serving forces one machine configuration to serve two workloads with opposite bottlenecks. Prefill wants FLOPs and tolerates high latency variance. Decode wants memory bandwidth, wants a large KV cache, and needs flat latency. Disaggregation splits them into separate pools and ships the KV cache between them, which removes the compromise and adds a network transfer to the critical path.
+
+---
+
+## What colocation costs
+
+Three distinct problems, each with its own symptom.
+
+**Hardware mismatch.** A prefill step is compute-bound at arithmetic intensity equal to the prompt length. A decode step is bandwidth-bound at intensity equal to the batch size. One SKU sized for the blended average is oversized for both: it carries HBM capacity that prefill never touches and FLOPs that decode never reaches.
+
+**SLO interference.** A 32K-token prefill occupies the GPU for over a second. Every decode step in that batch stalls, so the p99 inter-token latency of unrelated users spikes. Chunked prefill bounds the damage but does not remove it, because the chunks still consume iterations that decode needed.
+
+**Scaling coupling.** Prefill load scales with prompt volume and length; decode load scales with output volume and concurrency. In a colocated pool you add hardware for whichever arrived first and over-provision the other. Independent pools let each scale on its own signal, and let each use a different parallelism strategy, since prefill benefits from tensor parallelism while decode benefits from more replicas.
+
+---
+
+## The topology
+
+<Mermaid
+  chart={`
+flowchart LR
+    R["Router"] --> P1["Prefill node A<br/>compute-optimized, TP=8"]
+    R --> P2["Prefill node B"]
+    P1 -->|"KV transfer<br/>NIXL over NVLink or InfiniBand"| D1["Decode node 1<br/>bandwidth-optimized, large batch"]
+    P2 --> D1
+    P1 --> D2["Decode node 2"]
+    P2 --> D2
+    D1 --> O["Response stream"]
+    D2 --> O
+    C[("Shared KV pool<br/>CPU DRAM and SSD")] -.-> P1
+    C -.-> D1
+`}
+/>
+
+The router admits a request to a prefill node, which computes the full KV cache for the prompt and emits the first token. The cache transfers to a decode node chosen for available blocks, and that node streams the remaining tokens. The shared pool is optional and exists to make the cache outlive the node that produced it, so a resumed conversation or a repeated prefix does not re-prefill.
+
+---
+
+## The KV transfer arithmetic
+
+Everything hinges on whether the transfer is small next to the prefill that produced it. The cache for a prompt of `S` tokens costs `S x bytes_per_token`, and bytes per token comes from the KV cache formula. For Llama 3 70B at 320 KiB per token:
+
+| Prompt length | KV to transfer |
+| :------------ | :------------- |
+| 4,096         | 1.34 GB        |
+| 32,768        | 10.7 GB        |
+| 131,072       | 42.9 GB        |
+
+Transfer times for the 1.34 GB case, using published interconnect bandwidths:
+
+| Interconnect            | Bandwidth              | Time for 1.34 GB |
+| :---------------------- | :--------------------- | :--------------- |
+| NVLink 4 on H100        | 450 GB/s per direction | 3.0 ms           |
+| InfiniBand NDR 400 Gb/s | 50 GB/s                | 27 ms            |
+| InfiniBand HDR 200 Gb/s | 25 GB/s                | 54 ms            |
+| 100 Gigabit Ethernet    | 12.5 GB/s              | 107 ms           |
+
+Compare against the prefill that produced it. A 4K-token prompt on 70B is `2 * 70e9 * 4096 = 573` TFLOPs of linear work, about 580 ms on two H100s at a realistic 50 percent MFU. The transfer is 5 percent of prefill over NDR and 18 percent over commodity Ethernet.
+
+The ratio improves with context length, because prefill grows superlinearly while the transfer grows linearly. At 128K tokens the 70B prefill is about 63,400 TFLOPs, dominated by the quadratic attention term, which is roughly 16 seconds on eight H100s at 50 percent MFU against a 42.9 GB transfer. That is 0.9 seconds over NDR, or 5 percent, and 3.4 seconds over 100 Gigabit Ethernet, or 21 percent.
+
+<Callout type="warn">
+  ### The decision rule is a ratio
+
+Disaggregation pays when KV transfer time is a small fraction of prefill time. Short prompts on fast interconnects clear that bar easily. Short prompts on Ethernet do not: a 512-token prompt prefills in about 70 ms on two H100s, and a 168 MB transfer over 100 Gigabit Ethernet costs 13 ms, which is 19 percent of the work you were trying to save. Measure your own prompt-length distribution before splitting anything.
+
+</Callout>
+
+---
+
+## Published systems
+
+| System    | Contribution                                                                                                                                                            | Reported gain                                                                                                                  | Source           |
+| :-------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------- | :--------------- |
+| DistServe | Places prefill and decode on separate GPUs with a placement search over parallelism strategy per phase                                                                  | Up to 4.48x more requests, or 10.2x tighter SLO, within latency constraints for over 90 percent of requests                    | arXiv:2401.09670 |
+| Splitwise | Splits the phases into separate machine pools sized independently, with mixed pool composition                                                                          | 1.4x higher throughput at 20 percent lower cost for the same power budget; 2.35x more throughput under the same cost and power | arXiv:2311.18677 |
+| Mooncake  | KVCache-centric design for Kimi: a cluster-wide cache pool spanning GPU memory, CPU DRAM, and SSD, with prefill, decode, and attention scheduled against cache locality | About 25 percent more requests in production                                                                                   | arXiv:2407.00079 |
+
+Mooncake is the one to read for the storage half of the problem. Treating the KV cache as a first-class distributed object rather than per-node scratch means a cache entry produced by one node can serve a later request on another, which turns prefix reuse from a node-local optimization into a cluster-wide one.
+
+The transfer layer is its own component. NVIDIA's Dynamo ships NIXL, an inference transfer library that picks a path across NVLink, InfiniBand, and storage; LMCache provides a KV cache layer for vLLM with offloading and cross-instance sharing; Mooncake open-sourced its own transfer engine. All three exist because a naive `send`/`recv` of a paged block table over TCP leaves most of the bandwidth unused.
+
+---
+
+## Where disaggregation is the wrong call
+
+- **Small deployments.** Two or four GPUs cannot be split into pools without leaving one side underutilized, and the interference that disaggregation fixes is mild at that scale.
+- **Short prompts.** The transfer is a fixed fraction of prefill, and that fraction grows as prefill shrinks. Chat traffic with 200-token prompts and 400-token outputs is the worst case.
+- **Slow interconnects.** Without InfiniBand or NVLink between pools, transfer time can exceed the interference it removes.
+- **Balanced prompt and output lengths.** When prefill and decode cost roughly the same per request, one pool sized for the blend is not far off, and the operational complexity of two pools is not repaid.
+- **Cache-bound decode.** If the decode pool is already limited by KV memory rather than by interference, splitting does not add capacity; it only moves the limit.
+
+---
+
+## Other axes of disaggregation
+
+Splitting prefill from decode is the first cut. Two more appear in production MoE serving.
+
+**Attention from feed-forward.** Attention and the MoE feed-forward have different optimal parallelism: attention is memory-bound and shards by head, while expert layers are compute-bound and shard by expert. MegaScale-Infer separates them into distinct node pools so each runs at its own parallelism degree (arXiv:2504.02263).
+
+**Experts from the rest of the model.** A large MoE cannot hold all experts on one node, so expert layers live on their own pool and activations are all-to-all routed to them per token. The traffic pattern is different again: many small messages per token rather than one large transfer per request.
+
+Multimodal serving separates the vision encoder from the language model for the same reason, since the encoder is a batch-parallel compute workload with no KV cache and no autoregressive dependency.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Name the three problems colocation creates.">
+
+    Hardware mismatch, since one SKU must be sized for a compute-bound phase and a bandwidth-bound phase at once; SLO interference, since a long prefill stalls every decode in its batch; and scaling coupling, since prompt volume and output volume grow independently.
+
+  </Accordion>
+  <Accordion title="2. Why do prefill and decode want different parallelism strategies?">
+
+    Prefill is compute-bound, so tensor parallelism splits the FLOPs and shortens the pass. Decode is bandwidth-bound per stream, so more replicas each reading their own copy of the weights gives more aggregate bandwidth than splitting one copy.
+
+  </Accordion>
+  <Accordion title="3. How much KV does a 32K-token prompt on Llama 3 70B produce?">
+
+    About 10.7 GB, at 320 KiB per token. That is the payload the prefill node must hand to the decode node.
+
+  </Accordion>
+  <Accordion title="4. What is the decision rule for whether disaggregation pays?">
+
+    KV transfer time must be a small fraction of the prefill time that produced it. A 1.34 GB transfer over NDR InfiniBand is 27 ms against roughly 580 ms of prefill, so 5 percent; over 100 Gigabit Ethernet it is 107 ms, so 18 percent.
+
+  </Accordion>
+  <Accordion title="5. Why does the ratio improve at longer context?">
+
+    The transfer grows linearly with prompt length while prefill grows superlinearly, because the attention term is quadratic. At 128K tokens the transfer stays near 5 percent of prefill over NDR.
+
+  </Accordion>
+  <Accordion title="6. What does DistServe report, and against what?">
+
+    Up to 4.48x more requests or 10.2x tighter SLO while staying within latency constraints for over 90 percent of requests, against colocated state-of-the-art serving systems.
+
+  </Accordion>
+  <Accordion title="7. What does Mooncake add beyond splitting the phases?">
+
+    A cluster-wide KV cache pool spanning GPU memory, CPU DRAM, and SSD, scheduled against cache locality. A cache entry produced on one node can serve a later request on another, which makes prefix reuse a cluster property rather than a node-local one.
+
+  </Accordion>
+  <Accordion title="8. Why is the transfer layer a separate component rather than a socket send?">
+
+    The cache is paged, so it is a set of non-contiguous blocks described by a block table. Shipping that efficiently needs scatter-gather across NVLink, InfiniBand, and storage, which is what NIXL, LMCache, and the Mooncake transfer engine implement.
+
+  </Accordion>
+  <Accordion title="9. When should you not disaggregate?">
+
+    Small deployments that cannot fill two pools, short prompts where the transfer is a large fraction of prefill, slow interconnects, roughly balanced prompt and output lengths, and decode that is already KV-memory-bound rather than interference-bound.
+
+  </Accordion>
+  <Accordion title="10. What is attention-feed-forward disaggregation?">
+
+    Splitting within the decode phase, since attention shards by head and MoE experts shard by expert, and each has a different optimal parallelism degree. MegaScale-Infer runs them in separate node pools.
+
+  </Accordion>
+  <Accordion title="11. Chunked prefill already reduces interference. Why disaggregate anyway?">
+
+    Chunking bounds the per-iteration stall but the phases still share memory, hardware, and a scaling unit. Disaggregation also lets each pool use a different SKU and a different parallelism strategy, which chunking cannot deliver.
+
+  </Accordion>
+  <Accordion title="12. A chat service with 200-token prompts and 400-token outputs is considering disaggregation. What do you advise?">
+
+    Against it. Prefill for 200 tokens is tens of milliseconds, so any transfer is a large fraction of it, and the decode-dominated load means the prefill pool would sit idle. Chunked prefill plus prefix caching is the better lever.
+
+  </Accordion>
+</Accordions>

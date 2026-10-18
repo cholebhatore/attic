@@ -1,0 +1,185 @@
+---
+title: Serving Engines Compared
+description: 'vLLM PagedAttention, SGLang RadixAttention and constrained decoding, TensorRT-LLM engine compilation and CUDA graphs, and how to choose between them.'
+---
+
+Four engines cover most production LLM serving. They differ in where they spend their complexity: vLLM on memory management, SGLang on prefix reuse and structured output, TensorRT-LLM on compile-time kernel generation, and `llama.cpp` on running anywhere. The scheduling ideas are largely shared now, so the differences are in memory, compilation, and flexibility.
+
+---
+
+## The comparison
+
+|                    | vLLM                               | SGLang                                | TensorRT-LLM                       | llama.cpp server               |
+| :----------------- | :--------------------------------- | :------------------------------------ | :--------------------------------- | :----------------------------- |
+| Language           | Python with CUDA kernels           | Python with CUDA kernels              | C++ with CUDA                      | C                              |
+| Build step         | None                               | None                                  | Required, per GPU and shape        | None, but model must be GGUF   |
+| KV management      | PagedAttention, block table        | RadixAttention, radix tree            | Paged KV cache                     | Contiguous, per-slot           |
+| Prefix caching     | Block hash chain                   | Native, tree-structured               | Supported                          | Partial                        |
+| Constrained output | Outlines, xgrammar, guidance       | xgrammar, compressed FSM              | Limited                            | GBNF grammars                  |
+| Quantization       | FP8, INT8, AWQ, GPTQ, bitsandbytes | FP8, AWQ, GPTQ                        | FP8, INT4 AWQ, W4A16, INT8         | All GGUF types                 |
+| Hardware           | NVIDIA, AMD, TPU, CPU              | NVIDIA, AMD                           | NVIDIA only                        | CPU, CUDA, Metal, Vulkan, SYCL |
+| Best at            | Broad model support, large batch   | Multi-turn, agents, structured output | Peak single-node NVIDIA throughput | Local and edge                 |
+
+---
+
+## vLLM and PagedAttention
+
+The problem PagedAttention solves is allocator fragmentation. A contiguous KV cache must reserve each sequence's maximum possible length up front, because the allocation cannot grow in place. Real sequences stop early, so the reserved tail is wasted, and gaps between allocations cannot be reused. Kwon et al. measured existing systems wasting 60 to 80 percent of KV memory to fragmentation and over-reservation (SOSP 2023, arXiv:2309.06180).
+
+The fix is the one operating systems already had. Split the cache into fixed-size blocks, 16 tokens by default, allocated anywhere in physical memory. Each sequence holds a block table mapping its logical block index to a physical one, and the attention kernel reads through that indirection. vLLM wastes under 4 percent, and reports 2 to 4x higher throughput than FasterTransformer and Orca at matched latency.
+
+Two consequences worth naming. Sharing becomes cheap: parallel sampling and beam search keep several sequences pointing at the same physical prefix blocks, reference-counted, with copy-on-write when one of them writes. And admission becomes cheap, which is what makes continuous batching practical, since a new request needs blocks, not a contiguous region.
+
+The V1 engine rewrite made prefix caching the default and replaced the single-process scheduler with a multiprocess architecture, so the Python side stops being the bottleneck at high request rates.
+
+---
+
+## SGLang and RadixAttention
+
+SGLang's premise is that real workloads are programs rather than single calls: multi-turn conversations, agent loops, tree-of-thoughts expansions, and few-shot prompts all reuse long prefixes (arXiv:2312.07104). A flat block-hash table represents that reuse awkwardly, because the sharing is a tree.
+
+RadixAttention stores cached KV in a radix tree keyed by token sequences. Shared prefixes are single nodes with many children, so a system prompt used by a thousand conversations is stored once, a branching search is a subtree, and eviction is LRU across the whole tree. SGLang reports up to 6.4x higher throughput than prior systems on prefix-heavy workloads.
+
+The second contribution is a compressed finite state machine for constrained decoding, which is the basis of the engine's structured-output speed. SGLang also ships a frontend DSL for expressing these programs, so the runtime sees the whole call graph and can schedule reuse across it rather than per request.
+
+---
+
+## TensorRT-LLM and compile-time specialization
+
+TensorRT-LLM takes the opposite trade: less flexibility at runtime for more performance per kernel. `trtllm-build` compiles a model into an engine specialized to a GPU architecture, a maximum batch size, a maximum beam width, and a maximum sequence length. The build produces a kernel-fused engine, collapsing several operations into single kernels, selects per-shape kernel implementations by benchmarking candidates, and bakes in the quantization format.
+
+The result is the highest raw throughput available on NVIDIA hardware for a fixed workload shape, and the cost is that changing the shape means rebuilding. An engine built for a maximum batch of 32 cannot serve 64, and an engine built for H100 does not run on A100.
+
+Its continuous batching is called in-flight batching and works the same way as everywhere else. It supports paged KV cache, FP8, INT4 AWQ, and W4A16, and it leans harder on CUDA graphs than the Python engines do.
+
+---
+
+## CUDA graphs
+
+A decode step launches a lot of kernels. Per layer there are roughly a dozen: normalization, the QKV projection, rotary embedding, attention, the output projection, another normalization, the gate and up projections, the activation, and the down projection. A 32-layer model launches on the order of 400 kernels per step.
+
+```text
+400 launches x 5 microseconds   = 2.0 ms of CPU launch time
+one 8B decode step at batch 1   = 4.8 ms of GPU time
+```
+
+At small batch the CPU cannot feed the GPU. A CUDA graph captures the whole launch sequence once and replays it with a single submission, which removes the per-launch cost and lets the GPU run back to back.
+
+The constraint is that a graph bakes in tensor addresses and shapes. Serving engines therefore capture a family of graphs, one per batch size and per sequence-length bucket, and pad each step to the nearest captured shape. This is why `max_num_seqs` and the length buckets affect performance more than they should: they determine how many graphs exist and how much padding each request eats.
+
+---
+
+## Constrained and structured output
+
+Grammar-constrained decoding masks the logits at every step so only tokens that legally continue the current partial output survive. It is how a model is made to emit valid JSON against a schema, and it is exact rather than best-effort.
+
+The naive implementation re-derives the valid token set every step by testing vocabulary entries against the grammar, which is expensive at 128K vocabulary. Outlines instead compiles a regular expression into a finite state machine ahead of time and precomputes, for each state, the set of tokens allowed from it (arXiv:2307.09702). Per-step masking then becomes an index lookup. xGrammar extends this to context-free grammars with a token-adaptive representation, reporting orders-of-magnitude speedups over prior structured-generation engines on complex schemas (arXiv:2411.15100).
+
+Three practical notes.
+
+- Grammar compilation is a real cost paid on first use of a schema. Cache it, because a large multi-field schema takes longer to compile than a small one.
+- Masking changes the sampling distribution. The model's probability mass on invalid tokens is discarded and the remainder renormalized, so constrained generation is not the same as unconstrained generation filtered afterward.
+- Forcing keys in schema order prevents the model from reasoning before it commits. Where accuracy matters, put a free-text reasoning field first and the constrained fields after, or use a grammar that permits it.
+
+---
+
+## The rest of the field
+
+| Engine                 | Note                                                                                                       |
+| :--------------------- | :--------------------------------------------------------------------------------------------------------- |
+| Hugging Face TGI       | Rust router in front of a Python model server, production-oriented, broad hardware support                 |
+| LMDeploy and TurboMind | Shanghai AI Lab's C++ engine, strong W4A16 AWQ support                                                     |
+| NVIDIA Dynamo          | Disaggregated serving framework with NIXL for KV transfer, engine-agnostic                                 |
+| `llama.cpp` server     | OpenAI-compatible endpoint, GGUF only, the widest hardware reach                                           |
+| Ollama                 | Wraps `llama.cpp` with a model registry and an OpenAI-compatible API                                       |
+| Managed APIs           | No engine to run, prompt caching sold as a discounted input tier, no control over batching or quantization |
+
+---
+
+## Choosing
+
+<Callout type="info">
+  ### Start with vLLM, move only on evidence
+
+vLLM is the default because it needs no build step, supports the most models and the most hardware, and its memory management is the reference implementation the others copied. Move to SGLang when the workload is prefix-heavy, meaning multi-turn chat, agent loops, or a large shared system prompt, or when structured output throughput is the bottleneck. Move to TensorRT-LLM when the workload shape is fixed, the hardware is NVIDIA, and you have measured that a build step buys throughput you need. Move to `llama.cpp` when the deployment target is not a datacenter GPU.
+
+</Callout>
+
+The migration cost between the first three is low, because they all expose an OpenAI-compatible endpoint. The migration cost from a managed API is also low for the same reason, which is worth knowing before committing to one.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What does PagedAttention fix?">
+
+    Allocator fragmentation. Contiguous KV cache must reserve each sequence's maximum length up front because it cannot grow in place, and Kwon et al. measured 60 to 80 percent of KV memory wasted to fragmentation and over-reservation. Fixed-size blocks with a per-sequence block table bring that under 4 percent.
+
+  </Accordion>
+  <Accordion title="2. Why does PagedAttention make continuous batching practical?">
+
+    Admitting a request mid-batch needs cache allocated on the fly. With blocks that is a block-table update; with a contiguous allocator it requires a free region large enough for the whole sequence.
+
+  </Accordion>
+  <Accordion title="3. How does vLLM handle parallel sampling and beam search without duplicating the prefix?">
+
+    Multiple sequences point at the same physical prefix blocks, reference-counted, with copy-on-write when one of them writes to a shared block.
+
+  </Accordion>
+  <Accordion title="4. What is RadixAttention's advantage over a block-hash table?">
+
+    Sharing in real workloads is a tree, not a flat set. A radix tree keyed by token sequences stores a system prompt used by a thousand conversations as one node with many children, represents a branching search as a subtree, and applies LRU eviction across the whole tree.
+
+  </Accordion>
+  <Accordion title={<>5. What does <code>trtllm-build</code> specialize an engine to?</>}>
+
+    A GPU architecture, a maximum batch size, a maximum beam width, and a maximum sequence length. It fuses operations into single kernels and benchmarks candidate implementations per shape. An engine built for one combination will not run on another.
+
+  </Accordion>
+  <Accordion title="6. Why do CUDA graphs matter more at small batch than large?">
+
+    A 32-layer model launches roughly 400 kernels per decode step. At 5 microseconds of CPU launch time each that is 2 ms against a 4.8 ms GPU step, so the CPU cannot feed the GPU. At large batch the GPU work per step grows while the launch count stays the same.
+
+  </Accordion>
+  <Accordion title="7. What constraint forces engines to capture many CUDA graphs?">
+
+    A graph bakes in tensor addresses and shapes. Engines capture one graph per batch size and sequence-length bucket and pad each step to the nearest captured shape, so the bucket configuration determines both graph count and padding waste.
+
+  </Accordion>
+  <Accordion title="8. How does Outlines make per-step grammar masking cheap?">
+
+    It compiles the regular expression into a finite state machine ahead of time and precomputes the allowed token set for each state, turning per-step masking into an index lookup instead of a vocabulary scan.
+
+  </Accordion>
+  <Accordion title="9. Does constrained decoding change the model's output distribution?">
+
+    Yes. Probability mass on invalid tokens is discarded and the remainder renormalized, so it is not equivalent to sampling freely and filtering afterward.
+
+  </Accordion>
+  <Accordion title="10. Why put a reasoning field before the constrained fields in a JSON schema?">
+
+    Because forcing keys in schema order prevents the model from reasoning before it commits to an answer. A free-text field first, then the constrained fields, keeps the chain of thought.
+
+  </Accordion>
+  <Accordion title="11. When does SGLang beat vLLM?">
+
+    On prefix-heavy workloads: multi-turn conversation, agent loops, tree-of-thoughts, or a large shared system prompt, and when structured-output throughput is the bottleneck. SGLang reports up to 6.4x higher throughput on those.
+
+  </Accordion>
+  <Accordion title="12. What is in-flight batching?">
+
+    TensorRT-LLM's name for continuous batching: iteration-level scheduling that admits and retires requests between forward passes.
+
+  </Accordion>
+  <Accordion title={<>13. Why is <code>llama.cpp</code> not a competitor to the others in a datacenter?</>}>
+
+    It targets GGUF models and reaches CPU, Metal, Vulkan, and SYCL hardware that the others do not. It has no paged block allocator, so its batch ceiling is set by contiguous per-slot cache reservation.
+
+  </Accordion>
+  <Accordion title="14. A team runs a fixed 70B workload on H100 with a stable shape and needs 20 percent more throughput. What is the cheapest path?">
+
+    A TensorRT-LLM build with FP8 weights and an FP8 KV cache, since the shape is fixed and the hardware is NVIDIA, which is exactly the case the build step is designed for. If the shape were not fixed, the operational cost of rebuilding would outweigh the gain.
+
+  </Accordion>
+</Accordions>

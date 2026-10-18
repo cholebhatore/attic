@@ -1,0 +1,266 @@
+---
+title: GPU Hardware and CUDA Fundamentals
+description: 'Threads, warps, blocks and SMs, the memory hierarchy from registers to HBM, the roofline ridge point, and why kernel fusion is the main lever.'
+---
+
+A GPU is a throughput machine built around a memory system that is slow relative to its arithmetic. Every optimization in this phase, from quantization to PagedAttention to speculative decoding, exists because of that imbalance. Understanding it is worth more than memorizing any single engine's flags.
+
+---
+
+## The execution hierarchy
+
+<Mermaid
+  chart={`
+flowchart TD
+    G["Grid<br/>all blocks of one kernel launch"] --> B1["Thread block 0"]
+    G --> B2["Thread block 1"]
+    G --> B3["Thread block N"]
+    B1 --> W1["Warp 0<br/>32 threads in lockstep"]
+    B1 --> W2["Warp 1"]
+    W1 --> T1["Thread 0"]
+    W1 --> T2["Thread 31"]
+    B1 -.scheduled on.-> S1["Streaming Multiprocessor"]
+    S1 --> R["Register file, 256 KB"]
+    S1 --> SM["Shared memory and L1, up to 228 KB"]
+    S1 --> TC["Tensor cores"]
+    SM --> L2["L2 cache, 50 MB, device wide"]
+    L2 --> HBM["HBM3, 80 GB, 3.35 TB/s"]
+`}
+/>
+
+| Level        | What it is                                                    | Programmable by               |
+| :----------- | :------------------------------------------------------------ | :---------------------------- |
+| Thread       | One scalar execution of the kernel program                    | The index arithmetic          |
+| Warp         | 32 threads issued in lockstep (64 on AMD, called a wavefront) | Nothing, it is fixed          |
+| Thread block | Up to 1024 threads, one shared-memory pool, one SM            | `blockDim`, `__syncthreads()` |
+| Grid         | Every block in one launch                                     | `gridDim`                     |
+| SM           | The physical unit: schedulers, tensor cores, registers        | The chip                      |
+
+Counts from the NVIDIA datasheets: A100 80GB SXM has 108 SMs, H100 SXM has 132, and both cap a block at 1024 threads. Blocks are the unit of scheduling, so a grid with 132 blocks on an H100 uses one block per SM and leaves the rest of the machine's parallelism on the table unless each block is large.
+
+---
+
+## Warps and SIMT
+
+A warp issues one instruction for 32 threads. That is SIMT: single instruction, multiple threads, with a per-thread program counter so divergence is possible but expensive.
+
+```text
+if (threadIdx.x < 16) {
+    do_a();          // threads 0-15
+} else {
+    do_b();          // threads 16-31
+}
+```
+
+The warp runs `do_a` with threads 16 to 31 masked off, then runs `do_b` with threads 0 to 15 masked off. Both branches cost their full time. This is warp divergence, and it is why kernels are written so that a warp's 32 lanes take the same path.
+
+Two more consequences that shape kernel design:
+
+- **Memory coalescing.** A warp's 32 threads should touch 32 consecutive addresses so the hardware merges them into one transaction. Strided access turns one transaction into 32 and cuts effective bandwidth by an order of magnitude.
+- **Shared memory bank conflicts.** Shared memory is 32 banks wide. Two threads in a warp hitting the same bank with different addresses serialize. Padding a tile by one element is the usual fix.
+
+---
+
+## The memory hierarchy
+
+Sizes are exact from the H100 SXM datasheet. Latencies are typical published orders of magnitude in cycles, and vary by access pattern.
+
+| Level                | Capacity            | Typical latency   | Scope        |
+| :------------------- | :------------------ | :---------------- | :----------- |
+| Registers            | 256 KB per SM       | Under 1 cycle     | One thread   |
+| Shared memory and L1 | Up to 228 KB per SM | 20 to 30 cycles   | One block    |
+| L2                   | 50 MB               | ~200 cycles       | Whole device |
+| HBM3                 | 80 GB               | 400 to 600 cycles | Whole device |
+
+| GPU       | HBM    | Bandwidth | BF16 dense TFLOPS | Ridge point   |
+| :-------- | :----- | :-------- | :---------------- | :------------ |
+| A100 80GB | 80 GB  | 2.0 TB/s  | 312               | 156 FLOP/byte |
+| H100 SXM  | 80 GB  | 3.35 TB/s | 989               | 295 FLOP/byte |
+| B200      | 192 GB | 8 TB/s    | 2,250             | 281 FLOP/byte |
+
+The capacity-to-bandwidth ratio barely moves across generations while absolute bandwidth climbs, so the machine gets better at everything except running a model that does not fit in HBM.
+
+---
+
+## HBM against on-chip SRAM
+
+HBM is large and slow per bit. SRAM is small and fast. The gap is not only latency, it is energy, and energy is what sets the bandwidth ceiling in a power-limited package.
+
+Mark Horowitz's measurements at ISSCC 2014 (_Computing's Energy Problem_) are still the canonical reference for the ratios, in 45 nm:
+
+| Operation          | Energy |
+| :----------------- | :----- |
+| 32-bit DRAM access | 640 pJ |
+| 8 KB SRAM access   | 5 pJ   |
+| 32-bit MAC         | 3.7 pJ |
+| 32-bit integer add | 0.1 pJ |
+
+Reading a value from DRAM costs roughly 170 times as much as a multiply-accumulate on it. A kernel that moves data through HBM twice to do one FLOP on it spends most of its energy budget on transport rather than arithmetic.
+
+That single ratio explains four separate things in this phase: why kernel fusion works, why FlashAttention was a step change, why LPUs put everything in SRAM, and why quantization helps even when the arithmetic gets no faster.
+
+<Callout type="info">
+  ### Bandwidth sets the decode speed limit
+
+The published TFLOPS figures describe what the tensor cores can do when they are fed. Decode cannot feed them. Every generated token reads the whole weight matrix set once, so the ceiling is `bandwidth / model_bytes`, and the tensor cores idle. An 8B model in BF16 is 16 GB; on an H100 at 3.35 TB/s the floor is `16 / 3350 = 4.8 ms` per token, about 209 tokens per second, no matter how the kernel is written. A 70B model on two H100s bottoms out near 21 ms per token, about 48 tokens per second.
+
+</Callout>
+
+---
+
+## The roofline
+
+The roofline model (Williams, Waterman and Patterson, CACM 2009) says attainable performance is the lesser of peak compute and peak bandwidth times arithmetic intensity:
+
+```text
+attainable_FLOPs = min( peak_FLOPs, arithmetic_intensity * bandwidth )
+
+arithmetic_intensity = FLOPs performed / bytes moved through HBM
+```
+
+Plotting that gives two regions meeting at the **ridge point**, where `peak_FLOPs / bandwidth` holds:
+
+- Below the ridge, the kernel is **memory-bound**. Faster tensor cores do nothing. Reduce bytes moved.
+- Above the ridge, the kernel is **compute-bound**. Reducing bytes does nothing. Reduce FLOPs or get more arithmetic.
+
+The ridge points in the table above sit at 156 to 295 FLOP/byte. A dense matrix multiply of two large square matrices has arithmetic intensity that grows with the matrix dimension, so large GEMMs are comfortably above the ridge. Almost everything else in an LLM is below it.
+
+---
+
+## Where LLM inference sits
+
+Take one linear layer, weight `W` of shape `(n_out, n_in)`, batch of `B` tokens.
+
+```text
+FLOPs          = 2 * B * n_in * n_out
+bytes from HBM = 2 * n_in * n_out        (BF16 weights, read once)
+                                        + 2 * B * n_in   (activations)
+
+intensity ~= B FLOP/byte                  when the weight term dominates
+```
+
+Arithmetic intensity of a decode GEMM is approximately the batch size, in FLOP per byte, for BF16 weights. That is a remarkably clean result and it explains the whole serving story:
+
+| Batch | Intensity | Against the H100 ridge of 295 | Attainable BF16 TFLOPS |
+| :---- | :-------- | :---------------------------- | :--------------------- |
+| 1     | ~1        | 295x below                    | ~3.4                   |
+| 8     | ~8        | 37x below                     | ~27                    |
+| 64    | ~64       | 4.6x below                    | ~215                   |
+| 295   | ~295      | at the ridge                  | 989                    |
+
+At batch 1 the GPU delivers about 0.3 percent of its rated throughput. Batching is not a nice optimization, it is the difference between using the machine and not using it, and [continuous batching](/ai/inference/continuous-batching) is the engineering that makes a large batch out of independent user requests.
+
+Prefill is the other side. Processing a 4,000-token prompt is a GEMM with an effective batch of 4,000, so its intensity is far above the ridge and it is compute-bound. Same weights, same kernel, opposite bottleneck. That asymmetry is the subject of [prefill and decode](/ai/inference/prefill-and-decode).
+
+Quantization moves the ridge rather than the workload. INT4 weights are a quarter the bytes, so intensity quadruples for the same FLOPs, and the memory-bound decode phase speeds up by close to 4x even though the arithmetic did not change.
+
+---
+
+## Kernel fusion
+
+Every kernel launch reads its inputs from HBM and writes its outputs back. A chain of three elementwise ops therefore makes three round trips over the same tensor, and the arithmetic in between is nearly free by comparison.
+
+```text
+unfused:  read x -> write t1 -> read t1 -> write t2 -> read t2 -> write y
+          6 passes over a tensor of size N
+
+fused:    read x -> write y
+          2 passes, intermediates stay in registers
+```
+
+For a `(B, T, 4096)` BF16 activation tensor with `B*T = 8192`, that is 64 MB per pass, so fusing three ops into one saves 128 MB of HBM traffic per call. At 3.35 TB/s the saving is about 38 microseconds, per layer, per forward pass. Over 80 layers that is milliseconds, on every decode step.
+
+Fusion only helps memory-bound kernels. Fusing two GEMMs that are already above the ridge saves almost nothing, because the traffic was never the constraint.
+
+The canonical fused kernel in LLM inference is FlashAttention (Dao et al., arXiv:2205.14135). Naive attention materializes the `T x T` score matrix in HBM, reads it back for the softmax, reads it again for the weighted sum. FlashAttention tiles the computation so the score matrix never leaves SRAM, and it removes a term that was quadratic in memory traffic. Other common fusions: RMSNorm plus residual, the gated MLP's three projections plus activation, and quantize-dequantize pairs.
+
+---
+
+## Launch overhead and CUDA graphs
+
+A kernel launch costs roughly 5 to 10 microseconds of CPU-side work. When the kernels themselves take 40 microseconds, that overhead is significant. During decode, a single token step launches hundreds of small kernels, and the CPU can become the bottleneck rather than the GPU. This shows up as the GPU reporting low utilization while latency stays high.
+
+CUDA graphs fix it by capturing a sequence of launches once and replaying the whole sequence as one submission. The per-launch CPU cost collapses to one. The requirement is that the captured graph has fixed shapes and fixed pointers, which is why serving engines pad or bucket sequence lengths before capturing, and why graphs are usually captured per batch-size bucket.
+
+`torch.compile` gets a related benefit by generating fused Triton kernels and by wrapping them in a graph, which is why enabling it is often a double-digit latency win on decode with no code change.
+
+---
+
+## Latency hiding and occupancy
+
+A CPU makes one thread fast: out-of-order execution, branch prediction, large caches. A GPU makes one thread slow and runs thousands of them. When a warp stalls on an HBM read that takes 500 cycles, the SM's scheduler issues from another resident warp. Nothing idles as long as enough warps are resident.
+
+```text
+occupancy = resident warps per SM / maximum warps per SM
+```
+
+Occupancy is limited by whichever resource a kernel consumes most per thread: registers, shared memory, or block slots. A kernel using 128 registers per thread can only keep a few warps resident, because the register file is 64K 32-bit registers per SM. That is the usual reason a hand-written kernel underperforms, and it is why CUDA kernel authors tune register pressure and shared-memory tile sizes rather than instruction counts.
+
+The tension worth naming: high occupancy hides latency but leaves less shared memory and fewer registers per thread, which can force more HBM traffic. FlashAttention deliberately runs at moderate occupancy with large SRAM tiles, trading latency hiding for less memory movement. On a memory-bound kernel that trade is correct.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Walk through the GPU execution hierarchy from a thread up.">
+
+    A thread runs one scalar instance of the kernel. 32 threads form a warp, issued in lockstep. Up to 1024 threads form a thread block, which shares one shared-memory pool, can synchronize with `__syncthreads()`, and runs entirely on one SM. Every block in a launch forms the grid. An SM is the physical unit holding warp schedulers, the register file, shared memory and tensor cores: 108 on an A100, 132 on an H100.
+
+  </Accordion>
+  <Accordion title="2. What is warp divergence and why does it cost?">
+
+    A warp issues one instruction for 32 lanes. When a branch splits the warp, the hardware executes each path in turn with the other lanes masked off, so both paths cost their full time. Kernels are therefore written so a warp's lanes take the same path, typically by making the branch depend on the block index rather than the lane index.
+
+  </Accordion>
+  <Accordion title="3. What is memory coalescing?">
+
+    When a warp's 32 threads access 32 consecutive addresses, the hardware merges them into one memory transaction. Strided or scattered access produces up to 32 separate transactions, cutting effective bandwidth by roughly an order of magnitude. Layout choices that keep a warp reading contiguous memory are usually the single largest win in a hand-written kernel.
+
+  </Accordion>
+  <Accordion title="4. Why does the energy cost of a DRAM access matter to an inference engineer?">
+
+    Because it sets the bandwidth ceiling inside a power-limited package. Horowitz's ISSCC 2014 measurements put a 32-bit DRAM access at 640 pJ against 3.7 pJ for a 32-bit MAC, a ratio of about 170 to 1. A kernel that spends its energy moving data cannot spend it computing. That is the argument behind kernel fusion, FlashAttention, SRAM-only designs like the Groq LPU, and quantization.
+
+  </Accordion>
+  <Accordion title="5. State the roofline model and the ridge point.">
+
+    Attainable FLOPs equal the minimum of peak compute and arithmetic intensity times peak bandwidth, where arithmetic intensity is FLOPs performed divided by bytes moved through HBM. The ridge point is `peak_FLOPs / bandwidth`: below it a kernel is memory-bound and reducing bytes moved helps, above it the kernel is compute-bound and reducing FLOPs helps. For an H100 SXM that is `989 TFLOPS / 3.35 TB/s`, about 295 FLOP per byte.
+
+  </Accordion>
+  <Accordion title="6. What is the arithmetic intensity of a decode GEMM and why does it matter?">
+
+    For a linear layer with BF16 weights and a batch of `B` tokens, FLOPs are `2 * B * n_in * n_out` while the weight bytes read are `2 * n_in * n_out`, so intensity is approximately `B` FLOP per byte. At batch 1 an H100 runs about 295 times below its ridge and delivers roughly 3.4 of its 989 TFLOPS. Batching is what moves decode toward the ridge, which is why continuous batching is the core serving optimization.
+
+  </Accordion>
+  <Accordion title="7. Prefill and decode use the same weights and kernels. Why do they have opposite bottlenecks?">
+
+    Prefill processes the whole prompt as one GEMM with an effective batch equal to the prompt length, putting it far above the ridge and making it compute-bound. Decode processes one token per sequence per step, so its effective batch is the number of concurrent sequences, which is far below the ridge and makes it memory-bandwidth-bound. Same arithmetic, different intensity.
+
+  </Accordion>
+  <Accordion title="8. How does quantization speed up a memory-bound kernel if the FLOPs do not change?">
+
+    It reduces bytes moved, which raises arithmetic intensity and moves the kernel toward the ridge. INT4 weights are a quarter the bytes of BF16, so intensity quadruples at the same FLOP count, and decode throughput approaches a 4x improvement because decode time is `model_bytes / bandwidth`. The gain is a bandwidth saving, not an arithmetic one.
+
+  </Accordion>
+  <Accordion title="9. What does kernel fusion save, and when does it not help?">
+
+    It keeps intermediates in registers or shared memory instead of round-tripping them through HBM. Three elementwise ops over a 64 MB tensor go from six HBM passes to two, saving 128 MB of traffic per call. It does not help kernels that are already above the ridge, since their traffic was never the constraint, and fusing two large GEMMs buys almost nothing.
+
+  </Accordion>
+  <Accordion title="10. Why do serving engines use CUDA graphs?">
+
+    A kernel launch costs roughly 5 to 10 microseconds of CPU time, and a decode step launches hundreds of small kernels, so the CPU can bottleneck while the GPU reports low utilization. A CUDA graph captures the launch sequence once and replays it as a single submission. The constraint is fixed shapes and fixed pointers, which is why engines bucket by batch size and sequence length before capturing.
+
+  </Accordion>
+  <Accordion title="11. What limits occupancy, and is higher always better?">
+
+    Occupancy is resident warps per SM over the maximum, and it is limited by whichever resource the kernel consumes most per thread: registers, shared memory, or block slots. Higher occupancy hides memory latency better, but it leaves fewer registers and less shared memory per thread, which can force more HBM traffic. FlashAttention deliberately runs at moderate occupancy with large SRAM tiles because on a memory-bound kernel, moving less data beats hiding latency.
+
+  </Accordion>
+  <Accordion title="12. An 8B model in BF16 runs at 60 tokens per second on an H100 at batch 1. What is wrong?">
+
+    The bandwidth floor for 16 GB of weights at 3.35 TB/s is 4.8 ms per token, about 209 tokens per second, so 60 is roughly 3.5x off the ceiling. Likely causes are CPU-side launch overhead, an unbatched pipeline doing per-layer host round trips, poor memory coalescing, or the weights not being read once per step because of a cache miss. Measure the per-stage breakdown before changing the kernel.
+
+  </Accordion>
+</Accordions>

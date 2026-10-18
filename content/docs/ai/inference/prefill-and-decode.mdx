@@ -1,0 +1,223 @@
+---
+title: Prefill and Decode
+description: 'Why the first token costs tens of times more than the rest, TTFT against TPOT, arithmetic intensity per phase, and the interference behind chunked prefill.'
+---
+
+One forward pass generates the first token; every token after it comes from a different kind of step. The two phases have opposite bottlenecks, opposite scaling behavior, and opposite economics, and most serving design follows from refusing to treat them as one workload.
+
+---
+
+## The two phases
+
+|                        | Prefill                                        | Decode                                |
+| :--------------------- | :--------------------------------------------- | :------------------------------------ |
+| Tokens processed       | The whole prompt, in parallel                  | One, sequentially                     |
+| Forward passes         | One                                            | One per generated token               |
+| Bottleneck             | Compute, FLOPs                                 | Memory bandwidth, bytes moved         |
+| Weight traffic         | Read once for all prompt tokens                | Read once per token                   |
+| KV cache               | Written for every prompt position              | Appended one position per step        |
+| Cost scales with       | Prompt length, and quadratically for attention | Number of output tokens               |
+| Latency metric         | TTFT                                           | TPOT, also called inter-token latency |
+| Improves with batching | Little, already compute-bound                  | A lot, weight read is amortized       |
+
+Prefill is parallel because the prompt tokens do not depend on each other for their key and value projections, so one large matrix multiply covers all of them. Decode is sequential because token `t+1` cannot be sampled until token `t` exists.
+
+---
+
+## Latency vocabulary
+
+```text
+TTFT   time to first token   queueing + scheduling + prefill
+TPOT   time per output token one decode step, steady state
+E2E    TTFT + (n_output_tokens - 1) x TPOT
+```
+
+Throughput is aggregate tokens per second across all requests. Goodput is throughput measured only for requests that met their latency SLO, which is the number that matters when a product has a latency budget. A server can raise throughput by batching harder and lose goodput doing it, because TPOT rises. Sarathi-Serve (arXiv:2403.02310) popularized the distinction.
+
+---
+
+## Prefill cost
+
+Two terms, one linear and one quadratic in prompt length `S`:
+
+```text
+linear work     projections and MLP over S tokens     2 x P x S
+attention work  QK transpose plus AV, all layers      4 x L x S^2 x d_model
+```
+
+`P` is non-embedding parameter count, `L` is layer count, `d_model` is hidden size. The factor of 2 in the linear term is one multiply and one add per parameter. The factor of 4 in the attention term is two matrix multiplies, each a multiply-add pair.
+
+Setting them equal gives the crossover where attention work matches everything else:
+
+```text
+S_crossover = P / (2 x L x d_model)
+```
+
+For Llama 3 8B, `8.0e9 / (2 * 32 * 4096) = 30,517`. Below about 30K tokens the model's own projections dominate prefill; above it, attention does. That is a much lower crossover than most people guess.
+
+Worked prefill costs for Llama 3 8B on one H100 SXM, at 989.4 TFLOPS BF16 dense:
+
+| Prompt tokens | Linear TFLOPs | Attention TFLOPs | Total  | Time at 100 percent MFU |
+| :------------ | :------------ | :--------------- | :----- | :---------------------- |
+| 1,000         | 16            | 0.5              | 16.5   | 17 ms                   |
+| 8,192         | 131           | 35               | 166    | 168 ms                  |
+| 32,768        | 524           | 562              | 1,086  | 1.1 s                   |
+| 131,072       | 2,097         | 9,007            | 11,104 | 11.2 s                  |
+
+No production kernel reaches 100 percent model FLOPs utilization. A well-tuned prefill runs at 40 to 60 percent, so multiply these times by roughly two. At 128K tokens the attention term is 81 percent of the total, and FlashAttention is the difference between a feasible request and an unusable one.
+
+---
+
+## Decode cost
+
+Decode reads the weights and the KV cache and produces one token. The read is the cost:
+
+```text
+Llama 3 8B, BF16, one H100 SXM
+
+bytes per step   16 GB of weights + KV cache for the current context
+time per step    16.0 / 3,350 s = 4.8 ms
+ceiling          1 / 4.8 ms = 209 tokens per second
+
+FLOPs per step   2 x 8.0e9 = 1.6e10
+FLOPs achieved   1.6e10 / 4.8e-3 = 3.3 TFLOPS
+utilization      3.3 / 989.4 = 0.34 percent
+```
+
+The GPU spends 99.66 percent of its arithmetic capacity idle during a batch-1 decode step. That is not a bug to fix with a better kernel; it is what happens when arithmetic intensity is one and the ridge point is 295.
+
+---
+
+## Arithmetic intensity explains both
+
+Intensity is FLOPs divided by bytes moved from HBM. For BF16 weights at two bytes per parameter:
+
+```text
+prefill    2 x P x S FLOPs over P x 2 bytes   ->  intensity ~= S
+decode     2 x P x B FLOPs over P x 2 bytes   ->  intensity ~= B
+```
+
+The H100 SXM ridge point is `989.4 TFLOPS / 3.35 TB/s = 295` FLOP per byte. Below the ridge the operation is memory-bound and above it compute-bound.
+
+So prefill becomes compute-bound once the prompt exceeds about 295 tokens, which is nearly every real prompt. Decode reaches the ridge only at a batch of about 295 sequences, which is why GPU serving must batch aggressively and why a single user on a single GPU sees 0.34 percent utilization.
+
+The consequence for cost: adding the 296th request to a batch that already reads the weights costs almost nothing in time and almost nothing in money. That asymmetry is the entire business model of shared LLM serving.
+
+---
+
+## The first-token penalty
+
+Comparing the two on the same model and hardware, for a 10,000-token prompt:
+
+```text
+prefill   2 x 8.0e9 x 10,000 = 1.6e14 FLOPs
+          1.6e14 / 989.4e12  = 162 ms at 100 percent MFU
+decode    4.8 ms per token
+ratio     162 / 4.8 = 34x
+```
+
+At a realistic 50 percent MFU the first token costs about 68 times a subsequent one. Three things follow.
+
+Prompt caching removes the ratio entirely for a repeated prefix, since the cached KV state is reused rather than recomputed. Chunked prefill bounds it per iteration. And a retrieval-augmented pipeline that stuffs 8,000 tokens of context into every turn pays that penalty on every turn, which is the latency argument for compact context over exhaustive context.
+
+---
+
+## Interference between the phases
+
+Prefill and decode want different things from the same GPU, and running them in one batch makes each worse.
+
+A 32K-token prefill takes over a second. During that second, every decode step in the same batch is stalled, so the inter-token latency of every active user spikes. This is head-of-line blocking, and it is the reason a server that looks healthy on average has terrible p99 latency under mixed load.
+
+**Chunked prefill** splits the prompt into fixed-size chunks, typically 512 to 4,096 tokens, and runs one chunk per scheduler iteration alongside the decode steps of other requests. Per-iteration compute becomes bounded, TPOT stays flat, and TTFT rises slightly because the prompt now takes several iterations. Sarathi-Serve reports up to 2.6x higher serving capacity for Mistral-7B on a single A100 and up to 6.9x for Falcon-180B on eight A100s at matched SLOs (arXiv:2403.02310). Iteration-level scheduling, introduced by Orca at OSDI 2022, is what makes the interleaving possible at all, since it reschedules after every step rather than after every request.
+
+**Disaggregation** goes further and puts the phases on separate machines. Prefill nodes are sized for FLOPs and decode nodes for bandwidth and cache capacity, so neither pays for the other's idle resource. That is a whole page of its own.
+
+<Callout type="info">
+  ### Which lever fixes which metric
+
+TTFT problems come from prefill: shorten the prompt, cache the prefix, chunk the prefill, or add prefill capacity. TPOT problems come from decode: raise batch size, quantize the weights, shrink the KV cache, or use speculative decoding. Adding GPUs helps TTFT through tensor parallelism but helps TPOT only if it raises achievable batch or bandwidth, and a naive fix can make TPOT worse by adding an all-reduce to every step.
+
+</Callout>
+
+---
+
+## Mixture of experts changes the arithmetic
+
+The decode intensity derivation assumes every parameter is read every step. A sparse MoE reads only the active experts, so the weight traffic per token is a fraction of the total parameter count while the model's quality tracks the total. Decode gets cheaper without the model getting smaller, and the intensity math has to be redone against activated parameters rather than total ones. Prefill is affected the same way, with the added complication that different tokens in one prompt route to different experts, which reduces the effective batch per expert.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Why is prefill compute-bound and decode memory-bound?">
+
+    Prefill amortizes one weight read across every prompt token, giving arithmetic intensity roughly equal to the prompt length. Decode amortizes one weight read across one token, giving intensity equal to the batch size. The H100 ridge point is 295 FLOP per byte, so a 1,000-token prefill is well above it and a batch-1 decode is 295 times below it.
+
+  </Accordion>
+  <Accordion title="2. What fraction of an H100's BF16 capacity does a batch-1 decode step use for an 8B model?">
+
+    About 0.34 percent. The step takes 4.8 ms at the bandwidth limit and performs 1.6e10 FLOPs, which is 3.3 TFLOPS against a 989.4 TFLOPS peak.
+
+  </Accordion>
+  <Accordion title="3. Write the end-to-end latency formula and name each term.">
+
+    `TTFT + (n_output_tokens - 1) x TPOT`. TTFT is queueing, scheduling, and prefill; TPOT is one decode step in steady state.
+
+  </Accordion>
+  <Accordion title="4. Where does the attention crossover at 30K tokens for Llama 3 8B come from?">
+
+    Setting `2 x P x S = 4 x L x S^2 x d_model` and solving gives `S = P / (2 x L x d_model)`, which is `8.0e9 / (2 * 32 * 4096) = 30,517`. Below it the projections dominate prefill, above it attention does.
+
+  </Accordion>
+  <Accordion title="5. Estimate the prefill time for a 128K-token prompt on an 8B model and one H100.">
+
+    About 11 seconds at 100 percent MFU, from 11,104 TFLOPs of combined work, so 20 to 28 seconds in practice. Attention is 9,007 of those TFLOPs, or 81 percent.
+
+  </Accordion>
+  <Accordion title="6. What is goodput, and how does it differ from throughput?">
+
+    Throughput counts all tokens per second. Goodput counts only tokens from requests that met their latency SLO. Batching harder raises the first and can lower the second, because TPOT rises past the SLO.
+
+  </Accordion>
+  <Accordion title="7. Why does a long prefill hurt users who are not sending long prompts?">
+
+    Head-of-line blocking. A 32K-token prefill occupies the GPU for over a second, during which every decode step in the batch is stalled, so p99 inter-token latency spikes for everyone.
+
+  </Accordion>
+  <Accordion title="8. What does chunked prefill trade?">
+
+    It splits the prompt into fixed-size chunks and interleaves one chunk per iteration with other requests' decode steps. Per-iteration compute becomes bounded and TPOT stays flat, at the cost of a slightly higher TTFT since the prompt now spans several iterations.
+
+  </Accordion>
+  <Accordion title="9. Why does adding a 296th request to a large batch cost almost nothing?">
+
+    The weights are already being read for that step, so the marginal cost is the extra KV reads and the extra arithmetic, and the GPU is using 0.34 percent of its arithmetic at batch 1. The weight read dominates and it is shared.
+
+  </Accordion>
+  <Accordion title="10. Why does prompt caching remove the first-token penalty rather than reduce it?">
+
+    For a repeated prefix the KV state already exists, so no prefill runs over those tokens at all. A 10,000-token system prompt cached across requests turns a 162 ms prefill into a lookup.
+
+  </Accordion>
+  <Accordion title="11. Which phase does speculative decoding accelerate, and why not the other?">
+
+    Decode. It verifies several draft tokens in one forward pass, converting sequential steps into one parallel step. Prefill is already a single parallel pass, so there is nothing to speculate about.
+
+  </Accordion>
+  <Accordion title="12. How does mixture of experts change the decode intensity argument?">
+
+    Only the active experts are read per token, so weight traffic tracks activated parameters rather than total parameters. Decode gets cheaper at the same model quality, but different tokens route to different experts, which lowers the effective batch per expert.
+
+  </Accordion>
+  <Accordion title="13. A service has good TTFT and bad TPOT. What do you change?">
+
+    Nothing on the prefill side. Raise batch size, quantize weights or the KV cache, or add speculative decoding. Adding GPUs helps only if it raises achievable batch or bandwidth, since tensor parallelism adds an all-reduce to every decode step.
+
+  </Accordion>
+  <Accordion title="14. Why is a batch-1 decode step 34 times slower per token than the prefill that preceded it, for a 10K-token prompt?">
+
+    Because prefill does 1.6e14 FLOPs in one 162 ms pass while decode does 1.6e10 FLOPs in a 4.8 ms pass, and the prefill pass runs at the compute roof while the decode pass runs at the bandwidth floor. The ratio is `162 / 4.8`.
+
+  </Accordion>
+</Accordions>

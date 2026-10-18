@@ -1,0 +1,315 @@
+---
+title: Writing Kernels in CUDA and Triton
+description: 'The CUDA block model, shared memory reductions, the Triton block-programming model, tiling, and FlashAttention as the case study in fused kernels.'
+---
+
+Most inference work never needs a hand-written kernel. `torch.compile` fuses elementwise and reduction chains automatically, and the attention path already ships FlashAttention. Custom kernels are for the few percent of runtime that those do not reach, and for understanding why the fused version is faster.
+
+This page writes one kernel twice, in CUDA C++ and in Triton, so the two programming models are directly comparable.
+
+---
+
+## When a custom kernel is the answer
+
+| Situation                                                 | Reach for                                    |
+| :-------------------------------------------------------- | :------------------------------------------- |
+| A chain of elementwise and reduction ops                  | `torch.compile`, which emits Triton          |
+| Attention                                                 | Scaled dot-product attention, FlashAttention |
+| A fused op the framework lacks, on the hot path           | A Triton kernel                              |
+| Quantized matmul with a layout the library does not cover | CUDA with `mma` or CUTLASS                   |
+| A novel algorithm, research                               | Triton first, CUDA if it needs control       |
+
+Measure first. Profile with `torch.profiler` or Nsight Systems, find the kernels taking the most wall-clock time, and check whether they are memory-bound. Fusing compute-bound kernels saves almost nothing, per the roofline argument on the [GPU hardware page](/ai/inference/gpu-hardware).
+
+---
+
+## CUDA C++
+
+The mental model: you write the program for one thread, and the launch configuration says how many threads exist and how they are grouped.
+
+```cpp
+// fused_add_rmsnorm.cu
+// y = rmsnorm(x + residual), one thread block per row
+
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float warp_reduce_sum(float v) {
+    // butterfly reduction across the 32 lanes of a warp
+    for (int offset = 16; offset > 0; offset >>= 1)
+        v += __shfl_down_sync(0xffffffff, v, offset);
+    return v;   // valid in lane 0
+}
+
+__global__ void fused_add_rmsnorm(
+    const float* __restrict__ x,        // (rows, cols)
+    const float* __restrict__ residual, // (rows, cols)
+    const float* __restrict__ weight,   // (cols,)
+    float* __restrict__ y,              // (rows, cols)
+    int cols, float eps)
+{
+    const int row = blockIdx.x;                       // one block per row
+    const int tid = threadIdx.x;                      // 0 .. blockDim.x - 1
+    const size_t base = (size_t)row * cols;
+
+    // pass 1: sum of squares, strided so each warp reads consecutive addresses
+    float acc = 0.f;
+    for (int i = tid; i < cols; i += blockDim.x) {
+        float v = x[base + i] + residual[base + i];
+        acc += v * v;
+    }
+
+    // block reduction: warp-level, then across warps via shared memory
+    __shared__ float smem[32];
+    acc = warp_reduce_sum(acc);
+    if ((tid & 31) == 0) smem[tid >> 5] = acc;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < (blockDim.x >> 5)) ? smem[tid] : 0.f;
+        smem[tid] = warp_reduce_sum(v);
+    }
+    __syncthreads();
+    const float inv_rms = rsqrtf(smem[0] / cols + eps);
+
+    // pass 2: scale and store
+    for (int i = tid; i < cols; i += blockDim.x)
+        y[base + i] = (x[base + i] + residual[base + i]) * inv_rms * weight[i];
+}
+```
+
+Launched with one block per row:
+
+```cpp
+dim3 grid(rows);        // rows blocks
+dim3 block(256);        // 256 threads = 8 warps per block
+fused_add_rmsnorm<<<grid, block, 0, stream>>>(x, res, w, y, cols, 1e-5f);
+```
+
+Four things in that code are the whole of CUDA kernel writing:
+
+| Element                             | What it does                                                                            |
+| :---------------------------------- | :-------------------------------------------------------------------------------------- |
+| `blockIdx.x`                        | Which block this thread is in. Here it selects the row.                                 |
+| `threadIdx.x` plus the strided loop | Spreads `cols` elements over 256 threads while keeping each warp's accesses consecutive |
+| `__shared__`                        | Block-scoped SRAM, the only place threads in a block can exchange data                  |
+| `__syncthreads()`                   | Block-wide barrier. Every thread in the block must reach it                             |
+
+Pass 2 re-reads `x` and `residual`. That is a deliberate simplification: when `cols` is small enough to fit per-thread registers, holding the summed values in a register array removes the second read and roughly halves the traffic. At `cols = 4096` with 256 threads that is 16 floats per thread, which fits, and is what a production version does.
+
+---
+
+## Triton
+
+Triton's unit of programming is a **block**, not a thread. You write what one program instance does to a tile of data, and the compiler handles warp assignment, shared-memory allocation, and coalescing. That removes most of the ways a CUDA kernel goes accidentally slow.
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def fused_add_rmsnorm_kernel(
+    x_ptr, res_ptr, w_ptr, y_ptr,
+    n_rows, n_cols, eps,
+    BLOCK: tl.constexpr,          # compile-time constant, must be a power of 2
+):
+    row = tl.program_id(0)                     # one program per row
+    cols = tl.arange(0, BLOCK)                 # (BLOCK,)
+    mask = cols < n_cols                       # BLOCK may exceed n_cols
+
+    off = row * n_cols + cols
+    x = tl.load(x_ptr + off, mask=mask, other=0.0).to(tl.float32)   # (BLOCK,)
+    r = tl.load(res_ptr + off, mask=mask, other=0.0).to(tl.float32)
+    h = x + r                                  # (BLOCK,), stays in registers
+
+    inv_rms = 1.0 / tl.sqrt(tl.sum(h * h, axis=0) / n_cols + eps)   # scalar
+
+    w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    tl.store(y_ptr + off, h * inv_rms * w, mask=mask)
+
+
+def fused_add_rmsnorm(x: torch.Tensor, residual: torch.Tensor,
+                      weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    n_rows, n_cols = x.shape                   # (rows, cols)
+    y = torch.empty_like(x)
+    BLOCK = triton.next_power_of_2(n_cols)
+    fused_add_rmsnorm_kernel[(n_rows,)](       # grid = (n_rows,) programs
+        x, residual, weight, y, n_rows, n_cols, eps,
+        BLOCK=BLOCK,
+        num_warps=4 if BLOCK <= 2048 else 8,   # threads per program = 32 * num_warps
+    )
+    return y
+```
+
+Same algorithm, and the reduction that took twelve lines of shuffle intrinsics and shared memory in CUDA is `tl.sum(h * h, axis=0)`.
+
+| CUDA concept               | Triton equivalent                                |
+| :------------------------- | :----------------------------------------------- |
+| `threadIdx`, `blockIdx`    | `tl.program_id(axis)`, operating on a whole tile |
+| `__shared__` array         | Allocated automatically from tile sizes          |
+| `__syncthreads()`          | Inserted where the data dependence requires it   |
+| Warp shuffle reduction     | `tl.sum`, `tl.max`, `tl.dot`                     |
+| Manual coalescing          | Derived from the pointer arithmetic on the tile  |
+| `blockDim.x`               | `num_warps` times 32                             |
+| `__global__` launch config | `kernel[(grid,)](...)`                           |
+
+Three gotchas:
+
+- `BLOCK` must be a compile-time constant, declared `tl.constexpr`, and a power of two. Handle a ragged tail with a mask, not with a second kernel.
+- Anything in the signature that is not `tl.constexpr` is a runtime value, and Triton specializes on whether integer arguments are divisible by 16. Passing an oddly sized tensor can trigger a recompile.
+- `num_warps` and `num_stages` are the two tuning knobs. `num_stages` sets the software-pipelining depth for loops that load then compute, and raising it uses more shared memory.
+
+---
+
+## Tiling and FlashAttention
+
+Tiling is the technique behind every fast attention kernel: split the work into blocks that fit in SRAM, and restructure the math so the intermediate never reaches HBM.
+
+Naive attention materializes the score matrix:
+
+```text
+S = Q @ K^T / sqrt(d)        # (T, T) written to HBM
+P = softmax(S, dim=-1)       # (T, T) read, (T, T) written
+O = P @ V                    # (T, T) read
+```
+
+At `T = 8192` in FP16, `S` is 128 MB, and it crosses HBM three times. The FLOPs are `2 * T^2 * d` twice over; the traffic is `O(T^2)`. For any realistic `d`, that kernel is memory-bound, and the memory it is bound by is memory the algorithm did not need to materialize.
+
+FlashAttention tiles over both dimensions and keeps a running softmax so the full row is never needed at once:
+
+```text
+for each key block j:
+    S_ij  = Q_i @ K_j^T                       # (Br, Bc), lives in SRAM only
+    m_new = max(m_old, rowmax(S_ij))          # running max, for stability
+    P_ij  = exp(S_ij - m_new)
+    l_new = exp(m_old - m_new) * l_old + rowsum(P_ij)
+    O_i   = exp(m_old - m_new) * O_i + P_ij @ V_j
+```
+
+The rescale factor `exp(m_old - m_new)` is the whole trick. It corrects the accumulator already built from earlier blocks when a later block reveals a larger maximum, which is what makes an exact softmax computable in one pass over the keys. Nothing approximate happens; the output is bitwise-close to the naive version and the `T x T` matrix never exists.
+
+Three generations, each attacking a different bottleneck:
+
+| Version          | Paper            | Change                                                                                                  |
+| :--------------- | :--------------- | :------------------------------------------------------------------------------------------------------ |
+| FlashAttention   | arXiv:2205.14135 | Tiling plus online softmax; removes the `O(T^2)` HBM traffic                                            |
+| FlashAttention-2 | arXiv:2307.08691 | Reorders the loops so the sequence dimension is outer, cutting non-matmul FLOPs and improving occupancy |
+| FlashAttention-3 | arXiv:2407.08608 | Hopper-specific: warp specialization to overlap the matmul with the softmax, plus FP8 support           |
+
+**Flash-Decoding** addresses the opposite regime: a long context with a small batch, where there are not enough query blocks to fill the machine. It parallelizes over the key-value dimension and combines the partial results with the same rescaling trick, which raises occupancy during decode.
+
+---
+
+## torch.compile
+
+TorchInductor lowers a captured graph to Triton kernels on GPU, so enabling it gets a large part of a hand-written kernel's benefit with none of the work.
+
+```python
+model = torch.compile(model, mode="max-autotune", dynamic=False)
+```
+
+| Mode              | Effect                                                             |
+| :---------------- | :----------------------------------------------------------------- |
+| `default`         | Fusion of pointwise and reduction chains                           |
+| `reduce-overhead` | Adds CUDA graphs, which helps decode where launches dominate       |
+| `max-autotune`    | Also autotunes GEMM configs; slow to compile, fast to run          |
+| `dynamic=False`   | Specializes on shapes; avoids guard overhead, recompiles per shape |
+
+It fuses what it can see in the graph. It does not replace the attention kernel, which comes from scaled dot-product attention and dispatches to FlashAttention underneath, and it will not invent a novel algorithm. Expect a double-digit decode latency improvement and a long first-iteration compile.
+
+---
+
+## Measuring
+
+```python
+import triton
+
+ms = triton.testing.do_bench(
+    lambda: fused_add_rmsnorm(x, res, w),
+    warmup=25, rep=100,
+)
+```
+
+`do_bench` clears the L2 between reps and uses CUDA events rather than wall-clock time. Four rules that prevent most bad measurements:
+
+- Warm up. The first call compiles and may allocate.
+- Clear the L2, or a small kernel will appear bandwidth-free because its inputs never left the cache.
+- Lock clocks or accept variance. GPUs throttle under sustained load, so a benchmark run after a long session reads slower than the same benchmark run cold.
+- Compare against the roofline, not against another library. Compute `bytes_moved / measured_time` and see what fraction of peak bandwidth you reached. A memory-bound kernel at 80 percent of peak is done; at 30 percent something is wrong with coalescing or occupancy.
+
+Nsight Compute reports achieved occupancy, DRAM throughput, and the stall reasons per warp, which is how you find out whether a kernel is short on registers, short on shared memory, or waiting on memory.
+
+---
+
+## Learning path
+
+[`srush/GPU-Puzzles`](https://github.com/srush/GPU-Puzzles) is the fastest way to internalize the model. It is a sequence of small kernels, each introducing one idea: map, zip, guard, in-map, super-pool, thread index, block index, shared memory, atomic operations, and a final matrix-multiply puzzle that requires tiling. Solving them in order teaches coalescing, occupancy and reductions faster than reading about them.
+
+After that, read the Triton tutorials' fused-softmax and matrix-multiply examples, then the FlashAttention paper. The CUTLASS and `cute` documentation is where to go for hand-written tensor-core code, and it is rarely the right first move.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What is the difference between the CUDA and Triton programming models?">
+
+    CUDA programs one thread and you describe the grid, block and warp structure explicitly, managing shared memory, barriers, coalescing and shuffle reductions yourself. Triton programs one block: you write what a program instance does to a tile and the compiler derives warp assignment, shared-memory allocation, barriers and coalescing from the tile arithmetic. A block reduction that takes twelve lines of shuffle intrinsics in CUDA is `tl.sum(x, axis=0)` in Triton.
+
+  </Accordion>
+  <Accordion title={<>2. Why does <code>BLOCK</code> have to be a <code>tl.constexpr</code> power of two in Triton?</>}>
+
+    Because the compiler allocates registers and shared memory and unrolls the tile operations at compile time, which needs the tile shape known statically. A power of two makes the address arithmetic collapse to shifts. Ragged tails are handled with a mask on `tl.load` and `tl.store`, not with a second kernel.
+
+  </Accordion>
+  <Accordion title={<>3. What do <code>num_warps</code> and <code>num_stages</code> control?</>}>
+
+    `num_warps` sets threads per program at 32 times the value, which trades parallelism inside a tile against register pressure. `num_stages` sets the software-pipelining depth for loops that load then compute, so a later stage's load overlaps an earlier stage's compute; raising it uses more shared memory and can reduce occupancy.
+
+  </Accordion>
+  <Accordion title="4. Why is the naive attention implementation memory-bound?">
+
+    It materializes the `T x T` score matrix in HBM, writes it for the softmax, reads it back, writes the probabilities and reads them again for the value product. At `T = 8192` in FP16 that matrix is 128 MB crossing HBM three times, so the traffic is quadratic in sequence length while the useful arithmetic is quadratic in the same term but with a small constant. The kernel is limited by bytes moved, not by FLOPs.
+
+  </Accordion>
+  <Accordion title="5. How does FlashAttention compute an exact softmax without the full row?">
+
+    It keeps a running maximum `m` and a running denominator `l` per output row. When a new key block reveals a larger maximum, it rescales the accumulator built so far by `exp(m_old - m_new)` before adding the new block's contribution. That correction makes single-pass softmax exact, so the `T x T` matrix never has to exist.
+
+  </Accordion>
+  <Accordion title="6. What did FlashAttention-2 change?">
+
+    It reorders the loops so the sequence dimension is outer and the key dimension inner, which reduces non-matmul operations, avoids dividing by the running denominator at every step, and improves occupancy by lowering per-thread register pressure. Same asymptotic traffic, better utilization of the tensor cores.
+
+  </Accordion>
+  <Accordion title="7. When would you use Flash-Decoding rather than FlashAttention?">
+
+    When the batch is small and the context is long, so there are not enough query blocks to fill the SMs. Flash-Decoding parallelizes over the key-value dimension and merges partial results with the same rescaling trick, raising occupancy during decode where a single sequence's query blocks would otherwise leave most of the machine idle.
+
+  </Accordion>
+  <Accordion title={<>8. What does <code>torch.compile</code> do for an LLM?</>}>
+
+    TorchInductor captures the graph and emits fused Triton kernels for pointwise and reduction chains, which removes HBM round trips between elementwise ops. `mode="reduce-overhead"` adds CUDA graphs to cut launch overhead, which matters during decode. It does not replace the attention kernel, which dispatches to FlashAttention through scaled dot-product attention, and it cannot invent a new algorithm.
+
+  </Accordion>
+  <Accordion title="9. Why clear the L2 cache between benchmark repetitions?">
+
+    Because a small kernel's entire working set can stay resident in the 50 MB L2, so the measured time reflects cache bandwidth rather than HBM bandwidth and the kernel looks far faster than it is in production. `triton.testing.do_bench` clears it by default for this reason.
+
+  </Accordion>
+  <Accordion title="10. How do you know when a memory-bound kernel is finished?">
+
+    Compute the minimum bytes it must move, divide by the measured time, and compare with the device's peak bandwidth. A well-written memory-bound kernel reaches roughly 80 to 90 percent of peak. Below that, Nsight Compute's stall reasons and achieved occupancy tell you whether the limit is register pressure, shared memory, bank conflicts, or uncoalesced access.
+
+  </Accordion>
+  <Accordion title="11. In the fused RMSNorm kernel, what is the cost of pass 2 re-reading the inputs?">
+
+    It doubles the HBM traffic for `x` and `residual`. When `cols` divided by the thread count is small enough to hold in registers, for example 16 floats per thread at `cols = 4096` with 256 threads, caching the summed values removes the second read entirely. That is the difference between a correct kernel and a fast one.
+
+  </Accordion>
+  <Accordion title="12. Why does Triton recompile when you pass a differently shaped tensor?">
+
+    Triton specializes on `tl.constexpr` values and on divisibility properties of integer arguments, and it inserts guards on tensor shapes. A new shape that fails a guard triggers a fresh compile. Serving engines avoid this by bucketing sequence lengths and batch sizes so a small set of compiled variants covers the traffic.
+
+  </Accordion>
+</Accordions>

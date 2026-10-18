@@ -1,0 +1,257 @@
+---
+title: Overview
+description: 'GPU execution and CUDA kernels, quantization math and PTQ methods, KV cache arithmetic, prefill against decode, speculation, batching, and serving engines.'
+---
+
+Phase 9 assembled the right context and Phase 8 made the model reason. Neither says anything about the cost of running it. This phase is the hardware and systems layer: what a decode step spends, how much of that spend is avoidable, and what the engines that serve at scale do about it.
+
+The whole phase reduces to one observation. Autoregressive decode reads every weight in the model to produce one token, so tokens per second is memory bandwidth divided by bytes per token. Almost every technique here is an attack on one of those two quantities: quantization shrinks the bytes, batching amortizes the read across streams, speculation produces more tokens per read, and SRAM-first silicon buys more bandwidth.
+
+<Callout type="info">
+  ### Every number here is published or derived
+
+Hardware specifications come from vendor datasheets and architecture papers, with the source named next to the figure. Cost arithmetic is shown as arithmetic, from stated inputs, so you can redo it for your own model and GPU. Vendor throughput claims are labelled as vendor claims and distinguished from third-party measurements, which matters because only some of them are independent.
+
+</Callout>
+
+---
+
+## Reading order
+
+<Mermaid
+  chart={`
+flowchart TD
+    subgraph HW["Hardware and kernels"]
+        direction TB
+        A["GPU Hardware"] --> B["CUDA and Triton"]
+        B --> C["Specialized Silicon"]
+    end
+    subgraph QZ["Compression"]
+        direction TB
+        D["Quantization Math"] --> E["PTQ Against QAT"]
+        E --> F["GGUF and Local Inference"]
+    end
+    subgraph LAT["Latency mechanics"]
+        direction TB
+        G["KV Cache"] --> H["Prefill and Decode"]
+    end
+    subgraph SRV["Serving"]
+        direction TB
+        I["Speculative Decoding"] --> J["Continuous Batching"]
+        J --> K["Disaggregation"]
+        K --> L["Serving Engines"]
+    end
+    C --> D
+    F --> G
+    H --> I
+    L --> M["Phase 11 - Agents"]
+`}
+/>
+
+Read the hardware block first, because the roofline model is what makes every later number predictable instead of mysterious. The compression block depends on it, since the reason to quantize for inference is bandwidth and not model size. The latency and serving blocks assume you can already compute a per-token byte cost.
+
+`specialized-silicon` and `gguf-and-local` are the two pages you can read out of order. They are about hardware you probably will not buy and hardware you probably already own.
+
+---
+
+## Core topics
+
+<Cards>
+  <Card
+    icon={<Cpu />}
+    title="GPU Hardware"
+    description="Execution hierarchy from thread to SM, the memory pyramid, roofline and ridge points, why decode runs at 0.34 percent of peak, and kernel fusion."
+    href="/ai/inference/gpu-hardware"
+  />
+  <Card
+    icon={<Code />}
+    title="CUDA and Triton"
+    description="A fused add-RMSNorm kernel in both, shared memory and warp reduction, FlashAttention tiling with online softmax, torch.compile, and how to benchmark."
+    href="/ai/inference/cuda-and-triton"
+  />
+  <Card
+    icon={<Binary />}
+    title="Specialized Inference Silicon"
+    description="Groq LPUs, Cerebras WSE-3, SambaNova SN40L, TPU systolic arrays, Apple unified memory, and the four objections to SRAM-first designs."
+    href="/ai/inference/specialized-silicon"
+  />
+  <Card
+    icon={<Calculator />}
+    title="Quantization Math"
+    description="Scale and zero-point, error per bit, FP8 E4M3 against E5M2, NF4, granularity, the W4A16 and W8A8 scheme table, and the outlier problem."
+    href="/ai/inference/quantization-math"
+  />
+  <Card
+    icon={<Layers />}
+    title="PTQ Against QAT"
+    description="Calibration, GPTQ and its Hessian, AWQ salient channels, SmoothQuant, rotations, bitsandbytes double quantization, QLoRA, and the STE."
+    href="/ai/inference/ptq-and-qat"
+  />
+  <Card
+    icon={<Package />}
+    title="GGUF and Local Inference"
+    description="The GGUF container layout, llama.cpp quant types with their real bits per weight, CPU SIMD paths, layer offload, Ollama, and unified memory."
+    href="/ai/inference/gguf-and-local"
+  />
+  <Card
+    icon={<Database />}
+    title="KV Cache"
+    description="Per-token byte constants across six models, how many sequences fit on a GPU, the crossover where cache reads overtake weight reads, and four reductions."
+    href="/ai/inference/kv-cache"
+  />
+  <Card
+    icon={<Zap />}
+    title="Prefill and Decode"
+    description="TTFT against TPOT, the linear and quadratic prefill terms, the 30K-token attention crossover, arithmetic intensity per phase, and head-of-line blocking."
+    href="/ai/inference/prefill-and-decode"
+  />
+  <Card
+    icon={<Sparkles />}
+    title="Speculative Decoding"
+    description="Lossless rejection sampling, the expected-tokens formula, n-gram speculation, Medusa heads, EAGLE feature drafting, and tree attention."
+    href="/ai/inference/speculative-decoding"
+  />
+  <Card
+    icon={<Workflow />}
+    title="Continuous Batching"
+    description="Iteration-level scheduling, selective batching, the token budget, preemption by recompute against swap, and prefix caching with its block-aligned hit rules."
+    href="/ai/inference/continuous-batching"
+  />
+  <Card
+    icon={<GitBranch />}
+    title="Prefill-Decode Disaggregation"
+    description="What colocation costs, the KV transfer arithmetic that decides whether splitting pays, DistServe, Splitwise, Mooncake, and NIXL."
+    href="/ai/inference/disaggregation"
+  />
+  <Card
+    icon={<Cloud />}
+    title="Serving Engines Compared"
+    description="vLLM PagedAttention, SGLang RadixAttention, TensorRT-LLM engine compilation, CUDA graphs, and constrained structured output decoding."
+    href="/ai/inference/serving-engines"
+  />
+</Cards>
+
+---
+
+## Prerequisites
+
+- [Vectors and Matrices](/ai/math-foundations/vectors-and-matrices) for the shape arithmetic behind every FLOP count here
+- [Matrix Multiplication](/ai/pytorch/matrix-multiplication) for the matmul that every roofline claim is measured against
+- [Devices and Precision](/ai/pytorch/devices-and-precision) for FP32, FP16 and BF16 ranges, which the quantization pages compress from
+- [Attention Internals](/ai/transformers/attention-internals) for where K and V come from and why they are the tensors worth caching
+- [Inference Lifecycle](/ai/llm/inference-lifecycle) for the prefill-against-decode baseline and the KV formula this phase extends
+- [Attention Variants](/ai/llm/attention-variants) for MQA, GQA and MLA, which are cache-compression techniques that happen to be architectural
+- [Context Windows](/ai/llm/context-windows) for the long-context cost that makes the KV cache the binding constraint
+- [Scaling and Parallelism](/ai/llm/scaling-and-parallelism) for tensor and pipeline parallelism, which disaggregation splits along a third axis
+- [Mixture of Experts](/ai/llm/mixture-of-experts) for sparse activation, which changes the decode intensity argument
+- [QLoRA](/ai/fine-tuning/qlora) for NF4 and bitsandbytes from the training side
+- [Merging and Deployment](/ai/fine-tuning/merging-and-deployment) for where a merged adapter gets quantized and shipped
+- [Context Budgeting](/ai/rag/context-budgeting) for prompt-cache economics, which continuous batching implements at engine level
+- [RAG Against Long Context](/ai/rag/rag-vs-long-context) for the per-token KV ceilings reused in the cache arithmetic
+
+Nothing here needs a GPU to read, and PyTorch is not required. The CUDA and Triton samples are annotated by inspection; the Python samples use `transformers`, `torch`, and the quantization libraries named on each page.
+
+---
+
+## What you should be able to do afterwards
+
+- Walk the GPU execution hierarchy from thread to warp to block to SM, and say what limits each level
+- Place an operation on a roofline from its arithmetic intensity and a GPU's ridge point, and predict whether it is compute-bound or bandwidth-bound
+- Compute the batch-1 decode ceiling for any model and GPU from bandwidth and weight size
+- Explain why a decode step uses 0.34 percent of an H100's BF16 capacity, and why batching is the fix
+- Read a fused CUDA kernel: warp shuffles, shared memory, the two synchronization barriers, and what the strided loop is for
+- Say when to write a Triton kernel instead of a CUDA one, and name the three Triton gotchas
+- Explain FlashAttention's tiling and the online-softmax rescale well enough to say why it removes quadratic HBM traffic
+- Compare LPUs, wafer-scale engines, TPUs and tiered-memory designs on what each trades, and state the four objections to SRAM-first silicon
+- Convert between a floating-point range and its INT8 or INT4 representation using scale and zero-point
+- Compute the quantization error variance and say what one fewer bit costs in decibels
+- Distinguish per-tensor, per-channel and per-group quantization, and compute the effective bits per weight for a grouped scheme
+- Explain the outlier problem and the three responses to it: mixed precision, smoothing, and rotation
+- Walk through GPTQ's objective and Hessian, and say why AWQ protects salient channels instead
+- Explain the straight-through estimator and why QAT needs it
+- Say why QLoRA is not quantization-aware training
+- Read a GGUF header, and compute bits per weight for any llama.cpp quant type from its block struct
+- Estimate CPU and Apple Silicon decode ceilings from memory bandwidth
+- Compute the KV cache bytes per token for any model from its config, and the number of concurrent sequences a GPU supports
+- Find the context length at which KV reads overtake weight reads during decode
+- Compare FP8 KV cache, INT4 KV cache, and token eviction on what each costs in quality and where each fails
+- Explain why attention sinks must survive eviction
+- Decompose end-to-end latency into TTFT and TPOT and name the lever for each
+- Compute both prefill terms and the context length where attention work overtakes the projections
+- Derive prefill and decode arithmetic intensity and explain why they scale with different variables
+- Explain speculative sampling's accept-and-resample rule and why it preserves the target distribution exactly
+- Compute expected tokens per verification pass and the speedup after draft cost
+- Say when speculative decoding reduces throughput and why
+- Explain iteration-level scheduling, selective batching, and why continuous batching requires paged KV cache
+- State the four conditions for a prefix cache hit and the prompt-ordering rule that follows
+- Compute whether prefill-decode disaggregation pays for a stated prompt length and interconnect
+- Compare vLLM, SGLang, TensorRT-LLM and `llama.cpp` on build step, memory management, and what each is best at
+- Explain what a CUDA graph eliminates and why static shapes force engines to capture many of them
+- Describe how grammar-constrained decoding masks logits and why it changes the sampling distribution
+
+---
+
+## Canonical resources
+
+- **Repositories**
+  - [`vllm-project/vllm`](https://github.com/vllm-project/vllm) — high-throughput serving engine, the PagedAttention reference implementation
+  - [`sgl-project/sglang`](https://github.com/sgl-project/sglang) — RadixAttention plus a frontend DSL for structured LM programs
+  - [`NVIDIA/TensorRT-LLM`](https://github.com/NVIDIA/TensorRT-LLM) — compile-time specialization for NVIDIA hardware
+  - [`ai-dynamo/dynamo`](https://github.com/ai-dynamo/dynamo) — disaggregated serving framework with NIXL for KV transfer
+  - [`LMCache/LMCache`](https://github.com/LMCache/LMCache) — KV cache layer for vLLM with offloading and cross-instance sharing
+  - [`ggerganov/llama.cpp`](https://github.com/ggerganov/llama.cpp) — the C inference engine, GGUF, and every quant type in this phase
+  - [`ollama/ollama`](https://github.com/ollama/ollama) — registry, blob store and HTTP API around `llama.cpp`
+  - [`ggml-org/ggml`](https://github.com/ggml-org/ggml) — the tensor library underneath
+  - [`openai/triton`](https://github.com/openai/triton) — GPU kernels in Python
+  - [`srush/GPU-Puzzles`](https://github.com/srush/GPU-Puzzles) — interactive exercises that teach CUDA and Triton by writing them
+  - [`vllm-project/llm-compressor`](https://github.com/vllm-project/llm-compressor) — GPTQ, AWQ, SmoothQuant and FP8 recipes that produce vLLM-loadable checkpoints
+  - [`AutoGPTQ/AutoGPTQ`](https://github.com/AutoGPTQ/AutoGPTQ) and [`casper-hansen/AutoAWQ`](https://github.com/casper-hansen/AutoAWQ) — the two most-used PTQ toolkits
+  - [`TimDettmers/bitsandbytes`](https://github.com/Timdettmers/bitsandbytes) — LLM.int8() and NF4
+  - [`NVIDIA/TensorRT-Model-Optimizer`](https://github.com/NVIDIA/TensorRT-Model-Optimizer) — PTQ and QAT for the TensorRT path
+  - [`mlc-ai/xgrammar`](https://github.com/mlc-ai/xgrammar) — the constrained-decoding engine behind SGLang and vLLM
+  - [`huggingface/optimum`](https://github.com/huggingface/optimum) — hardware-specific optimization and export
+  - [`InternLM/lmdeploy`](https://github.com/InternLM/lmdeploy) — the TurboMind engine, strong W4A16 support
+  - [`huggingface/text-generation-inference`](https://github.com/huggingface/text-generation-inference) — Rust router over a Python model server
+- **Guides**
+  - Outcome School (`outcomeschool.com/blog`): _How does Model Quantization work?_, _How does Ollama work?_, _What is KV Cache in LLMs?_, _KV Cache Compression_, _The First-Token Latency Problem in LLMs_, _Continuous Batching in LLMs_, _Prompt Caching_, _Prefill-Decode Disaggregation_, _Medusa_, _EAGLE_, _N-gram Speculation in LLMs_, _How vLLM works_, _How SGLang works (RadixAttention)_, _How TensorRT-LLM works_, _How CUDA Kernels work_, _How an LPU works_
+  - NVIDIA, _Hopper Architecture In-Depth_ (2022) — the source for the H100 SXM figures used throughout
+  - SemiAnalysis, _Groq Inference Tokenomics: Speed, but at What Cost?_ (February 2024) — the cost side of SRAM-first serving
+  - `llama.cpp` wiki and the `k-quants.h` header — the block struct sizes behind every bits-per-weight figure
+- **Papers**
+  - Hardware and kernels
+    - _Roofline: An Insightful Visual Performance Model for Multicore Architectures_ (Williams et al., CACM 2009)
+    - _Computing's Energy Problem (and what we can do about it)_ (Horowitz, ISSCC 2014) — the per-operation energy table
+    - _Think Fast: A Tensor Streaming Processor (TSP)_ (Abts et al., ISCA 2020) — Groq's deterministic architecture
+    - _TPU v4: An Optically Reconfigurable Supercomputer for Machine Learning_ (Jouppi et al., ISCA 2023, arXiv:2304.01433)
+    - _The SN40L RPU and Dataflow Architecture_ (Prabhakar et al., MICRO 2024, arXiv:2405.07518)
+    - _FlashAttention_ (Dao et al., arXiv:2205.14135), _FlashAttention-2_ (Dao, arXiv:2307.08691), _FlashAttention-3_ (Shah et al., arXiv:2407.08608)
+  - Quantization
+    - _LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale_ (Dettmers et al., arXiv:2208.07339)
+    - _GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers_ (Frantar et al., arXiv:2210.17323) and _Optimal Brain Compression_ (Frantar and Alistarh, arXiv:2208.11589)
+    - _AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration_ (Lin et al., arXiv:2306.00978)
+    - _SmoothQuant: Accurate and Efficient Post-Training Quantization_ (Xiao et al., arXiv:2211.10438)
+    - _QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs_ (Ashkboos et al., arXiv:2404.00456) and _SpinQuant_ (Liu et al., arXiv:2405.16406)
+    - _QLoRA: Efficient Finetuning of Quantized LLMs_ (Dettmers et al., arXiv:2305.14314)
+    - _LLM-QAT: Data-Free Quantization Aware Training_ (Liu et al., arXiv:2305.17053), _EfficientQAT_ (Chen et al., arXiv:2407.11062), _BitNet b1.58_ (Ma et al., arXiv:2402.17764)
+  - KV cache
+    - _Fast Transformer Decoding: One Write-Head is All You Need_ (Shazeer, arXiv:1911.02150) and _GQA: Training Generalized Multi-Query Transformer Models_ (Ainslie et al., arXiv:2305.13245)
+    - _DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model_ (arXiv:2405.04434) — multi-head latent attention
+    - _KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache_ (Liu et al., arXiv:2402.02750) and _KVQuant_ (Hooper et al., arXiv:2401.18079)
+    - _Efficient Streaming Language Models with Attention Sinks_ (Xiao et al., arXiv:2309.17453)
+    - _Scissorhands_ (Liu et al., arXiv:2305.17118), _H2O: Heavy-Hitter Oracle_ (Zhang et al., arXiv:2306.14048), _SnapKV_ (Li et al., arXiv:2404.14469), _PyramidKV_ (Cai et al., arXiv:2406.02069)
+  - Latency and scheduling
+    - _Fast Inference from Transformers via Speculative Decoding_ (Leviathan et al., arXiv:2211.17192) and _Accelerating LLM Decoding with Speculative Sampling_ (Chen et al., arXiv:2302.01318)
+    - _Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads_ (Cai et al., arXiv:2401.10774)
+    - _EAGLE_ (Li et al., arXiv:2401.15077), _EAGLE-2_ (Li et al., arXiv:2406.16858), _EAGLE-3_ (Li et al., arXiv:2503.01840)
+    - _Break the Sequential Dependency of LLM Inference Using Lookahead Decoding_ (Fu et al., arXiv:2402.02057), _Draft & Verify_ (Zhang et al., arXiv:2311.14845), _REST_ (He et al., arXiv:2311.08252)
+    - _Better and Faster Large Language Models via Multi-token Prediction_ (Gloeckle et al., arXiv:2404.19737)
+    - _Orca: A Distributed Serving System for Transformer-Based Generative Models_ (Yu et al., OSDI 2022) — iteration-level scheduling
+    - _Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve_ (Agrawal et al., arXiv:2403.02310) — chunked prefills and goodput
+    - _DistServe: Disaggregating Prefill and Decoding for Goodput-optimized LLM Serving_ (Zhong et al., arXiv:2401.09670)
+    - _Splitwise: Efficient Generative LLM Inference Using Phase Splitting_ (Patel et al., arXiv:2311.18677)
+    - _Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving_ (Qin et al., arXiv:2407.00079)
+    - _MegaScale-Infer: Disaggregating LLM Inference by Granularity of Computation_ (Li et al., arXiv:2504.02263)
+  - Engines and structured output
+    - _Efficient Memory Management for Large Language Model Serving with PagedAttention_ (Kwon et al., SOSP 2023, arXiv:2309.06180)
+    - _SGLang: Efficient Execution of Structured Language Model Programs_ (Zheng et al., arXiv:2312.07104)
+    - _Efficient Guided Generation for Large Language Models_ (Willard and Louf, arXiv:2307.09702) and _xGrammar_ (Dong et al., arXiv:2411.15100)

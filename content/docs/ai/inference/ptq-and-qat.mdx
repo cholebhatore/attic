@@ -1,0 +1,265 @@
+---
+title: PTQ Against QAT
+description: 'Round-to-nearest, GPTQ, AWQ, SmoothQuant, bitsandbytes, rotation-based methods, and what quantization-aware training costs and buys.'
+---
+
+The [math](/ai/inference/quantization-math) says a scale and a zero-point define a quantizer. It does not say how to choose them, and the choice is where the accuracy lives. Round-to-nearest from the min and max is the baseline. Everything else is a better way to pick scales, or a way to train the model to survive the scales you picked.
+
+---
+
+## Two families
+
+| Property            | Post-training quantization       | Quantization-aware training          |
+| :------------------ | :------------------------------- | :----------------------------------- |
+| Needs training data | A small calibration set, or none | A full training corpus               |
+| Needs gradients     | No                               | Yes                                  |
+| Cost                | Minutes to a few GPU hours       | A training run                       |
+| Typical bit width   | 8 and 4 bits                     | 4 bits and below                     |
+| Recovers            | Most of the loss at 4 bits       | Most of the loss at 3 bits and below |
+| Applies to          | An existing checkpoint           | The training recipe                  |
+
+PTQ is the default because it is cheap and, at 4-bit weight-only on a model above roughly 7B, it is usually good enough. QAT is what you reach for at 3 bits and below, or when a specific task degrades in a way PTQ cannot fix.
+
+---
+
+## Calibration
+
+PTQ methods that beat round-to-nearest need to see representative activations. The calibration set is small: 128 to 512 sequences is standard, drawn from a general corpus like C4, WikiText-2, or the Pile, at the model's training sequence length.
+
+```python
+from datasets import load_dataset
+
+calib = load_dataset("allenai/c4", "en", split="train", streaming=True)
+# 128 sequences of 2048 tokens, tokenized, no labels needed
+```
+
+Two properties of calibration that are easy to get wrong:
+
+- **Domain matters.** Calibrating a medical model on C4 produces scales tuned to web prose. Use a sample of the deployment distribution, or a mixture.
+- **Calibration is not evaluation.** The calibration set determines scales; a held-out set measures the damage. Using the same set for both hides the failure.
+
+Methods that need no calibration exist, and for weight-only quantization the gap is small. Round-to-nearest needs only the weights. HQQ uses half-quadratic splitting to solve for scales and zeros without forward passes, which makes it minutes rather than hours.
+
+---
+
+## Round-to-nearest
+
+```text
+scale = max(abs(W)) / (2^(b-1) - 1)        # symmetric, per group
+q     = clamp(round(W / scale), -2^(b-1), 2^(b-1) - 1)
+```
+
+No compensation, no Hessian, no calibration. It is the baseline every other method reports against, and at INT8 per-channel it is close to optimal. At INT4 per-group it leaves a visible gap, because it treats every weight as equally important and every rounding error as independent. Neither is true.
+
+---
+
+## GPTQ
+
+GPTQ (Frantar et al., arXiv:2210.17323) quantizes one column of a weight matrix at a time and repairs the error it just introduced by adjusting the columns that have not been quantized yet.
+
+The objective is the layer's output error on calibration data:
+
+```text
+minimize  || W X - W_q X ||_F^2        over W_q with W_q in the quantization grid
+```
+
+`X` is the layer's cached calibration input. Its second-moment matrix `H = 2 X X^T` is the Hessian of that objective, and the optimal compensation for quantizing one weight is a scaled update to the remaining weights using the inverse Hessian. This is Optimal Brain Surgeon applied to quantization, descended from Optimal Brain Compression (arXiv:2208.11589).
+
+Three engineering details make it tractable:
+
+| Detail                 | Why                                                                                                                       |
+| :--------------------- | :------------------------------------------------------------------------------------------------------------------------ |
+| Lazy batch updates     | Quantizing a column at a time is bandwidth-bound on the GPU. Updating in blocks of 128 columns keeps the arithmetic dense |
+| Cholesky factorization | Inverting `H` repeatedly is numerically unstable and slow. Factoring once and reading rows from the factor is both        |
+| Per-group scales       | Applied on top, at a group size of 128 by default                                                                         |
+
+The published result: GPTQ quantizes a 175B model to 3 or 4 bits in about four GPU hours with a negligible perplexity increase, which is what made 4-bit large models practical.
+
+The limitation is that it optimizes layer output error against calibration activations. It does not know which weights the model depends on, and it can underperform on instruction-tuned and chat models, whose activation distributions differ from the pretraining corpus the calibration set came from.
+
+---
+
+## AWQ
+
+AWQ (Lin et al., arXiv:2306.00978) starts from an observation rather than an optimization: about 1 percent of weight channels matter far more than the rest, and **which** channels they are is determined by the magnitude of the corresponding **activation**, not by the magnitude of the weight.
+
+```text
+1. Run calibration data, record the mean absolute activation per input channel
+2. Mark the top ~1% of channels as salient
+3. Find a per-channel scale s that minimizes output error when salient
+   channels are scaled up by s before quantization and the previous layer's
+   output is scaled down by s to compensate
+4. Quantize with round-to-nearest on the rescaled weights
+```
+
+Scaling a salient channel up reduces its relative rounding error, because the error bound is `scale / 2` and a larger signal-to-step ratio means fewer effective lost bits. The compensating down-scale on the activation keeps the product exact.
+
+Three properties that explain its adoption:
+
+- **No backpropagation and no reconstruction.** It is a scale search plus round-to-nearest, so it is much faster than GPTQ.
+- **Generalizes across distributions.** Because salience comes from activations rather than from fitting a calibration Hessian, it holds up better on chat and instruction-tuned models and on domains the calibration set did not cover.
+- **It gets better at lower precision.** The advantage over GPTQ widens at 3 bits, which is where GPTQ's output-error objective starts to overfit its calibration set.
+
+AWQ ships with TinyChat, which reports up to 3.2x speedup over FP16 for the W4A16 path on desktop GPUs.
+
+---
+
+## SmoothQuant and the W8A8 path
+
+[SmoothQuant](/ai/inference/quantization-math) (Xiao et al., arXiv:2211.10438) is the method that makes weight-and-activation INT8 work, by migrating activation outliers into the weights through a matched per-channel rescale. It is a PTQ method: no gradients, one hyperparameter controlling how much difficulty moves, and a calibration pass to measure activation magnitudes.
+
+It sits in the same family as AWQ in that both are scale-migration methods, and differs in that SmoothQuant's goal is to make activations quantizable at all, while AWQ's goal is to protect a small set of important weights.
+
+Rotation-based methods push the same idea further. QuaRot (arXiv:2404.00456) and SpinQuant (arXiv:2405.16406) multiply weights and activations by orthogonal matrices, which leaves the model's function unchanged but rotates outliers so they spread across dimensions instead of concentrating in a few. With outliers dispersed, per-tensor quantization becomes viable and W4A4 stops being a research problem. SpinQuant learns the rotations rather than choosing Hadamard matrices at random, and reports better results at the same bit width.
+
+---
+
+## bitsandbytes and the QLoRA path
+
+`bitsandbytes` provides two things that are often conflated.
+
+**LLM.int8()** is the mixed-decomposition method from arXiv:2208.07339: outlier dimensions run in FP16, everything else in INT8, results combined. It is accurate and slow, because the decomposition adds a branch to every matmul. It is a debugging and accuracy-reference tool more than a serving format.
+
+**NF4 with double quantization** is the QLoRA format from arXiv:2305.14314. Weights are stored in NF4 with a block size of 64 and an FP32 scale per block. Double quantization then quantizes those FP32 scales to FP8 with a block size of 256, saving about 0.37 bits per parameter.
+
+<Callout type="warn">
+  ### QLoRA is not quantization-aware training
+
+QLoRA freezes the NF4 base weights, dequantizes them to BF16 for the forward pass, and trains FP16 LoRA adapters on top. Gradients flow to the adapters only. The base weights are never updated, so there is no quantization step in the backward pass and no straight-through estimator. The name suggests otherwise and interviewers ask. QAT means the quantizer is inside the training loop and the model learns to tolerate it. QLoRA means the quantizer is a storage format for a frozen model.
+
+</Callout>
+
+---
+
+## Quantization-aware training
+
+QAT inserts a fake-quantize node into the forward pass: quantize, dequantize, and use the result, so the model computes with the same values it will see at inference. Training then proceeds against the simulated rounding noise, which teaches the weights to land on representable levels instead of between two of them.
+
+```python
+def fake_quantize(w: torch.Tensor, scale: torch.Tensor,
+                  zero_point: torch.Tensor, bits: int = 4) -> torch.Tensor:
+    q_max = 2 ** (bits - 1) - 1
+    q_min = -(2 ** (bits - 1))
+    q = torch.clamp(torch.round(w / scale) + zero_point, q_min, q_max)
+    return (q - zero_point) * scale      # same shape and dtype as w
+```
+
+`round` has zero gradient almost everywhere and undefined gradient at the boundaries, so the backward pass cannot use it. The **straight-through estimator** replaces it with the identity:
+
+```text
+forward:   y = round(x)
+backward:  dy/dx := 1
+```
+
+That approximation is what makes QAT possible at all, and it works because the rounding error is small relative to the gradient scale. Clamping still passes a real gradient, which is zero outside the range, and that is what teaches the model to keep weights inside the representable interval.
+
+| Method       | Paper            | Approach                                                                     |
+| :----------- | :--------------- | :--------------------------------------------------------------------------- |
+| LLM-QAT      | arXiv:2305.17053 | Data-free: the model generates its own training data                         |
+| EfficientQAT | arXiv:2407.11062 | Block-wise reconstruction, cheap enough for 70B                              |
+| BitNet b1.58 | arXiv:2402.17764 | Trains ternary weights from initialization, not from a pretrained FP16 model |
+
+BitNet b1.58 is the interesting case because it is not compressing an existing model. Weights are constrained to `-1, 0, +1` from the start, so matmuls become additions. At the 3B scale the paper reports matching a same-size FP16 LLaMA while reducing compute, memory and energy, which is a different claim from "quantization loses a little accuracy". The catch is that it requires training from scratch, so it is a recipe rather than a conversion tool.
+
+The honest cost of QAT for an existing model: a full fine-tuning run with the fake-quantize nodes in place, a real training corpus, and careful learning-rate scheduling, because the loss surface is noisier than the FP16 one. Budget it against the alternative, which is shipping 8-bit or a larger model.
+
+---
+
+## Choosing
+
+| Situation                                           | Method                                      |
+| :-------------------------------------------------- | :------------------------------------------ |
+| 8-bit, any model                                    | Per-channel round-to-nearest                |
+| 4-bit weight-only, base model, have a few GPU hours | GPTQ                                        |
+| 4-bit weight-only, chat or instruction model        | AWQ                                         |
+| 4-bit weight-only, no calibration data, fast        | HQQ or round-to-nearest with group size 128 |
+| W8A8 for prefill throughput on INT8 hardware        | SmoothQuant                                 |
+| Below 4 bits, or W4A4                               | Rotation-based PTQ first, QAT if that fails |
+| Training a new small model for edge deployment      | BitNet-style from-scratch training          |
+| Fine-tuning a frozen quantized base                 | QLoRA, which is not QAT                     |
+| Serving on Hopper or Blackwell with FP8 support     | FP8 PTQ, which needs almost no machinery    |
+
+---
+
+## Tooling
+
+- [`vllm-project/llm-compressor`](https://github.com/vllm-project/llm-compressor) — GPTQ, AWQ, SmoothQuant and FP8 recipes that emit checkpoints vLLM loads directly.
+- [`AutoGPTQ`](https://github.com/autogptq/autogptq) and [`AutoAWQ`](https://github.com/casper-hansen/AutoAWQ) — the original single-method implementations, still widely used for producing checkpoints.
+- [`TimDettmers/bitsandbytes`](https://github.com/TimDettmers/bitsandbytes) — LLM.int8() and the NF4 quantizer under QLoRA.
+- [`mobiusml/hqq`](https://github.com/mobiusml/hqq) — calibration-free half-quadratic quantization, fast at 4-bit and below.
+- [`NVIDIA/TensorRT-Model-Optimizer`](https://github.com/NVIDIA/TensorRT-Model-Optimizer) — the PTQ and QAT path for TensorRT-LLM, including FP8 and INT4 AWQ.
+- [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) — its own quantization family for GGUF, covered on the [local inference page](/ai/inference/gguf-and-local).
+
+Checkpoint formats are not interchangeable. A GPTQ checkpoint, an AWQ checkpoint, a GGUF file and a bitsandbytes-quantized HF model each encode scales, zeros and packing differently, and each needs a matching kernel in the serving engine. Confirm the engine supports the format before quantizing.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What is the difference between PTQ and QAT?">
+
+    PTQ converts an existing checkpoint using statistics gathered from a small calibration set or from the weights alone, with no gradients, and costs minutes to a few GPU hours. QAT puts a fake-quantize node in the forward pass and trains the model so it tolerates the quantizer, using a straight-through estimator for the rounding, and costs a training run. PTQ handles 8-bit and 4-bit well; QAT is what you need below 4 bits.
+
+  </Accordion>
+  <Accordion title="2. What is a calibration set and how big is it?">
+
+    A few hundred representative sequences, typically 128 to 512 at the model's training sequence length, drawn from a general corpus or from the deployment distribution. It is used to measure activation statistics for choosing scales, not to evaluate the result. Calibrating a domain-specific model on web text is a common and silent error.
+
+  </Accordion>
+  <Accordion title="3. How does GPTQ work?">
+
+    It minimizes the layer's output error `||WX - W_q X||^2` against cached calibration activations, quantizing one column of weights at a time and compensating the not-yet-quantized columns using the inverse Hessian `H = 2 X X^T`. Lazy batch updates over 128 columns keep it bandwidth-efficient and a single Cholesky factorization makes it numerically stable. It quantizes a 175B model to 3 or 4 bits in about four GPU hours.
+
+  </Accordion>
+  <Accordion title="4. What is AWQ's core observation?">
+
+    That roughly 1 percent of weight channels are salient, and that salience is determined by the magnitude of the corresponding activation, not the magnitude of the weight. AWQ scales those channels up before quantization, which reduces their relative rounding error, and compensates by scaling the activation down so the product is unchanged. No backpropagation, no output reconstruction.
+
+  </Accordion>
+  <Accordion title="5. When does AWQ beat GPTQ?">
+
+    On instruction-tuned and chat models, on domains the calibration set does not represent, and at lower bit widths. GPTQ fits an output-error objective to its calibration set, so it overfits when the deployment distribution differs. AWQ derives scales from activation magnitudes, which transfer better. At 3 bits the gap widens.
+
+  </Accordion>
+  <Accordion title="6. What is SmoothQuant and how does it differ from AWQ?">
+
+    SmoothQuant migrates activation outliers into the weights with a matched per-channel rescale so that W8A8 INT8 becomes viable, targeting the case where activations must be quantized for INT8 tensor-core arithmetic. AWQ protects a small set of salient weights to enable weight-only 4-bit. Both are scale migration; the goal and the target scheme differ.
+
+  </Accordion>
+  <Accordion title="7. What do QuaRot and SpinQuant add?">
+
+    They multiply weights and activations by orthogonal matrices, which preserves the model's function while rotating outlier dimensions so their magnitude spreads across all dimensions. With outliers dispersed, per-tensor quantization becomes workable and W4A4 becomes feasible. QuaRot uses Hadamard matrices; SpinQuant learns the rotations and reports better results at the same width.
+
+  </Accordion>
+  <Accordion title="8. Why is QLoRA not QAT?">
+
+    QLoRA freezes the NF4 base weights, dequantizes them to BF16 for the forward pass, and trains FP16 LoRA adapters. Gradients reach only the adapters, so no quantizer sits in the backward path and there is no straight-through estimator. The base model never learns to tolerate quantization; it was quantized once by round-to-nearest-style block scaling.
+
+  </Accordion>
+  <Accordion title="9. What is the straight-through estimator and why is it needed?">
+
+    The gradient of `round` is zero almost everywhere, so the backward pass through a fake-quantize node would carry no signal. The straight-through estimator defines the backward pass as the identity, passing the incoming gradient through unchanged. It works because the rounding error is small relative to the gradient magnitude. Clamping still contributes a real zero gradient outside the representable range, which is what teaches the model to stay inside it.
+
+  </Accordion>
+  <Accordion title="10. What is double quantization in QLoRA?">
+
+    NF4 stores an FP32 scale per block of 64 weights, and those scales are themselves a meaningful fraction of the budget. Double quantization quantizes the FP32 scales to FP8 with a block size of 256, saving about 0.37 bits per parameter. It is a second quantizer applied to the first quantizer's constants.
+
+  </Accordion>
+  <Accordion title="11. What does BitNet b1.58 do differently?">
+
+    It trains ternary weights, `-1`, `0` and `+1`, from initialization rather than compressing a pretrained FP16 model, so matmuls become additions. At the 3B scale the paper reports matching a same-size FP16 LLaMA with lower compute, memory and energy. It is a training recipe for new models, not a conversion path for existing ones.
+
+  </Accordion>
+  <Accordion title="12. You quantize a 70B model to 4 bits and perplexity barely moves, but a downstream task regresses. What do you suspect?">
+
+    That the task depends on capabilities the aggregate metric does not capture. Reasoning and arithmetic degrade first under weight quantization while retrieval and classification hold up, and small models degrade more than large ones at the same width. Check whether the regression concentrates in long chains of computation, then try a finer group size, AWQ instead of GPTQ, or 8-bit, and evaluate on the task set rather than on perplexity.
+
+  </Accordion>
+  <Accordion title="13. Why are quantization checkpoint formats not interchangeable?">
+
+    Because each encodes scales, zero-points, group boundaries and bit packing differently, and each needs a matching dequantizing kernel in the serving engine. A GPTQ checkpoint will not load as AWQ, a GGUF file only runs in llama.cpp and its derivatives, and bitsandbytes quantization is a runtime state rather than a portable format. Confirm engine support before choosing the method.
+
+  </Accordion>
+</Accordions>

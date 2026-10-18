@@ -1,0 +1,214 @@
+---
+title: Specialized Inference Silicon
+description: 'LPUs, wafer-scale engines, TPUs, and three-tier memory: why SRAM-first designs trade capacity for bandwidth, with published specs and the cost objections.'
+---
+
+A GPU streams weights from HBM every decode step. An LPU keeps them in SRAM and never leaves the chip. That single design choice explains the whole category: SRAM is roughly 100 times faster per byte than HBM and roughly 100 times smaller per chip, so any design that commits to SRAM must solve capacity with parallelism instead.
+
+---
+
+## The arithmetic that motivates the category
+
+Decode reads every weight once per token, so at batch 1 the ceiling is bandwidth divided by model size. Llama 3 70B in FP16 is about 140 GB of weights, and an H100 SXM has 3.35 TB/s of HBM3 bandwidth and 50 MB of L2 (NVIDIA Hopper whitepaper, 2022). The L2 covers about 0.04 percent of the weights, so nothing is reused across steps:
+
+```text
+3.35 TB/s / 140 GB = 24 tokens per second, one stream, no batching
+```
+
+That division is the entire LPU pitch. Increasing batch size raises arithmetic intensity and amortizes the weight read across streams, which is why GPU serving is fast in aggregate but slow per user. SRAM-first designs invert the trade: fast single streams, no batching required.
+
+---
+
+## Three memory philosophies
+
+<Mermaid
+  chart={`
+flowchart LR
+    subgraph GPUC["HBM-centric, NVIDIA H100"]
+      G1["Registers and shared<br/>256 KB per SM"] --> G2["L2 cache<br/>50 MB"] --> G3["HBM3<br/>80 GB at 3.35 TB/s"]
+    end
+    subgraph LPUC["SRAM-only, Groq TSP"]
+      L1["On-chip SRAM<br/>230 MB at 80 TB/s"] --> L2["No DRAM.<br/>Weights sharded across<br/>hundreds of chips"]
+    end
+    subgraph RDUC["Tiered, SambaNova SN40L"]
+      R1["SRAM<br/>520 MB"] --> R2["HBM<br/>64 GB at 1.8 TB/s"] --> R3["DDR<br/>1.5 TB at 200 GB/s"]
+    end
+`}
+/>
+
+Each column buys something the others cannot. HBM-centric keeps one model on one or two chips. SRAM-only buys deterministic per-token latency. Tiered memory buys capacity for mixture-of-experts weights that will not fit in SRAM.
+
+---
+
+## Groq LPU: deterministic SRAM token streaming
+
+Groq calls the chip an LPU, a Language Processing Unit, meaning a processor built for one workload rather than a general accelerator retargeted at it. The GroqChip 1 Tensor Streaming Processor (TSP) holds 230 MB of on-chip SRAM with 80 TB/s internal bandwidth and no HBM or DRAM at all (Groq SC23 exhibitor deck; GroqChip product brief v1.5). It delivers 750 TOPS INT8 and 188 TFLOPS FP16 at 900 MHz, using 320 by 320 fused dot-product matrix engines on a GlobalFoundries 14nm process. Groq publishes FP16 figures, not BF16.
+
+The architectural claim is the interesting part. From Abts et al., "Think Fast: A Tensor Streaming Processor," ISCA 2020: the machine is fully deterministic and software-scheduled by design, with the compiler planning all instruction timing statically. There are no caches, no dynamic schedulers, and no arbitration, because data movement is decided at compile time rather than resolved at runtime.
+
+Consequences worth naming in an interview:
+
+| Property                | Why it follows from static scheduling                                                    |
+| :---------------------- | :--------------------------------------------------------------------------------------- |
+| Predictable latency     | Every instruction has a known cycle, so time-to-first-token has low variance             |
+| No dynamic batching     | Batching exists on GPUs to amortize scheduling and memory overhead the LPU does not have |
+| Weights live in SRAM    | The read that dominates GPU decode does not leave the chip                               |
+| Capacity is the problem | 230 MB per chip means a 70B model spans many chips, tensor-pipelined across a rack       |
+
+Published throughput, with the measurement source named because only some of these are third-party:
+
+- Llama 2 70B: first provider above 100 tokens per second per user (Groq press release, August 2023).
+- Llama 2 Chat 70B: 241 tokens per second median, measured independently by Artificial Analysis (February 2024).
+- Llama 3 70B: 284 tokens per second (Groq, April 2024).
+- Llama 3.3 70B: 276 tokens per second (Groq, December 2024).
+
+On capacity, the one chip count that is properly sourced is 576 chips, arranged as 8 racks of 9 servers of 8 chips, to serve Mixtral 8x7B (SemiAnalysis, "Groq Inference Tokenomics," February 2024). The widely repeated "304 chips for Llama 2 70B" does not appear in any primary source and should not be quoted as fact.
+
+---
+
+## Cerebras WSE-3: wafer scale
+
+Cerebras puts the whole wafer on one engine. WSE-3 is 46,225 square millimeters, about 57 times a GPU die, with 4 trillion transistors, 900,000 cores, 44 GB of on-chip SRAM, and 125 PFLOPS peak FP16 on TSMC 5nm (Cerebras press release, March 2024). SRAM bandwidth is 21 PB/s with a 214 Pb/s fabric (Hot Chips 2024). Model weights that exceed 44 GB stream from MemoryX, sold in 1.5 TB, 12 TB, and 1.2 PB tiers.
+
+Announced inference rates: 1,800 tokens per second on Llama 3.1 8B and 450 on Llama 3.1 70B (August 2024), later 2,100 on 70B (October 2024). The current product page describes a WSE-3 Turbo at 250 PFLOPS and 43.2 PB/s claiming above 4,400 tokens per second per user on GPT-OSS-120B, so date-stamp any 125 PFLOPS figure to 2024.
+
+Note that 44 GB of SRAM cannot hold a 70B model in FP16, which needs about 140 GB. Cerebras has not published the precision or the share streamed from MemoryX, so do not claim the whole model is SRAM-resident.
+
+---
+
+## SambaNova SN40L: three-tier memory
+
+SN40L is the counterexample to "all SRAM." Per socket it has 520 MB on-chip SRAM, 64 GB on-package HBM at about 1.8 TB/s, and up to 1.5 TB off-package DDR at about 200 GB/s, for roughly 2.07 TB of memory (Prabhakar et al., arXiv:2405.07518, MICRO 2024). It is a TSMC 5nm 2.5D CoWoS chiplet design with two compute dies and 638 TFLOPS BF16. Nodes hold 8 sockets. Third-party summaries quote 2 TB/s for HBM; the paper says 1.8 TB/s. Transistor count, TDP, and die size are not published.
+
+The tiering exists for mixture-of-experts models. Published rates on 16 sockets: Llama 3.1 8B at 1,042 tokens per second, 70B at 457, and 405B at 129 per user. SambaNova's Composition-of-Experts keeps the active experts in fast memory and streams the rest from DDR, which is exactly the workload an SRAM-only design handles badly.
+
+---
+
+## Google TPU: systolic arrays at pod scale
+
+A TPU's Matrix Unit is a systolic array of 128 by 128 MACs, enlarged to 256 by 256 on v6e (Google Cloud TPU architecture docs). Operands flow through the array without returning to memory, so one load feeds many multiplications.
+
+| Version      | BF16       | INT8       | HBM                  | Pod                                                  |
+| :----------- | :--------- | :--------- | :------------------- | :--------------------------------------------------- |
+| v4           | 275 TFLOPS | 275 TOPS   | 32 GiB at 1,200 GB/s | 4,096 chips, 3D torus with optical circuit switches  |
+| v5e          | 197 TFLOPS | 393 TOPS   | 16 GB at 800 GiB/s   | 256 chips                                            |
+| v6e Trillium | 918 TFLOPS | 1,836 TOPS | 32 GB at 1,638 GB/s  | 256 chips, 2D torus, 234.9 PFLOPS BF16, ICI 800 GB/s |
+
+Sources: Google Cloud TPU docs for v4, v5e, and v6e, plus Jouppi et al., ISCA 2023, arXiv:2304.01433 for v4. The v5e bandwidth is 819 GB/s if you convert from GiB/s; both numbers are the same figure.
+
+The v4 optical circuit switch is worth remembering. It reconfigures the 3D torus topology in hardware, so a pod can be repartitioned for a different job without rewiring. TPUs remain HBM-centric, so decode is bandwidth-bound the same way it is on a GPU.
+
+---
+
+## Apple Silicon: unified memory as the capacity play
+
+One address space shared by CPU and GPU changes the offload calculus, because there is no PCIe copy between host and device memory.
+
+| Chip     | Memory bandwidth | Maximum unified memory |
+| :------- | :--------------- | :--------------------- |
+| M4 Max   | 546 GB/s         | 128 GB                 |
+| M2 Ultra | 800 GB/s         | 192 GB                 |
+| M3 Ultra | 819 GB/s         | 512 GB                 |
+| M5 Ultra | 1.2 TB/s         | 512 GB                 |
+
+Sources: Apple Mac Studio and Mac mini spec pages, and the October 2024 M4 Pro and M4 Max newsroom post. No M4 Ultra shipped.
+
+The consequence is capacity, not speed. A quantized 70B, or even a 405B at 4 bits, fits on a desk machine where a discrete GPU would need model parallelism across hosts. But 0.5 to 1.2 TB/s is three to seven times below an H100, so decode stays bandwidth-bound and per-token latency stays in the range a GPU gives at batch 1.
+
+---
+
+## The GPU baseline, for scale
+
+| Accelerator | Memory       | Bandwidth | BF16 dense   |
+| :---------- | :----------- | :-------- | :----------- |
+| H100 SXM    | 80 GB HBM3   | 3.35 TB/s | 989.4 TFLOPS |
+| B200        | 180 GB HBM3e | 8 TB/s    | 2.25 PFLOPS  |
+
+Sources: NVIDIA H100 datasheet and DGX B200 page, which gives 1,440 GB and 64 TB/s across 8 GPUs. Some vendor tables list 192 GB for B200, which is total versus usable, and some asterisk the 2.25 PFLOPS figure as sparse. NVIDIA has not published a B200 L2 size.
+
+---
+
+## The objections
+
+Every tok/s number above is either a vendor announcement or an Artificial Analysis measurement quoted by the vendor. Say which.
+
+Four criticisms hold up against the sources:
+
+1. **Cost per token.** A single model instance spans hundreds of chips. 576 for Mixtral 8x7B is the documented case, and vendor throughput figures are single-stream rates, not aggregate cluster throughput.
+2. **KV cache competes with weights** for the same scarce SRAM. Long context is where SRAM-only designs hurt most, because the cache grows with sequence length while the weights stay resident.
+3. **Mixture of experts does not fit "all resident."** Sparse activation means a large total weight footprint with a small active subset per token, which is a streaming problem. SambaNova built Composition-of-Experts specifically for this.
+4. **Static scheduling is inflexible.** New models and new shapes need recompilation, and utilization collapses at low batch because the machine was sized for a specific operating point.
+
+<Callout type="info">
+  ### When the LPU argument wins
+
+Low-latency single-stream workloads where per-token time is the product: realtime voice, interactive agents whose chains multiply latency by the number of steps, and any UI where a human waits on the output. High-throughput offline batch jobs go the other way, because a GPU's aggregate throughput at large batch beats an SRAM design on cost per token.
+
+</Callout>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Why does an LPU not need dynamic batching to hit low per-token latency?">
+
+    Because its compiler schedules every instruction statically, so there is no runtime scheduling or memory arbitration overhead to amortize. GPUs use batching to spread those costs across streams; the LPU removes them instead.
+
+  </Accordion>
+  <Accordion title="2. Groq's TSP has no DRAM. Where do the weights of a 70B model live?">
+
+    Sharded across the SRAM of many chips, tensor-pipelined through a rack. The documented case is 576 GroqChip 1 units, in 8 racks of 9 servers of 8 chips, serving Mixtral 8x7B.
+
+  </Accordion>
+  <Accordion title="3. What is the batch-1 decode ceiling for a 70B FP16 model on an H100 SXM?">
+
+    About 24 tokens per second: 3.35 TB/s of HBM3 bandwidth divided by roughly 140 GB of weights. The 50 MB L2 covers 0.04 percent of the model, so nothing is reused between steps.
+
+  </Accordion>
+  <Accordion title="4. Why does a systolic array reduce memory traffic?">
+
+    Operands flow through the 128 by 128 grid of MACs, so each loaded value participates in many multiplications before being evicted. One memory read feeds 128 multiply-accumulate operations in the ideal case.
+
+  </Accordion>
+  <Accordion title="5. What makes long context expensive on SRAM-only hardware?">
+
+    The KV cache grows linearly with sequence length and must live in the same 230 MB of SRAM as the weights. On an HBM design the cache has tens of gigabytes to grow into.
+
+  </Accordion>
+  <Accordion title="6. Why does mixture of experts suit tiered memory better than SRAM-only?">
+
+    Sparse activation means a large total weight footprint with a small active subset per token. SN40L keeps active experts in 520 MB of SRAM and 64 GB of HBM and streams the rest from 1.5 TB of DDR, which is Composition-of-Experts.
+
+  </Accordion>
+  <Accordion title="7. What does unified memory change for local inference on Apple Silicon?">
+
+    CPU and GPU share one address space, so there is no host-to-device copy and the GPU can address all 512 GB on an M3 Ultra. Capacity stops being the constraint; bandwidth, at 819 GB/s, still is.
+
+  </Accordion>
+  <Accordion title="8. A vendor claims 2,100 tokens per second on a 70B model. What two questions do you ask?">
+
+    Whether that is per user or aggregate cluster throughput, and who measured it. Vendor announcements quote single-stream rates, and only Artificial Analysis figures are third-party.
+
+  </Accordion>
+  <Accordion title="9. Why is static scheduling a liability as well as an asset?">
+
+    It gives cycle-accurate predictability, but every new model or tensor shape requires recompilation, and utilization drops at low batch because the machine was sized for one operating point.
+
+  </Accordion>
+  <Accordion title="10. What did the v4 TPU's optical circuit switches buy?">
+
+    Hardware reconfiguration of the 3D torus, so a 4,096-chip pod can be repartitioned for a different job without physical rewiring.
+
+  </Accordion>
+  <Accordion title="11. WSE-3 has 44 GB of SRAM. Can a 70B model in FP16 be resident on chip?">
+
+    No. FP16 at 70B needs about 140 GB, so some of it streams from MemoryX. Cerebras has not published the precision used for its 2,100 tokens per second claim.
+
+  </Accordion>
+  <Accordion title="12. Where does an SRAM-first design lose to a GPU?">
+
+    Offline batch and any workload measured in tokens per dollar at high concurrency. A GPU's aggregate throughput at large batch amortizes its slower memory across many streams, which is the operating point SRAM capacity cannot serve cheaply.
+
+  </Accordion>
+</Accordions>

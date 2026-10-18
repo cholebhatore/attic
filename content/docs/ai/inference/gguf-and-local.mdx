@@ -1,0 +1,255 @@
+---
+title: GGUF and Local Inference
+description: 'The GGUF container layout, llama.cpp quant types and their real bits per weight, CPU vector paths, layer offload, Ollama, and Apple Silicon unified memory.'
+---
+
+Local inference is a different engineering problem from datacenter serving. There is no HBM, no continuous batching, and often no discrete GPU. `llama.cpp` solves it with a C tensor library, a self-describing container format, and quant types tuned so a 70B model runs on a machine with 48 GB of RAM.
+
+---
+
+## GGML, llama.cpp, and GGUF
+
+Three names that get conflated:
+
+| Name          | What it is                                                                                           |
+| :------------ | :--------------------------------------------------------------------------------------------------- |
+| **GGML**      | A C tensor library. Quantized types, SIMD kernels, no Python, no autograd beyond what training needs |
+| **llama.cpp** | The inference engine built on GGML. Also the `llama-server`, `llama-cli`, and `llama-quantize` tools |
+| **GGUF**      | The container file format, introduced August 2023 to replace the older GGML format                   |
+
+GGUF replaced the GGML format because the older one carried no metadata. A GGML file was tensors plus a sidecar JSON describing the architecture, and the two could disagree. GGUF puts everything in one file.
+
+---
+
+## The GGUF container
+
+```text
+magic               "GGUF" (4 bytes)
+version             uint32, currently 3
+tensor count        uint64
+metadata KV count   uint64
+metadata pairs      typed key-value entries: general.architecture,
+                    general.name, llama.context_length,
+                    llama.block_count, tokenizer.ggml.model, ...
+tensor info block   per tensor: name, dimension count, dimensions,
+                    quant type, byte offset into the data section
+alignment           uint64, usually 32
+padding             zeroes up to the alignment boundary
+tensor data         the quantized bytes, in info-block order
+```
+
+The padding step exists so the data section starts on an alignment boundary and tensors can be memory-mapped and read in place. `mmap` is why a large model loads quickly on a desktop: the OS pages weights in on demand rather than copying the whole file into RAM first.
+
+Supported quant types are stored per tensor in the info block, which is why a single GGUF can hold an embedding table at Q8_0, most layers at Q4_K, and the output head at Q6_K.
+
+---
+
+## Quant types and their real bits per weight
+
+Legacy types use a block of 32 weights with one FP16 scale. K-quants use a super-block of 256 weights split into sub-blocks, with a mix of an FP16 super-scale and small integer sub-scales. The struct sizes are from `k-quants.h`:
+
+| Type   | Block bytes per 256 weights                                    | Bits per weight          |
+| :----- | :------------------------------------------------------------- | :----------------------- |
+| `Q8_0` | 2 + 8 = 10 per 32 weights                                      | `(256 + 16) / 32` = 8.50 |
+| `Q4_0` | 16 + 2 = 18 per 32 weights                                     | `(128 + 16) / 32` = 4.50 |
+| `Q6_K` | `qh[64]` + `ql[128]` + `scales[16]` int8 + FP16 d = 210        | `210 * 8 / 256` = 6.56   |
+| `Q5_K` | FP16 d + FP16 dmin + `scales[12]` + `qh[32]` + `qs[128]` = 176 | `176 * 8 / 256` = 5.50   |
+| `Q4_K` | FP16 d + FP16 dmin + `scales[12]` + `qs[128]` = 144            | `144 * 8 / 256` = 4.50   |
+| `Q2_K` | FP16 d + FP16 dmin + `scales[16]` + `qs[64]` = 84              | `84 * 8 / 256` = 2.63    |
+
+Two things follow. K-quants carry a second scale, `dmin`, which makes them asymmetric: they store a minimum as well as a step, matching the zero-point scheme from the quantization math page. And the `_S`, `_M`, `_L` suffixes are not new formats; they are recipes that pick a different type per tensor. `Q4_K_M` keeps attention and feed-forward output tensors at `Q6_K` and quantizes the rest at `Q4_K`, which is why its effective rate lands near 4.85 bits per weight rather than 4.50.
+
+The i-quants (`IQ1_S` through `IQ4_XS`) go further and encode groups of weights against a fixed codebook built on the E8 lattice, so a block stores indices into that codebook instead of per-weight integers. They need an **importance matrix**, computed by running calibration text through the FP16 model and recording how much each weight affects the output. Without the matrix the low-bit i-quants degrade sharply.
+
+File sizes follow from the rate. For a model with `P` parameters at `b` bits per weight, the tensor data is `P * b / 8` bytes:
+
+```text
+8B  at Q4_K_M (4.85 bpw)   8.0e9 * 4.85 / 8 = 4.85 GB   (published GGUF: 4.92 GB)
+8B  at Q8_0   (8.50 bpw)   8.0e9 * 8.50 / 8 = 8.50 GB
+8B  at Q2_K   (2.63 bpw)   8.0e9 * 2.63 / 8 = 2.63 GB
+70B at Q4_K_M (4.85 bpw)   7.0e10 * 4.85 / 8 = 42.4 GB  (published GGUF: 42.5 GB)
+70B at Q6_K   (6.56 bpw)   7.0e10 * 6.56 / 8 = 57.4 GB
+```
+
+The published sizes come from the model cards on Hugging Face and run slightly above the arithmetic because the embedding and output tensors are held at higher precision and the metadata adds a few hundred kilobytes.
+
+<Callout type="warn">
+  ### GGUF quant types are not GPTQ or AWQ
+
+`Q4_K_M` and `AWQ 4-bit group-128` are both roughly 4.5 to 4.9 bits per weight, and both are weight-only, but the block layout, the scale precision, and the calibration method differ. A GPTQ checkpoint cannot be loaded as a GGUF without conversion, and `llama.cpp` cannot read `.safetensors` directly. The path is `convert_hf_to_gguf.py` to FP16 GGUF, then `llama-quantize` to the target type.
+
+</Callout>
+
+---
+
+## Executing on CPU
+
+Weight-only quantization suits CPUs better than weight-and-activation quantization does, because the CPU never has to quantize the activations. The kernel dequantizes a block into registers and immediately multiplies, so the memory read is the narrow 4-bit form and the arithmetic is ordinary FP32.
+
+The SIMD width sets the throughput:
+
+| Instruction set | FP32 lanes per register | Typical hardware                      |
+| :-------------- | :---------------------- | :------------------------------------ |
+| AVX2            | 8                       | x86-64 from Haswell onward            |
+| AVX-512         | 16                      | Xeon, Zen 4 and later                 |
+| ARM NEON        | 4                       | Apple Silicon, Raspberry Pi, Graviton |
+
+Decode on CPU is bandwidth-bound, and desktop bandwidth is calculable. Dual-channel DDR5-5600 moves `5600 MT/s * 8 bytes * 2 channels`:
+
+```text
+5600 * 8 * 2 = 89.6 GB/s
+89.6 GB/s / 4.92 GB (8B at Q4_K_M) = ~18 tokens per second ceiling
+```
+
+That matches what people observe on a mid-range desktop, and it explains why 4-bit is the default for local use: at FP16 the same model would need 16 GB of traffic per token and drop to about 5 tokens per second.
+
+---
+
+## GPU offload
+
+`llama.cpp` splits the model by layer. The flag is `-ngl` on the command line and `n_gpu_layers` in the API, and the idiomatic value is `999`, meaning "offload everything and clamp to the real layer count."
+
+```bash
+# every layer on the GPU, 4096-token context, 8 parallel slots
+llama-server -m Qwen2.5-7B-Instruct-Q4_K_M.gguf \
+  --n-gpu-layers 999 \
+  --ctx-size 4096 \
+  --parallel 8 \
+  --port 8080
+```
+
+Layers that do not fit stay in host RAM and run on CPU. Because the split is per layer, a partially offloaded model pays a PCIe transfer at every boundary, and the cost is proportional to the number of split layers rather than the model size. Offloading half a model is usually much worse than half the speed.
+
+Backends are compiled in as separate flags: `-DGGML_CUDA=ON`, `-DGGML_METAL=ON` (default on macOS), `-DGGML_VULKAN=ON`, `-DGGML_SYCL=ON`. Vulkan is the portable path for AMD and Intel GPUs without a vendor-specific build.
+
+---
+
+## Apple Silicon unified memory
+
+Metal and unified memory remove the PCIe problem entirely. CPU and GPU share one address space, so a layer running on the GPU reads the same bytes the CPU would, with no copy. `-ngl 999` therefore means what it says rather than "as much as fits in VRAM."
+
+| Chip             | Bandwidth | Largest comfortable quantized model |
+| :--------------- | :-------- | :---------------------------------- |
+| M4 Max, 128 GB   | 546 GB/s  | 70B at Q6_K (57 GB)                 |
+| M3 Ultra, 512 GB | 819 GB/s  | 405B at Q4_K_M (~232 GB)            |
+
+The sizing rule is that macOS reserves memory for the display and system, so the practical ceiling is roughly 75 percent of installed RAM. On a 512 GB M3 Ultra, 405B at Q4_K_M leaves headroom for a KV cache of a few gigabytes at moderate context.
+
+```text
+819 GB/s / 42.5 GB (70B at Q4_K_M) = ~19 tokens per second ceiling
+```
+
+Bandwidth, not capacity, is what limits these machines.
+
+---
+
+## Ollama
+
+Ollama wraps `llama.cpp` with a model registry, a blob store, and an HTTP API. It does not implement its own kernels.
+
+```dockerfile
+FROM qwen2.5:7b-instruct-q4_K_M
+
+PARAMETER temperature 0.2
+PARAMETER num_ctx 8192
+SYSTEM """You are a retrieval assistant. Answer only from the supplied context."""
+```
+
+```bash
+ollama create rag-assistant -f Modelfile
+ollama run rag-assistant
+```
+
+The Modelfile `FROM` line accepts either a registry tag or a local GGUF path, which is the supported way to serve your own quantization. Registry models are pulled at `Q4_K_M` unless the tag says otherwise; tags like `:7b-instruct-q8_0` and `:7b-instruct-fp16` select the precision.
+
+Ollama exposes an OpenAI-compatible endpoint at `http://localhost:11434/v1`, so an existing OpenAI SDK client works with `base_url` changed and any string as the API key. `llama-server` provides the same interface on its own port, with more flags and no registry.
+
+---
+
+## Choosing local over an API
+
+| Local wins                                                      | API wins                                            |
+| :-------------------------------------------------------------- | :-------------------------------------------------- |
+| Data cannot leave the machine                                   | Aggregate throughput above ~1,000 tokens per second |
+| Latency budget is dominated by network hops, not compute        | Context beyond ~128K tokens                         |
+| The model is 13B or smaller and runs above 30 tokens per second | Frontier-capability reasoning                       |
+| Offline or air-gapped deployment                                | Elastic demand with idle periods                    |
+
+Local inference trades peak quality for control and marginal cost. A 7B or 8B model quantized to 4 bits handles classification, extraction, and short-form generation competently on hardware you already own, and it is the right default when the alternative is sending the data somewhere else.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What does GGUF contain that the older GGML format did not?">
+
+    Inline metadata. GGML files held tensors only and relied on a sidecar JSON for the architecture, so the two could disagree. GGUF stores typed key-value metadata, tensor info, alignment, and tensor data in one file.
+
+  </Accordion>
+  <Accordion title="2. Why does GGUF pad the header to an alignment boundary?">
+
+    So the tensor data section starts aligned and can be memory-mapped and read in place. `mmap` is what makes a 42 GB model load quickly, since the OS pages weights in on demand instead of copying the file into RAM.
+
+  </Accordion>
+  <Accordion title={<>3. How many bits per weight does <code>Q4_K</code> use?</>}>
+
+    4.50. Its block is 144 bytes for 256 weights: FP16 `d`, FP16 `dmin`, 12 bytes of sub-scales, and 128 bytes of 4-bit weights. `Q4_K_M` averages about 4.85 because it keeps some tensors at `Q6_K`.
+
+  </Accordion>
+  <Accordion title={<>4. What is <code>dmin</code>, and what does its presence imply about the quantization scheme?</>}>
+
+    A second FP16 scale storing the block minimum. Its presence makes K-quants asymmetric, equivalent to the zero-point form rather than the symmetric form.
+
+  </Accordion>
+  <Accordion title="5. What do the i-quants need that K-quants do not?">
+
+    An importance matrix, computed by running calibration text through the FP16 model and recording each weight's effect on the output. The i-quants encode weight groups against a fixed E8-lattice codebook, and without the matrix the low-bit variants degrade sharply.
+
+  </Accordion>
+  <Accordion title="6. Why is weight-only quantization a better fit for CPUs than W8A8?">
+
+    The CPU never quantizes activations. It dequantizes a block of weights into registers and multiplies in FP32, so the narrow form only has to survive the memory read, and the arithmetic stays on the well-optimized FMA path.
+
+  </Accordion>
+  <Accordion title={<>7. Estimate the CPU decode ceiling for an 8B model at <code>Q4_K_M</code> on dual-channel DDR5-5600.</>}>
+
+    About 18 tokens per second. Bandwidth is `5600 * 8 * 2 = 89.6` GB/s, and one token reads the whole 4.92 GB of weights.
+
+  </Accordion>
+  <Accordion title="8. Why is offloading half the layers usually much worse than half the speed?">
+
+    The split is per layer, so every boundary between a GPU layer and a CPU layer pays a PCIe transfer of the activation tensor. Partially offloaded models serialize those transfers on the critical path of every token.
+
+  </Accordion>
+  <Accordion title={<>9. What does <code>-ngl 999</code> mean?</>}>
+
+    Offload all layers, clamped to the model's real layer count. It is the idiomatic way to say "use the GPU for everything," and on Apple Silicon it means exactly that because there is no separate VRAM budget.
+
+  </Accordion>
+  <Accordion title="10. Why does unified memory change the offload calculus on Apple Silicon?">
+
+    CPU and GPU share one address space, so a GPU layer reads the same bytes a CPU layer would with no copy. Capacity stops being the constraint and bandwidth, at 546 to 819 GB/s, becomes the limit.
+
+  </Accordion>
+  <Accordion title={<>11. What is Ollama's relationship to <code>llama.cpp</code>?</>}>
+
+    Ollama embeds it and adds a model registry, a blob store, and an HTTP API. It does not implement its own kernels, and a Modelfile `FROM` line can point at any local GGUF.
+
+  </Accordion>
+  <Accordion title={<>12. Can <code>llama.cpp</code> load a GPTQ or AWQ checkpoint directly?</>}>
+
+    No. The path is `convert_hf_to_gguf.py` to an FP16 GGUF, then `llama-quantize` to a GGUF quant type. GPTQ and AWQ use different block layouts and scale precision from the GGUF types.
+
+  </Accordion>
+  <Accordion title="13. Which endpoint makes an existing OpenAI client work against a local model?">
+
+    `http://localhost:11434/v1` on Ollama, or `llama-server`'s own `/v1/chat/completions`. Set `base_url` to it and pass any non-empty string as the API key.
+
+  </Accordion>
+  <Accordion title="14. A 70B model needs about 140 GB in FP16. What is the smallest practical local deployment?">
+
+    70B at `Q4_K_M` is about 42.5 GB, so a 64 GB Mac or a 48 GB GPU works. Below `Q3_K` quality drops fast, and the i-quants at 2 to 3 bits per weight need an importance matrix to stay usable.
+
+  </Accordion>
+</Accordions>

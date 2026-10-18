@@ -1,0 +1,251 @@
+---
+title: Quantization Math
+description: 'Scale and zero-point, symmetric against asymmetric, INT8, INT4, FP8 and NF4, per-tensor to per-group granularity, and weight-only against weight-and-activation.'
+---
+
+Quantization is a bandwidth optimization that happens to also save disk space. Decode reads every weight once per token, so halving the bytes per weight roughly halves the time per token. That follows directly from the roofline argument on the [GPU hardware page](/ai/inference/gpu-hardware): intensity is FLOPs over bytes, so cutting bytes raises intensity and moves the kernel toward the ridge.
+
+Everything else on this page is the question of how much accuracy that costs and which knob controls the trade.
+
+---
+
+## The mapping
+
+A quantizer maps a real value `r` to an integer `q` in a bounded range and back:
+
+```text
+quantize:     q = round(r / scale) + zero_point
+dequantize:   r_hat = (q - zero_point) * scale
+
+range covered: [ (0 - zero_point) * scale , (q_max - zero_point) * scale ]
+```
+
+For `b` bits there are `2^b` levels. INT8 gives 256, INT4 gives 16.
+
+Two variants, differing in whether the representable range is centered on zero:
+
+| Variant    | `zero_point` | Scale                           | Best for                                       |
+| :--------- | :----------- | :------------------------------ | :--------------------------------------------- |
+| Symmetric  | 0            | `max(abs(r)) / (2^(b-1) - 1)`   | Weights, which center near 0                   |
+| Asymmetric | Non-zero     | `(max(r) - min(r)) / (2^b - 1)` | Activations, especially post-ReLU or post-GELU |
+
+Symmetric is faster because the dequantize is one multiply, and it is the right choice for weights, which are approximately zero-mean. Asymmetric wastes no levels when a distribution is skewed, which matters for activations like the output of a GELU or a softmax, where every value is positive and a symmetric quantizer would spend half its levels on an empty range.
+
+The `zero_point` must be an integer for asymmetric quantization, so it is itself rounded: `zero_point = round(-min(r) / scale)`. That rounding is a small extra error, and it is why asymmetric INT4 on a narrow range underperforms expectations.
+
+---
+
+## Quantization error
+
+The error is the rounding residual, bounded by half a step:
+
+```text
+error = r_hat - r,  bounded by  +/- scale / 2
+```
+
+Modeling it as uniform over that range gives a variance of `scale^2 / 12`, so the signal-to-quantization-noise ratio grows about 6 dB per bit. Going from INT8 to INT4 does not halve the precision, it cuts the noise ratio by roughly 24 dB, which is why 4-bit needs more machinery than a plain scale and why the granularity choices below matter so much at that width.
+
+Three things determine how much of that error survives to the output:
+
+- How heavy-tailed the tensor is. One large value inflates `scale` and coarsens every other value in its group.
+- Where the tensor sits. Errors in the final projection reach the logits directly; errors in an early layer get partially absorbed by the following normalization.
+- Whether the consumer is a matmul. Independent rounding errors across a long reduction partially cancel, so a quantized GEMM degrades more gracefully than its per-element error suggests.
+
+---
+
+## Number formats
+
+| Format      | Bits | Shape                                                                    | Notes                                                             |
+| :---------- | :--- | :----------------------------------------------------------------------- | :---------------------------------------------------------------- |
+| FP16        | 16   | 1 sign, 5 exponent, 10 mantissa                                          | Range-limited, overflows above 65,504                             |
+| BF16        | 16   | 1 sign, 8 exponent, 7 mantissa                                           | FP32's range, less precision. The training default                |
+| INT8        | 8    | Integer with a scale                                                     | Native tensor-core support on every modern GPU                    |
+| FP8 E4M3    | 8    | 1 sign, 4 exponent, 3 mantissa                                           | More precision, less range. Forward activations                   |
+| FP8 E5M2    | 8    | 1 sign, 5 exponent, 2 mantissa                                           | More range, less precision. Gradients                             |
+| INT4        | 4    | Integer with a scale                                                     | Needs a dequantizing kernel; no native INT4 GEMM on most hardware |
+| NF4         | 4    | Non-uniform, information-theoretically optimal for a normal distribution | QLoRA's format, arXiv:2305.14314                                  |
+| FP4 / NVFP4 | 4    | Floating point, Blackwell-native                                         | Hardware support arrives with B200-class parts                    |
+
+Two distinctions worth being precise about.
+
+**INT against FP.** An integer format spaces its levels uniformly, so it wastes resolution where the distribution is dense and starves where it is sparse. A floating-point format spaces levels logarithmically, which suits heavy-tailed data but has fewer levels overall at the same width. NF4 splits the difference: it is a 4-bit format whose 16 levels are placed at the quantiles of a unit normal, so each level carries equal expected information for normally distributed weights. That is the argument in the QLoRA paper, and it is why NF4 beats INT4 on transformer weights at the same bit width.
+
+**E4M3 against E5M2.** Same 8 bits, different split. E4M3 keeps three mantissa bits for precision but saturates at 448. E5M2 reaches 57,344 with two mantissa bits. Mixed FP8 training uses E4M3 forward and E5M2 backward, because gradients span a wider dynamic range than activations.
+
+---
+
+## Granularity
+
+One scale for a whole tensor is cheap and usually wrong. The fix is more scales, and the question is how many.
+
+| Granularity | One scale per           | Overhead at INT4          | Protects against                              |
+| :---------- | :---------------------- | :------------------------ | :-------------------------------------------- |
+| Per-tensor  | The whole tensor        | None                      | Nothing                                       |
+| Per-channel | An output row or column | Tiny                      | Channels with different magnitudes            |
+| Per-group   | A block of `g` weights  | `16 / g` bits per weight  | Local outliers inside a channel               |
+| Per-token   | An activation row       | Tiny, computed at runtime | Varying activation magnitude across the batch |
+
+The per-group arithmetic is worth doing once. At `g = 128` with a FP16 scale per group:
+
+```text
+weights:  128 * 4 bits          = 512 bits = 64 bytes
+scale:    1 * 16 bits           = 2 bytes
+total:    66 bytes per 128 weights
+effective: 66 * 8 / 128         = 4.125 bits per weight
+```
+
+A 3 percent overhead to buy a 32-fold reduction in the number of values sharing one scale. At `g = 32` the effective width rises to 4.5 bits. Group size is the standard quality dial in a 4-bit deployment, and the storage cost is small enough that 128 is almost always worth it over per-channel.
+
+Some formats store a zero-point per group as well, which adds another `16 / g` bits and is what pushes a nominal "4-bit" checkpoint to 4.5 or 5 bits on disk. Always compute effective bits per weight from the file size and the parameter count rather than trusting the label.
+
+---
+
+## Weight-only against weight-and-activation
+
+The naming convention states what is quantized: `W4A16` is 4-bit weights with 16-bit activations.
+
+| Scheme | Weights | Activations | Speeds up          | Needs                                      |
+| :----- | :------ | :---------- | :----------------- | :----------------------------------------- |
+| W16A16 | BF16    | BF16        | Baseline           | Nothing                                    |
+| W8A8   | INT8    | INT8        | Prefill and decode | INT8 tensor cores, activation quantization |
+| W4A16  | INT4    | FP16        | Decode, mostly     | A dequantizing mixed-precision kernel      |
+| W4A8   | INT4    | FP8         | Both, in principle | New hardware and careful calibration       |
+| W4A4   | INT4    | INT4        | Both, aggressively | Still a research problem                   |
+
+**W4A16** is the common local-inference choice. Weights are stored at 4 bits and dequantized into FP16 registers inside the matmul kernel, so the arithmetic still runs on FP16 tensor cores. The win is entirely bandwidth: a quarter of the bytes cross HBM. That makes it a big win for decode, which is bandwidth-bound, and a small win for prefill, which is compute-bound and now does the same FLOPs on a dequantization path that is not free.
+
+**W8A8** quantizes activations too, so the matmul itself runs on INT8 tensor cores at twice the FP16 rate. That helps prefill, where the arithmetic is the constraint, as well as decode. The cost is that activations are harder to quantize than weights, for the reason in the next section.
+
+The asymmetry is easy to state and often gets missed in interviews: weight-only quantization buys bandwidth, weight-and-activation quantization buys arithmetic. Which one you want depends on which phase dominates your workload.
+
+---
+
+## The outlier problem
+
+Weights quantize well. Activations do not, and the reason is specific.
+
+_LLM.int8()_ (Dettmers et al., arXiv:2208.07339) documents that above roughly 6.7B parameters, transformer activations develop a small number of systematic outlier dimensions whose magnitudes reach thousands of times the typical value. They appear in the same feature dimensions across layers and across inputs, and they carry a disproportionate share of the model's capability.
+
+The consequence for quantization is arithmetic. A per-tensor INT8 scale is set by the maximum, so with one value at 6000 and typical values at 1, the scale is `6000 / 127 ~= 47`, and every typical value rounds to zero. The tensor is destroyed.
+
+Three responses, each used in production:
+
+| Approach            | Mechanism                                                                           | Where                         |
+| :------------------ | :---------------------------------------------------------------------------------- | :---------------------------- |
+| Finer granularity   | Per-channel or per-token scales confine an outlier to its own row                   | The default first fix         |
+| Mixed decomposition | Run the outlier dimensions in FP16 and the rest in INT8, then combine               | LLM.int8(), arXiv:2208.07339  |
+| Migration           | Rescale channels so activation outliers become weight outliers, which quantize fine | SmoothQuant, arXiv:2211.10438 |
+
+SmoothQuant's insight is that quantization difficulty is a property of the pair. A channel with a large activation magnitude is multiplied by a weight column with a small magnitude, so scaling the activation down and the weight up by the same factor leaves the product unchanged and moves the dynamic-range problem to the side that handles it better. It reports W8A8 across a range of models with up to 1.56x speedup and 2x memory reduction.
+
+Weight-only quantization sidesteps the whole issue, which is a large part of why W4A16 is more common in the field than W4A4.
+
+---
+
+## What it saves
+
+Bytes per parameter, and the memory a model needs at load time. Weights only; the KV cache is separate and is covered on the [KV cache page](/ai/inference/kv-cache).
+
+| Model | BF16   | INT8   | INT4 (4.125 effective) |
+| :---- | :----- | :----- | :--------------------- |
+| 8B    | 16 GB  | 8 GB   | 4.25 GB                |
+| 13B   | 26 GB  | 13 GB  | 6.9 GB                 |
+| 70B   | 140 GB | 70 GB  | 37.2 GB                |
+| 405B  | 810 GB | 405 GB | 215 GB                 |
+
+The hardware consequence is what makes these numbers interesting. A 70B model at BF16 needs two 80 GB GPUs; at INT4 it fits on one with room for a large KV cache. A 405B model goes from a ten-GPU node to three GPUs. Fewer devices means no tensor-parallel communication, which is often a larger latency win than the bandwidth saving itself.
+
+---
+
+## What it costs
+
+Perplexity is the wrong headline metric, and it is the one most quantization papers report. Two observations that hold across the literature:
+
+- A 4-bit weight-only quantization of a 70B model typically moves perplexity by well under a point, which sounds free, while individual downstream tasks can move several points. Reasoning and arithmetic tasks degrade first; retrieval and classification tasks hold up.
+- Small models degrade more than large models at the same bit width. Redundancy is what absorbs quantization noise, and a 1B model has less of it than a 70B model.
+
+The practical rule: evaluate on your own task set, at the bit width you intend to ship, and compare against the FP16 baseline of the same checkpoint rather than against a published table. See the regression-suite pattern in [merging and deployment](/ai/fine-tuning/merging-and-deployment).
+
+---
+
+## When not to quantize
+
+| Situation                                           | Better move                                              |
+| :-------------------------------------------------- | :------------------------------------------------------- |
+| Batch sizes are large and prefill dominates         | W8A8 or stay in BF16; W4A16 barely helps                 |
+| The model is small enough to fit with room to spare | Spend the memory on a larger KV cache and a bigger batch |
+| Accuracy is already marginal                        | Fix retrieval or the prompt first                        |
+| Latency is dominated by scheduling or network       | Nothing here will help                                   |
+| You have the GPU budget and the model is under 13B  | Quantization buys little at BF16 on one GPU              |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Write the quantize and dequantize functions and explain each term.">
+
+    `q = round(r / scale) + zero_point` and `r_hat = (q - zero_point) * scale`. The scale maps the real range onto the integer range and is `(max - min) / (2^b - 1)` for asymmetric or `max(abs(r)) / (2^(b-1) - 1)` for symmetric. The zero-point is the integer that corresponds to real zero; it is exactly zero for symmetric quantization and `round(-min / scale)` for asymmetric.
+
+  </Accordion>
+  <Accordion title="2. When do you use symmetric versus asymmetric quantization?">
+
+    Symmetric for weights, which are roughly zero-mean, because it needs no zero-point and the dequantize is a single multiply. Asymmetric for skewed distributions such as post-GELU or post-softmax activations, where a symmetric quantizer would spend half its levels on an empty range. The extra cost is storing and applying an integer zero-point, which is itself rounded and adds a small error.
+
+  </Accordion>
+  <Accordion title="3. How does quantization error scale with bit width?">
+
+    The residual is bounded by half a step, so modeling it as uniform gives variance `scale^2 / 12` and a signal-to-quantization-noise ratio that grows about 6 dB per bit. Dropping from INT8 to INT4 costs roughly 24 dB, which is why 4-bit deployments need per-group scales and careful outlier handling rather than a single scale.
+
+  </Accordion>
+  <Accordion title="4. Why is NF4 better than INT4 at the same bit width?">
+
+    NF4 places its 16 levels at the quantiles of a unit normal distribution, so each level carries equal expected information for normally distributed weights. INT4 spaces levels uniformly, which over-resolves the tails and under-resolves the dense center. The argument is in the QLoRA paper, arXiv:2305.14314.
+
+  </Accordion>
+  <Accordion title="5. What is the difference between FP8 E4M3 and E5M2?">
+
+    Both are 8 bits. E4M3 has four exponent and three mantissa bits, so more precision but saturation at 448. E5M2 has five exponent and two mantissa bits, reaching 57,344 with less precision. Mixed-precision FP8 training uses E4M3 for forward activations and E5M2 for gradients, because gradients span a wider dynamic range.
+
+  </Accordion>
+  <Accordion title="6. Compute the effective bits per weight for INT4 with a group size of 128 and an FP16 scale.">
+
+    128 weights at 4 bits is 64 bytes, plus a 2-byte scale, giving 66 bytes per 128 weights. That is `66 * 8 / 128 = 4.125` bits per weight, a 3 percent overhead. At a group size of 32 it rises to 4.5 bits. Formats that also store a per-group zero-point add another `16 / g` bits, which is why a nominal 4-bit checkpoint can measure 4.5 to 5 bits on disk.
+
+  </Accordion>
+  <Accordion title="7. What is the difference between W4A16 and W8A8, and which phase does each help?">
+
+    W4A16 stores weights at 4 bits and dequantizes them into FP16 inside the kernel, so the arithmetic stays on FP16 tensor cores and the gain is purely bandwidth. That helps decode, which is memory-bound, and barely helps prefill. W8A8 quantizes activations too so the matmul runs on INT8 tensor cores at twice the FP16 rate, which helps prefill as well, at the cost of having to quantize activations, which is the hard part.
+
+  </Accordion>
+  <Accordion title="8. Why do activations quantize worse than weights?">
+
+    Because they contain systematic outliers. LLM.int8(), arXiv:2208.07339, shows that above about 6.7B parameters a small set of feature dimensions develop magnitudes thousands of times the typical value, consistently across layers and inputs. A per-tensor INT8 scale set by a 6000-magnitude outlier is about 47, so every typical value of magnitude 1 rounds to zero.
+
+  </Accordion>
+  <Accordion title="9. What does SmoothQuant do?">
+
+    It migrates quantization difficulty from activations to weights. Since a large activation channel is multiplied by a small weight column, scaling the activation down and the weight up by a matched factor leaves the product unchanged while moving the dynamic-range problem onto the tensor that tolerates it. It reports W8A8 with up to 1.56x speedup and 2x memory reduction, arXiv:2211.10438.
+
+  </Accordion>
+  <Accordion title="10. Name three responses to activation outliers.">
+
+    Finer granularity, with per-channel or per-token scales confining an outlier to its own row. Mixed-precision decomposition, running the outlier dimensions in FP16 and the rest in INT8 as LLM.int8() does. And migration, rescaling channels so the difficulty lands on the weights, as SmoothQuant does. Weight-only quantization avoids the problem entirely by not quantizing activations.
+
+  </Accordion>
+  <Accordion title="11. Why does a 4-bit model sometimes reduce latency by more than the bandwidth saving implies?">
+
+    Because it can fit on fewer devices. A 70B model at BF16 needs 140 GB and therefore two 80 GB GPUs with tensor parallelism between them; at INT4 it fits on one. Removing the inter-GPU all-reduce from every layer often saves more latency than the bandwidth reduction does.
+
+  </Accordion>
+  <Accordion title="12. Why is perplexity a poor metric for a quantization decision?">
+
+    Because a 4-bit weight-only quantization of a large model typically moves perplexity by well under a point while individual downstream tasks move by several. Reasoning and arithmetic degrade first, retrieval and classification hold up. The decision needs the task set you ship, measured against the FP16 baseline of the same checkpoint.
+
+  </Accordion>
+  <Accordion title="13. Why does W4A16 need a special kernel?">
+
+    Because there is no native INT4-by-FP16 matmul on most hardware. The kernel loads packed 4-bit weights, unpacks and dequantizes them into registers, and feeds FP16 values to the tensor cores, all while keeping the unpacking off the critical path. That is why formats are usually paired with an engine that ships the matching kernel, and why a GGUF checkpoint runs in llama.cpp rather than in an arbitrary framework.
+
+  </Accordion>
+</Accordions>

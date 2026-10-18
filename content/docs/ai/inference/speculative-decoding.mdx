@@ -1,0 +1,238 @@
+---
+title: Speculative Decoding
+description: 'Draft and verify with lossless rejection sampling, the expected-tokens formula, n-gram speculation, Medusa heads, EAGLE feature drafting, and tree attention.'
+---
+
+Decode produces one token per forward pass because the next token does not exist until the current one is sampled. Speculative decoding breaks that by guessing several tokens cheaply and checking them all in a single target-model pass. Checking is nearly free, because the pass is memory-bound and reading the weights costs the same whether it verifies one position or eight.
+
+---
+
+## Why verification is cheap
+
+A decode step at batch 1 has arithmetic intensity 1 against an H100 ridge point of 295 FLOP per byte. Verifying `γ + 1` positions in one pass raises intensity to `γ + 1`, still far below the ridge, so the pass remains bandwidth-bound and takes roughly the same wall time. The GPU was idle for 99.66 percent of the step; speculation fills that idle arithmetic.
+
+The cost is not zero. It scales with the KV cache read, which grows with `γ + 1` positions, and with the extra draft passes. Both are small next to the weight read, which is why the speedup is close to the number of tokens accepted.
+
+---
+
+## Draft and verify
+
+Two models. A small, fast **draft** model proposes `γ` tokens. The **target** model runs one forward pass over all of them in parallel and returns its own distribution at each position. The first position where the two disagree ends the run, and the target's token replaces the draft's.
+
+The acceptance rule is speculative sampling, from Leviathan et al., "Fast Inference from Transformers via Speculative Decoding" (arXiv:2211.17192) and Chen et al. (arXiv:2302.01318). For a draft token `x` sampled from `q` and a target probability `p`:
+
+```text
+accept x with probability   min(1, p(x) / q(x))
+on reject, resample from    normalize(max(0, p(x) - q(x)))
+```
+
+<Callout type="info">
+  ### The output distribution is exactly preserved
+
+This is not an approximation and it is not a heuristic. The accept-plus-residual-resample rule makes the composed procedure sample exactly from `p`, so a speculative decoder is bit-for-bit equivalent in distribution to the target model running alone. Greedy decoding is the simpler special case: accept while the draft's argmax equals the target's argmax. Any claim that speculation degrades quality is a claim about a buggy implementation.
+
+</Callout>
+
+---
+
+## The expected-tokens formula
+
+With a per-token acceptance rate `α` and `γ` draft tokens, the expected number of tokens produced per target pass is a truncated geometric sum:
+
+```text
+E = (1 - α^(γ+1)) / (1 - α)
+```
+
+| Acceptance rate α | γ = 2 | γ = 4 | γ = 8 |
+| :---------------- | :---- | :---- | :---- |
+| 0.4               | 1.56  | 1.87  | 2.00  |
+| 0.6               | 2.36  | 3.22  | 4.14  |
+| 0.7               | 2.53  | 2.77  | 3.02  |
+| 0.8               | 2.84  | 3.36  | 3.95  |
+| 0.9               | 2.97  | 4.10  | 6.13  |
+
+Diminishing returns set in fast. Going from `γ = 4` to `γ = 8` at `α = 0.7` buys 0.25 tokens and doubles the draft cost. Tuning `γ` means finding where the extra draft passes stop paying for themselves.
+
+The speedup also has to divide by what the draft costs. If a draft pass costs `c` times a target pass:
+
+```text
+speedup = E / (1 + γ x c)
+```
+
+Three regimes:
+
+| Draft mechanism                   | Typical c | Typical α | γ   | Speedup              |
+| :-------------------------------- | :-------- | :-------- | :-- | :------------------- |
+| 7B draft on a 70B target          | 0.10      | 0.70      | 4   | `2.77 / 1.4` = 2.0x  |
+| EAGLE-style single-layer head     | 0.03      | 0.80      | 5   | `3.69 / 1.15` = 3.2x |
+| N-gram copy from context          | ~0        | 0.40      | 8   | `2.00 / 1.0` = 2.0x  |
+| N-gram copy on high-overlap tasks | ~0        | 0.90      | 8   | `6.13 / 1.0` = 6.1x  |
+
+---
+
+## N-gram speculation
+
+The cheapest possible draft is a copy. Find the longest suffix of the generated text that also appears earlier in the prompt or context, and propose the tokens that followed it there. No draft model, no extra weights, no memory, and `c` is effectively zero.
+
+It works wherever output overlaps input lexically, which is a large share of real workloads:
+
+| Workload                                  | Why n-gram speculation hits                |
+| :---------------------------------------- | :----------------------------------------- |
+| Retrieval-augmented generation            | Answers quote retrieved passages           |
+| Summarization                             | Entity names and phrases carry over        |
+| Code editing and refactoring              | The diff repeats surrounding lines         |
+| Structured extraction                     | Field names and enum values recur          |
+| Multi-turn chat with a long system prompt | Boilerplate repeats across turns           |
+| Creative generation                       | Almost nothing carries over, `α` collapses |
+
+Both vLLM (`--speculative-config` with the ngram method) and `llama.cpp` (`--model-draft` or prompt lookup decoding) ship it. It is the first thing to try because it costs nothing.
+
+REST generalizes the same idea by retrieving candidate continuations from a datastore of text rather than from the current prompt (arXiv:2311.08252).
+
+---
+
+## Medusa: extra decoding heads
+
+Medusa attaches `K` additional output heads to the target model's final hidden state, where head `k` predicts the token at position `t + k + 1` (arXiv:2401.10774). The backbone's own head predicts `t + 1` as usual, so one pass produces `K + 1` candidate positions.
+
+Each head emits a top-`n` set rather than a single token, and the candidates are combined into a tree of possible continuations that a single tree-attention pass verifies. Two training regimes:
+
+- **Medusa-1** freezes the backbone and trains only the heads, so it can be added to a served model without touching its weights. Reported about 2.2x.
+- **Medusa-2** jointly fine-tunes heads and backbone, recovering more of the lost alignment. Reported 2.3 to 3.6x on Vicuna.
+
+The heads are cheap in memory, a few hundred megabytes for a 7B model, but they are a real quality risk if trained on a distribution that differs from production traffic.
+
+---
+
+## EAGLE: drafting at the feature level
+
+EAGLE observes that predicting the next _token_ from a hidden state is hard, while predicting the next _hidden state_ is easier, because the feature sequence is smoother and lower entropy than the token sequence (arXiv:2401.15077). Its draft model is a single decoder layer that autoregresses over the target's second-to-top-layer features, concatenating the sampled token's embedding as input, and applies the target's own LM head to produce token probabilities.
+
+Three generations:
+
+| Version | Change                                                                                                                                       | Source           |
+| :------ | :------------------------------------------------------------------------------------------------------------------------------------------- | :--------------- |
+| EAGLE   | Feature-level autoregressive drafting with a static draft tree                                                                               | arXiv:2401.15077 |
+| EAGLE-2 | Context-aware dynamic tree: expand branches the draft is confident about, prune the rest, using the draft's own scores as a confidence proxy | arXiv:2406.16858 |
+| EAGLE-3 | Drops the feature-prediction constraint, fuses features from several layers, and trains with test-time behavior in the loop                  | arXiv:2503.01840 |
+
+The dynamic tree in EAGLE-2 is the interesting idea. A static tree spends its verification budget uniformly across branches that are not equally likely, so the effective `α` is much lower than the draft model's own accuracy suggests. Allocating tree width by confidence raises tokens accepted per verified node.
+
+---
+
+## Tree attention
+
+Verifying a tree of candidates in one pass needs a mask that is not causal-rectangular. Each node attends to its own ancestors and to nothing else, so several branches share a common prefix in one attention call.
+
+```text
+root: "the"
+ ├── "cat"   ── "sat"
+ │        └── "slept"
+ └── "dog"   ── "ran"
+```
+
+Six nodes verified in one pass instead of six. The mask is built from the tree's parent pointers, and the cost is proportional to node count, which is still one weight read. After the pass, the longest accepted path through the tree is taken and the rest is discarded.
+
+The practical limit on tree size is the extra KV cache written for rejected branches and the extra positions in the attention call. Trees beyond a few dozen nodes stop paying.
+
+---
+
+## Other draft-free variants
+
+| Method                 | Mechanism                                                                                             | Source           |
+| :--------------------- | :---------------------------------------------------------------------------------------------------- | :--------------- |
+| Lookahead decoding     | Runs Jacobi iterations over the sequence to generate and verify n-grams in parallel, no draft model   | arXiv:2402.02057 |
+| Self-speculative       | Skips a subset of the target's own layers to make a cheap draft, then verifies with all layers        | arXiv:2311.14845 |
+| Multi-token prediction | Trains the model with `K` output heads from the start, so speculation is native rather than bolted on | arXiv:2404.19737 |
+
+Multi-token prediction is the cleanest long-term answer, since it removes the draft model entirely and the heads are trained against the real objective.
+
+---
+
+## When speculation loses
+
+<Callout type="warn">
+  ### Speculation is a latency optimization
+
+At batch 1 the GPU runs at 0.34 percent of its arithmetic capacity, so verification is free and speculation wins. At a large batch the GPU is already compute-bound, and every speculative pass adds real FLOPs that displace other requests. Throughput falls even as single-request latency improves. Production servers therefore gate speculation on batch size, or run it only for latency-sensitive traffic. A draft model also costs memory that would otherwise hold KV cache, which lowers the achievable batch and hurts throughput a second time.
+
+</Callout>
+
+Acceptance rate also falls with sampling temperature. High-temperature creative generation produces high-entropy tokens the draft cannot guess, so `α` drops and the speedup with it. Greedy and low-temperature decoding are the favorable case, which is why reported speedups from deterministic benchmarks overstate what a creative workload will see.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Why does verifying five tokens cost about the same as generating one?">
+
+    Because decode is memory-bound at arithmetic intensity 1 against an H100 ridge point of 295. Reading the weights dominates the step, and the same read serves all verified positions.
+
+  </Accordion>
+  <Accordion title="2. State the acceptance rule and why it preserves the target distribution.">
+
+    Accept a draft token `x` with probability `min(1, p(x)/q(x))`; on rejection resample from `normalize(max(0, p(x) - q(x)))`. The residual resampling puts back exactly the probability mass the accept step under-sampled, so the composed procedure samples from `p` exactly.
+
+  </Accordion>
+  <Accordion title="3. Write the expected tokens per verification pass for acceptance rate α and γ draft tokens.">
+
+    `E = (1 - α^(γ+1)) / (1 - α)`, a truncated geometric sum.
+
+  </Accordion>
+  <Accordion title="4. Why does increasing γ past four usually stop helping?">
+
+    `E` saturates: at α = 0.7, going from γ = 4 to γ = 8 raises E from 2.77 to 3.02 while doubling draft cost. The speedup formula divides by `1 + γ x c`, so the denominator grows faster than the numerator.
+
+  </Accordion>
+  <Accordion title="5. What makes n-gram speculation free, and where does it work?">
+
+    The draft is a string lookup in the existing context, so there is no model, no weights, and no memory cost. It works wherever output overlaps input lexically: RAG, summarization, code editing, structured extraction, and multi-turn chat with a repeated system prompt.
+
+  </Accordion>
+  <Accordion title="6. Why does EAGLE draft at the feature level rather than the token level?">
+
+    Predicting the next hidden state is easier than predicting the next token, because the feature sequence is smoother and lower entropy. A single decoder layer over second-to-top-layer features, plus the target's own LM head, gives a cheap draft with a high acceptance rate.
+
+  </Accordion>
+  <Accordion title="7. What does EAGLE-2's dynamic draft tree fix?">
+
+    A static tree spends its verification budget uniformly across branches of unequal likelihood, so realized α is far below the draft model's accuracy. Growing and pruning the tree by the draft's own confidence raises tokens accepted per verified node.
+
+  </Accordion>
+  <Accordion title="8. How does tree attention verify several candidates in one pass?">
+
+    The mask is built from the tree's parent pointers so each node attends only to its ancestors. Branches share a common prefix within a single attention call, and cost scales with node count rather than with the number of separate passes.
+
+  </Accordion>
+  <Accordion title="9. What is the difference between Medusa-1 and Medusa-2?">
+
+    Medusa-1 freezes the backbone and trains only the added heads, so it can be attached to a model already in service, at about 2.2x. Medusa-2 jointly fine-tunes heads and backbone and reaches 2.3 to 3.6x.
+
+  </Accordion>
+  <Accordion title="10. Why can speculative decoding reduce throughput in a production server?">
+
+    At large batch the GPU is compute-bound, so speculative passes add FLOPs that displace other requests. The draft model also consumes memory that would otherwise hold KV cache, lowering the achievable batch.
+
+  </Accordion>
+  <Accordion title="11. How does sampling temperature affect the speedup?">
+
+    Higher temperature raises token entropy, so the draft guesses worse and α falls. Reported speedups measured under greedy decoding overstate what a high-temperature creative workload achieves.
+
+  </Accordion>
+  <Accordion title="12. What is the long-term alternative to a separate draft model?">
+
+    Multi-token prediction, which trains the model with K output heads from the start so speculation is native to the architecture (arXiv:2404.19737).
+
+  </Accordion>
+  <Accordion title="13. A 7B draft serves a 70B target at α = 0.7 and γ = 4. Estimate the speedup.">
+
+    About 2.0x. `E = 2.77`, the draft costs `c = 7/70 = 0.1` per pass, so speedup is `2.77 / (1 + 4 x 0.1) = 1.98`.
+
+  </Accordion>
+  <Accordion title="14. Why is the first rejected token the end of the run rather than a skip?">
+
+    Because positions after a rejection are conditioned on a token the target would not have produced, so their drafts are drawn from the wrong distribution. The target's own token at the rejection point is kept, which is why a fully rejected round still emits one token.
+
+  </Accordion>
+</Accordions>
