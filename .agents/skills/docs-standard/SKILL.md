@@ -34,14 +34,14 @@ Five things determine more about the output than any rule below:
   `$...$` renders as literal dollar signs and braces like `2^{h+1}` throw Acorn JSX parse errors.
   Write math in inline backticks instead.
 - **Two or three existing pages in the same section.** They define depth, tone, and structure better
-  than this file does.
+  than this file does. If the user explicitly asks to write in a specific tone, then you can skip this part.
 
 ## Find the scope document
 
-Documentation usually has a source of truth that enumerates what must be covered: a `toc.md`, an
+Documentation usually has a source of truth that enumerates what must be covered: a toc, an
 outline, an architecture spec, a roadmap, a set of tracking issues, or a section index that already
 links pages which do not exist yet. Look for one before writing — `ls content/docs`, grep for
-`toc|outline|plan|roadmap|architecture`, and read the nearest index page.
+`toc|outline|plan|roadmap|architecture`, and read the nearest index page. The user will most likely provide the scope.
 
 If you find one, cover **every topic and subtopic** it lists for the part you are writing. Skipping
 a subtopic because it looks minor is the worst failure mode available here: weak prose is subjective
@@ -75,6 +75,7 @@ Breadth over depth. There is no limit to the number of code lines, but avoid wri
 - Keep the language conversational, clear, and easy to follow, but never omit important technical terms. Instead, define them immediately using the analogy.
 - Highlight common developer mistakes and practical interview pitfalls.
 - Use bullet points when appropriate, bold key phrases, and direct headings. No fluff, no robotic introductions.
+- First lay out the hierarchy, then dive into the subtopics. For example, if a topic has four subtopics, list all four before you start explaining each one, instead of jumping straight into the first and then the second and so on.
 
 The reason to hold a line budget is that a reader scanning for one term should find it. Length is
 not a proxy for rigor, and padding buries the thing they came for.
@@ -162,15 +163,5 @@ Put such fragments in backticks, or spell them out in words.
    corrupt each other's output. Restart the dev server afterwards.
 4. `curl` each new route and expect `200`. Derive the URL from the app directory, not the content
    path.
-5. Browser-check each page with the browser-use MCP: count `<Mermaid>` SVGs and their `.node`
-   elements, assert no `/Syntax error|Parse error|Render Error/` in `document.body.innerText`, and
-   confirm callout headings rendered as headings rather than merging into their bodies. Where a page
-   has an accordion list, count its triggers against the number of items you wrote, then click one
-   and read the panel — collapsed bodies are not in the DOM, so a count alone proves nothing about
-   the answers.
-
-   Use `evaluate_script`, never `wait_for` — it dumps the full accessibility tree and exhausts the
-   context window. Scripts have a hard 15s timeout, so check one page per call instead of looping
-   over routes or loading them into iframes.
 
 Do not commit unless asked.
