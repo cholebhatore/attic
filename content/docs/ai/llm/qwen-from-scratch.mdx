@@ -235,15 +235,65 @@ Counting only the 8 experts each token activates gives 3,353,032,704, which is t
 
 ## Interview questions
 
-1. What did Qwen 3 replace QKV bias with, and what bound does the replacement place on an attention logit?
-2. Why is `q_norm` an RMSNorm over `head_dim` rather than over `hidden_size`?
-3. What does `num_key_value_heads = 8` with `num_attention_heads = 32` mean for the KV cache, and what is it for Qwen3-30B-A3B?
-4. Which field in Qwen3-30B-A3B's config tells you the shared expert is gone, and what does Qwen 3 rely on instead?
-5. How does Qwen 3's load balancing differ from DeepSeek-V3's?
-6. What is `rope_theta = 1000000` doing, and what would you change to reach a 128K window?
-7. Show that Qwen3-8B has 8.19B parameters given its config.
-8. Compute the active parameters per token for Qwen3-30B-A3B and compare the active-to-total ratio with DeepSeek-V3's.
-9. Is hybrid thinking mode an architectural feature? Where does the mode get selected?
-10. What is the difference between the global `enable_thinking` switch and the `/think` soft switch?
-11. What is a thinking budget, and what problem does it solve?
-12. `mlp_only_layers` is empty and `decoder_sparse_step` is 1. What does that combination tell you about the model?
+<Accordions>
+  <Accordion title="1. What did Qwen 3 replace QKV bias with, and what bound does the replacement place on an attention logit?">
+
+    Qwen 2 put a bias on `q_proj`, `k_proj` and `v_proj`. Qwen 3 sets `attention_bias = false` and normalizes queries and keys per head instead. After the `1/sqrt(head_dim)` scale, every attention logit is bounded at `sqrt(head_dim) = 11.3` rather than growing with activation magnitude.
+
+  </Accordion>
+  <Accordion title={<>2. Why is <code>q_norm</code> an RMSNorm over <code>head_dim</code> rather than over <code>hidden_size</code>?</>}>
+
+    Because the quantity that becomes the logit is one head's query dotted with one head's key. Normalizing over `hidden_size` would bound the average and still let a single head's magnitude run away, which is the failure being prevented. Per-head normalization also matches `head_dim` being its own config field rather than a quotient.
+
+  </Accordion>
+  <Accordion title={<>3. What does <code>num_key_value_heads = 8</code> with <code>num_attention_heads = 32</code> mean for the KV cache, and what is it for Qwen3-30B-A3B?</>}>
+
+    Four query heads share each key-value head, so the cache is a quarter of MHA at the same width: `2 * 8 * 128 * 2 = 4096` bytes per token per layer at bf16, 144 KiB across 36 layers. Qwen3-30B-A3B sets `num_key_value_heads = 4` against 32 query heads, an eighth of MHA: 2,048 bytes per token per layer, 96 KiB across its 48 layers.
+
+  </Accordion>
+  <Accordion title="4. Which field in Qwen3-30B-A3B's config tells you the shared expert is gone, and what does Qwen 3 rely on instead?">
+
+    The absence of `shared_expert_intermediate_size`. Qwen 2-MoE has that field and an always-active expert; Qwen 3 dropped it and relies on 128 fine-grained routed experts of `moe_intermediate_size = 768` with top-8 selection.
+
+  </Accordion>
+  <Accordion title="5. How does Qwen 3's load balancing differ from DeepSeek-V3's?">
+
+    Qwen 3 keeps the Switch Transformer auxiliary loss at `router_aux_loss_coef = 0.001` with softmax scoring, while DeepSeek-V3 removes the loss and updates a gradient-free per-expert bias on the router logits. Qwen's one deviation from textbook Switch is that the load statistics accumulate across the global batch rather than per micro-batch, which keeps each expert's share estimate stable when micro-batches are small.
+
+  </Accordion>
+  <Accordion title={<>6. What is <code>rope_theta = 1000000</code> doing, and what would you change to reach a 128K window?</>}>
+
+    It is the RoPE base frequency, the term in the rotary angles that DeepSeek-V3 sets to 10000. A larger base stretches the wavelengths, so the slowest rotary dimensions complete fewer cycles across a long sequence and distant positions stay distinguishable without interpolation. To reach 128K from the native 40,960, set `rope_scaling` to a YaRN config with factor 4.0 and continue training on long sequences.
+
+  </Accordion>
+  <Accordion title="7. Show that Qwen3-8B has 8.19B parameters given its config.">
+
+    Per layer: `16,777,216 + 4,194,304 + 4,194,304 + 16,777,216` for the projections, 256 for `q_norm` and `k_norm`, `3 * 4096 * 12288 = 150,994,944` for the MLP, and 8,192 for the two block norms, which is 192,946,432. Times 36 layers gives 6,946,071,552, and the untied embedding and output head add `2 * 151936 * 4096 = 1,244,659,712`: 8,190,735,360.
+
+  </Accordion>
+  <Accordion title="8. Compute the active parameters per token for Qwen3-30B-A3B and compare the active-to-total ratio with DeepSeek-V3's.">
+
+    Eight experts of 4,718,592 plus attention at 18,874,624, the router, the norms, over 48 layers, plus embeddings gives 3,353,032,704 against 30,532,122,624 total: 11%. DeepSeek-V3 is 37B active against 671B total, 5.5%. Qwen's experts are much narrower (`moe_intermediate_size = 768` against 2,048), so a larger fraction of the stored capacity is used per token.
+
+  </Accordion>
+  <Accordion title="9. Is hybrid thinking mode an architectural feature? Where does the mode get selected?">
+
+    No. The architecture is unchanged; the switch is in the chat template. `apply_chat_template` either ends the prompt with a header that invites a reasoning block or does not, and the same weights handle both because training included prompts of each shape. Selection happens in the template and the serving layer, not in the model graph.
+
+  </Accordion>
+  <Accordion title={<>10. What is the difference between the global <code>enable_thinking</code> switch and the <code>/think</code> soft switch?</>}>
+
+    `enable_thinking` is a keyword argument to template rendering that fixes the prompt shape for that turn, so changing it means re-rendering. `/think` and `/no_think` are markers appended to the user content and take effect mid-conversation without re-rendering; the model was trained on both and obeys whichever came last.
+
+  </Accordion>
+  <Accordion title="11. What is a thinking budget, and what problem does it solve?">
+
+    A cap on how many tokens the reasoning block may use, passed as `thinking_budget` in vLLM. An unconstrained chain of thought can keep deliberating until it fills the context window and the answer never starts; the budget forces the answer after a bounded amount of reasoning.
+
+  </Accordion>
+  <Accordion title={<>12. <code>mlp_only_layers</code> is empty and <code>decoder_sparse_step</code> is 1. What does that combination tell you about the model?</>}>
+
+    That every layer is MoE. `decoder_sparse_step = 1` makes each layer index sparse-eligible and the empty `mlp_only_layers` list exempts none, so the decoder has no dense feed-forward path and the `intermediate_size = 6144` field is unused at runtime.
+
+  </Accordion>
+</Accordions>

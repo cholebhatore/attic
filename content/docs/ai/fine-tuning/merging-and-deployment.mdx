@@ -188,42 +188,55 @@ Keep the previous version loadable. Rolling back a merged model means redeployin
 
 ## Interview questions
 
-1. What does merging a LoRA adapter do, and is it lossless?
+<Accordions>
+  <Accordion title="1. What does merging a LoRA adapter do, and is it lossless?">
 
-   It computes `W = W_0 + (alpha / r) * B @ A` and writes the result as an ordinary weight file. For an FP16 or BF16 base it is exact up to the dtype's rounding, since the LoRA update is additive by construction. The served model then has the base model's shapes, its inference cost, and no runtime dependency on PEFT.
+    It computes `W = W_0 + (alpha / r) * B @ A` and writes the result as an ordinary weight file. For an FP16 or BF16 base it is exact up to the dtype's rounding, since the LoRA update is additive by construction. The served model then has the base model's shapes, its inference cost, and no runtime dependency on PEFT.
 
-2. Why can't you merge a QLoRA adapter directly into the 4-bit base?
+  </Accordion>
+  <Accordion title="2. Why can't you merge a QLoRA adapter directly into the 4-bit base?">
 
-   The base weights are stored as packed NF4 values with block-wise quantisation constants, and adding a BF16 matrix to them requires dequantising, adding, and requantising. The supported path is to load the base in full precision, attach the adapter, merge, save in bf16, and then quantise for serving with AWQ or GPTQ.
+    The base weights are stored as packed NF4 values with block-wise quantisation constants, and adding a BF16 matrix to them requires dequantising, adding, and requantising. The supported path is to load the base in full precision, attach the adapter, merge, save in bf16, and then quantise for serving with AWQ or GPTQ.
 
-3. Why quantise with AWQ or GPTQ instead of `bitsandbytes` for serving?
+  </Accordion>
+  <Accordion title={<>3. Why quantise with AWQ or GPTQ instead of <code>bitsandbytes</code> for serving?</>}>
 
-   Both calibrate against a representative activation sample and produce kernels that inference engines execute fast. `bitsandbytes` 4-bit is designed for training memory, not throughput, and is slower per token. The training-time quantiser and the serving-time quantiser solve different problems.
+    Both calibrate against a representative activation sample and produce kernels that inference engines execute fast. `bitsandbytes` 4-bit is designed for training memory, not throughput, and is slower per token. The training-time quantiser and the serving-time quantiser solve different problems.
 
-4. When would you serve adapters instead of merging them?
+  </Accordion>
+  <Accordion title="4. When would you serve adapters instead of merging them?">
 
-   Multi-tenant serving, where one resident base carries many task adapters and vLLM swaps them per request, and any setup where adapters update often enough that redeploying full weights each time is wasteful. Merging costs a full copy of the weights per variant in GPU memory.
+    Multi-tenant serving, where one resident base carries many task adapters and vLLM swaps them per request, and any setup where adapters update often enough that redeploying full weights each time is wasteful. Merging costs a full copy of the weights per variant in GPU memory.
 
-5. What is a regression suite and why does a task metric not replace it?
+  </Accordion>
+  <Accordion title="5. What is a regression suite and why does a task metric not replace it?">
 
-   A fixed set of prompts covering general ability, safety, long context and style, scored separately and gated independently. A fine-tune raises the narrow metric while degrading things you did not train on, and a blended score hides that. The safety suite in particular should be allowed to fail the release on its own.
+    A fixed set of prompts covering general ability, safety, long context and style, scored separately and gated independently. A fine-tune raises the narrow metric while degrading things you did not train on, and a blended score hides that. The safety suite in particular should be allowed to fail the release on its own.
 
-6. How do you remove position bias from an LLM judge?
+  </Accordion>
+  <Accordion title="6. How do you remove position bias from an LLM judge?">
 
-   Score each pair twice, once in each order, at temperature 0 with an identical prompt, and average. Judges favour the first candidate presented, and a single-order comparison measures that preference as much as the models. Pin the judge model and version, since changing the judge invalidates comparisons across runs.
+    Score each pair twice, once in each order, at temperature 0 with an identical prompt, and average. Judges favour the first candidate presented, and a single-order comparison measures that preference as much as the models. Pin the judge model and version, since changing the judge invalidates comparisons across runs.
 
-7. What is shadow traffic and what does it catch that an eval set does not?
+  </Accordion>
+  <Accordion title="7. What is shadow traffic and what does it catch that an eval set does not?">
 
-   Replaying real production requests against the candidate model without returning its output. It catches distribution shift between your curated eval set and actual user prompts, including lengths, languages and malformed inputs you never wrote a test for. It costs inference compute and carries no user-facing risk.
+    Replaying real production requests against the candidate model without returning its output. It catches distribution shift between your curated eval set and actual user prompts, including lengths, languages and malformed inputs you never wrote a test for. It costs inference compute and carries no user-facing risk.
 
-8. Which monitoring signal detects a bad deployment fastest?
+  </Accordion>
+  <Accordion title="8. Which monitoring signal detects a bad deployment fastest?">
 
-   The output token length distribution. A fine-tune that changed verbosity, or a serving config that truncated generation, moves the mean and the tail before any quality score does. Parse or validation failure rate is the next fastest, and latency percentiles catch serving regressions.
+    The output token length distribution. A fine-tune that changed verbosity, or a serving config that truncated generation, moves the mean and the tail before any quality score does. Parse or validation failure rate is the next fastest, and latency percentiles catch serving regressions.
 
-9. What must be saved alongside the merged weights for the model to load?
+  </Accordion>
+  <Accordion title="9. What must be saved alongside the merged weights for the model to load?">
 
-   The tokenizer files and the chat template. `merge_and_unload` followed by `save_pretrained` writes weights and config only, so a missing `tokenizer.json` or `chat_template` makes the directory unloadable by every serving engine. Save the tokenizer explicitly into the same directory.
+    The tokenizer files and the chat template. `merge_and_unload` followed by `save_pretrained` writes weights and config only, so a missing `tokenizer.json` or `chat_template` makes the directory unloadable by every serving engine. Save the tokenizer explicitly into the same directory.
 
-10. Why does the chat template have to match between training and serving?
+  </Accordion>
+  <Accordion title="10. Why does the chat template have to match between training and serving?">
 
     The adapter learns a conditional distribution over completions given a specific rendered input shape, including special tokens and role markers. Changing the template at serving time gives the model an input format it never saw, and the failure is usually subtle: correct-looking output with wrong stop behaviour or degraded format adherence.
+
+  </Accordion>
+</Accordions>

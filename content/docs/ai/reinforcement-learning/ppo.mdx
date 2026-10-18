@@ -261,46 +261,60 @@ Sequence-level importance sampling treats the response as the action, which matc
 
 ## Interview questions
 
-1. What problem does PPO solve that REINFORCE does not?
+<Accordions>
+  <Accordion title="1. What problem does PPO solve that REINFORCE does not?">
 
-   REINFORCE can only take one gradient step per batch of rollouts, because after the step the data is off-policy and the estimator is invalid. PPO's clipped surrogate bounds how much any single action's probability can change, so several steps on the same batch stay safe. That multiplies sample efficiency by the number of steps, which matters when generation is the bottleneck.
+    REINFORCE can only take one gradient step per batch of rollouts, because after the step the data is off-policy and the estimator is invalid. PPO's clipped surrogate bounds how much any single action's probability can change, so several steps on the same batch stay safe. That multiplies sample efficiency by the number of steps, which matters when generation is the bottleneck.
 
-2. Write the importance sampling ratio and explain why it appears.
+  </Accordion>
+  <Accordion title="2. Write the importance sampling ratio and explain why it appears.">
 
-   `r_t(theta) = pi_theta(a_t|s_t) / pi_theta_old(a_t|s_t)`. Data was collected under `pi_theta_old`, but the objective is an expectation under `pi_theta`. Weighting each sample by the likelihood ratio converts one expectation into the other. It is exact in expectation and grows in variance as the two policies diverge.
+    `r_t(theta) = pi_theta(a_t|s_t) / pi_theta_old(a_t|s_t)`. Data was collected under `pi_theta_old`, but the objective is an expectation under `pi_theta`. Weighting each sample by the likelihood ratio converts one expectation into the other. It is exact in expectation and grows in variance as the two policies diverge.
 
-3. Explain the clipped objective mechanically.
+  </Accordion>
+  <Accordion title="3. Explain the clipped objective mechanically.">
 
-   `L = E[min(r A, clip(r, 1-eps, 1+eps) A)]`. When the advantage is positive and the ratio has already risen past `1 + eps`, the clipped term is smaller so `min` selects it and the gradient is zero: no further reward for pushing. When the ratio is below the band, the unclipped term is smaller and the gradient stays active. The `min` makes it a pessimistic bound in both directions.
+    `L = E[min(r A, clip(r, 1-eps, 1+eps) A)]`. When the advantage is positive and the ratio has already risen past `1 + eps`, the clipped term is smaller so `min` selects it and the gradient is zero: no further reward for pushing. When the ratio is below the band, the unclipped term is smaller and the gradient stays active. The `min` makes it a pessimistic bound in both directions.
 
-4. What is the asymmetry in PPO's clipping and why does it matter?
+  </Accordion>
+  <Accordion title="4. What is the asymmetry in PPO's clipping and why does it matter?">
 
-   The clip caps how much a positive-advantage action can be reinforced, but for negative advantage it only caps suppression up to `1 - eps`, leaving the ratio unbounded below. Over many updates this systematically removes probability mass and collapses entropy, at which point all rollouts become identical and the advantage goes to zero. DAPO decouples `eps` into separate upper and lower bounds to fix it.
+    The clip caps how much a positive-advantage action can be reinforced, but for negative advantage it only caps suppression up to `1 - eps`, leaving the ratio unbounded below. Over many updates this systematically removes probability mass and collapses entropy, at which point all rollouts become identical and the advantage goes to zero. DAPO decouples `eps` into separate upper and lower bounds to fix it.
 
-5. Derive GAE's recursion and state its two endpoints.
+  </Accordion>
+  <Accordion title="5. Derive GAE's recursion and state its two endpoints.">
 
-   From `A_t = sum_l (gamma lambda)^l delta_{t+l}`, factor out the first term: `A_t = delta_t + gamma lambda A_{t+1}`. At `lambda = 0` it reduces to the one-step TD residual, which is low variance and biased by the critic. At `lambda = 1` it becomes `G_t - V(s_t)`, the Monte Carlo advantage, which is unbiased and high variance. `0.95` is the standard compromise.
+    From `A_t = sum_l (gamma lambda)^l delta_{t+l}`, factor out the first term: `A_t = delta_t + gamma lambda A_{t+1}`. At `lambda = 0` it reduces to the one-step TD residual, which is low variance and biased by the critic. At `lambda = 1` it becomes `G_t - V(s_t)`, the Monte Carlo advantage, which is unbiased and high variance. `0.95` is the standard compromise.
 
-6. Why does RLHF add a KL penalty against a reference model when classical PPO has none?
+  </Accordion>
+  <Accordion title="6. Why does RLHF add a KL penalty against a reference model when classical PPO has none?">
 
-   The reward model is a learned function, accurate only on the distribution it was trained on. A policy optimised hard against it finds adversarial inputs where its scores are wrong, which is reward hacking. Charging the policy for divergence from the frozen pre-SFT model bounds how far it can travel into that region. The reference plays the same stabilising role as DQN's target network, applied to the policy rather than the value.
+    The reward model is a learned function, accurate only on the distribution it was trained on. A policy optimised hard against it finds adversarial inputs where its scores are wrong, which is reward hacking. Charging the policy for divergence from the frozen pre-SFT model bounds how far it can travel into that region. The reference plays the same stabilising role as DQN's target network, applied to the policy rather than the value.
 
-7. What is the difference between the k1 and k3 KL estimators?
+  </Accordion>
+  <Accordion title="7. What is the difference between the k1 and k3 KL estimators?">
 
-   k1 is `log(pi_theta / pi_ref)`, unbiased but high variance and able to go negative. k3 is `(pi_ref/pi_theta) - log(pi_ref/pi_theta) - 1`, always non-negative with lower variance and a small bias. Implementations use k3 for the per-token penalty because a negative KL estimate produces nonsense gradients.
+    k1 is `log(pi_theta / pi_ref)`, unbiased but high variance and able to go negative. k3 is `(pi_ref/pi_theta) - log(pi_ref/pi_theta) - 1`, always non-negative with lower variance and a small bias. Implementations use k3 for the per-token penalty because a negative KL estimate produces nonsense gradients.
 
-8. Name the four models resident during PPO-based RLHF and which are trainable.
+  </Accordion>
+  <Accordion title="8. Name the four models resident during PPO-based RLHF and which are trainable.">
 
-   The actor and the critic are trainable; the reference model and the reward model are frozen. For a 7B base at bf16 with AdamW that is roughly 112 GB for each trained model and 14 GB for each frozen one, so about 252 GB before activations and KV cache. GRPO removes the critic and RLVR removes the reward model.
+    The actor and the critic are trainable; the reference model and the reward model are frozen. For a 7B base at bf16 with AdamW that is roughly 112 GB for each trained model and 14 GB for each frozen one, so about 252 GB before activations and KV cache. GRPO removes the critic and RLVR removes the reward model.
 
-9. Why must `old_logp` be recomputed rather than taken from the generation engine?
+  </Accordion>
+  <Accordion title={<>9. Why must <code>old_logp</code> be recomputed rather than taken from the generation engine?</>}>
 
-   Inference kernels and training kernels differ in precision, batching and sometimes in which attention implementation they use. If the stored log-probabilities came from the sampler, the ratio will not equal exactly 1.0 on the first pass even though the policy has not changed, and every subsequent update is biased by that offset. Recomputing with a forward pass in the training precision makes the first pass exact.
+    Inference kernels and training kernels differ in precision, batching and sometimes in which attention implementation they use. If the stored log-probabilities came from the sampler, the ratio will not equal exactly 1.0 on the first pass even though the policy has not changed, and every subsequent update is biased by that offset. Recomputing with a forward pass in the training precision makes the first pass exact.
 
-10. Why is the PPO learning rate for LLMs an order of magnitude below the SFT rate?
+  </Accordion>
+  <Accordion title="10. Why is the PPO learning rate for LLMs an order of magnitude below the SFT rate?">
 
     PPO takes several steps per batch and compounds them. A large step makes the importance ratios extreme, so the clip saturates and the update carries little information while still moving the policy. `1e-6` to `5e-6` keeps ratios inside the band for most tokens, which is what makes the reuse worthwhile.
 
-11. What is the advantage of token-level against sequence-level importance ratios?
+  </Accordion>
+  <Accordion title="11. What is the advantage of token-level against sequence-level importance ratios?">
 
     Token-level matches the original PPO formulation and gives per-position credit, but the product of many per-token ratios has high variance. Sequence-level treats the whole response as the action, which matches how the reward is assigned and reduces variance at the cost of coarser credit assignment. Token-level remains what every shipped framework implements.
+
+  </Accordion>
+</Accordions>

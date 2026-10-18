@@ -278,15 +278,65 @@ The MoE layer holds 16 times the parameters of one expert but runs one expert pe
 
 ## Interview questions
 
-1. Why does Llama 4 set `head_dim` explicitly instead of deriving it from `hidden_size / num_attention_heads`?
-2. Where in the attention block is QK-Norm applied, and why before RoPE rather than after?
-3. What bound does QK-Norm place on an attention logit, and what failure does that prevent?
-4. What is the difference between aligned chunked attention and a sliding window?
-5. Position 8,192 in a chunked layer sees how many previous tokens?
-6. Why must `layer_types` include full-attention layers rather than making every layer chunked?
-7. Compute the attention temperature factor at `T = 8192` and at `T = 131072` with `floor_scale = 8192` and `attn_scale = 0.1`.
-8. What problem does attention temperature tuning solve at long context?
-9. How many parameters does one expert hold, and how many does the dense MLP hold, at these defaults?
-10. Why is an MoE layer's active cost lower than the dense MLP's even though its total cost is 16 times higher?
-11. What does `router_jitter_noise` do, and at what point in training does it apply?
-12. Llama 4 Scout has 16 experts and Maverick has 128, both at 17B active. What does that difference change about inference memory and about router behaviour?
+<Accordions>
+  <Accordion title={<>1. Why does Llama 4 set <code>head_dim</code> explicitly instead of deriving it from <code>hidden_size / num_attention_heads</code>?</>}>
+
+    Because the quotient is a coincidence at these defaults: `40 * 128` happens to equal 5120. Deriving it would fuse two knobs, so changing head count would silently change per-head width. An explicit `head_dim` lets a config add or remove heads without touching the residual stream, or pick a per-head width that does not divide `hidden_size`.
+
+  </Accordion>
+  <Accordion title="2. Where in the attention block is QK-Norm applied, and why before RoPE rather than after?">
+
+    Between the projections and RoPE: `q_norm` and `k_norm` are RMSNorms over `head_dim`, applied per head right after `q_proj` and `k_proj`. RoPE is a rotation and preserves norm, so the bound survives either order, but RMSNorm's learned per-dimension scale does not commute with that rotation. Normalizing first applies the scale in the projection's own coordinate frame and caps magnitude exactly where activation growth enters.
+
+  </Accordion>
+  <Accordion title="3. What bound does QK-Norm place on an attention logit, and what failure does that prevent?">
+
+    `sqrt(head_dim) = 11.3`. Two normalized vectors of dimension `d_head` have a dot product of at most `d_head`, and the `1/sqrt(d_head)` factor brings the ceiling down to `sqrt(d_head)`. Without it the logit bound grows with activation magnitude, and the failure modes are attention distributions saturating and the loss spikes that appear in deep bf16 stacks.
+
+  </Accordion>
+  <Accordion title="4. What is the difference between aligned chunked attention and a sliding window?">
+
+    A sliding window follows the query: each token sees the previous `w` positions, and the visible set moves with it. Aligned chunking fixes non-overlapping blocks, the mask being causal AND `i // chunk == j // chunk`, so a token sees only earlier tokens in its own chunk and the window jumps at each boundary instead of sliding.
+
+  </Accordion>
+  <Accordion title="5. Position 8,192 in a chunked layer sees how many previous tokens?">
+
+    None. Position 8,192 is the first token of the second chunk and sees only itself until that chunk fills, because positions 0 through 8,191 belong to chunk 0.
+
+  </Accordion>
+  <Accordion title={<>6. Why must <code>layer_types</code> include full-attention layers rather than making every layer chunked?</>}>
+
+    Chunked layers cannot see across a boundary, so if every layer were local, a query in the second chunk would have no path at any depth to the first chunk's content. Full-attention layers are the only bridges across boundaries, which is why `layer_types` alternates instead of going all-local.
+
+  </Accordion>
+  <Accordion title={<>7. Compute the attention temperature factor at <code>T = 8192</code> and at <code>T = 131072</code> with <code>floor_scale = 8192</code> and <code>attn_scale = 0.1</code>.</>}>
+
+    `log(floor(T / floor_scale) + 1) * attn_scale + 1`. At `T = 8192` the floor is 1, giving `log(2) * 0.1 + 1 = 1.069`. At `T = 131072` the floor is 16, giving `log(17) * 0.1 + 1 = 1.284`.
+
+  </Accordion>
+  <Accordion title="8. What problem does attention temperature tuning solve at long context?">
+
+    Softmax over a longer set of keys spreads probability mass thinner, so attention at 131K is flatter than at 8K for the same logit gaps and retrieval gets weaker. Scaling the logits by a factor that grows with position sharpens the distribution back; YaRN calls the same correction `mscale`.
+
+  </Accordion>
+  <Accordion title="9. How many parameters does one expert hold, and how many does the dense MLP hold, at these defaults?">
+
+    One expert is `3 * 5120 * 8192 = 125,829,120`. The dense MLP is `3 * 5120 * 16384 = 251,658,240`, exactly twice as wide.
+
+  </Accordion>
+  <Accordion title="10. Why is an MoE layer's active cost lower than the dense MLP's even though its total cost is 16 times higher?">
+
+    The layer stores 16 experts plus the router, 2,013,347,840 parameters, but top-1 routing runs one expert per token: 125,829,120 active, half of what the dense MLP costs. Total parameters are set by how many experts exist; active parameters by how wide one expert is.
+
+  </Accordion>
+  <Accordion title={<>11. What does <code>router_jitter_noise</code> do, and at what point in training does it apply?</>}>
+
+    It adds Gaussian noise to the router logits so close-scoring experts swap order between steps, which stops the router locking into its earliest assignment and starving the experts it never picks. It applies during training only; at inference routing is deterministic.
+
+  </Accordion>
+  <Accordion title="12. Llama 4 Scout has 16 experts and Maverick has 128, both at 17B active. What does that difference change about inference memory and about router behaviour?">
+
+    Both run one expert per token, so per-token FLOPs match and the difference is memory and routing. Maverick's 128 experts mean about 400B resident instead of 109B, so it needs more VRAM or more devices to hold weights a given token never touches. And with top-1, each token picks 1 of 128 rather than 1 of 16: a wrong pick is a bigger miss, per-expert load is sparser, and the batch arriving at any one expert is smaller and more ragged.
+
+  </Accordion>
+</Accordions>

@@ -319,11 +319,45 @@ The details, including graph breaks and the `mode` argument, are on the [Autogra
 
 ## Interview questions
 
-- **Why does BF16 not need loss scaling while FP16 does?** BF16 keeps FP32's eight exponent bits, so small gradients stay representable. FP16 has five exponent bits and a smallest normal of `6.10e-5`, which zeroes out gradients in the `1e-8` to `1e-9` range that deep networks routinely produce.
-- **Why do master weights stay in FP32 under AMP?** A typical update is around `1e-5` relative to a weight near `0.1`. In BF16 the ulp at `0.1` is about `4e-4`, so the update rounds away and the parameter never moves.
-- **What is arithmetic intensity and why does it decide your batch size?** FLOPs performed per byte moved. Below the ridge point `peak_flops / peak_bandwidth` the operation is memory bound, so more compute does nothing. A matmul at `M = 1` runs at 1 FLOP/byte in FP16 against an A100 ridge of 200.
-- **Why is LLM decoding bandwidth bound?** One token reads every weight once for two FLOPs each. A 7B FP16 model is 14 GB per token, so an A100 at 1555 GB/s caps out near 111 tokens/s regardless of how much compute is idle.
-- **What does pinned memory buy?** Host memory the OS cannot page out can be DMA'd straight to the device without staging through an internal pinned buffer. That roughly doubles achievable PCIe bandwidth, and it is what lets a `non_blocking=True` transfer overlap with compute.
-- **Why must `scaler.unscale_(optimizer)` run before `clip_grad_norm_`?** The gradients are still scaled by 65536, so clipping against a threshold of 1.0 would trigger on essentially every step and destroy the update.
-- **What is TF32?** A compute mode where FP32 tensors are stored normally but matmuls truncate the mantissa to ten bits and accumulate in FP32 on tensor cores. It costs no memory and typically gives 2 to 3x on matmul-heavy models.
-- **How do you diagnose an OOM that happens at a batch size that worked before?** Fragmentation in the caching allocator. `memory_allocated()` and `memory_reserved()` diverge, and `expandable_segments:True` usually fixes it.
+<Accordions>
+  <Accordion title="1. Why does BF16 not need loss scaling while FP16 does?">
+
+    BF16 keeps FP32's eight exponent bits, so small gradients stay representable. FP16 has five exponent bits and a smallest normal of `6.10e-5`, which zeroes out gradients in the `1e-8` to `1e-9` range that deep networks routinely produce.
+
+  </Accordion>
+  <Accordion title="2. Why do master weights stay in FP32 under AMP?">
+
+    A typical update is around `1e-5` relative to a weight near `0.1`. In BF16 the ulp at `0.1` is about `4e-4`, so the update rounds away and the parameter never moves.
+
+  </Accordion>
+  <Accordion title="3. What is arithmetic intensity and why does it decide your batch size?">
+
+    FLOPs performed per byte moved. Below the ridge point `peak_flops / peak_bandwidth` the operation is memory bound, so more compute does nothing. A matmul at `M = 1` runs at 1 FLOP/byte in FP16 against an A100 ridge of 200.
+
+  </Accordion>
+  <Accordion title="4. Why is LLM decoding bandwidth bound?">
+
+    One token reads every weight once for two FLOPs each. A 7B FP16 model is 14 GB per token, so an A100 at 1555 GB/s caps out near 111 tokens/s regardless of how much compute is idle.
+
+  </Accordion>
+  <Accordion title="5. What does pinned memory buy?">
+
+    Host memory the OS cannot page out can be DMA'd straight to the device without staging through an internal pinned buffer. That roughly doubles achievable PCIe bandwidth, and it is what lets a `non_blocking=True` transfer overlap with compute.
+
+  </Accordion>
+  <Accordion title={<>6. Why must <code>scaler.unscale_(optimizer)</code> run before <code>clip_grad_norm_</code>?</>}>
+
+    The gradients are still scaled by 65536, so clipping against a threshold of 1.0 would trigger on essentially every step and destroy the update.
+
+  </Accordion>
+  <Accordion title="7. What is TF32?">
+
+    A compute mode where FP32 tensors are stored normally but matmuls truncate the mantissa to ten bits and accumulate in FP32 on tensor cores. It costs no memory and typically gives 2 to 3x on matmul-heavy models.
+
+  </Accordion>
+  <Accordion title="8. How do you diagnose an OOM that happens at a batch size that worked before?">
+
+    Fragmentation in the caching allocator. `memory_allocated()` and `memory_reserved()` diverge, and `expandable_segments:True` usually fixes it.
+
+  </Accordion>
+</Accordions>

@@ -279,16 +279,70 @@ Modern recurrent variants (Mamba, RWKV, RetNet, xLSTM) revisit these trade-offs 
 
 ## Interview questions
 
-1. Write the LSTM update equations and label each gate.
-2. Why does an LSTM avoid the vanishing gradient that a vanilla RNN suffers? Point at the specific term.
-3. What is the constant error carousel?
-4. Derive the bound on `||dh_T / dh_k||` for a vanilla RNN and explain what `rho` does.
-5. Why does gradient clipping preserve direction with `clip_grad_norm_` but not with `clip_grad_value_`?
-6. Where does clipping go in an AMP training step, and why does the order matter?
-7. What is truncated BPTT, and what does it cost you?
-8. Why initialize the LSTM forget gate bias to a positive value?
-9. What does GRU give up relative to LSTM, and how many parameters does each have at equal hidden size?
-10. What goes wrong if you feed a padded batch to `nn.LSTM` without packing, and read `h_n`?
-11. Why must time series splits be chronological rather than random?
-12. Compare recursive and direct multi-step forecasting, and say when each fails.
-13. What does a recurrent model give you at inference time that a transformer does not?
+<Accordions>
+  <Accordion title="1. Write the LSTM update equations and label each gate.">
+
+    `i_t = sigmoid(W_ix x_t + b_ix + W_ih h_(t-1) + b_ih)` input gate, `f_t` forget gate, `o_t` output gate, same form with their own weights, and `g_t = tanh(...)` the candidate. Then `c_t = f_t * c_(t-1) + i_t * g_t` is the additive cell update and `h_t = o_t * tanh(c_t)` is the exposed hidden state. Every gate reads both `x_t` and `h_(t-1)`.
+
+  </Accordion>
+  <Accordion title="2. Why does an LSTM avoid the vanishing gradient that a vanilla RNN suffers? Point at the specific term.">
+
+    The cell line. `dc_t / dc_(t-1) = f_t` plus terms through the gate pre-activations, whereas the RNN's equivalent factor is `diag(tanh') W_hh` applied once per step. The LSTM replaces that multiplicative `W_hh` chain with an elementwise gate the network can hold near `1`, and then the gradient passes through almost unchanged for hundreds of steps.
+
+  </Accordion>
+  <Accordion title="3. What is the constant error carousel?">
+
+    The additive path `c_t = f_t * c_(t-1) + i_t * g_t`, where the previous state is carried forward by multiplication with a gate value instead of through a saturating nonlinearity and a shared matrix. With the forget gate near 1 the cell is a running sum, so error signals circulate without decaying.
+
+  </Accordion>
+  <Accordion title={<>4. Derive the bound on <code>||dh_T / dh_k||</code> for a vanilla RNN and explain what <code>rho</code> does.</>}>
+
+    Unrolling gives `dh_T / dh_k` as a product of `T - k` Jacobians, each `diag(tanh') W_hh`, so its norm is bounded by `(gamma * rho)^(T-k)` with `gamma = max tanh' = 1` and `rho` the spectral norm of `W_hh`. `rho` decides everything: above 1 the gradient grows exponentially and you get `NaN` loss, below 1 it decays and long dependencies are unreachable, and at 1 stability holds only where the tanh derivatives are near 1. Because one matrix serves every step, no value works for both long and short dependencies; a vanilla RNN learns roughly ten to twenty steps and not much beyond.
+
+  </Accordion>
+  <Accordion title={<>5. Why does gradient clipping preserve direction with <code>clip_grad_norm_</code> but not with <code>clip_grad_value_</code>?</>}>
+
+    `clip_grad_norm_` rescales the whole vector by the single scalar `min(1, max_norm / ||g||)`, so direction is untouched and only magnitude is capped. `clip_grad_value_` clamps each element independently, which changes the relative sizes of coordinates and therefore the direction of the update.
+
+  </Accordion>
+  <Accordion title="6. Where does clipping go in an AMP training step, and why does the order matter?">
+
+    After `scaler.unscale_(opt)` and before `scaler.step(opt)`. GradScaler multiplies gradients by a large constant during backward to keep FP16 values above underflow, so clipping the scaled tensor applies your threshold in the wrong units and the bound means nothing.
+
+  </Accordion>
+  <Accordion title="7. What is truncated BPTT, and what does it cost you?">
+
+    Processing the input in chunks of length `L`, carrying the hidden state across chunk boundaries but detaching it there, and backpropagating only within a chunk. It bounds activation memory and makes long sequences trainable. The cost is gradient flow: the model still sees earlier context through the hidden state, but it cannot learn dependencies that have to be established across the boundary.
+
+  </Accordion>
+  <Accordion title="8. Why initialize the LSTM forget gate bias to a positive value?">
+
+    So the forget gate starts near 1 and the cell remembers by default at the beginning of training. With a zero bias, `sigmoid(0) = 0.5` erases half the cell content at every step, which sends early gradients toward zero and can prevent the network from ever learning to retain anything.
+
+  </Accordion>
+  <Accordion title="9. What does GRU give up relative to LSTM, and how many parameters does each have at equal hidden size?">
+
+    A GRU merges forget and input into one update gate `z_t` that interpolates between the previous state and the new candidate, so `i_t = 1 - f_t`, and it has no separate cell state. The constraint is what it gives up: it cannot forget and not write in the same step. Three gates instead of four gives `3 * (d*h + h*h + h)` against `4 * (d*h + h*h + h)`, so an LSTM holds roughly 4/3 the parameters, and published results are close enough that the choice comes down to parameter budget and library support.
+
+  </Accordion>
+  <Accordion title={<>10. What goes wrong if you feed a padded batch to <code>nn.LSTM</code> without packing, and read <code>h_n</code>?</>}>
+
+    Every padded position is processed as if it were real, so the hidden state accumulates from zero embeddings, and `h_n` is the state at the last timestep of the longest sequence in the batch rather than each sample's own last real step. For every sequence shorter than the maximum, `h_n` is garbage. `pack_padded_sequence` removes padded positions from the computation so the state is read at the true final step.
+
+  </Accordion>
+  <Accordion title="11. Why must time series splits be chronological rather than random?">
+
+    A random split puts observations that come later in time inside the training set, and because neighbouring points are highly correlated the model interpolates rather than forecasts. Metrics look excellent and leak information the deployment will not have. A chronological split keeps the test window strictly after everything used for training.
+
+  </Accordion>
+  <Accordion title="12. Compare recursive and direct multi-step forecasting, and say when each fails.">
+
+    Recursive feeds its own one-step prediction back as input, so it needs only a one-step model and stays coherent, but errors compound and drift accumulates over the horizon. Direct trains a separate output per horizon step, which removes compounding and is better at long horizons, but each step needs enough data and the predictions can disagree with one another at the joins.
+
+  </Accordion>
+  <Accordion title="13. What does a recurrent model give you at inference time that a transformer does not?">
+
+    A constant-size state. The hidden vector summarizes arbitrarily long history at fixed width, so per-step compute and memory do not grow with sequence length. Attention reads the whole context, so both grow with it — the thing a recurrent model does not pay.
+
+  </Accordion>
+</Accordions>

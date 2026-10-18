@@ -184,15 +184,65 @@ Production runs combine all of them. A typical DeepSeek-V3-scale configuration p
 
 ## Interview questions
 
-1. State Kaplan's optimal compute split and Chinchilla's, and explain why they disagree.
-2. How many training tokens per parameter does the Chinchilla rule of thumb specify, and what two numbers from the paper support it?
-3. What does the `E` term in the Chinchilla loss fit represent?
-4. Llama 3 8B was trained on 15T tokens. Compute its tokens-per-parameter ratio and explain why a lab would choose that.
-5. Account for the 16 bytes per parameter in mixed-precision Adam training.
-6. What does each ZeRO stage shard, and what does ZeRO-3 cost you in communication?
-7. Explain the column-parallel then row-parallel pattern and why it needs only one all-reduce per MLP.
-8. Why is tensor parallelism degree limited to a single node?
-9. Derive the pipeline bubble fraction for 4 stages and 32 microbatches.
-10. What does 1F1B change relative to GPipe?
-11. Name the two different things called sequence parallelism and say what each one shards.
-12. Why does expert parallelism require all-to-all rather than all-reduce?
+<Accordions>
+  <Accordion title="1. State Kaplan's optimal compute split and Chinchilla's, and explain why they disagree.">
+
+    Kaplan: `N` goes as `C^0.73` and `D` as `C^0.27`, so compute mostly buys parameters because large models are more sample-efficient. Chinchilla: `N_opt` and `D_opt` both go as `C^0.50`, so parameters and tokens scale together. The disagreement comes from method. Kaplan fit loss against each axis while holding the others at correlated values, which biased the exponents; Hoffmann et al. rederived the split three independent ways (frontier fits, the parametric surface, a compute-free transfer method) and all three landed on equal scaling.
+
+  </Accordion>
+  <Accordion title="2. How many training tokens per parameter does the Chinchilla rule of thumb specify, and what two numbers from the paper support it?">
+
+    20 tokens per parameter. Chinchilla is 70B parameters on 1.4T tokens, exactly that ratio, and it beat Gopher, 280B on 300B tokens, at matched compute: 67.5% average MMLU against 60.0%, at roughly 7.5x lower serving cost. Gopher's 1.07 tokens per parameter was the counterexample.
+
+  </Accordion>
+  <Accordion title={<>3. What does the <code>E</code> term in the Chinchilla loss fit represent?</>}>
+
+    The irreducible entropy of the data. It is the loss floor no model can predict past, which is why the surface saturates instead of heading to zero and why loss curves flatten at scale rather than continuing to fall.
+
+  </Accordion>
+  <Accordion title="4. Llama 3 8B was trained on 15T tokens. Compute its tokens-per-parameter ratio and explain why a lab would choose that.">
+
+    15T / 8B = 1,875 tokens per parameter, about 94x the Chinchilla optimum. Chinchilla minimizes training compute and says nothing about inference compute, and a deployed model pays inference every day forever. A small model overtrained on enormous data costs more to build and much less to run, and the Llama 3 paper (arXiv:2407.21783) reports it matching a much larger model at inference.
+
+  </Accordion>
+  <Accordion title="5. Account for the 16 bytes per parameter in mixed-precision Adam training.">
+
+    Two bytes of bf16 parameters, two bytes of bf16 gradients, and twelve bytes of Adam state in fp32: a 4-byte master copy, 4-byte momentum, 4-byte variance. That is why a 7.5B model needs 120 GB before a single activation is allocated, and why optimizer state is the first thing worth sharding.
+
+  </Accordion>
+  <Accordion title="6. What does each ZeRO stage shard, and what does ZeRO-3 cost you in communication?">
+
+    ZeRO-1 shards optimizer states, ZeRO-2 also shards gradients, ZeRO-3 also shards parameters. ZeRO-3 pays an all-gather of each layer's parameters before its forward and again before its backward, so communication grows as memory shrinks: 120 GB per GPU falls to 15 GB across 8 devices, and the extra traffic is the whole difference.
+
+  </Accordion>
+  <Accordion title="7. Explain the column-parallel then row-parallel pattern and why it needs only one all-reduce per MLP.">
+
+    The first MLP Linear is column-parallel: each GPU holds `[d, d_ff/t]` and computes an independent slice of the hidden activation, so nothing needs exchanging. The second is row-parallel: each GPU holds `[d_ff/t, d]` and produces a partial sum of the full output vector, and one all-reduce adds those partials together. Attention mirrors it, shard by head then a row-parallel output projection. Two all-reduces per layer forward, two in backward.
+
+  </Accordion>
+  <Accordion title="8. Why is tensor parallelism degree limited to a single node?">
+
+    Those all-reduces sit on the critical path twice per layer per step, so the degree is bounded by interconnect bandwidth. NVLink inside a node is about an order of magnitude above the inter-node fabric, and past the node boundary the communication cancels the compute saving that tensor parallelism was bought for.
+
+  </Accordion>
+  <Accordion title="9. Derive the pipeline bubble fraction for 4 stages and 32 microbatches.">
+
+    `(p - 1) / (m + p - 1) = 3 / (32 + 3) = 3/35 = 8.6%`. Stage `k` cannot start until stage `k-1` produces something, and splitting the batch into 32 microbatches interleaves the stages so only the head and tail of the schedule sit idle.
+
+  </Accordion>
+  <Accordion title="10. What does 1F1B change relative to GPipe?">
+
+    GPipe runs every forward microbatch and then every backward one, which keeps activations stored for all `m` microbatches. 1F1B interleaves the two so each stage frees an activation as soon as its backward pass consumes it, bounding peak activation memory at about `p` microbatches instead of `m`.
+
+  </Accordion>
+  <Accordion title="11. Name the two different things called sequence parallelism and say what each one shards.">
+
+    Megatron sequence parallelism shards what tensor parallelism leaves replicated: LayerNorm, dropout and the residual stream, along the sequence dimension, trading one all-reduce for an all-gather plus a reduce-scatter of the same volume to cut activation memory by the TP degree. Ring Attention and DeepSpeed-Ulysses shard the token sequence itself, each device owning a contiguous block of positions, so a context longer than one GPU's memory can be trained.
+
+  </Accordion>
+  <Accordion title="12. Why does expert parallelism require all-to-all rather than all-reduce?">
+
+    Each token's destination depends on its own routing decision, so data moves from arbitrary sources to arbitrary destinations: a many-to-many dispatch and combine. All-reduce requires every device to hold an identically shaped shard and combine corresponding elements, which expert sharding breaks, and volume scales with tokens times `k` times `d_model`.
+
+  </Accordion>
+</Accordions>

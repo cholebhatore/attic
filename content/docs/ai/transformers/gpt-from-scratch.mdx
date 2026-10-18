@@ -327,15 +327,65 @@ If you build one thing from this phase, build the character-level model above an
 
 ## Interview questions
 
-1. Why are the targets in `get_batch` shifted by one rather than computed from the logits?
-2. What does `register_buffer(..., persistent=False)` do for the causal mask?
-3. Why fuse `W_Q`, `W_K`, `W_V` into one `wqkv` matmul?
-4. Why are `wo` and `down` initialized with `std / sqrt(2 * n_layer)`?
-5. What breaks if you generate past `block_size` without cropping?
-6. What do temperature and top-k each control, and when would you use both?
-7. Why is weight decay excluded from norm and bias parameters?
-8. What loss should an untrained model report, and what does a different number mean?
-9. Compute GPT-2's `50,257` from its tokenizer components.
-10. Why does a BPE model have a higher cross-entropy per token but a lower one per byte?
-11. Which tensor runs out of memory first when you switch from characters to BPE?
-12. Name four things nanoGPT adds over a single-GPU reference implementation.
+<Accordions>
+  <Accordion title={<>1. Why are the targets in <code>get_batch</code> shifted by one rather than computed from the logits?</>}>
+
+    The target at position `t` is simply the token that sits at `t + 1` in the same sequence, so `x[:, 1:]` is the label for `x[:, :-1]`. Nothing needs computing from the logits, and doing so would mix the prediction with the ground truth; the shift is the whole objective.
+
+  </Accordion>
+  <Accordion title={<>2. What does <code>register_buffer(..., persistent=False)</code> do for the causal mask?</>}>
+
+    `register_buffer` makes the mask module state that follows `.to(device)` and dtype conversions without becoming a trainable parameter, and `persistent=False` keeps it out of `state_dict`. A mask is derivable from `block_size`, so storing it in every checkpoint would only add bytes.
+
+  </Accordion>
+  <Accordion title={<>3. Why fuse <code>W_Q</code>, <code>W_K</code>, <code>W_V</code> into one <code>wqkv</code> matmul?</>}>
+
+    One `(d_model, 3 * d_model)` GEMM instead of three launches of `(d_model, d_model)`: the same FLOPs with fewer kernel calls and better matrix-multiply efficiency, since the weights stream in together. It is the same trick every inference engine uses, and it costs nothing but a reshape.
+
+  </Accordion>
+  <Accordion title={<>4. Why are <code>wo</code> and <code>down</code> initialized with <code>std / sqrt(2 * n_layer)</code>?</>}>
+
+    `wo` and `down` are the last matrices on each residual branch, so their output is what gets added into the stream. Scaling their standard deviation by `1 / sqrt(2 * n_layer)` keeps the variance of the summed stream near its initial scale through depth, so the network starts life with an output-variance that does not grow linearly with `n_layer`.
+
+  </Accordion>
+  <Accordion title={<>5. What breaks if you generate past <code>block_size</code> without cropping?</>}>
+
+    The position-embedding table and the causal mask are both sized `block_size`. Past that length you either index out of bounds or, if you extended them, feed the model positions it was never trained on. Cropping to the last `block_size` tokens keeps every shape valid; the cost is silently forgetting the beginning.
+
+  </Accordion>
+  <Accordion title="6. What do temperature and top-k each control, and when would you use both?">
+
+    Temperature divides the logits before softmax, so it controls the flatness of the whole distribution. Top-k truncates the support to the `k` highest logits, so it controls which tokens are even candidates. Use both when you want a varied sample that still cannot reach the long tail: temperature for fluency, top-k as the safety rail.
+
+  </Accordion>
+  <Accordion title="7. Why is weight decay excluded from norm and bias parameters?">
+
+    Weight decay pulls every parameter it touches toward zero. On normalization scales and biases that shrinks the very gains the optimizer is trying to make, since those parameters set the conditioning of the signal rather than storing capacity. Excluding them is a small, consistent optimization win.
+
+  </Accordion>
+  <Accordion title="8. What loss should an untrained model report, and what does a different number mean?">
+
+    `ln(V)`, because an untrained model with a near-zero output projection gives an almost uniform distribution. At `V = 65` that is 4.17 and at GPT-2's `V = 50,257` it is 10.83. A materially higher first loss means something is broken: bad initialization, a mask that leaks, or shifted targets pointing the wrong way.
+
+  </Accordion>
+  <Accordion title={<>9. Compute GPT-2's <code>50,257</code> from its tokenizer components.</>}>
+
+    256 base byte tokens, plus 50,000 learned merges, plus one end-of-text token, giving 50,257.
+
+  </Accordion>
+  <Accordion title="10. Why does a BPE model have a higher cross-entropy per token but a lower one per byte?">
+
+    The units are not the same quantity. A BPE token covers three to four characters, so each token prediction is harder and carries more information, raising per-token cross-entropy. Measured per byte, BPE wins, because the same text is described with far fewer decisions. Multiply by tokens per byte to convert.
+
+  </Accordion>
+  <Accordion title="11. Which tensor runs out of memory first when you switch from characters to BPE?">
+
+    The logits tensor `(B, T, V)`. Switching tokenizers multiplies `V` from 65 to 50,257, about 770x, and that tensor is allocated once per step at the end of the graph, so `B = 64, T = 256` already costs about 3.3 GB in fp32 before any block has run.
+
+  </Accordion>
+  <Accordion title="12. Name four things nanoGPT adds over a single-GPU reference implementation.">
+
+    Any four of: `F.scaled_dot_product_attention` for the FlashAttention path, `torch.compile` for fused elementwise ops, bf16 `autocast` with a `GradScaler`, gradient accumulation for a large effective batch, `DistributedDataParallel` under `torchrun`, pre-tokenized `uint16` memory-mapped datasets, `crop_block_size`, and checkpoint resume or initialization from OpenAI's GPT-2 weights.
+
+  </Accordion>
+</Accordions>

@@ -242,15 +242,65 @@ A model that never emits its stop token runs to `max_tokens` and stops mid-sente
 
 ## Interview questions
 
-1. Why does greedy decoding not produce the highest-probability sequence?
-2. What is neural text degeneration, and why does beam search make it worse for open-ended generation?
-3. Write the length-normalized beam score and say where the exponent `alpha` comes from.
-4. What does temperature change about a distribution, and what can it never change?
-5. Given logits `[2.0, 1.5, 0.5, -1.0]`, what happens to the top token's probability as `T` goes from 0.5 to 2.0?
-6. Construct one distribution where top-k=3 is too permissive and one where it is too restrictive.
-7. Why did Holtzman et al. argue that top-p beats top-k on both perplexity and human judgment?
-8. How does min-p decide its threshold, and why is that better than a fixed k?
-9. What is the sign bug in a naive repetition penalty?
-10. In what order should penalties, temperature, top-k, top-p, and sampling be applied, and why?
-11. What is the difference between a stop token and a stop sequence in terms of where each one is checked?
-12. A model runs to `max_tokens` every time and stops mid-sentence. What is the most likely cause?
+<Accordions>
+  <Accordion title="1. Why does greedy decoding not produce the highest-probability sequence?">
+
+    Greedy maximizes each conditional probability one step at a time, and the product of per-step maxima is not the maximum over sequences. A token with a slightly lower first-step probability can open a far more likely continuation, so the true argmax sequence can diverge from the greedy path. Recovering it needs search over exponentially many continuations, and even beam search only approximates it.
+
+  </Accordion>
+  <Accordion title="2. What is neural text degeneration, and why does beam search make it worse for open-ended generation?">
+
+    Degeneration is the drift into short repeated loops, and Holtzman et al. (arXiv:1904.09751) showed it is a sampling artifact: the model assigns nonzero probability to many low-likelihood tokens, and after a repeated phrase the distribution tips toward the loop. Beam search optimizes likelihood, and the highest-likelihood open-ended text is generic and repetitive, so search amplifies rather than avoids the failure.
+
+  </Accordion>
+  <Accordion title={<>3. Write the length-normalized beam score and say where the exponent <code>alpha</code> comes from.</>}>
+
+    `score = (1 / L^alpha) * sum(log p_t)` for a hypothesis of length `L`. The exponent comes from the Wu et al. GNMT paper (arXiv:1609.08144) as a soft length penalty: `alpha = 0` ignores length, `alpha = 1` divides by raw length, and around 0.6 to 0.7 interpolates so longer hypotheses stay competitive without dominating.
+
+  </Accordion>
+  <Accordion title="4. What does temperature change about a distribution, and what can it never change?">
+
+    It divides the logits by `T` before softmax, so it changes the shape of the distribution: below 1 sharpens, above 1 flattens, and the entropy moves accordingly. It cannot change the ordering, so the argmax token is the same at every temperature, and it cannot invent support for a token the model gave zero probability.
+
+  </Accordion>
+  <Accordion title={<>5. Given logits <code>[2.0, 1.5, 0.5, -1.0]</code>, what happens to the top token's probability as <code>T</code> goes from 0.5 to 2.0?</>}>
+
+    Scaling by `1/T` at `T = 0.5` doubles the logits to `[4, 3, 1, -2]`, giving the top token about 0.70; at `T = 2` they become `[1, 0.75, 0.25, -0.5]`, giving about 0.40. So the top probability falls from roughly seven in ten to four in ten while the ranking stays fixed.
+
+  </Accordion>
+  <Accordion title="6. Construct one distribution where top-k=3 is too permissive and one where it is too restrictive.">
+
+    Too permissive: a nearly flat distribution, such as generating a random identifier, where the model puts 0.05 on the best token and the next two slots are still noise, so `k = 3` lets bad samples through. Too restrictive: a sharp but wide-tailed one, such as naming the third item in a list the prompt just gave, where the correct token sits fourth in rank and `k = 3` removes it entirely.
+
+  </Accordion>
+  <Accordion title="7. Why did Holtzman et al. argue that top-p beats top-k on both perplexity and human judgment?">
+
+    Because a fixed cut ignores the shape of the distribution. Top-k removes the same number of candidates whether the model is confident or diffuse, which both cuts good tokens in flat regions and keeps bad ones in sharp ones. The nucleus keeps the smallest set of tokens whose cumulative probability exceeds `p`, so the set size adapts to confidence, and they measured lower perplexity, less repetition and better human ratings than top-k.
+
+  </Accordion>
+  <Accordion title="8. How does min-p decide its threshold, and why is that better than a fixed k?">
+
+    It keeps every token whose probability is at least `p` times the probability of the most likely token, so the threshold moves with the peak instead of with an absolute rank or mass. A confident step gets a very narrow set automatically and an uncertain step gets a wide one, which is what top-k and top-p were both reaching for with fixed numbers.
+
+  </Accordion>
+  <Accordion title="9. What is the sign bug in a naive repetition penalty?">
+
+    The penalty is meant to reduce a token's score, but scores can be negative. Dividing a negative logit by a factor greater than one makes it less negative, which raises its probability, so the repeated token gets a reward instead of a punishment. The standard implementation branches: divide when the score is positive, multiply when it is negative.
+
+  </Accordion>
+  <Accordion title="10. In what order should penalties, temperature, top-k, top-p, and sampling be applied, and why?">
+
+    Penalties first, then temperature, then top-k, then top-p, then min-p, then the sample. Penalties edit the raw scores and should act before any renormalization. Temperature has to precede truncation, because the cut is applied to the distribution you actually want. Truncation must precede sampling, since sampling needs a support to draw from, and every step after normalization would change the relative weights you just decided.
+
+  </Accordion>
+  <Accordion title="11. What is the difference between a stop token and a stop sequence in terms of where each one is checked?">
+
+    A stop token is a vocabulary id, so it is detected in the sampled output itself, at decode time, from the model's own emission. A stop sequence is a string, so it is checked against the decoded text after detokenization, because it may span several tokens and never exist as a single id. The first is exact and cheap; the second needs a post-generation scan.
+
+  </Accordion>
+  <Accordion title={<>12. A model runs to <code>max_tokens</code> every time and stops mid-sentence. What is the most likely cause?</>}>
+
+    The output cap is being hit, almost always because the model is not emitting its end-of-turn token. Usual causes, in order: a chat template mismatch, so the model was never cued to stop where it does; the generation prompt was cut off mid-turn, so it rambles; `max_tokens` set below the natural answer length; or a repetition that never terminates. Check the raw text for the stop token before touching temperature.
+
+  </Accordion>
+</Accordions>

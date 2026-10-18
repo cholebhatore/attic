@@ -161,15 +161,65 @@ Qwen3's config carries `sliding_window: null` and `use_sliding_window: false`, s
 
 ## Interview questions
 
-1. Why is autoregressive decode memory-bandwidth bound rather than compute bound?
-2. What does MQA change about the KV cache, and what quality does it cost?
-3. Explain GQA as a generalization, and state what `g = h` and `g = 1` recover.
-4. How do you convert a pretrained multi-head checkpoint to GQA without retraining from scratch?
-5. Compute the KV cache bytes per token per layer for Qwen3-8B at bf16, and the same number if it used MHA.
-6. Why does `repeat_interleave` on the KV heads defeat the point of GQA in an inference engine?
-7. What is the low-rank observation behind MLA?
-8. Why must the RoPE component be decoupled from the compressed latent in MLA?
-9. MLA caches 576 elements per token per layer. What would it cost to reconstruct the per-head keys at inference instead of absorbing the up-projections?
-10. Write the absorbed form of the MLA score in terms of `c_Q` and `c_KV`.
-11. What receptive field does a sliding window of `w` give in an `L`-layer model, and what does it lose?
-12. DeepSeek-V3's config sets `num_key_value_heads = 128`, the same as `num_attention_heads`. Why does that field not mean what it means in a GQA model?
+<Accordions>
+  <Accordion title="1. Why is autoregressive decode memory-bandwidth bound rather than compute bound?">
+
+    Each step is one row of activations multiplied against every weight matrix and the whole KV cache. The flops per byte of memory traffic is tiny, so time goes into moving weights rather than computing, and tensor-core utilization stays in the single digits.
+
+  </Accordion>
+  <Accordion title="2. What does MQA change about the KV cache, and what quality does it cost?">
+
+    MQA keeps one key and value head shared by all query heads, so cache size drops by a factor of `h`, the head count. The cost is quality: one `d_head` vector cannot carry what `h` separate head-specific summaries did, and perplexity rises, which is why original MQA (Shazeer, arXiv:1911.02150) retrains rather than converts.
+
+  </Accordion>
+  <Accordion title={<>3. Explain GQA as a generalization, and state what <code>g = h</code> and <code>g = 1</code> recover.</>}>
+
+    GQA partitions the `h` query heads into `g` groups and shares one KV head per group. `g = h` gives every head its own KV pair, which is multi-head attention; `g = 1` gives one shared pair, which is multi-query attention. The two published variants are endpoints of one parameter.
+
+  </Accordion>
+  <Accordion title="4. How do you convert a pretrained multi-head checkpoint to GQA without retraining from scratch?">
+
+    Average. Point each group's KV projection at the mean of the `h/g` pretrained KV heads it covers, copy the query heads over unchanged, then continue training for a small fraction of the original run. Alistarh et al. (arXiv:2310.06825) show this recovers most of the quality.
+
+  </Accordion>
+  <Accordion title="5. Compute the KV cache bytes per token per layer for Qwen3-8B at bf16, and the same number if it used MHA.">
+
+    `2 * 8 * 128 * 2 = 4096` bytes, 4 KiB per token per layer. At MHA with all 32 heads: `2 * 32 * 128 * 2 = 16384` bytes, 16 KiB. Across the model's 36 layers that is 144 KiB versus 576 KiB per token.
+
+  </Accordion>
+  <Accordion title={<>6. Why does <code>repeat_interleave</code> on the KV heads defeat the point of GQA in an inference engine?</>}>
+
+    Reproducing the `h` key and value heads in the kernel re-materializes what the cache deliberately stored once, so the extra read bandwidth — the entire reason for GQA in a memory-bound phase — comes straight back. Engines instead loop the query heads and index the shared KV head, never expanding it into a wider tensor.
+
+  </Accordion>
+  <Accordion title="7. What is the low-rank observation behind MLA?">
+
+    The K and V matrices across all heads are highly redundant, so instead of caching `h * d_head` values per token you cache one low-rank latent (`kv_lora_rank = 512`) plus a shared rotary key (64), and reconstruct the head-specific keys and values from the latent. DeepSeek-V2 (arXiv:2405.04434) reports a 93.3% cache reduction and up to 5.76x generation throughput over DeepSeek 67B.
+
+  </Accordion>
+  <Accordion title="8. Why must the RoPE component be decoupled from the compressed latent in MLA?">
+
+    RoPE rotates by an angle that depends on the token's position, so a rotary-transformed key is not recoverable from a shared latent unless the position is known too. Folding position into the compression would force per-position, per-head data back into the cache and cancel the reduction. Keeping `k_R` as a separate full-rank vector shared across heads leaves the 512-dimensional content part compressed and the positional part exact.
+
+  </Accordion>
+  <Accordion title="9. MLA caches 576 elements per token per layer. What would it cost to reconstruct the per-head keys at inference instead of absorbing the up-projections?">
+
+    `128 heads * 192 dimensions = 24,576` elements per token per layer to reconstruct, versus 576 cached, so roughly 43x more stored data on the reconstruction side than the compression saves — larger than the 32,768-element MHA cache it was meant to beat. That is why the up-projections are absorbed instead.
+
+  </Accordion>
+  <Accordion title={<>10. Write the absorbed form of the MLA score in terms of <code>c_Q</code> and <code>c_KV</code>.</>}>
+
+    `score_i = c_Q^T (W_UQ_i^T W_UK_i) c_KV`, defining `W'_i = W_UQ_i^T W_UK_i` with shape `(1536, 512)`. The score comes straight from the two cached latents, and the same fold applies to `W_UV` and `W_O` on the output side.
+
+  </Accordion>
+  <Accordion title={<>11. What receptive field does a sliding window of <code>w</code> give in an <code>L</code>-layer model, and what does it lose?</>}>
+
+    Stacking layers widens the window multiplicatively: `w * L` tokens of effective reach, since each layer's window pulls in what the layer below summarized. What is lost is direct, exact access — a token beyond `w` is only reachable through compressed intermediate activations, which is weaker than attending to its own key and value, so needle-in-a-haystack retrieval suffers.
+
+  </Accordion>
+  <Accordion title={<>12. DeepSeek-V3's config sets <code>num_key_value_heads = 128</code>, the same as <code>num_attention_heads</code>. Why does that field not mean what it means in a GQA model?</>}>
+
+    MLA has no per-head KV cache at all: every query head reads the same 512-plus-64 latent. The field would size a GQA cache that never exists. In MLA the count that matters is the single `kv_lora_rank` latent, not a grouping of key-value heads.
+
+  </Accordion>
+</Accordions>

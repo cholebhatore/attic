@@ -295,15 +295,65 @@ ConvNeXt is the interesting entry. It takes a ResNet-50 and applies transformer-
 
 ## Interview questions
 
-1. Why does a residual block train better than a plain block of the same depth, in terms of the gradient?
-2. What is a bottleneck block, and what does the `1 x 1` convolution in it accomplish?
-3. When does a ResNet shortcut need a projection instead of an identity?
-4. What is the difference between ResNet v1 and v2 block ordering, and why does v2 train deeper?
-5. Why does an Inception module put a `1 x 1` conv before its `5 x 5` conv?
-6. Give three distinct roles a `1 x 1` convolution plays in modern architectures.
-7. Which CIFAR-10 augmentations must run before normalization, and why?
-8. What does `Mixup` do to the loss function, and why can you not use plain `CrossEntropyLoss` with it?
-9. What does `timm.create_model(..., num_classes=0)` return, and what shape?
-10. How would you extract features from four stages of a backbone for a feature pyramid, using `timm`?
-11. Why did VGG-16 have 138 M parameters while GoogLeNet had 7 M at comparable accuracy?
-12. What did ConvNeXt change relative to ResNet, and what does that tell you about CNNs versus transformers?
+<Accordions>
+  <Accordion title="1. Why does a residual block train better than a plain block of the same depth, in terms of the gradient?">
+
+    Differentiating `y = F(x) + x` gives `dy/dx = dF/dx + 1`, so the gradient back to `x` always carries an unattenuated identity term. Across depth the signal travels as `1 + sum` of residual Jacobians instead of a product of every layer's Jacobian, which is what a plain stack has and why plain networks past about twenty layers stopped training.
+
+  </Accordion>
+  <Accordion title={<>2. What is a bottleneck block, and what does the <code>1 x 1</code> convolution in it accomplish?</>}>
+
+    A block shaped `1 x 1` squeeze, `3 x 3`, `1 x 1` expand, used from ResNet-50 upward. The first `1 x 1` drops the channel count so the expensive `3 x 3` runs on a narrow tensor: at `planes = 64` the block goes 256 to 64 to 64 to 256, and the `3 x 3` costs `64 * 64 * 9 = 36,864` weights per position instead of `256 * 256 * 9 = 589,824`.
+
+  </Accordion>
+  <Accordion title="3. When does a ResNet shortcut need a projection instead of an identity?">
+
+    When the shortcut and the block output no longer have matching shape, which happens at stage boundaries where channels grow and resolution halves. Then a stride-2 `1 x 1` projection on the shortcut makes the addition legal; everywhere else the shortcut stays a free identity with no parameters.
+
+  </Accordion>
+  <Accordion title="4. What is the difference between ResNet v1 and v2 block ordering, and why does v2 train deeper?">
+
+    v1 runs conv, BatchNorm, ReLU inside the branch and adds the residual before the following ReLU. v2 puts normalization and ReLU before each convolution, a pre-activation block, so the residual sum is clean. The identity path then carries both the forward signal and the gradient across the whole network without passing through a nonlinearity, which is what let v2 train far deeper without extra tricks.
+
+  </Accordion>
+  <Accordion title={<>5. Why does an Inception module put a <code>1 x 1</code> conv before its <code>5 x 5</code> conv?</>}>
+
+    Cost. Run directly on 256 input channels, the `5 x 5` branch with 32 outputs needs `32 * 256 * 25 = 204,800` multiply-adds per spatial position. A `1 x 1` reducing 256 channels to 16 first makes it `32 * 16 * 25 = 12,800`, and the projection itself costs `256 * 16 = 4,096`, so the branch total is 16,896, roughly twelve times cheaper.
+
+  </Accordion>
+  <Accordion title={<>6. Give three distinct roles a <code>1 x 1</code> convolution plays in modern architectures.</>}>
+
+    Reducing channels before an expensive kernel, in Inception branches and bottleneck blocks. Mixing or expanding channels after a cheap one, the pointwise convolution in a depthwise-separable block. Changing channel count with no spatial cost at all, which covers the projection shortcut and replacing a huge dense classifier with a `1 x 1` plus global pooling.
+
+  </Accordion>
+  <Accordion title="7. Which CIFAR-10 augmentations must run before normalization, and why?">
+
+    The geometric and photometric ones: random crop with padding and horizontal flip, plus any brightness jitter. Normalization is a per-channel affine transform, so padding after it would fill the border with ImageNet's mean gray instead of black, and cutmix's patch replacement has to compose with pixel values, not with their normalized counterparts. Run layout-affecting augmentation before subtracting the mean.
+
+  </Accordion>
+  <Accordion title={<>8. What does <code>Mixup</code> do to the loss function, and why can you not use plain <code>CrossEntropyLoss</code> with it?</>}>
+
+    Mixup trains on convex combinations of two examples and the same combination of their labels, so the target is a distribution rather than a class index. `CrossEntropyLoss` expects an index (or applies log-softmax to a hard one-hot), which is undefined for a soft target; you need the soft-target variant, `-sum_k y_k log p_k`, which is what `timm`'s `SoftTargetCrossEntropy` computes.
+
+  </Accordion>
+  <Accordion title={<>9. What does <code>timm.create_model(..., num_classes=0)</code> return, and what shape?</>}>
+
+    A model with its classifier head replaced by the identity, so `forward` returns the pooled feature vector with shape `(B, num_features)`: 512 for ResNet-18, 2048 for ResNet-50, 1024 for ConvNeXt-Base. It is the standard way to get embeddings without patching `forward`.
+
+  </Accordion>
+  <Accordion title={<>10. How would you extract features from four stages of a backbone for a feature pyramid, using <code>timm</code>?</>}>
+
+    `timm.create_model("resnet50", pretrained=True, features_only=True, out_indices=(1, 2, 3, 4))` returns a backbone whose forward gives a list of four feature maps, one per stage, at strides 4, 8, 16 and 32. Feed them into the top-down path smallest-map first, upsampling by 2 at each merge.
+
+  </Accordion>
+  <Accordion title="11. Why did VGG-16 have 138 M parameters while GoogLeNet had 7 M at comparable accuracy?">
+
+    VGG's 138M is mostly classifier: `25088 x 4096`, `4096 x 4096` and `4096 x 1000` in its three dense layers come to roughly 124M, while the convolutions hold only about 14M. GoogLeNet pools globally before a small head, so it spends no parameters there, and its Inception modules put `1 x 1` reductions in front of every wide convolution.
+
+  </Accordion>
+  <Accordion title="12. What did ConvNeXt change relative to ResNet, and what does that tell you about CNNs versus transformers?">
+
+    Five things, applied one at a time to a ResNet-50: a modern training recipe, a `7 x 7` depthwise convolution, GELU in place of ReLU, LayerNorm in place of BatchNorm, and fewer activation and normalization points. Each is worth roughly a point and the result matches a Swin transformer at the same FLOPs. Convolutions did not lose to attention because the operator was wrong; they lost to a better recipe and a few design choices that a CNN can also adopt.
+
+  </Accordion>
+</Accordions>

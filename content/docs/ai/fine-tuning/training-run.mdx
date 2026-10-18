@@ -157,7 +157,7 @@ For QLoRA the picture is different. Base weights sit in 4-bit at about 0.5 bytes
 
 Standard attention materialises an `n x n` score matrix in HBM, writes it out, reads it back for the softmax, then reads it again for the value product. At 8,192 tokens that matrix is 64 million entries per head, and the memory traffic dominates the arithmetic.
 
-FlashAttention (Dao et al., arXiv:2205.14135) tiles the computation so the score matrix never leaves SRAM, using an online softmax that updates the running maximum and denominator per tile. FlashAttention-2 (arXiv:2305.14135) reworks the work partitioning between warps and reaches 50% to 73% of theoretical peak FLOPS on an A100, about 2x the first version.
+FlashAttention (Dao et al., arXiv:2205.14135) tiles the computation so the score matrix never leaves SRAM, using an online softmax that updates the running maximum and denominator per tile. FlashAttention-2 (arXiv:2307.08691) reworks the work partitioning between warps and reaches 50% to 73% of theoretical peak FLOPS on an A100, about 2x the first version.
 
 ```python
 model = AutoModelForCausalLM.from_pretrained(
@@ -233,42 +233,55 @@ config = SFTConfig(
 
 ## Interview questions
 
-1. Why is the LoRA learning rate an order of magnitude higher than the full fine-tuning rate?
+<Accordions>
+  <Accordion title="1. Why is the LoRA learning rate an order of magnitude higher than the full fine-tuning rate?">
 
-   The base weights are frozen and the adapter's `B` matrix starts at zero, so the first update is small regardless of the step size. There is no pretrained knowledge in the trainable parameters to destroy. `1e-4` to `3e-4` is typical against `1e-5` to `2e-5` for full fine-tuning.
+    The base weights are frozen and the adapter's `B` matrix starts at zero, so the first update is small regardless of the step size. There is no pretrained knowledge in the trainable parameters to destroy. `1e-4` to `3e-4` is typical against `1e-5` to `2e-5` for full fine-tuning.
 
-2. Why does the schedule include warmup?
+  </Accordion>
+  <Accordion title="2. Why does the schedule include warmup?">
 
-   Adam's second-moment estimate is unreliable for the first tens of steps. Dividing by an underestimate of gradient variance produces an oversized update, and on a pretrained model that update is not recoverable. Three to ten percent of total steps is the usual range.
+    Adam's second-moment estimate is unreliable for the first tens of steps. Dividing by an underestimate of gradient variance produces an oversized update, and on a pretrained model that update is not recoverable. Three to ten percent of total steps is the usual range.
 
-3. What does gradient accumulation buy, and what does it not buy?
+  </Accordion>
+  <Accordion title="3. What does gradient accumulation buy, and what does it not buy?">
 
-   A larger effective batch at constant memory, since activations from each micro-batch are freed after its backward pass and only gradient buffers persist. It does not buy speed: wall-clock cost is linear in the accumulation count.
+    A larger effective batch at constant memory, since activations from each micro-batch are freed after its backward pass and only gradient buffers persist. It does not buy speed: wall-clock cost is linear in the accumulation count.
 
-4. What is the failure mode of naive sequence packing?
+  </Accordion>
+  <Accordion title="4. What is the failure mode of naive sequence packing?">
 
-   Without a block-diagonal attention mask, examples concatenated into one block attend to each other. The model learns to continue text that was never part of its prompt, which surfaces as outputs referencing unrelated examples. FlashAttention's variable-length path and `trl`'s packing implementation handle the mask correctly.
+    Without a block-diagonal attention mask, examples concatenated into one block attend to each other. The model learns to continue text that was never part of its prompt, which surfaces as outputs referencing unrelated examples. FlashAttention's variable-length path and `trl`'s packing implementation handle the mask correctly.
 
-5. Why bf16 rather than fp16 for training?
+  </Accordion>
+  <Accordion title="5. Why bf16 rather than fp16 for training?">
 
-   BF16 keeps FP32's 8 exponent bits, so it has the same dynamic range and cannot overflow on a large loss or underflow on a small gradient. FP16's 5 exponent bits cap out at 65504, which is why it needs loss scaling. BF16 gives up mantissa precision instead, which costs less during training.
+    BF16 keeps FP32's 8 exponent bits, so it has the same dynamic range and cannot overflow on a large loss or underflow on a small gradient. FP16's 5 exponent bits cap out at 65504, which is why it needs loss scaling. BF16 gives up mantissa precision instead, which costs less during training.
 
-6. Give the memory per parameter for full fine-tuning with AdamW.
+  </Accordion>
+  <Accordion title="6. Give the memory per parameter for full fine-tuning with AdamW.">
 
-   Sixteen bytes: 2 for bf16 weights, 2 for gradients, 4 for the FP32 master weights, and 8 for Adam's momentum and variance. A 7B model is therefore 112 GB before activations, which is why ZeRO-3 sharding across GPUs is required above that scale.
+    Sixteen bytes: 2 for bf16 weights, 2 for gradients, 4 for the FP32 master weights, and 8 for Adam's momentum and variance. A 7B model is therefore 112 GB before activations, which is why ZeRO-3 sharding across GPUs is required above that scale.
 
-7. What does each ZeRO stage shard?
+  </Accordion>
+  <Accordion title="7. What does each ZeRO stage shard?">
 
-   Stage 1 shards optimizer states, stage 2 adds gradients, stage 3 adds parameters. Each stage divides that component's memory by the number of GPUs. Activations are handled separately by gradient checkpointing.
+    Stage 1 shards optimizer states, stage 2 adds gradients, stage 3 adds parameters. Each stage divides that component's memory by the number of GPUs. Activations are handled separately by gradient checkpointing.
 
-8. How does FlashAttention make attention memory linear instead of quadratic?
+  </Accordion>
+  <Accordion title="8. How does FlashAttention make attention memory linear instead of quadratic?">
 
-   It never materialises the `n x n` score matrix in HBM. The computation is tiled so scores live in SRAM, and an online softmax maintains a running maximum and denominator per tile so the result is exact rather than approximated. FlashAttention-2 improves warp partitioning and reaches 50% to 73% of peak FLOPS on an A100.
+    It never materialises the `n x n` score matrix in HBM. The computation is tiled so scores live in SRAM, and an online softmax maintains a running maximum and denominator per tile so the result is exact rather than approximated. FlashAttention-2 improves warp partitioning and reaches 50% to 73% of peak FLOPS on an A100.
 
-9. Your training loss is flat from the first step. What do you check first?
+  </Accordion>
+  <Accordion title="9. Your training loss is flat from the first step. What do you check first?">
 
-   That the adapter is attached and trainable. Call `print_trainable_parameters()` and confirm the count is nonzero. Then check the learning rate and the data formatting, in particular whether the chat template produced labels that are all `-100`, which masks every token and gives zero gradient.
+    That the adapter is attached and trainable. Call `print_trainable_parameters()` and confirm the count is nonzero. Then check the learning rate and the data formatting, in particular whether the chat template produced labels that are all `-100`, which masks every token and gives zero gradient.
 
-10. What does `gradient_checkpointing=True` trade?
+  </Accordion>
+  <Accordion title={<>10. What does <code>gradient_checkpointing=True</code> trade?</>}>
 
     Stored activations for recomputation. During the backward pass the forward activations are rebuilt from the checkpointed layer inputs rather than read from memory. It costs roughly 30% more compute and removes the activation memory term, which otherwise scales with batch size and sequence length.
+
+  </Accordion>
+</Accordions>

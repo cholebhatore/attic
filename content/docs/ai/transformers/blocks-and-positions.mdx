@@ -270,15 +270,65 @@ ALiBi (Press et al., arXiv:2108.12409) adds a fixed per-head penalty `-m * |i - 
 
 ## Interview questions
 
-1. What does "position-wise" mean for the FFN, and which operation mixes across positions?
-2. Why is `d_ff = (8/3) * d_model` used with SwiGLU instead of `4 * d_model`?
-3. What fraction of a transformer block's parameters is in the FFN, and why does that matter?
-4. Explain the key-value memory reading of the FFN and the evidence behind it.
-5. Derive `dy/dx` for a residual connection and explain why the `I` term matters.
-6. What is the residual stream, and why is the norm placed on the read path?
-7. Why does post-norm need learning-rate warmup and pre-norm not?
-8. Show that attention is permutation equivariant and state the consequence for language.
-9. Write the sinusoidal encoding formula and explain the wavelength progression.
-10. Why is `PE(pos + k)` a linear function of `PE(pos)`, and who uses this in practice?
-11. What are the two limits of learned absolute positions?
-12. Derive why RoPE makes the score depend only on `m - n`, and what `rotate_half` assumes.
+<Accordions>
+  <Accordion title={'1. What does "position-wise" mean for the FFN, and which operation mixes across positions?'}>
+
+    The same MLP is applied to every position independently, with weights shared across positions and no interaction between them; it is a `1 x 1` convolution over the sequence. Attention is the only operation that moves information between positions, which is why removing it leaves a bag of position-wise vector transforms.
+
+  </Accordion>
+  <Accordion title={<>2. Why is <code>d_ff = (8/3) * d_model</code> used with SwiGLU instead of <code>4 * d_model</code>?</>}>
+
+    SwiGLU uses three projections (gate, up, down) instead of two, so a hidden width of `4 * d_model` would raise FFN parameters by half. `(8/3) * d_model` makes `3 * d * d_ff` equal `2 * d * 4d`, keeping the FFN's parameter budget identical to the two-matrix ReLU block it replaces.
+
+  </Accordion>
+  <Accordion title="3. What fraction of a transformer block's parameters is in the FFN, and why does that matter?">
+
+    Roughly two thirds: the FFN costs `8 * d_model^2` per block against `4 * d_model^2` for attention. That is where most of the capacity sits, so it drives the practical decisions: it is the first tensor off the memory ledger when quantizing, the target of most expert and pruning work, and the part that knowledge-editing studies find carrying factual associations.
+
+  </Accordion>
+  <Accordion title="4. Explain the key-value memory reading of the FFN and the evidence behind it.">
+
+    Each FFN neuron is a lookup: its input weights are a prototype key, its output weight a value, and the neuron fires in proportion to how closely the residual vector matches that key. Geva et al. (arXiv:2102.05262) formalized this and showed the FFN predicts the next token through such match-and-copy reads, which is why multilayer FFNs behave as key-value memories for factual recall, and why editing a fact changes FFN weights rather than attention weights.
+
+  </Accordion>
+  <Accordion title={<>5. Derive <code>dy/dx</code> for a residual connection and explain why the <code>I</code> term matters.</>}>
+
+    `y = x + f(x)`, so `dy/dx = I + df/dx`. The identity term guarantees a path whose Jacobian is exactly `1` regardless of depth, so gradient reaches early layers even when `df/dx` is small or badly conditioned. Without it, stacking `n` layers multiplies `n` Jacobians and the product either decays or explodes.
+
+  </Accordion>
+  <Accordion title="6. What is the residual stream, and why is the norm placed on the read path?">
+
+    The residual stream is the running sum that every block reads from and writes into, so it acts as shared memory that later layers can overwrite or ignore. Pre-norm puts the norm on the read path: the block sees a scale-stable input, while the stream itself keeps growing unnormalized. Writing after the norm would shrink each block's contribution as the stream's magnitude rises with depth.
+
+  </Accordion>
+  <Accordion title="7. Why does post-norm need learning-rate warmup and pre-norm not?">
+
+    Post-norm applies the norm after the addition, so at initialization the residual stream is large and every layer's update is renormalized into it; gradients to early layers pass through norms whose statistics move fast, which makes the first thousands of steps unstable, and warmup exists to survive them. Pre-norm keeps an unobstructed identity path, so the optimization is stable enough at full learning rate from step one.
+
+  </Accordion>
+  <Accordion title="8. Show that attention is permutation equivariant and state the consequence for language.">
+
+    With no positional signal, the scores depend only on content, and softmax is applied row-wise, so permuting the inputs permutes the outputs identically: `Attn(PX) = P Attn(X)`. Consequence for language: word order is invisible, and `dog bites man` and `man bites dog` produce the same representation. Order has to be injected, by encodings, by RoPE inside attention, or by relative biases.
+
+  </Accordion>
+  <Accordion title="9. Write the sinusoidal encoding formula and explain the wavelength progression.">
+
+    `PE(pos, 2i) = sin(pos / 10000^(2i/d))` and `PE(pos, 2i+1) = cos(pos / 10000^(2i/d))`. Dimension pair `i` has wavelength `2*pi*10000^(2i/d)`, so the first pair completes a cycle every `2*pi` positions and the last every `10000 * 2*pi`. The geometric spread works like place values: nearby positions differ in the fast dimensions, distant positions differ in the slow ones.
+
+  </Accordion>
+  <Accordion title={<>10. Why is <code>PE(pos + k)</code> a linear function of <code>PE(pos)</code>, and who uses this in practice?</>}>
+
+    The angle-addition identities give `sin(pos + k)` and `cos(pos + k)` as a fixed `2 x 2` rotation of `[sin(pos), cos(pos)]`, and that rotation depends only on `k`. So the whole encoding is a linear map per offset, which is what makes relative position learnable from absolute vectors. T5's relative position bias exploits the same idea directly, and RoPE is the version applied inside attention rather than added to the embedding.
+
+  </Accordion>
+  <Accordion title="11. What are the two limits of learned absolute positions?">
+
+    The table is indexed by position, so any index beyond the trained maximum has no vector and length extrapolation fails outright. And each position gets one vector trained only when that exact position appears, so late positions in a long context are seen far less often than early ones and end up undertrained while costing the same parameters.
+
+  </Accordion>
+  <Accordion title={<>12. Derive why RoPE makes the score depend only on <code>m - n</code>, and what <code>rotate_half</code> assumes.</>}>
+
+    RoPE rotates `q` at position `m` and `k` at position `n` by `theta_i * m` and `theta_i * n` in each 2-D coordinate plane. Since a rotation's inverse is its transpose, `R(m)^T R(n) = R(n - m)`, so `(R(m)q) . (R(n)k) = q . R(n - m)k` and the score depends only on the offset. `rotate_half` assumes the pairs are laid out as consecutive dimensions `(0,1), (2,3), ...`, i.e. the second half of the vector is the first half shifted by `d/2` with frequencies in the same order; an interleaved layout no longer matches that shift and rotates the wrong planes.
+
+  </Accordion>
+</Accordions>

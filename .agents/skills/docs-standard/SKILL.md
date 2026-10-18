@@ -61,6 +61,8 @@ exercises, a summary, or a further-reading section; how long a code sample runs;
 are sentence case; whether an overview page tracks progress per section. Read a few and follow
 them. If the corpus contradicts itself, follow the most recent pages and say which you chose.
 
+## Writing standard
+
 ## Depth policy
 
 Breadth over depth. There is no limit to the number of code lines, but avoid writing unnecessarily.
@@ -69,6 +71,10 @@ Breadth over depth. There is no limit to the number of code lines, but avoid wri
 - One short paragraph per idea. Skip a worked example when a formula plus one sentence carries the
   same information.
 - Keep boilerplate low: no repeated "in this section we will" framing, no recap paragraphs.
+- Break explanations down into a logical story: start with a real-world system failure or puzzle, explain the root cause, and then show the working solution.
+- Keep the language conversational, clear, and easy to follow, but never omit important technical terms. Instead, define them immediately using the analogy.
+- Highlight common developer mistakes and practical interview pitfalls.
+- Use bullet points when appropriate, bold key phrases, and direct headings. No fluff, no robotic introductions.
 
 The reason to hold a line budget is that a reader scanning for one term should find it. Length is
 not a proxy for rigor, and padding buries the thing they came for.
@@ -116,6 +122,11 @@ additions:
   afterwards" list, and canonical resources. The last three only apply to learning material; a
   reference or guide section stops after the cards.
 - Content pages: intro paragraph, `---` between every `## H2`, closing section last.
+- Where a page ends with a recall list (interview questions, review prompts, self-checks), make it an
+  `<Accordions>` block with one `<Accordion>` per item and a short answer in the body. A prompt the
+  reader cannot check is a list of anxieties, not a study tool; collapsing it keeps the page scannable
+  while leaving the answer one click away. Number the titles so the list still reads in order when
+  everything is closed, and give each term its own definition page entry rather than a repeated gloss.
 
 ## MDX gotchas not covered elsewhere
 
@@ -136,6 +147,11 @@ Body paragraph starts at column 0 and is never re-wrapped.
 The same applies to any JSX block whose children are markdown. If a heading or list vanished after
 formatting, the blank lines were missing.
 
+The other JSX-child trap: text inside a component's children is still parsed as MDX, so a literal
+`{` or `}` opens an expression and throws, and a `<` followed by a letter opens a tag. That catches
+accordion answers, callout bodies and table cells containing set notation, tags, or config literals.
+Put such fragments in backticks, or spell them out in words.
+
 ## Verify before reporting done
 
 1. Run the repo's formatter on the new files. A clean parse also proves the MDX is valid, which
@@ -148,7 +164,10 @@ formatting, the blank lines were missing.
    path.
 5. Browser-check each page with the browser-use MCP: count `<Mermaid>` SVGs and their `.node`
    elements, assert no `/Syntax error|Parse error|Render Error/` in `document.body.innerText`, and
-   confirm callout headings rendered as headings rather than merging into their bodies.
+   confirm callout headings rendered as headings rather than merging into their bodies. Where a page
+   has an accordion list, count its triggers against the number of items you wrote, then click one
+   and read the panel — collapsed bodies are not in the DOM, so a count alone proves nothing about
+   the answers.
 
    Use `evaluate_script`, never `wait_for` — it dumps the full accessibility tree and exhausts the
    context window. Scripts have a hard 15s timeout, so check one page per call instead of looping

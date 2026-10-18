@@ -231,46 +231,60 @@ Zephyr (Tunstall et al., arXiv:2310.16944) is the reference result for what plai
 
 ## Interview questions
 
-1. Derive DPO's loss from the RLHF objective.
+<Accordions>
+  <Accordion title="1. Derive DPO's loss from the RLHF objective.">
 
-   Solve `max_pi E[r] - beta KL(pi || pi_ref)` analytically to get `pi*(y|x) = pi_ref(y|x) exp(r(x,y)/beta) / Z(x)`. Invert it for `r(x,y) = beta log(pi*/pi_ref) + beta log Z(x)`. Substitute into the Bradley-Terry preference model: the `Z(x)` terms are identical for chosen and rejected and cancel. Replacing `pi*` with `pi_theta` and maximising the log-likelihood of observed preferences gives the DPO loss.
+    Solve `max_pi E[r] - beta KL(pi || pi_ref)` analytically to get `pi*(y|x) = pi_ref(y|x) exp(r(x,y)/beta) / Z(x)`. Invert it for `r(x,y) = beta log(pi*/pi_ref) + beta log Z(x)`. Substitute into the Bradley-Terry preference model: the `Z(x)` terms are identical for chosen and rejected and cancel. Replacing `pi*` with `pi_theta` and maximising the log-likelihood of observed preferences gives the DPO loss.
 
-2. Why does the partition function cancel and why does that matter?
+  </Accordion>
+  <Accordion title="2. Why does the partition function cancel and why does that matter?">
 
-   `Z(x)` depends on the prompt but not on which response is being scored, so it appears identically in `r(x,y_w)` and `r(x,y_l)` and subtracts out. It matters because `Z(x)` sums over all possible responses and is not computable for a language model. Without the cancellation DPO would be intractable.
+    `Z(x)` depends on the prompt but not on which response is being scored, so it appears identically in `r(x,y_w)` and `r(x,y_l)` and subtracts out. It matters because `Z(x)` sums over all possible responses and is not computable for a language model. Without the cancellation DPO would be intractable.
 
-3. What is the implicit reward in DPO?
+  </Accordion>
+  <Accordion title="3. What is the implicit reward in DPO?">
 
-   `r_hat(x,y) = beta * log(pi_theta(y|x) / pi_ref(y|x))`. The policy is its own reward model, and the loss is exactly the Bradley-Terry loss with `r_hat` in place of a learned `r`. This is why no separate reward model is trained.
+    `r_hat(x,y) = beta * log(pi_theta(y|x) / pi_ref(y|x))`. The policy is its own reward model, and the loss is exactly the Bradley-Terry loss with `r_hat` in place of a learned `r`. This is why no separate reward model is trained.
 
-4. Interpret the DPO gradient.
+  </Accordion>
+  <Accordion title="4. Interpret the DPO gradient.">
 
-   `-beta * sigmoid(r_hat_l - r_hat_w) * [grad log pi(y_w) - grad log pi(y_l)]`. It raises the chosen response's log-probability and lowers the rejected one, with a coefficient that is large when the model currently ranks the pair backwards and near zero when it already ranks it correctly. That coefficient is a built-in curriculum focusing the gradient on unsolved pairs.
+    `-beta * sigmoid(r_hat_l - r_hat_w) * [grad log pi(y_w) - grad log pi(y_l)]`. It raises the chosen response's log-probability and lowers the rejected one, with a coefficient that is large when the model currently ranks the pair backwards and near zero when it already ranks it correctly. That coefficient is a built-in curriculum focusing the gradient on unsolved pairs.
 
-5. What does `beta` control, and what is a typical value?
+  </Accordion>
+  <Accordion title={<>5. What does <code>beta</code> control, and what is a typical value?</>}>
 
-   It sets how strongly the policy is anchored to the reference, appearing as a multiplier on the log-ratio inside the sigmoid. Small `beta` permits large divergence; large `beta` saturates the sigmoid and shrinks gradients. `0.1` is the common default, with learning rates between `5e-7` and `5e-6`.
+    It sets how strongly the policy is anchored to the reference, appearing as a multiplier on the log-ratio inside the sigmoid. Small `beta` permits large divergence; large `beta` saturates the sigmoid and shrinks gradients. `0.1` is the common default, with learning rates between `5e-7` and `5e-6`.
 
-6. What is likelihood displacement?
+  </Accordion>
+  <Accordion title="6. What is likelihood displacement?">
 
-   During DPO training the absolute log-probability of the chosen response often falls along with the rejected one, because the loss only constrains the margin and pushing the rejected response down is the cheapest way to widen it. Razin et al. tie it to interference between similar chosen and rejected hidden representations. The symptom is a model that degrades at the preferred behaviour while its training loss improves.
+    During DPO training the absolute log-probability of the chosen response often falls along with the rejected one, because the loss only constrains the margin and pushing the rejected response down is the cheapest way to widen it. Razin et al. tie it to interference between similar chosen and rejected hidden representations. The symptom is a model that degrades at the preferred behaviour while its training loss improves.
 
-7. How does DPOP address it?
+  </Accordion>
+  <Accordion title="7. How does DPOP address it?">
 
-   It adds `lambda * max(0, log pi_ref(y_w) - log pi_theta(y_w))`, a hinge penalty that activates only when the chosen response's log-probability drops below the reference's. It puts a floor under the chosen likelihood without changing the loss when things are going well.
+    It adds `lambda * max(0, log pi_ref(y_w) - log pi_theta(y_w))`, a hinge penalty that activates only when the chosen response's log-probability drops below the reference's. It puts a floor under the chosen likelihood without changing the loss when things are going well.
 
-8. Why does DPO have a length bias?
+  </Accordion>
+  <Accordion title="8. Why does DPO have a length bias?">
 
-   The implicit reward is a sum of per-token log-probabilities over the response, so longer responses accumulate more negative terms and score lower by construction. SimPO replaces the sum with a length-normalised mean, which also aligns training with what generation optimises, namely average per-token likelihood.
+    The implicit reward is a sum of per-token log-probabilities over the response, so longer responses accumulate more negative terms and score lower by construction. SimPO replaces the sum with a length-normalised mean, which also aligns training with what generation optimises, namely average per-token likelihood.
 
-9. What does KTO change about the data requirement?
+  </Accordion>
+  <Accordion title="9. What does KTO change about the data requirement?">
 
-   It needs a single response with a binary good or bad label rather than a matched chosen-rejected pair. Its loss comes from the Kahneman-Tversky value function and weights losses more heavily than gains. Unpaired feedback is far cheaper to collect than ranked pairs, which is the practical motivation.
+    It needs a single response with a binary good or bad label rather than a matched chosen-rejected pair. Its loss comes from the Kahneman-Tversky value function and weights losses more heavily than gains. Unpaired feedback is far cheaper to collect than ranked pairs, which is the practical motivation.
 
-10. When should you use PPO or GRPO instead of DPO?
+  </Accordion>
+  <Accordion title="10. When should you use PPO or GRPO instead of DPO?">
 
     When the target behaviour is rare or absent from the preference data. DPO can only reweight a fixed offline set, so it is bounded by what that set contains. On-policy methods sample from the current policy and can discover and reinforce responses better than anything in the dataset, which is what multi-step reasoning training requires.
 
-11. What does ORPO remove and how?
+  </Accordion>
+  <Accordion title="11. What does ORPO remove and how?">
 
     The reference model and the separate SFT stage. It adds an odds-ratio preference term directly to the cross-entropy loss, so one run does both jobs and only one model is in memory. The trade-off is less control, since the anchoring that a reference model provides is gone.
+
+  </Accordion>
+</Accordions>

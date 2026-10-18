@@ -152,38 +152,50 @@ The decisive factor is merging. A LoRA adapter folds into `W_0` and the served m
 
 ## Interview questions
 
-1. What is the difference between prefix tuning and prompt tuning?
+<Accordions>
+  <Accordion title="1. What is the difference between prefix tuning and prompt tuning?">
 
-   Prompt tuning prepends learnable vectors at the input embedding layer only, so its parameter count is `n * d_model` and independent of depth. Prefix tuning prepends learnable keys and values inside the attention of every transformer block, so its count scales with `n_layers`.
+    Prompt tuning prepends learnable vectors at the input embedding layer only, so its parameter count is `n * d_model` and independent of depth. Prefix tuning prepends learnable keys and values inside the attention of every transformer block, so its count scales with `n_layers`.
 
-2. Give the trainable parameter count for prefix tuning with 20 virtual tokens on Qwen3-8B.
+  </Accordion>
+  <Accordion title="2. Give the trainable parameter count for prefix tuning with 20 virtual tokens on Qwen3-8B.">
 
-   `2 * 36 * 20 * d_kv`. With `num_key_value_heads = 8` and `head_dim = 128`, `d_kv` is 1024, so 1,474,560 parameters. Using `d_model = 4096` instead gives 5,898,240, which is wrong by 4x because the prefix is injected into key and value states, not the full hidden dimension.
+    `2 * 36 * 20 * d_kv`. With `num_key_value_heads = 8` and `head_dim = 128`, `d_kv` is 1024, so 1,474,560 parameters. Using `d_model = 4096` instead gives 5,898,240, which is wrong by 4x because the prefix is injected into key and value states, not the full hidden dimension.
 
-3. Why does prompt tuning need a much higher learning rate than LoRA?
+  </Accordion>
+  <Accordion title="3. Why does prompt tuning need a much higher learning rate than LoRA?">
 
-   The soft prompt is the only free parameter and it sits at the input, so its gradient travels back through the entire network. It is also a tiny number of parameters steering a large model, which means the loss surface is flat with respect to a `1e-4` step. Typical values are `0.1` to `1.0`.
+    The soft prompt is the only free parameter and it sits at the input, so its gradient travels back through the entire network. It is also a tiny number of parameters steering a large model, which means the loss surface is flat with respect to a `1e-4` step. Typical values are `0.1` to `1.0`.
 
-4. What is the scale finding in the prompt tuning paper?
+  </Accordion>
+  <Accordion title="4. What is the scale finding in the prompt tuning paper?">
 
-   The gap to full fine-tuning closes as model size grows. On T5-XXL at 11B parameters, prompt tuning matches full model tuning on SuperGLUE. Below roughly 10B it is clearly weaker, which is why it saw less adoption than LoRA once 7B and 8B models became the common target.
+    The gap to full fine-tuning closes as model size grows. On T5-XXL at 11B parameters, prompt tuning matches full model tuning on SuperGLUE. Below roughly 10B it is clearly weaker, which is why it saw less adoption than LoRA once 7B and 8B models became the common target.
 
-5. Why does prefix tuning use an MLP reparameterization, and does it cost anything at inference?
+  </Accordion>
+  <Accordion title="5. Why does prefix tuning use an MLP reparameterization, and does it cost anything at inference?">
 
-   Optimizing the prefix vectors directly is poorly conditioned, so the original method parameterizes them as the output of a small MLP, trains that, then discards it and keeps only the prefix values. At inference there is no MLP and no extra cost beyond the prefix positions themselves.
+    Optimizing the prefix vectors directly is poorly conditioned, so the original method parameterizes them as the output of a small MLP, trains that, then discards it and keeps only the prefix values. At inference there is no MLP and no extra cost beyond the prefix positions themselves.
 
-6. Neither method can merge into the base weights. Why does that decide the production question?
+  </Accordion>
+  <Accordion title="6. Neither method can merge into the base weights. Why does that decide the production question?">
 
-   A merged LoRA is a normal weight matrix, so any inference engine serves it with no code changes and no latency penalty. A prefix or soft prompt has to be injected at runtime by an engine that understands the format, and it permanently consumes `n` positions of the context window on every request.
+    A merged LoRA is a normal weight matrix, so any inference engine serves it with no code changes and no latency penalty. A prefix or soft prompt has to be injected at runtime by an engine that understands the format, and it permanently consumes `n` positions of the context window on every request.
 
-7. When would you still pick prompt tuning over LoRA today?
+  </Accordion>
+  <Accordion title="7. When would you still pick prompt tuning over LoRA today?">
 
-   Multi-tenant serving, where one frozen backbone carries hundreds of task prompts and each is a few hundred kilobytes rather than a few hundred megabytes. Also on very large models where prompt tuning's parameter count does not grow with depth, and as a research probe for steering.
+    Multi-tenant serving, where one frozen backbone carries hundreds of task prompts and each is a few hundred kilobytes rather than a few hundred megabytes. Also on very large models where prompt tuning's parameter count does not grow with depth, and as a research probe for steering.
 
-8. What does `prompt_tuning_init="TEXT"` do and why does it matter?
+  </Accordion>
+  <Accordion title={<>8. What does <code>{'prompt_tuning_init="TEXT"'}</code> do and why does it matter?</>}>
 
-   It initializes the soft prompt from the token embeddings of a real sentence instead of at random. At small model sizes random initialization frequently fails to converge, and text initialization is the difference between a method that looks broken and one that works.
+    It initializes the soft prompt from the token embeddings of a real sentence instead of at random. At small model sizes random initialization frequently fails to converge, and text initialization is the difference between a method that looks broken and one that works.
 
-9. Prefix tuning adds 20 virtual tokens to a model with a 4,096-token window. What does that cost?
+  </Accordion>
+  <Accordion title="9. Prefix tuning adds 20 virtual tokens to a model with a 4,096-token window. What does that cost?">
 
-   Real content loses 20 positions and attention cost grows with the square of the total length, so the quadratic term rises by about 1%. At 20 tokens it is noise; at the 200 tokens some prompt-tuning work uses it is 5% of the window and worth measuring.
+    Real content loses 20 positions and attention cost grows with the square of the total length, so the quadratic term rises by about 1%. At 20 tokens it is noise; at the 200 tokens some prompt-tuning work uses it is 5% of the window and worth measuring.
+
+  </Accordion>
+</Accordions>

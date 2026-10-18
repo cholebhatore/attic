@@ -193,15 +193,65 @@ FlashAttention gets rid of the memory cost by never materializing the full matri
 
 ## Interview questions
 
-1. Write the attention formula and give the shape of every tensor in it for a batch of `B` sequences of length `T`.
-2. What is the difference between a key and a value, and why does attention need both?
-3. Derive the variance of `q . k` under the standard assumptions, and show why the scale factor is `1 / sqrt(d_k)`.
-4. What happens to the softmax gradient when the logits are unscaled at `d_k = 512`?
-5. Why is dividing by `d_k` instead of `sqrt(d_k)` wrong in the other direction?
-6. Write the softmax Jacobian and say where its diagonal terms are maximized.
-7. In cross-attention, which sequence length determines the output shape and which determines the width of the attention matrix?
-8. Why does a decoder block have more parameters than an encoder block?
-9. What does attention cost in compute and in memory as a function of `T`, and which one does FlashAttention fix?
-10. Why does `k.transpose(-2, -1)` work on a batched tensor where `k.T` does not?
-11. What does QK-Norm change about the scaling argument?
-12. If `q` and `k` were drawn from a distribution with variance `4` instead of `1`, what scale factor would you need?
+<Accordions>
+  <Accordion title={<>1. Write the attention formula and give the shape of every tensor in it for a batch of <code>B</code> sequences of length <code>T</code>.</>}>
+
+    `Attention(Q, K, V) = softmax(QK^T / sqrt(d_k)) V`. With `h` heads and `d_head = d_model / h`: `q` and `k` are `(B, h, T, d_head)`, `k.transpose(-2, -1)` is `(B, h, d_head, T)`, the score matrix and the softmax weights are `(B, h, T, T)`, `v` is `(B, h, T, d_head)`, and the output is `(B, h, T, d_head)` before the head merge restores `(B, T, d_model)`.
+
+  </Accordion>
+  <Accordion title="2. What is the difference between a key and a value, and why does attention need both?">
+
+    A key is an address and a value is a payload. The key is what a query is compared against, the value is what gets copied into the output. They need to be separate projections because the information that makes a token matchable is not the information you want to read out of it: one token may be retrieved for its syntactic role while contributing its semantic content. Sharing a single matrix would force the score and the payload to be the same vector, which caps what the attention pattern can express.
+
+  </Accordion>
+  <Accordion title={<>3. Derive the variance of <code>q . k</code> under the standard assumptions, and show why the scale factor is <code>1 / sqrt(d_k)</code>.</>}>
+
+    For independent `q_i, k_i` with mean 0 and variance 1, each product `q_i * k_i` has variance 1 and the terms are uncorrelated, so `Var(q . k) = sum_i Var(q_i k_i) = d_k`. The standard deviation is `sqrt(d_k)`. Dividing by `sqrt(d_k)` normalizes the logits back to unit variance, which keeps softmax in its responsive region instead of saturating as `d_k` grows.
+
+  </Accordion>
+  <Accordion title={<>4. What happens to the softmax gradient when the logits are unscaled at <code>d_k = 512</code>?</>}>
+
+    The logits have standard deviation `sqrt(512)` is about 22.6, so softmax returns an almost exact one-hot vector. The Jacobian entries are `p(1 - p)`, and both are near zero at the ends, so the gradient that flows back through the attention weights vanishes. Only the winning position keeps signal, and the model stops learning where to attend.
+
+  </Accordion>
+  <Accordion title={<>5. Why is dividing by <code>d_k</code> instead of <code>sqrt(d_k)</code> wrong in the other direction?</>}>
+
+    Dividing by `d_k` overshoots. Variance becomes `d_k / d_k^2 = 1 / d_k`, so logits sit within about `+/-0.04` of each other at `d_k = 512` and softmax returns an almost uniform distribution. The output collapses toward the mean of the values, which is exactly the selectivity attention exists to provide.
+
+  </Accordion>
+  <Accordion title="6. Write the softmax Jacobian and say where its diagonal terms are maximized.">
+
+    `J_ij = p_i * (delta_ij - p_j)`, so the diagonal is `J_ii = p_i(1 - p_i)`. It peaks at `p_i = 0.5` and goes to zero at both ends: a saturated row (one-hot) and a uniform row (`p_i = 1/n`) both have vanishing diagonal gradient. Sensitivity to a logit perturbation is largest for a moderately spread distribution.
+
+  </Accordion>
+  <Accordion title="7. In cross-attention, which sequence length determines the output shape and which determines the width of the attention matrix?">
+
+    The query length sets the output shape, because every query position produces one output row. The key and value length sets the width of the attention matrix, because that is how many positions each query can look at. The two are independent, which is why cross-attention can decode one token at a time against a source sequence of any length.
+
+  </Accordion>
+  <Accordion title="8. Why does a decoder block have more parameters than an encoder block?">
+
+    A decoder block runs self-attention, then cross-attention, then the FFN, while an encoder block runs self-attention and the FFN. Cross-attention adds its own `W_Q`, `W_K`, `W_V` and `W_O`, four matrices of about `d_model^2` each, so roughly `4 * d_model^2` more parameters per layer, plus the extra LayerNorm.
+
+  </Accordion>
+  <Accordion title={<>9. What does attention cost in compute and in memory as a function of <code>T</code>, and which one does FlashAttention fix?</>}>
+
+    Compute is `O(T^2 * d)` per head, because every query scores against every key, and memory is `O(T^2)` because the score matrix for each head is materialized. FlashAttention fixes the memory term, not the arithmetic: it tiles the computation and keeps a running softmax so the `T x T` matrix is never written out, bringing peak memory to `O(T)`. The `T^2` FLOPs remain.
+
+  </Accordion>
+  <Accordion title={<>10. Why does <code>k.transpose(-2, -1)</code> work on a batched tensor where <code>k.T</code> does not?</>}>
+
+    `k.T` only reverses dimensions, and on a tensor with more than two axes it either transposes the wrong pair or raises. On `(B, h, T, d_head)` you need the last two axes swapped while the batch axes stay put, which is exactly `k.transpose(-2, -1)`.
+
+  </Accordion>
+  <Accordion title="11. What does QK-Norm change about the scaling argument?">
+
+    QK-Norm puts a LayerNorm or RMSNorm on `q` and `k` per head before the dot product, so the norms are fixed and only the angles between them vary. Scores then stay inside a bounded range regardless of `d_k` or training drift, which removes the logit-growth failure mode in large-`d_k` and long-training regimes. The `1 / sqrt(d_k)` factor becomes a matter of convention rather than stability.
+
+  </Accordion>
+  <Accordion title={<>12. If <code>q</code> and <code>k</code> were drawn from a distribution with variance <code>4</code> instead of <code>1</code>, what scale factor would you need?</>}>
+
+    Each product has variance `4 * 4 = 16`, so `Var(q . k) = 16 * d_k` and the standard deviation is `4 * sqrt(d_k)`. The scale factor needs to be `1 / (4 * sqrt(d_k))`, or generally `1 / (sigma_q * sigma_k * sqrt(d_k))`. This is why normalizing before the dot product is cleaner than tuning a constant.
+
+  </Accordion>
+</Accordions>
