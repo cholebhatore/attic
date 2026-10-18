@@ -1,0 +1,358 @@
+---
+title: AI System Design Framework
+description: 'The 60-minute interview: stress-test Input, Retrieval, Generation, Verification, Feedback, then resolve the quality, latency, cost triangle with routing.'
+---
+
+AI system design interviews score failure analysis, not component lists. Naming RAG, a vector database, and a guardrail is what every candidate does in the first ten minutes. What separates a strong hire is saying, unprompted, how each stage breaks, what the user sees when it does, and what you would measure to know.
+
+The framework below is a fixed skeleton you can hold for any prompt, because every applied-LLM system has the same five stages whether it is a support copilot, a moderation queue, or a coding agent.
+
+---
+
+## The 60 minutes
+
+| Minutes | Move                                                             | What is being scored                                |
+| :------ | :--------------------------------------------------------------- | :-------------------------------------------------- |
+| 0-5     | Clarify: users, task, volume, stakes                             | Whether you ask before designing                    |
+| 5-10    | Requirements, and one metric per quality claim                   | Whether quality is measurable or vibes              |
+| 10-15   | Scale arithmetic: QPS, tokens, cost                              | Whether you can do the numbers without a calculator |
+| 15-35   | The five stages, with failure modes                              | Depth, and whether you know what breaks             |
+| 35-45   | The triangle: routing, caching, batching                         | Trade-off judgment, cost awareness                  |
+| 45-55   | Evaluation, monitoring, rollback                                 | Whether you have shipped anything                   |
+| 55-60   | Wrap: what you would build first, and what you still do not know | Judgment                                            |
+
+Two moves pay for themselves disproportionately. Write the success metric next to each quality requirement in minute seven, and say the failure mode of each stage as you draw it rather than saving them for the end.
+
+---
+
+## The five-stage stress-test
+
+<Mermaid
+  chart={`
+flowchart LR
+    IN["1 Input"] --> RT["2 Retrieval"]
+    RT --> GEN["3 Generation"]
+    GEN --> VF["4 Verification"]
+    VF --> OUT["Response"]
+    VF -.->|fail| RT
+    OUT --> FB["5 Feedback"]
+    FB -.->|datasets, gates| IN
+    FB -.->|routing, prompt fixes| GEN
+`}
+/>
+
+For every stage, answer the same four questions: what does it do, what breaks, what does the user experience when it breaks, and what is the mitigation. Reciting that quadruple is the entire technique.
+
+### 1. Input
+
+Validation, normalization, safety checks, budgeting, and prompt assembly. The unglamorous stage where most cheap wins live.
+
+| Fails how                      | User sees                             | Mitigation                                             |
+| :----------------------------- | :------------------------------------ | :----------------------------------------------------- |
+| Context blows the window       | Error, or a silently truncated prompt | Token budget with explicit drop order, summarization   |
+| Injection in retrieved content | The agent leaks or acts               | Delimit and mark untrusted content, strip tool rights  |
+| PII or secrets in the payload  | A compliance incident                 | Redact before logging and before sending to a vendor   |
+| Wrong language or modality     | Confident nonsense                    | Detect and route, or refuse explicitly                 |
+| Unbounded request size         | Cost spike, timeout                   | Reject over a stated size, count tokens not characters |
+| Rate-limited abuser            | Everyone else slows down              | Per-tenant limits with a queue, not a shared pool      |
+
+Say out loud: "input is where I put the token budget, the redaction, and the untrusted-content markers, so the rest of the pipeline does not have to know about them."
+
+### 2. Retrieval
+
+Query understanding, routing, hybrid search, reranking, freshness, and access control.
+
+| Fails how                             | User sees                      | Mitigation                                                      |
+| :------------------------------------ | :----------------------------- | :-------------------------------------------------------------- |
+| Silent recall loss                    | A confident wrong answer       | Retrieval metrics on labeled queries, alert on the median score |
+| Permission filter applied too late    | One tenant sees another's docs | Filter at the query, in the vector store, before ranking        |
+| Stale index                           | Contradicts the docs           | Freshness SLO, rebuild triggers, per-source TTL                 |
+| Embedding model swapped               | Every threshold is wrong       | Rebuild and re-tune together, version the index                 |
+| Answer is genuinely not in the corpus | Hallucinated fallback          | Explicit no-answer path, refuse-and-cite-empty                  |
+| Multilingual queries                  | English-only recall            | Multilingual encoder, or translate the query not the docs       |
+
+Say out loud: "recall failure is invisible in the response, so it needs its own measurement and its own alert, separate from generation quality."
+
+### 3. Generation
+
+Model choice, decoding, structured output, tool calls, streaming.
+
+| Fails how                 | User sees                    | Mitigation                                                    |
+| :------------------------ | :--------------------------- | :------------------------------------------------------------ |
+| Hallucination             | Plausible fabrication        | Ground with citations, allow no-answer, verify downstream     |
+| Format drift              | Parser failure               | Grammar-constrained decoding plus a schema retry              |
+| Mid-stream failure        | Half an answer, then nothing | Do not commit side effects until complete, retry or fall back |
+| Refusal on valid input    | Dead end                     | Track refusal rate by intent, tune rails                      |
+| Unbounded output          | Latency and cost spike       | Cap tokens, stream, stop sequences                            |
+| Tool-call argument errors | Wrong action taken           | Validate arguments against schema before execution            |
+
+Say out loud: "temperature and max tokens are part of the release, not runtime tuning, so they go in the manifest."
+
+### 4. Verification
+
+Everything between "the model produced text" and "we showed it to a person."
+
+| Layer        | Catches                                     | Cost                                 |
+| :----------- | :------------------------------------------ | :----------------------------------- |
+| Schema check | Structural impossibility                    | Sub-millisecond                      |
+| Rule check   | Wrong phone number format, missing citation | Sub-millisecond                      |
+| Groundedness | Claims not supported by retrieved spans     | One extra model call                 |
+| Safety rail  | Policy violations, leaked secrets           | One classifier call                  |
+| Judge        | Quality dimensions rules cannot express     | Slow, spendy, noisy                  |
+| Human review | Everything the above was never designed for | Expensive, and the only ground truth |
+
+| Fails how                           | Why it happens                             | Mitigation                                                          |
+| :---------------------------------- | :----------------------------------------- | :------------------------------------------------------------------ |
+| Verifier agrees with a wrong answer | Same model, same blind spot, same context  | Different signal: rules, retrieval-span check, or a different model |
+| Verification triples latency        | Full judge call on the request path        | Verify asynchronously, block only high-stakes routes                |
+| False confidence from a pass        | A schema-valid answer is not a correct one | Treat the schema as a floor, not a quality gate                     |
+| Rails over-trigger                  | Classifier tuned on the wrong distribution | Alert on hit rate, review sampled blocks weekly                     |
+
+Say out loud: "a verifier built from the same prompt context as the generator shares its blind spots, so grounding checks should test against the retrieved spans, not against the model's own reasoning."
+
+### 5. Feedback
+
+Labels, escalation, evaluation sampling, and the loop back into the dataset and the gate.
+
+| Fails how                      | Consequence                                 | Mitigation                                                  |
+| :----------------------------- | :------------------------------------------ | :---------------------------------------------------------- |
+| No label signal                | Nothing to measure, nothing to retrain on   | Cheap proxies: escalation rate, edit distance, regeneration |
+| Signal arrives weeks late      | A regression ships repeatedly               | Async judge on a daily sample plus weekly human review      |
+| Loop self-poisoning            | Generated answers enter the training corpus | Label provenance, exclude model output from eval sets       |
+| Feedback only from complainers | Distribution is the unhappy tail            | Stratified sampling for review, not opt-in alone            |
+
+Say out loud: "the feedback stage is what makes the other four improvable, so I would instrument it before building the second feature."
+
+---
+
+## The quality, latency, cost triangle
+
+Each corner has a metric, and moving one corner costs another. The interview is about naming the trade you are making instead of discovering it later.
+
+```text
+            quality
+           /       \
+   latency --------- cost
+
+pick a target on one axis, a floor on a second, and optimize the third.
+```
+
+| Axis    | Metric                                      | Levers                                                                                | What it costs                               |
+| :------ | :------------------------------------------ | :------------------------------------------------------------------------------------ | :------------------------------------------ |
+| Quality | Groundedness, task success, human agreement | Bigger model, more context, verification passes, fine-tuning                          | Money, latency, engineering time            |
+| Latency | p95 TTFT, p95 ITL, E2E                      | Quantization, speculative decoding, batching, caching, shorter prompts, smaller model | Quality risk, GPU cost, complexity          |
+| Cost    | Cents per resolved request                  | Routing, caching, distillation, smaller context, spot capacity                        | Latency if you queue, quality if you shrink |
+
+### Cascade routing
+
+The single highest-leverage move in a design answer: not every request needs the best model.
+
+```text
+request -> cheap classifier or heuristic
+   80% simple  -> 8B, quantized, self-hosted, 40 ms TTFT
+   18% medium  -> mid-tier API model, 400 ms TTFT
+    2% hard    -> frontier reasoning model, seconds
+```
+
+Cost arithmetic at assumed price points, 1,000 requests a day at 4,000 input and 400 output tokens each. Per-million rates are placeholders; substitute the vendor's current page.
+
+| Route                     | Per million, in and out | Per request | 1,000 requests |
+| :------------------------ | :---------------------- | :---------- | :------------- |
+| Frontier for everything   | 4.00 and 20.00          | 0.0240      | 24.00          |
+| 8B quantized, self-hosted | 0.10 and 0.30           | 0.0005      | 0.52           |
+| Mid-tier API              | 0.80 and 3.20           | 0.0045      | 4.48           |
+| 80/18/2 cascade           | weighted mix            | 0.0017      | 1.69           |
+
+The cascade line is `0.8 * 0.0005 + 0.18 * 0.0045 + 0.02 * 0.0240`, which is 0.0017 per request and 93 percent below serving everything on the frontier model. The shape is what to quote: 2 percent of traffic on an expensive model pays roughly 2 percent of that model's cost plus router overhead, and the remaining quality question is whether the router can identify which 2 percent.
+
+| Router signal                          | Latency           | Notes                                     |
+| :------------------------------------- | :---------------- | :---------------------------------------- |
+| Rules: length, keywords, intent field  | Microseconds      | Brittle, but free and debuggable          |
+| Fine-tuned classifier or embedding kNN | Milliseconds      | Needs labels, robust, easy to recalibrate |
+| Small-model structured estimate        | Tens of ms        | The 8B model answers or escalates itself  |
+| Failure-triggered escalation           | Adds a round trip | Best quality, worst latency and cost      |
+| Human or workflow routing              | Minutes           | For irreversible, high-stakes actions     |
+
+Router error is the cost the slide never mentions. A false negative sends a hard question to the small model and produces a confident wrong answer, which is worse than a slow right answer for high-stakes tasks. Say what you would do about it: keep a low-confidence escalation path, measure escalation quality separately, and treat the router as a model with its own eval set.
+
+### Caching, and where the 70 percent comes from
+
+Two independent mechanisms, often confused.
+
+| Mechanism      | What it reuses                           | Who controls it | Saves                                  |
+| :------------- | :--------------------------------------- | :-------------- | :------------------------------------- |
+| Prompt caching | Prefill work for a shared token prefix   | Vendor          | Around 90 percent of cached input cost |
+| Semantic cache | A completed response for a similar query | You             | The entire call on a hit               |
+
+Structural rule for prompt caching: put everything stable first, system prompt and tool definitions and retrieved policy text, and everything variable last. Cache keys are prefixes, so a timestamp at the top of the prompt destroys the hit rate for the entire document below it.
+
+Worked combination, starting from the 0.018 per-request figure from the telemetry page:
+
+```text
+prompt cache covers 10,000 of 12,000 input tokens at one tenth price
+  0.018  ->  0.00675          a 62 percent cut
+
+semantic cache hits 20 percent of requests, those cost nothing
+  0.00675 * 0.80  =  0.0054   a 70 percent cut from the original
+```
+
+That is the whole claim: prefix discipline plus a modest semantic hit rate, and spend drops by two thirds or more. It is available in almost every design problem, which is why it belongs in the answer before anyone asks about cost.
+
+### The trade table to recite
+
+| Asked to cut          | Pull this                                                  | Accept this                                           |
+| :-------------------- | :--------------------------------------------------------- | :---------------------------------------------------- |
+| Latency               | Smaller model, quantization, speculative decoding, cache   | Quality on the long tail, or money for warm replicas  |
+| Cost                  | Cascade routing, prompt and semantic caching, distillation | Latency from queueing, quality from the smaller model |
+| Cost, no quality loss | Prompt caching, output caps, retrieval trimming            | Almost nothing, this is the free lunch                |
+| Quality risk          | Verification pass, human review, escalation route          | Latency and money                                     |
+| Everything at once    | Batch the offline work, serve the rest from a cache        | A product decision, not an engineering one            |
+
+---
+
+## A default that survives review
+
+When the prompt is open-ended, do not negotiate component by component. State one stack, then justify each line in a clause. The version below is deliberately boring, which is what makes it defensible.
+
+| Stage    | Default                                                                   | Why it earns the slot                                                                              |
+| :------- | :------------------------------------------------------------------------ | :------------------------------------------------------------------------------------------------- |
+| Ingest   | Layout-aware parser, structure-aware chunks around 400 tokens             | Tables and headings survive; chunk boundaries follow the document instead of a character count     |
+| Index    | Postgres with `pgvector` plus a `tsvector` column                         | One database, one backup story, access control in the same query as the vector search              |
+| Embed    | A hostable open model, `BAAI/bge-m3`, with the query and passage prefixes | No vendor lock on the artifact you cannot rebuild cheaply; prefixes avoid the silent recall drop   |
+| Retrieve | Hybrid, fused with RRF at `k=60`, top 50                                  | Dense catches paraphrase, sparse catches part numbers and error codes; fusion needs no tuning      |
+| Rerank   | Cross-encoder down to 5 to 8                                              | The largest single precision gain available, and it runs only on the 50 candidates                 |
+| Assemble | Heading path above each chunk, budget enforced by dropping oldest turns   | The model sees where a fact came from, and overflow is a policy rather than an exception           |
+| Generate | Grounded prompt, citations as structured fields, capped output            | Server-side verification checks each citation id against the retrieved set before the answer ships |
+| Evaluate | Golden set plus RAGAS-style measures, run in CI on every change           | Prompt, chunking and model edits are all unmeasured until this exists                              |
+
+Two rules govern anything that is not in the table.
+
+**Add nothing without naming the failure it fixes.** Query rewriting goes in when follow-up questions retrieve the wrong documents. Parent-child chunking goes in when answers need a section a 400-token window cannot hold. An agent loop goes in when a single call with good tools measurably fails. Each is a diagnosis, and proposing one before the eval shows the symptom reads as résumé padding.
+
+**Do not fine-tune, and do not go multi-agent, in the first design.** Both are second-half answers to a first-half question, and both cost more than the retrieval and evaluation work left undone.
+
+---
+
+## Evaluation, monitoring, rollback
+
+The last ten minutes are where senior candidates separate. Four sentences, in this order:
+
+1. "The primary metric is one number with a baseline, and it is measured on a labeled set I would build in week one."
+2. "The golden set comes from real traffic, is versioned as an artifact, and runs as a gate on every pull request."
+3. "In production I watch quality proxies, latency percentiles, spend per request, and drift, and every trace carries the prompt and model versions."
+4. "Rollback is a pointer move on one release manifest covering prompt, model, decoding parameters, and index build."
+
+Then name what you cannot measure yet. Interviewers are listening for the boundary of your confidence, and "I would not know whether this helps first-time users until I have two weeks of labeled escalations" is a stronger sentence than any architecture diagram.
+
+| Level       | What they heard                                                                                                              |
+| :---------- | :--------------------------------------------------------------------------------------------------------------------------- |
+| No hire     | Components named, no numbers, no failure modes                                                                               |
+| Hire        | Correct architecture, latency and cost quantified when prompted                                                              |
+| Strong hire | Five-stage failure analysis volunteered, a routing or cache trade with arithmetic, and an eval loop designed before features |
+
+---
+
+## Failure modes
+
+| Symptom in the interview                  | Why it reads badly                                 | Fix                                                       |
+| :---------------------------------------- | :------------------------------------------------- | :-------------------------------------------------------- |
+| Box diagram with no numbers               | You have not shipped anything that carries traffic | Do the token and cost arithmetic out loud, on napkins     |
+| "We would use RAG" as the whole answer    | Retrieval is a stage, not a system                 | Walk all five stages, including verification              |
+| Guardrails mentioned once, at the end     | Safety treated as a product feature                | Place rails at the input, pre-tool, and output positions  |
+| No answer on how quality is measured      | The system cannot be improved                      | One primary metric plus a labeled set, stated in minute 7 |
+| Picking the frontier model for everything | No cost awareness                                  | Propose a cascade, then state the router error risk       |
+| Never mentions what fails silently        | No operational experience                          | Recall loss and false verification passes                 |
+| Multi-agent for a single-turn task        | Complexity as status                               | Say why one loop with good tools is enough                |
+| No rollback story                         | Deployment is theoretical                          | Alias move on a single manifest                           |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What are the five stages, and why that decomposition?">
+
+    Input, Retrieval, Generation, Verification, Feedback. Every applied LLM system has them, the failure modes are stage-local, and the list forces you to address measurement rather than only components.
+
+  </Accordion>
+  <Accordion title="2. What do you say about each stage as you draw it?">
+
+    What it does, how it fails, what the user sees when it fails, and the mitigation. Four clauses, in that order, every time.
+
+  </Accordion>
+  <Accordion title="3. Name three input-stage failures and their fixes.">
+
+    Context overflow, handled with a token budget and explicit drop order; injection in retrieved content, handled with delimiters and stripped tool rights; PII reaching logs or a vendor, handled by redaction before both.
+
+  </Accordion>
+  <Accordion title="4. Why does retrieval need its own metric?">
+
+    Because recall failure produces a fluent wrong answer instead of an error. Monitor median top-k similarity and labeled-query recall, and alert on distribution shift, not on status codes.
+
+  </Accordion>
+  <Accordion title="5. What is the most common verification mistake?">
+
+    Verifying with the same model on the same context, which shares the generator's blind spot. Grounding checks should compare output claims against retrieved spans, or use rules and a different model.
+
+  </Accordion>
+  <Accordion title="6. When should verification sit on the request path?">
+
+    Only where an action is irreversible or the stakes are high. Elsewhere it should run asynchronously and feed monitoring, because a judge call roughly doubles TTFT and cost.
+
+  </Accordion>
+  <Accordion title="7. What makes a feedback loop poison itself?">
+
+    Model-generated answers flowing back into the training or evaluation corpus. Track provenance on every example and exclude generated content from eval sets.
+
+  </Accordion>
+  <Accordion title="8. State the three axes of the triangle and the rule for using them.">
+
+    Quality, latency, cost. Set a target on one, a floor on the second, and optimize the third. Designing without a floor means discovering the trade after launch.
+
+  </Accordion>
+  <Accordion title="9. A system is too expensive. What is the first lever, and why?">
+
+    Prompt caching, because it requires a prompt ordering change and no quality sacrifice. Prefix discipline alone often beats a model downgrade.
+
+  </Accordion>
+  <Accordion title="10. What breaks a vendor prompt cache, and what is the rule?">
+
+    A mutating token early in the prompt invalidates everything after it, since the key is a prefix. Put system text, tool definitions, and stable retrieved content first; timestamps and user input last.
+
+  </Accordion>
+  <Accordion title={'11. Show the arithmetic behind "caching cuts API spend by about 70 percent".'}>
+
+    Cache-covered input at a tenth price takes 0.018 per request to 0.00675, a 62 percent cut. A semantic cache hitting 20 percent of requests multiplies that by 0.8, landing at 0.0054, which is 70 percent below the original.
+
+  </Accordion>
+  <Accordion title="12. Describe a cascade router and its hidden cost.">
+
+    A cheap classifier sends the easy majority to a small quantized model and escalates hard cases to a frontier reasoning model. Its hidden cost is router error: a false negative delivers a confident wrong answer, which is worse than a slow correct one.
+
+  </Accordion>
+  <Accordion title="13. How do you reduce cascade routing risk without abandoning it?">
+
+    Keep a low-confidence escalation path, evaluate the router as its own model with its own dataset, and measure quality separately per route so router drift shows up as a quality dip on the cheap arm.
+
+  </Accordion>
+  <Accordion title="14. Which four things belong in a release manifest for an LLM system?">
+
+    Prompt version, model id, decoding parameters, and index build id, plus the code SHA. Behavior is a function of the tuple, so rollback must move all of them together.
+
+  </Accordion>
+  <Accordion title="15. In the last ten minutes, what does a strong candidate say?">
+
+    One primary metric with a baseline, the golden set built from real traffic and gated on every pull request, production monitoring of quality proxies and spend, an atomic rollback, and an explicit statement of what cannot be measured yet.
+
+  </Accordion>
+  <Accordion title="16. Recite the default RAG stack, one line per stage.">
+
+    Layout-aware parsing into roughly 400-token structure-aware chunks; Postgres with `pgvector` and a `tsvector` column; a hostable open embedder with correct query and passage prefixes; hybrid retrieval fused with RRF at `k=60` to the top 50; cross-encoder reranking down to 5 to 8; a grounded prompt with structured citations verified server-side; an eval harness running in CI.
+
+  </Accordion>
+  <Accordion title="17. What is the rule for adding query rewriting, parent-child chunking, or an agent loop?">
+
+    Each one goes in only after naming the measured failure it fixes: rewriting for follow-up questions that retrieve the wrong documents, parent-child when an answer needs a section larger than the chunk window, an agent loop when one call with good tools demonstrably fails. Proposed before the eval shows the symptom, they read as complexity for its own sake.
+
+  </Accordion>
+</Accordions>

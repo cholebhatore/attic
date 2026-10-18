@@ -1,0 +1,299 @@
+---
+title: 'System Design: Support Copilot'
+description: 'High-throughput support: intent routing, four answer lanes, cache layers, multi-turn context cost, containment metrics, and cost per resolved conversation.'
+---
+
+Design prompt. A consumer company receives 2 million support conversations a month across chat and email. Build a system that resolves the simple ones without a human, drafts replies for the rest, and can take actions like checking an order status or issuing a refund within policy limits. Cost per resolved conversation is the number the business cares about.
+
+This is the highest-throughput applied-LLM workload in practice, and its difficulty is economic rather than technical: the answers are mostly known, the traffic is enormous, and the entire project is only justified if the per-conversation cost stays two orders of magnitude below a human's.
+
+---
+
+## Assumptions
+
+| Question                 | Assumption                                                         |
+| :----------------------- | :----------------------------------------------------------------- |
+| Volume                   | 2M conversations a month, average 3.5 bot turns each               |
+| Channels                 | Web chat, in-app chat, email                                       |
+| Languages                | 8 languages covering 95 percent of volume                          |
+| Actions in scope         | Read order state, create refunds under a threshold, change address |
+| Policy source            | A curated help-center corpus plus a policy document set            |
+| Human fallback           | Always available, and never hidden                                 |
+| Latency                  | p95 first token under 1.2 s, p95 end to end under 4 s              |
+| What counts as resolved? | No reopen within 7 days, and no escalation to a human              |
+| Is containment a target? | Yes, with a hard guardrail on escalation accessibility             |
+
+---
+
+## Requirements and the metrics that survive gaming
+
+| Metric                     | Definition                                                  | Whom it serves    |
+| :------------------------- | :---------------------------------------------------------- | :---------------- |
+| Containment rate           | Conversations finished without a human                      | Finance           |
+| True resolution rate       | Contained and not reopened within 7 days                    | Product           |
+| Deflection rate            | Users who do not reach a human queue                        | Careful: gameable |
+| CSAT after bot answer      | Post-conversation rating                                    | Experience        |
+| Escalation quality         | Was the escalation correct, given what the bot could see    | Operations        |
+| Average handle time, human | Minutes per ticket that reached a person                    | The copilot case  |
+| Cost per resolved          | Total spend divided by resolved conversations, not attempts | Finance           |
+| Time to first response     | From user message to first visible token                    | Experience        |
+
+Deflection is the metric to distrust. A system that makes escalation hard to find gets a high deflection rate and a worse business, so pair it with an accessibility guardrail: the human path must be reachable in at most two user actions, and the rate at which users ask for a human and receive one is monitored. The denominator on cost per resolved matters for the same reason, since counting attempts makes an escalations-heavy bot look cheap.
+
+---
+
+## Scale arithmetic
+
+| Quantity                 | Derivation                                 | Value              |
+| :----------------------- | :----------------------------------------- | :----------------- |
+| Conversations per day    | 2M divided by 30                           | about 67,000       |
+| Average per second       | Concentrated into 10 working hours         | about 1.9          |
+| Peak per second          | Factor 6 over the working-hour mean        | about 11           |
+| Bot turns                | 67,000 conversations times 3.5             | 234,000 a day      |
+| Context per conversation | Grows from 4K to 7K tokens across turns    | about 22K in       |
+| Output per conversation  | 3.5 turns times about 350 tokens           | about 1,400        |
+| Spend per conversation   | `22,000 * 0.80 + 1,400 * 3.20` per million | about 0.022        |
+| Monthly model spend      | 2M times 0.022                             | about 44,000       |
+| Human cost per ticket    | Assumed 4                                  | 4,000 per thousand |
+
+The comparison is the design brief: at an assumed 4 per human-handled ticket, a 0.022 bot conversation is about 180 times cheaper, so the system can tolerate a meaningful error rate and still pay for itself. That reframes every subsequent decision, because it means the binding constraint is the quality floor, not the budget.
+
+Context growth across turns is the second number to notice. A four-turn conversation re-sends turns one through three in full, so input tokens accumulate quadratically with conversation length rather than linearly. The arithmetic above hides that, because 3.5 turns is short. A conversation that reaches 12 turns costs several times a three-turn one, which is why the context management section is not optional.
+
+---
+
+## Architecture
+
+<Mermaid
+  chart={`
+flowchart TD
+    U["User message"] --> CLS["Intent and language classifier"]
+    CLS --> ENT["Entitlement and policy pre-check"]
+    ENT --> RT{"Router"}
+    RT -->|FAQ| SC["Semantic cache lookup"]
+    SC -->|hit| ANS["Canned answer"]
+    SC -->|miss| RAG["Retrieval plus generator"]
+    RT -->|status or action| TOOL["Action lane: tool call with confirmation"]
+    RT -->|complex| HUM["Human handoff with a drafted summary"]
+    RT -->|complaint| TRI["Triage and sentiment, priority queue"]
+    RAG --> VF["Groundedness and policy check"]
+    TOOL --> VF
+    VF --> REPLY["Reply with escalation path"]
+    REPLY --> FB["CSAT, reopen tracking"]
+    FB -.-> DS["Golden dataset"]
+    HUM -.-> AHT["Agent handle-time telemetry"]
+`}
+/>
+
+| Lane            | Share of traffic | Model                              | Latency target |
+| :-------------- | :--------------- | :--------------------------------- | :------------- |
+| FAQ             | 35 percent       | Semantic cache, or the small model | Under 400 ms   |
+| Grounded answer | 30 percent       | Mid-tier with retrieval            | Under 1.5 s    |
+| Action          | 20 percent       | Mid-tier with tool calls           | Under 3 s      |
+| Escalation      | 15 percent       | Small model, summarize only        | Under 1 s      |
+
+Those shares are the assumption the whole design rests on, and they are what a shadow week measures before you commit. A routing distribution you did not measure is a cost model you did not validate.
+
+---
+
+## The four answer lanes
+
+**FAQ lane.** Known questions with stable answers: refund window, shipping times, password reset. Serve from a semantic cache keyed on the normalized question, tenant-facing policy version, and language. A miss falls through to retrieval.
+
+**Grounded answer lane.** Retrieval over the help center and policy documents, then generation with citations. The output contract requires the answer to be supported by retrieved spans, or it must refuse and escalate. This lane is where hallucination would cost the most, because a wrong refund policy becomes a promise.
+
+**Action lane.** Tool calls against order, billing, and account APIs. Two rules: read operations are free, and write operations require either a policy-verified auto-approval under a threshold or an explicit user confirmation. A refund under the threshold runs automatically with the policy version logged; above it, the system drafts and asks.
+
+**Escalation lane.** Do not answer. Produce a compact summary for the human: what the user wants, what has been tried, which entities are involved, what the account is entitled to, and what the last three turns said. A good escalation summary is the difference between 6 minutes of handle time and 12, and it is the copilot feature with the clearest return.
+
+```text
+escalation summary contract
+  ask        user wants a partial refund on order 8842
+  state      delivered 3 days ago, one item damaged, photo attached
+  tried      FAQ answer given at turn 1, user rejected it
+  entitled   policy allows partial refund within 30 days, tier 2 customer
+  open       needs a human because damage assessment is subjective
+```
+
+---
+
+## Routing
+
+A small classifier runs first because it is free and because it determines both the lane and the model.
+
+| Signal                          | Used for                              | Failure mode                       |
+| :------------------------------ | :------------------------------------ | :--------------------------------- |
+| Keyword and regex rules         | Deterministic paths, legal and safety | Brittle, but debuggable            |
+| Fine-tuned intent classifier    | The 20-label taxonomy                 | Drift as intents shift             |
+| Embedding nearest neighbor      | FAQ detection against known questions | Threshold creep with corpus edits  |
+| Account and entitlement facts   | Whether an answer even applies        | Stale entitlement cache            |
+| Sentiment and severity          | Priority, and forced escalation       | Sarcasm, and language coverage     |
+| Small-model structured estimate | Complexity estimate for the cascade   | Adds a call, usually the cheap one |
+| Failure-triggered escalation    | Second failed attempt                 | Latency, and gaming by persistence |
+
+Route by intent first and complexity second, because intent determines which checks apply. Complexity determines which model answers. Escalation-on-failure is the safety valve for router mistakes: two turns without progress sends the conversation up, and the second-attempt threshold is one of the few numbers here that a product team should own rather than an engineering team.
+
+---
+
+## Caching, and the cost curve
+
+Four distinct caches, in decreasing order of certainty.
+
+| Cache                   | Key                                           | Hit rate assumption    | Saving per hit                         |
+| :---------------------- | :-------------------------------------------- | :--------------------- | :------------------------------------- |
+| Prompt cache, vendor    | Stable prefix: system, policy, tools          | 80 percent of calls    | 90 percent of that prefix's input cost |
+| Semantic response cache | Language, policy version, normalized question | 25 percent of FAQ lane | The entire call                        |
+| Conversation prefix     | Per-session KV reuse                          | Every turn after 1     | Prefill work                           |
+| Status lookup cache     | Order id, 30-60 second TTL                    | Repeated asks          | One API call                           |
+
+The arithmetic at the assumed rates, per conversation:
+
+```text
+baseline          22,000 in plus 1,400 out           = 0.0220
+prompt cache      10,000 cached at one tenth         = 0.0149   a 32 percent cut
+semantic cache    25 percent of first turns free     = 0.0127   a 42 percent cut
+```
+
+Prompt caching needs structural discipline: the system prompt, tool definitions, and the policy preamble come first and are byte-stable; the conversation and user text come last. A timestamp or a per-user id near the top of the prompt destroys the prefix for everything below it, which is the most common way a team ships caching, sees no reduction, and concludes caching does not work.
+
+| Context bloat source       | Effect on cost                      | Control                                          |
+| :------------------------- | :---------------------------------- | :----------------------------------------------- |
+| Full history re-sent       | Input grows with every turn         | Summarize past turns, keep the last two verbatim |
+| Tool outputs of 20 KB      | One call can triple a turn's input  | Truncate, extract fields, drop after use         |
+| Retrieved chunks           | 6 chunks is 3K tokens per turn      | Re-rank harder, keep fewer, cite by id           |
+| Attachments and images     | Vision tokens are expensive         | Downscale, or transcribe once and cache          |
+| Escalation carried forward | Human reads and re-sends everything | Compact summary contract, not a transcript dump  |
+
+---
+
+## Latency budget
+
+Chat is more latency-sensitive than a search interface, because a delay reads as silence rather than as loading.
+
+| Step                       | Budget    |
+| :------------------------- | :-------- |
+| Classifier and entitlement | 60 ms     |
+| Router plus cache lookup   | 40 ms     |
+| Retrieval plus rerank      | 200 ms    |
+| Prefill about 5K tokens    | 300 ms    |
+| TTFT                       | about 600 |
+| Decode 300 tokens at 15 ms | 4,500     |
+| p95 E2E target             | under 6 s |
+
+Five seconds of decode against a four-second end-to-end promise is a contradiction, and the resolution is one of three things: cap the answer at 150 tokens, stream the answer and let the user read while it writes, or split into a short first reply followed by detail. Say the trade explicitly. Support answers are short by product decision, which is why the 150-token cap is normally the right one.
+
+---
+
+## Evaluation and the loop
+
+| Layer          | Instrument                                                         |
+| :------------- | :----------------------------------------------------------------- |
+| Offline        | Golden set per intent, groundedness and refusal correctness        |
+| Replay         | Yesterday's real conversations re-run against the candidate        |
+| Shadow         | Candidate answers logged beside live ones for a week               |
+| Online         | A/B on containment and reopen rate, guardrail on escalation access |
+| Human          | Weekly review of a stratified sample of low-CSAT transcripts       |
+| Agent feedback | Edit distance between the draft and the reply actually sent        |
+
+Edit distance between draft and sent reply is the most underrated copilot metric: it is free, it is continuous, and it measures usefulness the way the agent experiences it. A draft that is rewritten entirely is worse than no draft, because the agent still had to read it.
+
+The reopen condition is what makes resolution measurable without labels. Reopen within 7 days is an observable proxy for a wrong answer, and it is the denominator that keeps cost per resolved honest. Pair it with the transfer rate to a human for the same intent, and you have a per-intent quality series you can alert on.
+
+---
+
+## Failure modes
+
+| Symptom                                   | Cause                                             | Fix                                                     |
+| :---------------------------------------- | :------------------------------------------------ | :------------------------------------------------------ |
+| Containment up, CSAT down                 | Users gave up on the bot                          | Guardrail on escalation accessibility, monitor give-ups |
+| Bot promises a policy that does not exist | Generation without grounding                      | Cite-or-refuse contract, groundedness verifier          |
+| Refund issued twice                       | Idempotency missing on the action lane            | Idempotency key per conversation times action           |
+| Cost grows across long conversations      | History and tool outputs re-sent every turn       | Summarize, drop stale observations                      |
+| Prompt cache shows no savings             | Variable content at the top of the prompt         | Reorder to a byte-stable prefix                         |
+| Reopen rate spikes for one intent         | Router drift after a corpus change                | Per-intent quality series with alerts                   |
+| Escalations with no context               | Summary contract not enforced                     | Structured handoff, block incomplete escalations        |
+| A language degrades unseen                | Classifier and rails trained on the big languages | Per-language slices on every dashboard                  |
+| Drafts ignored by agents                  | Draft quality below rewrite cost                  | Track edit distance, retire unhelpful lanes             |
+| Incident from a wrong answer              | No kill switch per lane                           | Feature flag per lane, per intent, per language         |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What is the first arithmetic you do for a support copilot at 2 million conversations a month?">
+
+    Conversations per day, per second at peak, tokens per conversation, and spend per conversation, then the ratio to a human-handled ticket. At the assumed rates that is 0.022 against 4, about 180 times cheaper.
+
+  </Accordion>
+  <Accordion title="2. Why does that ratio change the design priorities?">
+
+    Because the economics tolerate a real error rate, so the binding constraint is the quality floor and the safety of actions, not the model bill. It also means an expensive verification pass is affordable when it prevents a bad promise.
+
+  </Accordion>
+  <Accordion title="3. What is the difference between deflection, containment, and resolution?">
+
+    Deflection is a user not reaching a human, which is gameable by hiding the path. Containment is a conversation finished without one. Resolution adds the reopen window, and only resolution is a defensible business metric.
+
+  </Accordion>
+  <Accordion title="4. What denominator should cost per resolved conversation use?">
+
+    Resolved conversations, not attempts. Attempts flatter a bot that escalates often, since escalation spend gets attributed to the human queue instead of the system.
+
+  </Accordion>
+  <Accordion title="5. Name the four lanes and what each is for.">
+
+    FAQ from a semantic cache, grounded answers from retrieval with citations, actions through tools with confirmation or thresholds, and escalation that produces a compact summary instead of an answer.
+
+  </Accordion>
+  <Accordion title="6. What does a good escalation summary contain?">
+
+    The ask, the account state, what was already tried, what the user is entitled to under the current policy version, and why a human is needed. That contract is what cuts handle time.
+
+  </Accordion>
+  <Accordion title="7. Why route by intent before complexity?">
+
+    Intent decides which checks and entitlements apply; complexity decides which model answers. A cascade that picks a cheap model but skips an entitlement check is a compliance incident.
+
+  </Accordion>
+  <Accordion title="8. What is escalation on failure and why keep it?">
+
+    Two turns without progress sends the conversation up regardless of the router's confidence. It is the safety valve for router error, and its threshold is a product decision.
+
+  </Accordion>
+  <Accordion title="9. List four caches in a support system and their keys.">
+
+    Vendor prompt cache on the byte-stable prefix, semantic response cache keyed on normalized question plus policy version plus language, per-session prefix reuse, and a short-TTL lookup cache for mutable status.
+
+  </Accordion>
+  <Accordion title="10. Show the cost curve from prompt caching and a modest semantic hit rate.">
+
+    0.022 per conversation baseline, 0.0149 with 10,000 of 22,000 input tokens cached at a tenth price, and about 0.0127 once a quarter of FAQ turns are answered from cache.
+
+  </Accordion>
+  <Accordion title="11. What single prompt-ordering mistake kills vendor prompt caching?">
+
+    Placing variable content such as a timestamp or user id near the top. Cache keys are prefixes, so one early mutation invalidates the stable block below it.
+
+  </Accordion>
+  <Accordion title="12. Why does cost per conversation grow faster than turn count?">
+
+    Because history is re-sent, so input tokens accumulate across turns rather than resetting. Summarize old turns and drop stale tool output to keep it near linear.
+
+  </Accordion>
+  <Accordion title="13. Your generation budget says 4.5 seconds and the promise says 4. Name three resolutions.">
+
+    Cap output tokens, stream so reading overlaps writing, or split into a short answer plus optional detail. Support answers are short by product decision, so the cap usually wins.
+
+  </Accordion>
+  <Accordion title="14. What is the cheapest continuous quality signal on a copilot for agents?">
+
+    Edit distance between the draft and the reply actually sent. It needs no labels, it is continuous, and a fully rewritten draft measures as worthless, which is the truth.
+
+  </Accordion>
+  <Accordion title="15. Which metric keeps escalation honest?">
+
+    The rate at which users who ask for a human actually get one, plus the number of actions to reach that path. Without it, containment improvements can be pure friction.
+
+  </Accordion>
+</Accordions>

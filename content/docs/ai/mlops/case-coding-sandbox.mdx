@@ -1,0 +1,319 @@
+---
+title: 'System Design: Coding Agent Sandbox'
+description: 'Running model-generated code safely: microVM isolation, default-deny egress, scoped credentials, protected test harnesses, budgets, and replayable audits.'
+---
+
+Design prompt. Build a system where an autonomous coding agent can clone a repository, edit files, install dependencies, run builds and tests, and propose a patch. It runs unattended for minutes at a time and executes arbitrary code that a language model wrote. Design the execution environment and the controls around it.
+
+Everything in this design follows from one fact: the code being executed was written by a stochastic system that can be influenced by the contents of the repository it is operating on. A file in the checked-out project is an input to the model, and the model's output becomes a command in your environment. That is a prompt-injection path to remote code execution, and it is the reason the sandbox is the main component rather than an afterthought.
+
+---
+
+## Assumptions
+
+| Question                          | Assumption                                                    |
+| :-------------------------------- | :------------------------------------------------------------ |
+| Whose repositories?               | Tenants connect their own, with a scoped, short-lived token   |
+| Can the agent push?               | No. It produces a patch; a human or CI opens the pull request |
+| Package installs allowed?         | Yes, from a mirrored registry with an allowlist               |
+| Network during execution?         | Default deny, with an explicit egress allowlist               |
+| Run length                        | Median 90 seconds, p95 8 minutes, hard cap 15 minutes         |
+| Concurrency                       | 10,000 runs a day, peak 50 concurrent                         |
+| Does a run need a GPU?            | No, and GPU access is therefore simply denied                 |
+| Is unattended operation required? | Yes, so approval tiers must cover the destructive subset only |
+
+---
+
+## Threat model
+
+| Threat                            | Vector                                                          | Consequence                       |
+| :-------------------------------- | :-------------------------------------------------------------- | :-------------------------------- |
+| Injection from repository content | A README, a source comment, or an issue text steering the agent | Arbitrary command as the tenant   |
+| Malicious dependency              | A typosquatted package, a compromised upstream release          | Code execution inside the sandbox |
+| Credential theft                  | Env vars, `.npmrc`, git config, cloud metadata endpoint         | Access beyond the tenant          |
+| Data exfiltration                 | Outbound HTTP with the diff or secrets in a request body        | Breach with no visible artifact   |
+| Resource abuse                    | Fork bombs, miners, infinite build loops                        | Cost blowout, node contention     |
+| Cross-tenant leakage              | Shared cache layers, shared build artifacts, shared logs        | Private code in another tenant    |
+| Test gaming                       | The agent edits the test to match its buggy code                | False confidence, shipped bug     |
+| Supply-chain write                | The agent publishes a package or pushes a tag                   | Reputational and security damage  |
+| Denial of the review queue        | Endless low-value patches                                       | Human capacity exhaustion         |
+
+The metadata-service row is the classic serverless mistake: `169.254.169.254` reachable from inside an execution sandbox hands the node's IAM role to anything running there. Block it at the network layer, do not rely on the environment not having credentials.
+
+<Callout type="warn">
+  ### The agent will optimize the metric you gave it
+
+If the agent can see and write the test files, it can make the run pass without making the code correct. Put the acceptance tests on a read-only mount that the agent cannot edit, run them after its patch is applied, and treat a test file appearing in the diff as a signal for review rather than a passing grade.
+
+</Callout>
+
+---
+
+## Isolation options
+
+| Technology       | Boundary                                | Escape risk                      | Cold start           | Overhead                       | Fits when                       |
+| :--------------- | :-------------------------------------- | :------------------------------- | :------------------- | :----------------------------- | :------------------------------ |
+| `runc` container | Shared kernel, namespaces plus seccomp  | Highest of these                 | Tens of ms           | None                           | Trusted code only               |
+| gVisor           | User-space kernel intercepting syscalls | Low                              | Hundreds of ms       | Syscall-heavy workloads slower | Good fit for untrusted code     |
+| Firecracker      | MicroVM, KVM hardware boundary          | Very low                         | About 125 ms to boot | Virtio device emulation        | Multi-tenant arbitrary code     |
+| Kata Containers  | VM with a Kubernetes interface          | Very low                         | Seconds              | Heavier than Firecracker       | When Kubernetes API matters     |
+| WebAssembly      | Language-level sandbox, WASI            | Very low for supported languages | Milliseconds         | No native toolchains           | Narrow interpreters and plugins |
+| Full VM          | Hardware virtualization                 | Very low                         | Many seconds         | Slow and costly                | Legacy, or Windows workloads    |
+
+The ordering rule is simple: shared kernel for code you wrote, hardware or user-space-kernel boundary for code you did not. Model-generated code plus injected instructions plus untrusted dependencies is three ways of saying "code you did not write", so the container-only answer is the wrong one here, and saying why in the interview is the point.
+
+Firecracker's published boot figure of about 125 milliseconds is what makes a microVM-per-run affordable, and its API only exposes block and network devices, which shrinks the attack surface relative to a full hypervisor. gVisor's trade is different: it is a stronger-than-container, weaker-than-VM boundary with real overhead on syscall-heavy workloads, and it is often the right choice for builds because a full VM cannot start fast enough to feel interactive.
+
+---
+
+## The trust boundary
+
+The sandbox is where code runs. Everything that holds a credential is where it does not, and the shape of that split is the design.
+
+<Mermaid
+  chart={`
+flowchart TB
+    L["Agent loop, control plane"] --> P["Model provider"]
+    L --> AB["Approval gate for prompted-tier actions"]
+    AB -.->|decision resumes the checkpoint| L
+    L -->|tool call| WS
+    subgraph SB["Run sandbox, untrusted"]
+        direction TB
+        WS["Overlay workspace at a pinned commit"] --> EX["Build, test, install"]
+        EX --> PX["Egress proxy"]
+    end
+    WS -->|diff, logs, exit code| L
+    PX -->|allowlist only| REG["Registry mirror"]
+    PX -.->|denied| META["Cloud metadata address"]
+    PX -.->|denied| OUT["Arbitrary outbound"]
+    CRED["Provider key and tenant credentials"] -.->|never mounted| SB
+`}
+/>
+
+Three edges carry the whole security argument. The provider key is never mounted into the sandbox, so a compromise there buys nothing at the model API. The metadata address is denied at the network layer rather than by policy, because a link-local IP is the one target every workload can reach by default. And the diff, not the agent's own report, is what crosses back into the control plane, since the report is generated by the same process that wrote the code.
+
+---
+
+## Filesystem and workspace
+
+| Rule                         | Implementation                                                |
+| :--------------------------- | :------------------------------------------------------------ |
+| Ephemeral by default         | Overlay filesystem on a read-only base image, discard on exit |
+| Fixed starting state         | Clone at a pinned commit SHA, never a mutable branch          |
+| Bounded size                 | Quota on the writable layer, and an inode limit too           |
+| No host mounts               | Nothing from the node's filesystem, ever                      |
+| Secrets out of the file tree | Nothing in `.gitconfig`, `.npmrc`, or env vars                |
+| Acceptance tests read-only   | Separate mount the agent cannot write                         |
+| Audit everything             | Log the diff at exit, plus every command executed             |
+| Warm the workspace           | Pre-cloned base, `git fetch` on a bare repo per tenant        |
+
+The writable layer is where the artifact lives: apply the model's patch, build, test, then extract the diff by comparing against the pinned base commit. Extraction by diff, not by trusting the agent's own report of what it changed.
+
+---
+
+## Network
+
+Default deny is the whole policy, and exceptions are enumerated rather than subtracted.
+
+```text
+allow  registry mirror, internal package index, your own API
+deny   169.254.169.254 and every cloud metadata address
+deny   arbitrary outbound, since that is the exfiltration channel
+deny   RFC1918 ranges except the ones the task legitimately needs
+limit  connections per run, bytes per run, and requests per second
+proxy  terminate credentials at the proxy, never inside the sandbox
+```
+
+| Need                     | Naive approach         | Approach that survives injection                   |
+| :----------------------- | :--------------------- | :------------------------------------------------- |
+| Fetch packages           | Open outbound 443      | Mirror the registry, allow only the mirror         |
+| Clone the repo           | Git credentials in env | Short-lived scoped token injected by the proxy     |
+| Call an internal API     | Service token          | Proxy adds an entitlement header, sandbox has none |
+| Reach the model provider | Direct API call        | Agent process outside the sandbox, tools inside    |
+
+That last row is the cleanest architectural move available: the loop that talks to the model runs in a trusted control plane, and only tool execution runs in the sandbox. The sandbox never holds a provider key, and network egress from inside it is denied. The cost is a slightly higher-latency tool call, which is invisible next to model time.
+
+Package installation is executing untrusted code, so it needs its own treatment. Pin the index, verify hashes, disable lifecycle scripts where the package manager supports it, and treat an install as a state-changing action subject to the same approval tier as a push.
+
+---
+
+## Budgets and runaway control
+
+| Limit                  | Typical value               | Why it belongs here                         |
+| :--------------------- | :-------------------------- | :------------------------------------------ |
+| Wall-clock per run     | 15 minutes                  | Loops look like slow work otherwise         |
+| CPU                    | 2-4 vCPU                    | A build should not starve a node            |
+| Memory                 | 4-8 GB, no swap             | Test suites balloon, and OOM is informative |
+| Process count          | 64                          | Fork bombs are one line of generated code   |
+| Writable disk          | 2-10 GB plus inode cap      | `rm -rf` loops fill the node otherwise      |
+| Output tokens          | Per-run model cap           | The loop can call the model 200 times       |
+| Tool calls             | Step budget per task        | Prevents the retry-forever pattern          |
+| Cost                   | Per-run and per-day ceiling | The only alarm that catches a silent loop   |
+| Concurrency per tenant | Cap                         | One tenant should not consume the warm pool |
+
+Apply them at three layers: cgroups inside the sandbox, a scheduler-level timeout outside it, and a cost circuit-breaker in the agent loop. A single layer is always the one that failed. The cgroup catches the fork bomb, the scheduler timeout catches a hung build, and the cost breaker catches an agent that is making progress at a rate you cannot afford.
+
+---
+
+## Approval tiers
+
+| Tier      | Examples                                                      | Gate                         |
+| :-------- | :------------------------------------------------------------ | :--------------------------- |
+| Free      | Read files, grep, run tests, lint, local build                | Unattended                   |
+| Scoped    | Install from an allowlisted registry, write to the workspace  | Unattended, logged           |
+| Prompted  | Any egress beyond the allowlist, delete outside the workspace | Human in the loop, resumable |
+| Forbidden | Push, force-push, tag, publish, deploy, touch production data | No override path at all      |
+
+Forbidden has to mean forbidden, enforced at the sandbox boundary rather than in a prompt. "Please do not run `git push`" is not a control; the credential to push must not exist inside the environment, and the network path must not reach the remote.
+
+Pausing for a prompted-tier action requires state that survives the wait. Checkpoint the run after the model proposes the action, serialize the trajectory and the workspace reference, and resume from that record when the human decides. The trap is that code before the pause re-executes on resume if you replay the turn instead of restoring the state, so make the side-effecting step itself the resume boundary.
+
+---
+
+## Verification, outside the sandbox
+
+| Stage                               | Runs where                 | Catches                                           |
+| :---------------------------------- | :------------------------- | :------------------------------------------------ |
+| Build                               | Sandbox                    | Does it compile at all                            |
+| Existing tests                      | Sandbox                    | Obvious regressions                               |
+| Hidden acceptance                   | Sandbox, read-only         | Test gaming, and correctness                      |
+| Lint, typecheck, format             | Sandbox                    | Style drift that makes the diff unreviewable      |
+| Static analysis and secret scan     | CI, outside                | Injected or leaked credentials                    |
+| Dependency diff                     | CI, outside                | A new package the agent added without being asked |
+| Human review                        | Pull request               | Everything else                                   |
+| Full CI with production credentials | Restricted, after approval | Never inside the agent sandbox                    |
+
+The final row is the invariant worth stating: nothing the agent produced ever runs with production credentials automatically. The patch is an untrusted artifact until a second pipeline, in a different trust domain, decides otherwise.
+
+---
+
+## Capacity and cost
+
+```text
+10,000 runs a day at a 90 second median
+  900,000 run-seconds / 86,400      = about 10 concurrent runs average
+  peak factor 5                     = about 50 concurrent
+  on 48 vCPU nodes at 2 vCPU per run = about 3 nodes
+
+per run model spend, 30 turns
+  about 240,000 input tokens plus 15,000 output
+  at 0.80 and 3.20 per million       = about 0.24
+compute at 2 vCPU and 4 GB for 90 s   = a small fraction of that
+```
+
+Model spend dominates by roughly two orders of magnitude, which changes what you optimize. The interesting savings are context discipline and routing, not faster sandboxes: cap retrieved file contents, drop stale observations, send edit-suggestion turns to a small model and reserve the frontier model for planning and failure recovery. Isolation is cheap here, so buy it without hesitation.
+
+| Cost lever                            | Effect                                           |
+| :------------------------------------ | :----------------------------------------------- |
+| Warm pool sized to peak minus arrival | Removes boot time, costs idle capacity           |
+| Pre-baked common toolchains           | Kills per-run install and build setup            |
+| Layer cache keyed per tenant          | Faster clones, and a cross-tenant risk if shared |
+| Context truncation                    | The largest single spend reduction               |
+| Cascade routing by turn type          | Cuts cost without touching planning quality      |
+
+---
+
+## Audit and replay
+
+Every run writes an append-only record: the image digest, base commit SHA, model id and version, prompt version, every tool call with its arguments and result, the final diff, resource peak usage, and cost. That record is simultaneously the incident review artifact, the eval dataset, the compliance answer, and the input to the next prompt iteration.
+
+Replay is the property worth designing for. Given the record, you should be able to re-execute the same run against the same base commit in the same image and get the same behavior except for model sampling. Pin the seed, pin the image by digest, pin dependencies by lockfile, and record the wall-clock-insensitive results rather than timestamps.
+
+---
+
+## Failure modes
+
+| Symptom                                | Cause                                   | Fix                                                  |
+| :------------------------------------- | :-------------------------------------- | :--------------------------------------------------- |
+| A run reaches the internet             | Egress rule too broad                   | Default deny, allowlist only the mirror              |
+| Node IAM role usable from a sandbox    | Metadata endpoint reachable             | Block link-local addresses, use a proxy for identity |
+| Agent "passes" by editing tests        | Test files writable                     | Read-only acceptance mount, diff alert               |
+| Disk fills on one node                 | No quota on the writable layer          | Size plus inode caps, and a per-tenant budget        |
+| Runs pile up after a dependency CVE    | Every run rebuilds the same environment | Pre-baked layers, pinned and refreshed deliberately  |
+| Tenant A sees Tenant B's build output  | Shared layer or artifact cache          | Namespace caches by tenant, audit keys               |
+| Approval pause loses the run           | Replay instead of restore               | Serialize state at the side-effect boundary          |
+| Cost 20 times normal overnight         | A loop with no circuit-breaker          | Per-run and per-day cost ceilings in the agent loop  |
+| An installed package ran a postinstall | Lifecycle scripts enabled               | Ignore-scripts installs, hash-pinned mirror          |
+| Patch applied to the wrong branch      | Mutable branch checkout                 | Pin commit SHA in the run record                     |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What is the threat model for an agent that executes code it wrote?">
+
+    Repository content can inject instructions, dependencies can carry code, the environment can hold credentials, and the loop can consume unbounded resources. Injection turns a remote code execution problem into a data problem, so assume hostile code.
+
+  </Accordion>
+  <Accordion title="2. Why is a plain container the wrong isolation boundary here?">
+
+    Namespaces and seccomp still share the host kernel, which is the weakest available boundary for code you did not write. A user-space kernel or a microVM is the floor.
+
+  </Accordion>
+  <Accordion title="3. Compare gVisor and Firecracker for this workload.">
+
+    gVisor intercepts syscalls in a user-space kernel with real overhead on syscall-heavy work and starts in hundreds of milliseconds. Firecracker gives a hardware virtualization boundary, boots around 125 ms, and exposes only block and network devices. Builds usually take gVisor for speed, and multi-tenant arbitrary code takes Firecracker.
+
+  </Accordion>
+  <Accordion title="4. Name three things that must never be reachable from inside the sandbox.">
+
+    The cloud metadata address, production credentials, and arbitrary outbound network. The first two are what turn a sandbox escape into an account-level incident.
+
+  </Accordion>
+  <Accordion title="5. How do you let the agent install packages without opening egress?">
+
+    Mirror the registry, allow only the mirror, verify hashes, disable lifecycle scripts, and treat install as a state-changing action with its own approval tier.
+
+  </Accordion>
+  <Accordion title="6. Why put the model call outside the sandbox?">
+
+    Then the sandbox needs no provider key and no outbound internet at all. The trusted control plane holds the loop and the token, the untrusted execution environment holds neither.
+
+  </Accordion>
+  <Accordion title="7. How do you stop an agent from making its own tests pass?">
+
+    Put acceptance tests on a read-only mount, run them after applying the patch, and flag any diff that touches a test file for human review rather than treating a green run as proof.
+
+  </Accordion>
+  <Accordion title="8. Which resource limits do you set, and where are they enforced?">
+
+    Wall clock, CPU, memory, process count, disk and inodes, output tokens, tool-call count, and cost. Enforce at three layers: cgroups inside, scheduler timeout outside, cost breaker in the loop.
+
+  </Accordion>
+  <Accordion title="9. What is the difference between blocking a command and forbidding an action?">
+
+    A prompt instruction is advisory. Forbidding means the capability does not exist in the environment: no credential, no network path, no device, so the command fails regardless of what the model decides.
+
+  </Accordion>
+  <Accordion title="10. How do you pause for human approval without losing the run?">
+
+    Checkpoint after the model proposes the action, serialize the trajectory and workspace reference, and resume from that state. Replaying the turn re-executes the code before the pause, which is the bug to avoid.
+
+  </Accordion>
+  <Accordion title="11. Where does a sandbox-produced patch run next?">
+
+    In a different trust domain, in ordinary CI, with production credentials only after human approval. The agent's own test run is evidence, not a gate.
+
+  </Accordion>
+  <Accordion title="12. At 10,000 runs a day with a 90-second median, how much concurrency do you need?">
+
+    About 900,000 run-seconds divided by 86,400 is roughly 10 concurrent, and a peak factor of 5 makes about 50, which is a few nodes at 2 vCPU per run.
+
+  </Accordion>
+  <Accordion title="13. What dominates cost in this system, and what is the lever?">
+
+    Model tokens, by around two orders of magnitude over compute. Context truncation and per-turn routing cut far more than any sandbox optimization, so buy the isolation without hesitating.
+
+  </Accordion>
+  <Accordion title="14. What belongs in the audit record for one run?">
+
+    Image digest, base commit, model and prompt versions, every tool call with arguments and results, the final diff, peak resource use, and cost. That is the incident artifact and the eval dataset at once.
+
+  </Accordion>
+  <Accordion title="15. What makes a coding-agent run replayable?">
+
+    Pinned image by digest, pinned commit, pinned lockfile, a fixed seed, and recording results instead of timestamps, so a rerun differs only through model sampling.
+
+  </Accordion>
+</Accordions>

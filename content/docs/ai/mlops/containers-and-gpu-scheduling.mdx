@@ -1,0 +1,328 @@
+---
+title: Containers and GPU Scheduling
+description: 'Multi-stage CUDA Docker images, Kubernetes GPU scheduling with device plugins, MIG and time-slicing, gang scheduling, and GPU cold-start optimization.'
+---
+
+Three problems show up in every GPU deployment. The image is large enough that pulling it dominates startup, the scheduler does not natively understand a device that cannot be shared like a CPU, and a serverless GPU that scales to zero takes minutes to become useful rather than milliseconds.
+
+Each has an established answer, and the answers are mechanical enough to memorize for an interview.
+
+---
+
+## Multi-stage CUDA images
+
+A build needs the CUDA toolkit: `nvcc`, headers, static libraries. A running container needs only the runtime shared libraries. Shipping the toolkit in the final image costs gigabytes, expands the CVE surface, and buys nothing, unless the process compiles at startup.
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+ARG CUDA_VERSION=12.4.1
+ARG BASE_TAG=ubuntu22.04
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-${BASE_TAG} AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake git ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+ENV PIP_NO_CACHE_DIR=1
+WORKDIR /app
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu124
+COPY . .
+RUN pip install --no-build-isolation -e . && python -m compileall -q src
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-${BASE_TAG} AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libgomp1 curl dumb-init \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /usr/local/lib/python3.11/dist-packages /usr/local/lib/python3.11/dist-packages
+COPY --from=builder /app/src ./src
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV LD_LIBRARY_PATH=/usr/local/lib/python3.11/dist-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH}
+ENTRYPOINT ["dumb-init", "--", "python", "-m", "serve"]
+```
+
+The stage boundary is where the toolkit disappears. `-devel` carries the compiler and headers; `-runtime` carries the shared libraries only, and `COPY --from=builder` moves the installed site-packages across without the toolchain that produced them.
+
+| Layer, in build order    | Invalidated by         | Rule                                 |
+| :----------------------- | :--------------------- | :----------------------------------- |
+| Base CUDA image          | Bumping `CUDA_VERSION` | Pin by digest for reproducible rolls |
+| apt packages             | The package list       | One `RUN`, remove lists in the same  |
+| `pip install -r`         | `requirements.txt`     | Copy the lockfile, not the source    |
+| Compiled CUDA extensions | Any source change      | Last, so edits do not rebuild wheels |
+| Application source       | Every commit           | Copy it as late as possible          |
+
+### Driver and runtime compatibility
+
+The driver lives on the host and is never in the image, which is why `nvidia-smi` inside a container is a mount, not a library. The container's CUDA runtime version must be no newer than what the host driver supports.
+
+| Situation                                | Result                                                         |
+| :--------------------------------------- | :------------------------------------------------------------- |
+| Driver supports CUDA 12.6, image is 12.4 | Works. Minor versions are forward compatible within a major    |
+| Driver supports CUDA 11.8, image is 12.x | Fails at import with a version mismatch                        |
+| `libcuda.so` missing                     | Runtime device plugin or `--gpus` not wired                    |
+| cuDNN symbols missing                    | `LD_LIBRARY_PATH` does not include the pip `nvidia-cudnn` path |
+| Old driver, new toolkit                  | `nvidia-container-toolkit` compat layer, or upgrade driver     |
+
+Two packaging styles avoid the base image entirely. PyTorch's CUDA wheels vendor the CUDA and cuDNN runtime libraries into `site-packages/nvidia/`, so a plain `ubuntu` or even `python:3.11-slim` base works once `LD_LIBRARY_PATH` points at them. The image shrinks by gigabytes and stops tracking NVIDIA's release cadence. The cost is that `nvcc` is absent, so anything requiring a JIT-compiled extension at runtime breaks.
+
+`NVIDIA_VISIBLE_DEVICES` restricts which devices the container may see; `CUDA_VISIBLE_DEVICES` remaps them to indices 0..n inside the process. Setting both is normal, and the remapping is why multi-GPU code should address devices by UUID when the mapping is not guaranteed.
+
+### Operational details that bite
+
+- **PID 1 signals.** Without `dumb-init` or `tini`, a Python process is PID 1, does not reap zombies, and ignores `SIGTERM`, so a rolling restart waits for the kill timeout. `torchrun` children are the usual orphans.
+- **`.dockerignore` must exclude `.git`, the cache directory, and any `data/` tree.** A 40 GB build context turns a two-minute build into a ten-minute one before any layer runs.
+- **`--mount=type=cache` requires BuildKit.** It is the default in modern Docker, but a CI runner pinned to the legacy builder silently ignores it.
+- **Pin the base by digest.** `nvidia/cuda:12.4.1-runtime-ubuntu22.04` is mutable; a re-push changes what a rebuild means.
+- **Health checks must not need a shell.** A distroless final stage has no `sh`, so write `HEALTHCHECK` with an absolute binary path or drop it and use Kubernetes probes.
+
+---
+
+## Kubernetes GPU scheduling
+
+The default path is the NVIDIA device plugin: a DaemonSet that advertises allocatable GPUs to the kubelet and hands the pod the right device files plus `libcuda`.
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: copilot-inference
+spec:
+  containers:
+    - name: engine
+      image: registry.internal/copilot@sha256:9c1f...
+      resources:
+        limits:
+          nvidia.com/gpu: 2
+          cpu: '16'
+          memory: 64Gi
+        requests:
+          cpu: '16'
+          memory: 64Gi
+      volumeMounts:
+        - name: hf-cache
+          mountPath: /root/.cache/huggingface
+  volumes:
+    - name: hf-cache
+      persistentVolumeClaim: { claimName: hf-cache-pvc }
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+```
+
+`nvidia.com/gpu` is an extended resource, and extended resources are integer-counted and not overcommitable: `requests` must equal `limits`, and fractional values are rejected. GPUs do not behave like CPU, where a pod can be throttled. That single constraint explains most of the rest of this section.
+
+| Model        | Resource name example             | Isolation              | Sharing        | Fails how                         |
+| :----------- | :-------------------------------- | :--------------------- | :------------- | :-------------------------------- |
+| Whole GPU    | `nvidia.com/gpu: 1`               | Hardware               | None           | Small jobs waste a whole device   |
+| MIG          | `nvidia.com/mig-1g.10gb`          | Hardware partition     | Up to 7 slices | Fixed shapes, must re-slice       |
+| Time-slicing | `nvidia.com/gpu: 8`               | None, one CUDA context | N pods per GPU | One tenant's OOM kills the group  |
+| MPS          | MPS control daemon, shared device | Process isolation only | Many to one    | Still shares memory and SMs       |
+| DRA          | Resource claim                    | Driver decides         | Claim-scoped   | Needs a DRA driver, newer cluster |
+
+**MIG** (Multi-Instance GPU) slices an A100 or H100 into up to seven hardware-isolated instances, each with its own memory, SMs, and failure domain. It is the correct answer for a fleet of small models and low-batch endpoints, because the isolation is real and the memory split is enforced. It is the wrong answer for anything needing more than a slice's memory, and re-slicing requires draining the node.
+
+**Time-slicing** is a device-plugin config trick: advertise each physical GPU as N replicas so N pods land on one card. It raises utilization on genuinely bursty workloads and provides no memory protection. Two vLLM instances on one 80 GB card will both allocate what they think is available and then OOM.
+
+```yaml
+# device-plugin config for 4-way time-slicing
+version: v1
+sharing:
+  timeSlicing:
+    replicas: 4
+```
+
+The config schema is versioned, so read the device-plugin release notes before editing a running cluster. What matters conceptually is that `replicas` is a claim the scheduler is told to believe: four devices per physical GPU, with no accounting behind it.
+
+**DRA** reached GA in Kubernetes 1.34 and replaces the count-based model with structured requests: a pod asks for a claim describing what it needs, and a driver implements `ResourceSlice` and `Device` objects that the scheduler matches against. It can express "one device with at least 40 GB of VRAM, sharing it with another workload, on a node where these two devices are NVLink-connected", which the integer model cannot. Driver and ecosystem support is still uneven, so most clusters today run the device plugin.
+
+### Placement and gang scheduling
+
+| Concern                    | Mechanism                                                          |
+| :------------------------- | :----------------------------------------------------------------- |
+| Keep GPU pods on GPU nodes | Taint the node pool, tolerate it in the pod spec                   |
+| Prefer a specific SKU      | `nodeSelector` on `node.kubernetes.io/instance-type` or a label    |
+| Preempt lower jobs         | `priorityClassName` plus a `PriorityClass` with `preemptionPolicy` |
+| All-or-nothing multi-node  | A scheduler that supports gang semantics: Volcano, Kueue           |
+| Avoid splitting one job    | Topology-aware hints: same NVLink domain, same rack                |
+| Weight pulls off the path  | Pre-baked image, CSI volume, or a caching layer like Alluxio       |
+
+Gang scheduling matters more than people expect. A four-node `torchrun` job with three pods scheduled and one pending is not slow, it is stuck: NCCL waits for all ranks, the pending pod holds the reservation, and the cluster looks busy while doing nothing. `minAvailable` on a pod group makes the scheduler admit all the ranks or none.
+
+For multi-node training, `NCCL_SOCKET_IFNAME`, `NCCL_IB_GID_INDEX`, and `NCCL_DEBUG=INFO` are the three environment variables that turn an unexplainable hang into a readable one. InfiniBand interfaces are frequently not the default route, so NCCL picks eth0, connects, and then deadlocks at the first all-reduce.
+
+---
+
+## Cold start
+
+Serverless cold start is the operational name for this, and a GPU serverless endpoint pays four costs before it serves the first token. Only one of them is the model.
+
+```text
+t=0     request arrives, no warm replica
+        +-- image pull          5-8 GB layer transfer
+        +-- weight load        10-30 GB from object store or a cache volume
+        +-- engine init         memory profiling, KV block allocation, CUDA graph capture
+        +-- first prefill       the only part that is inference
+t=N     first token
+```
+
+The arithmetic on the second line is the one to quote. A 7B model in `fp16` is 14 GB of weights, so:
+
+| Source                         | Throughput    | 14 GB load     |
+| :----------------------------- | :------------ | :------------- |
+| Object store, single stream    | 150-300 MB/s  | 50-90 s        |
+| Object store, 32 parallel GETs | 3-5 GB/s      | 3-5 s          |
+| Local NVMe, pre-baked          | 3-7 GB/s      | 2-5 s          |
+| Network filesystem             | 0.5-2 GB/s    | 7-28 s         |
+| Node-local page cache, warm    | RAM bandwidth | under a second |
+
+Nothing in that table is about the model. It is about bytes and the path they travel, which is why the mitigations are storage and scheduling tricks rather than ML tricks.
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["Scale from zero"] --> B["Pull image"]
+    B --> C["Fetch weights"]
+    C --> D["Allocate KV pool"]
+    D --> E["Compile or capture graphs"]
+    E --> F["Prefill request 1"]
+    F --> G["Ready"]
+    C -.->|"pre-baked into image"| G
+    C -.->|"node-local cache"| G
+    E -.->|"persisted compile cache"| G
+    A -.->|"warm pool: skip entirely"| G
+`}
+/>
+
+| Technique                       | Attacks                  | Cost                                              |
+| :------------------------------ | :----------------------- | :------------------------------------------------ |
+| Pre-bake weights into the image | Weight fetch entirely    | Multi-gigabyte image, slow pull, rebake per model |
+| Node-local NVMe weight cache    | Weight fetch bandwidth   | Cache eviction, per-node disk                     |
+| Streaming tensor format         | Weight fetch latency     | Serializer choice, one-pass load                  |
+| Parallel range GETs             | Single-stream throttling | More connections, more egress cost                |
+| Process-memory snapshot/restore | Engine init and compile  | Vendor-specific, memory image storage             |
+| Persisted `torch.compile` cache | JIT on first request     | Cache keyed on GPU arch plus version              |
+| Skip CUDA graph capture         | Engine init              | Slower steady-state decode                        |
+| Warm pool, minimum instances    | Everything               | Paying for idle capacity                          |
+| Allow true scale-to-zero        | Idle cost entirely       | Every first request pays the full boot            |
+
+`tensorizer` and `safetensors` both matter here. `safetensors` is mmap-friendly and avoids loading through a Python deserializer, so a warm page cache makes reload nearly free. `tensorizer` writes tensors as one contiguous, network-streamable file so loading overlaps transfer, and it can skip materializing weights the process will memory-map instead.
+
+`torch.compile` and CUDA graph capture are the two silent contributors. Compilation is keyed on graph shape and GPU architecture, so a cache directory on a shared volume cuts the second cold start dramatically, while `--enforce-eager` in an inference engine removes capture at the price of per-step kernel launch overhead.
+
+### Deciding whether serverless is even right
+
+Break-even is a utilization question, not a preference.
+
+```text
+dedicated:  P_gpu_per_hour * 24 * 30                       (paid every hour)
+serverless: P_per_second * active_seconds + cold_starts * penalty
+
+dedicated wins once utilization > cold-start-and-idle overhead / total hours
+```
+
+The premium is the whole calculation. Serverless per-second GPU rates run several times the amortized hourly price of the same card, so idle savings have to cover that multiplier plus every cold start. If the serverless rate is three times the dedicated equivalent, serverless only wins below roughly 33 percent duty cycle.
+
+Run the numbers on real traffic shape rather than on average utilization. A model that idles all night and spikes for four hours is the profile serverless exists for. A model at a steady 30 percent of one card, all day, is a dedicated instance with a spare GPU, and per-second billing there costs several times more while adding 40-second p99 first tokens.
+
+Autoscaling should key on queue depth or in-flight tokens, not CPU. A GPU serving a long generation shows idle CPU the entire time it is busy.
+
+---
+
+## Failure modes
+
+| Symptom                                         | Cause                                                  | Fix                                                  |
+| :---------------------------------------------- | :----------------------------------------------------- | :--------------------------------------------------- |
+| `CUDA unknown error - all devices busy`         | A pod holding the device crashed without releasing     | Restart the device plugin, check for leaked contexts |
+| Image pulls for 6 minutes on every deploy       | Weights baked into a mutable layer                     | Move weights to a cache volume, keep the image small |
+| Two pods OOM together on one GPU                | Time-slicing with no memory limit                      | MIG, or one engine per GPU with batching             |
+| `torchrun` job hangs with 3 of 4 pods running   | No gang scheduling                                     | Pod group with `minAvailable`                        |
+| NCCL times out at the first collective          | Wrong `NCCL_SOCKET_IFNAME`                             | Pin the interface, enable `NCCL_DEBUG=INFO`          |
+| Cold start 90 seconds, then fine                | Single-stream weight download                          | Parallel range GETs or a node-local cache            |
+| Every pod compiles kernels on boot              | `torch.compile` cache not shared                       | Volume keyed on GPU arch plus library versions       |
+| Rolling update leaves GPU nodes unschedulable   | `limits` omitted on the extended resource              | Set `requests` equal to `limits`                     |
+| Pod starts, `nvidia-smi` missing                | Container runtime not configured with the toolkit hook | Install `nvidia-container-toolkit` on the node       |
+| Endpoint slow only on the first request per day | Scale-to-zero plus lazy engine init                    | Warm pool sized to the arrival gap                   |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What goes in the builder stage of a CUDA image and what stays out of the final one?">
+
+    The toolkit, compiler, headers, and build tools. The final stage keeps the runtime shared libraries and the installed packages, so `nvcc` and the apt build dependencies do not ship.
+
+  </Accordion>
+  <Accordion title={<>2. How can a container run PyTorch on CUDA without an <code>nvidia/cuda</code> base image?</>}>
+
+    The pip CUDA wheels vendor the runtime libraries into site-packages. Point `LD_LIBRARY_PATH` at them and a slim Python base works, as long as nothing needs `nvcc` at runtime.
+
+  </Accordion>
+  <Accordion title="3. Why is the driver never in the image?">
+
+    The kernel-mode driver belongs to the host. The container runtime mounts `libcuda.so` and the device nodes, so the image only carries the user-space runtime, which must be no newer than the host driver supports.
+
+  </Accordion>
+  <Accordion title={<>4. What breaks when you forget an init process like <code>dumb-init</code>?</>}>
+
+    Python becomes PID 1, does not reap children or handle `SIGTERM`, so rolling restarts block until the kill timeout and `torchrun` leaves zombies.
+
+  </Accordion>
+  <Accordion title={<>5. Why must <code>requests</code> equal <code>limits</code> for <code>nvidia.com/gpu</code>?</>}>
+
+    GPUs are an extended resource: integer counted, not compressible, not overcommitable. Kubernetes therefore refuses fractional values and requires an explicit limit.
+
+  </Accordion>
+  <Accordion title="6. When is MIG the right call and when is it not?">
+
+    Right for many small low-batch models, because the memory and SM split is hardware-enforced with an independent failure domain. Wrong for a single large model needing more memory than one slice, and re-slicing needs a node drain.
+
+  </Accordion>
+  <Accordion title="7. What is the specific danger of time-slicing?">
+
+    It advertises replicas with no memory isolation. Each tenant believes it owns the whole card, allocations succeed, and the first OOM kills the co-located workloads.
+
+  </Accordion>
+  <Accordion title="8. What does DRA add over the device plugin, and what is its catch?">
+
+    Structured device claims let you request capacity, sharing, and topology constraints instead of an integer count. GA in Kubernetes 1.34, it still needs a DRA driver and cluster support, so most fleets run the device plugin today.
+
+  </Accordion>
+  <Accordion title="9. Why does a multi-node training job need gang scheduling?">
+
+    NCCL waits for every rank. With three of four pods placed, the job is stuck while holding resources, so a scheduler that admits all ranks or none prevents a dead reservation.
+
+  </Accordion>
+  <Accordion title="10. Name four components of GPU cold start and the cheapest one to remove.">
+
+    Image pull, weight fetch, engine init including memory profiling and graph capture, then the first prefill. Weight fetch is the cheapest to remove with a node-local cache or parallel range reads.
+
+  </Accordion>
+  <Accordion title="11. A 14 GB model takes 80 seconds to load on one endpoint and 4 seconds on another identical one. What differs?">
+
+    Bandwidth per stream. One pulls with a single sequential stream from object storage; the other uses parallel range GETs or a warm local cache.
+
+  </Accordion>
+  <Accordion title={<>12. What do <code>safetensors</code> and streamed tensor formats each improve?</>}>
+
+    `safetensors` is mmap-friendly and skips pickle-style deserialization, so a warm page cache reloads almost free. A streamable format overlaps network transfer with tensor materialization.
+
+  </Accordion>
+  <Accordion title="13. When does a dedicated GPU beat serverless inference?">
+
+    Once sustained utilization exceeds the idle-plus-cold-start overhead. Around a third of a day at high duty cycle, per-second billing and 40-second first tokens cost more than a reserved instance.
+
+  </Accordion>
+  <Accordion title="14. Which metric should a GPU endpoint autoscale on, and why not CPU?">
+
+    Queue depth or in-flight tokens. A GPU mid-generation shows near-idle CPU, so a CPU-based autoscaler never scales out during the busiest moments.
+
+  </Accordion>
+  <Accordion title={<>15. What does <code>--enforce-eager</code> trade?</>}>
+
+    It skips CUDA graph capture, removing seconds of engine initialization, and pays for it in per-step kernel launch overhead during decode.
+
+  </Accordion>
+</Accordions>

@@ -1,0 +1,309 @@
+---
+title: 'System Design: Multi-Tenant RAG'
+description: 'Enterprise retrieval over tenant documents with role-based access: scale math, isolation models, permission propagation, and the leak failure modes.'
+---
+
+Design prompt. Build an internal knowledge assistant for a B2B SaaS company. Every customer uploads documents into their own workspace, employees of that customer ask questions through your product, and your own support agents answer questions too. Roughly 400 customer tenants, 10,000 seats, and a strict requirement that no tenant can retrieve another tenant's content.
+
+This is the question that tests whether you understand role-based access control as a property of the retrieval path rather than a layer bolted on afterwards. Everything else is ordinary RAG. The RBAC mapping is the deliverable: a role becomes a group id, a group id becomes a query predicate, and the predicate constrains the search itself.
+
+---
+
+## Clarify first
+
+| Question                                      | Assumption I commit to                                                      |
+| :-------------------------------------------- | :-------------------------------------------------------------------------- |
+| Whose documents, whose questions?             | Tenant content, asked by tenant users and by internal support               |
+| Where does the permission truth live?         | The customer's identity provider and app database                           |
+| Real-time or overnight freshness?             | Documents searchable within 10 minutes of upload                            |
+| How fast must revocation take effect?         | Under 5 minutes, and it is a security requirement                           |
+| Cross-tenant search needed?                   | Never for tenant users, yes for internal support                            |
+| Data residency?                               | Yes for 40 tenants in the EU, so region-scoped clusters                     |
+| Can the answer reveal that a document exists? | No, so titles and counts are access-controlled too                          |
+| Volume and latency target?                    | 24,000 queries a day, p95 first token under 1.5 s, p95 end to end under 6 s |
+
+Two of those answers change the architecture, and a candidate who does not ask about them spends the next twenty minutes designing the wrong system: revocation latency, because it rules out overnight permission re-indexing, and whether document existence is itself sensitive, because it rules out naive citations.
+
+---
+
+## Scale math
+
+Write this down before drawing boxes. The numbers are design inputs, not measurements.
+
+| Quantity                | Derivation                                                      | Value          |
+| :---------------------- | :-------------------------------------------------------------- | :------------- |
+| Documents               | 400 tenants, 12,500 each                                        | 5 million      |
+| Chunks                  | 5M docs, average 12 chunks of 512 tokens                        | 60 million     |
+| Vector storage          | 60M chunks, 1024 dimensions, 4 bytes each                       | about 245 GB   |
+| After int8 quantization | 1 byte per dimension                                            | about 61 GB    |
+| Text payload            | 60M chunks, 512 tokens, roughly 2 bytes per token in storage    | about 61 GB    |
+| Embedding backfill      | 60M chunks times 512 tokens is 30.7B tokens at 0.02 per million | about 600      |
+| Ingestion wall time     | 5M docs at 50 docs per second                                   | about 28 hours |
+| Queries per day         | 3,000 daily actives times 8 queries                             | 24,000         |
+| Average and peak QPS    | 24,000 over an 8-hour working day, peak factor 6                | 0.8 and 5      |
+| Prompt size per query   | 1.5K system plus 6 retrieved chunks of 512 plus the question    | about 5K in    |
+
+The 245 GB figure is the one to say out loud, because it decides your index type. A single HNSW graph over 60M vectors needs its neighbors resident in RAM, which means either a large-memory node per shard or quantized vectors plus a reranker. If you had said "one cluster, no sharding" before doing this arithmetic, the arithmetic is where you change your mind.
+
+---
+
+## Architecture
+
+<Mermaid
+  chart={`
+flowchart TD
+    U["Tenant user"] --> GW["API gateway, authn and tenant claim"]
+    GW --> PMS["Permission resolver, group ids from the app DB"]
+    PMS --> QR["Query rewriter"]
+    QR --> VDB["Vector store, pre-filtered ANN"]
+    VDB --> RR["Cross-encoder reranker"]
+    RR --> BUD["Context budget and dedupe"]
+    BUD --> GEN["Generator with citation schema"]
+    GEN --> VER["Groundedness verifier"]
+    VER --> RESP["Answer plus citations"]
+    subgraph INGEST["Ingestion path"]
+      UP["Upload"] --> PARSE["Parse and chunk"]
+      PARSE --> EMB["Embed"]
+      EMB --> ACL["Attach ACL and tenant metadata"]
+      ACL --> VDB
+    end
+    IDP["Identity provider"] --> PMS
+    IDP --> ACL
+    RESP --> TRACE["Trace store"]
+    TRACE --> DS["Eval dataset"]
+`}
+/>
+
+| Component             | Job                                                         | Runs                                  |
+| :-------------------- | :---------------------------------------------------------- | :------------------------------------ |
+| Gateway               | Authentication, tenant claim, rate limit                    | Request path                          |
+| Permission resolver   | Expand the user into group ids, cache 60 seconds            | Request path                          |
+| Query rewriter        | HyDE or decomposition only if it earns its latency          | Request path                          |
+| Vector store          | Filtered ANN returning top 50, filter applied before search | Request path                          |
+| Reranker              | Cross-encoder scoring the 50 down to 6                      | Request path                          |
+| Context budget        | Dedupe by parent span, truncate by score, pack tokens       | Request path                          |
+| Generator             | Structured output with per-claim source spans               | Request path                          |
+| Groundedness verifier | Claim against retrieved spans asynchronously                | Request path, high-stakes routes only |
+| Ingestion pipeline    | Parse, chunk, embed, attach ACL, publish                    | Background                            |
+| Revocation consumer   | Deletes or re-tags vectors on an access-change event        | Background                            |
+
+The permission resolver is the component most designs omit. Group membership is not in the document, it is a property of the user at query time, and resolving it is the difference between correct filtering and a cache of stale answers.
+
+---
+
+## Where access control actually lives
+
+Four options, and the differences are operational rather than theoretical.
+
+| Model                             | Isolation | Ops cost                    | Cross-tenant search | Failure mode                             |
+| :-------------------------------- | :-------- | :-------------------------- | :------------------ | :--------------------------------------- |
+| One index per tenant              | Strongest | 400 indices                 | Impossible          | Empty index explosion, per-tenant tuning |
+| Shared index, metadata pre-filter | Good      | One cluster                 | Trivial for staff   | A bug in the filter is a breach          |
+| Shared index, post-filter         | Weak      | One cluster                 | Yes                 | Returns nothing, and leaks by count      |
+| Document-level allowlist at query | Good      | One cluster plus a resolver | Yes                 | Resolver cache staleness                 |
+
+**Pre-filter versus post-filter is the whole question.** A post-filter runs ANN for the top 50 across everything, then throws away what the user may not read. The result is an empty answer for a user with plenty of accessible content, and a count or a snippet that reveals what exists. Every serious vector store exposes filtered search where the predicate constrains the graph traversal, and that is what you must ask for by name.
+
+The predicate carries tenant id, the user's group ids, and a document-level public flag. A document visible to everyone in the tenant is a tag, not a copy. The store's payload must therefore hold a permission array, and the query must match it, rather than relying on the application to check afterwards.
+
+For a tenant count in the thousands, one index per tenant becomes unmanageable: HNSW parameters tuned per tenant, tiny shards with poor recall, and a control plane with 400 moving parts. The hybrid that holds up is one cluster per region with tenant partitioning inside it, plus a hard filter.
+
+### Permission propagation
+
+| Event                     | Required reaction                                 | Budget     |
+| :------------------------ | :------------------------------------------------ | :--------- |
+| New document uploaded     | Parsed, embedded, searchable                      | 10 minutes |
+| User added to a group     | Nothing in the index; resolver cache expires      | 60 seconds |
+| User removed from a group | Nothing in the index, same reason                 | 60 seconds |
+| Document ACL narrowed     | Update the vector payload tags, not the embedding | 5 minutes  |
+| Document deleted          | Remove vectors and text payload, plus cache flush | 5 minutes  |
+| Tenant offboarded         | Delete the partition, verify by query             | SLA-bound  |
+| Embedding model changed   | Full re-embed, dual-write, then cut over          | Days       |
+
+Note which rows touch the index and which do not. Group membership is a query-time fact and must never be baked into the stored vectors, because baking it in turns a permission change into a re-embedding job, and that is how revocation takes overnight. Document-level ACLs do live in the payload, and they change rarely enough that a metadata-only update is the right cost.
+
+<Callout type="warn">
+  ### The leak nobody designs for
+
+A generated answer summarizes a document the user cannot open. Retrieval filtered correctly, the summary came from an accessible chunk, and the citation reveals a title from a restricted set. Or the answer itself is derived from a chunk that a permission change had already revoked, and the trace cache still holds it. Treat three things as access-controlled objects, not just documents: retrieved text, generated claims that quote it, and metadata revealing existence.
+
+</Callout>
+
+---
+
+## Query path, in order
+
+```text
+1  authenticate, extract tenant id, verify entitlement
+2  resolve group ids (60-second cache)
+3  embed the query, 1 call, about 30 ms
+4  filtered ANN, top 50 under the predicate, 40-120 ms
+5  keyword and vector merge if hybrid, 20 ms
+6  cross-encoder rerank 50 to 6, 80-150 ms batched
+7  dedupe overlapping chunks to parent spans, pack the budget
+8  generate with a citation schema, stream
+9  groundedness check on the claims, async unless high-stakes
+10 write the trace with tenant, filter, versions, tokens, cost
+```
+
+Steps 4 and 6 are where recall is won or lost. Steps 7 and 8 are where the answer becomes defensible, because a chunk boundary cutting a table in half produces a wrong number with a perfect citation. Dedupe to the parent span and hand the generator the surrounding context, not the fragment.
+
+| Budget line                    | Milliseconds |
+| :----------------------------- | :----------- |
+| Gateway plus resolver          | 40           |
+| Query embed plus ANN           | 120          |
+| Rerank                         | 130          |
+| Context assembly               | 20           |
+| Prefill 5K tokens              | 350          |
+| TTFT subtotal                  | about 660    |
+| Decode 400 tokens at 13 ms ITL | 5,200        |
+| E2E                            | about 5.9 s  |
+
+Decode is 88 percent of the budget, which is the point worth making out loud: at a fixed inter-token latency, end-to-end time is a function of answer length, so the output cap is a first-class latency control rather than a safety net. Seven hundred tokens at the same 13 ms would land at 9.8 seconds and break the promise, and the honest fix is a shorter answer, not a faster GPU nobody has quoted you for.
+
+---
+
+## Cost
+
+| Line                             | Assumption                                 | Monthly         |
+| :------------------------------- | :----------------------------------------- | :-------------- |
+| Generation, 24K queries a day    | 5K in at 0.80 per million, 400 out at 3.20 | about 3,800     |
+| Embeddings, incremental          | 3 percent of corpus re-embedded monthly    | about 20        |
+| Reranker, self-hosted            | One L4 or a CPU pool                       | about 250       |
+| Vector store                     | 61 GB quantized plus replicas              | about 1,200     |
+| Object storage and parse compute | 61 GB text plus parsing spikes             | about 150       |
+| Trace store and eval judge       | Sample 5 percent for async judging         | about 600       |
+| **Total**                        |                                            | **about 6,000** |
+
+Generation is two thirds of the bill at these volumes, which makes prompt caching the first optimization: the 1.5K system block and the per-tenant policy preamble are stable prefixes, and moving the variable user text to the end can cut input cost by half before any model routing exists.
+
+Cost per tenant is the number the business wants, and it is only computable if the trace carries the tenant id. Export `sum(tokens * rate) group by tenant` nightly, and you will discover that two tenants account for a third of spend, which is a pricing conversation, not an engineering one.
+
+---
+
+## Evaluation
+
+| Layer          | Set                                | Metric                                | Gate                          |
+| :------------- | :--------------------------------- | :------------------------------------ | :---------------------------- |
+| Retrieval      | 300 labeled queries                | Recall at 6, and mean reciprocal rank | Recall floor per intent slice |
+| Access control | 40 adversarial cross-tenant probes | Any retrieval outside the predicate   | Zero tolerance                |
+| Generation     | 200 golden cases                   | Groundedness, citation validity       | No regression versus baseline |
+| Refusal        | 50 out-of-corpus questions         | Correct "not in the corpus" rate      | Above 90 percent              |
+| Cost           | Every run                          | Tokens per answer, p95 latency        | Within budget                 |
+
+The adversarial suite is the one that earns the design its security review: ask each tenant's user a question whose only good answer lives in another tenant, and assert that retrieval returns nothing and the model refuses. That test runs in CI on every pull request, because a filter regression is silent otherwise.
+
+Citation validity means every cited chunk id was actually in the prompt and contains the quoted span. LLMs cite confidently from context they never used, and a validator that checks id membership plus a substring match catches most of it in microseconds.
+
+---
+
+## Failure modes
+
+| Symptom                                        | Root cause                                       | Fix                                                    |
+| :--------------------------------------------- | :----------------------------------------------- | :----------------------------------------------------- |
+| Correct data, wrong number with a citation     | Chunk cut a table row in half                    | Parent-span dedupe and window the chunk                |
+| Empty answer for a document-rich tenant        | Post-filtering ate the top-k                     | Filtered ANN, pre-constraint                           |
+| Revoked user still sees content                | Resolver or answer cache with no invalidation    | Short cache TTL plus explicit flush on revoke          |
+| Two tenants in one answer                      | Missing predicate, or a shared default namespace | Assert the tenant filter is non-null at the store call |
+| Recall drops after re-embedding                | Thresholds tuned against the old encoder         | Version the index and re-tune together                 |
+| Search latency 10 times baseline               | A tenant uploaded 2M files, hot partition        | Partition-aware placement, per-tenant caps             |
+| Answer reveals a restricted document's title   | Metadata not access-controlled                   | Filter the citation list with the same predicate       |
+| Support agent sees a customer's private answer | Internal tools share the retrieval path          | Separate route, separate audit, explicit entitlement   |
+| Ingestion backlog, stale corpus                | Embedding rate limit during backfill             | Batch plus concurrency cap, priority lane for edits    |
+| Judge score improves, users escalate more      | Eval set is synthetic                            | Rebuild the golden set from production traces          |
+
+---
+
+## Rollout
+
+| Phase | Scope                                                       | Exit criterion                                               |
+| :---- | :---------------------------------------------------------- | :----------------------------------------------------------- |
+| 1     | One friendly tenant, shadow traffic, no user-facing answers | Cross-tenant probes return zero                              |
+| 2     | Internal support agents only, answers shown with citations  | Edit distance from the agent's final reply under a threshold |
+| 3     | 5 percent of tenants, canary by hashed tenant id            | No quality or latency breach for a week                      |
+| 4     | All tenants in one region                                   | Revocation SLA met under load                                |
+| 5     | EU region, residency isolation                              | Regional filter test passes                                  |
+
+Canary by tenant rather than by user. A single user seeing two retrieval configurations within one conversation is how a rollout produces an unreproducible bug report.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What are the first three questions for a multi-tenant RAG prompt?">
+
+    Where the permission truth lives, how fast a revocation must take effect, and whether the existence of a document is itself sensitive.
+
+  </Accordion>
+  <Accordion title="2. Five million documents at twelve chunks of 512 tokens in 1024 dimensions. What does the vector storage cost you?">
+
+    60 million vectors times 4 kilobytes, about 245 GB in float32 and about 61 GB after int8 quantization, before counting text payload and replicas.
+
+  </Accordion>
+  <Accordion title="3. Why does that number decide your index type?">
+
+    A single HNSW graph keeps its neighbor structure resident in RAM, so 60 million vectors forces either large-memory shards or quantized search with a reranker.
+
+  </Accordion>
+  <Accordion title="4. Explain pre-filter versus post-filter, and why it is the central question.">
+
+    Post-filter searches everything then discards what the user cannot read, producing empty answers and information leakage through counts. Pre-filter constrains the graph traversal itself, so only permitted nodes are ever scored.
+
+  </Accordion>
+  <Accordion title="5. Why must group membership be resolved at query time instead of indexed?">
+
+    Because it is a property of the user, not the document. Baked into vectors, a permission change becomes a re-embedding job, and revocation cannot meet a five-minute requirement.
+
+  </Accordion>
+  <Accordion title="6. What does a document ACL change in the store then?">
+
+    A payload metadata update, which is cheap and does not touch the embedding. Only chunking or encoder changes require re-embedding.
+
+  </Accordion>
+  <Accordion title="7. Name three access-controlled objects beyond the documents themselves.">
+
+    Retrieved text placed into the prompt, generated claims that quote it, and metadata such as titles or result counts that reveal existence.
+
+  </Accordion>
+  <Accordion title="8. One index per tenant or a shared index with a filter?">
+
+    Shared index with a hard pre-filter, partitioned per region, once the tenant count makes 400 control planes unmanageable. Separate indexes only for a handful of contractually isolated customers.
+
+  </Accordion>
+  <Accordion title="9. Walk the query path and name the two stages where recall is decided.">
+
+    Auth, resolver, embed, filtered ANN, hybrid merge, rerank, dedupe and pack, generate, verify, trace. Recall is decided at filtered ANN and at the reranker.
+
+  </Accordion>
+  <Accordion title="10. How do you get a correct citation for a chunk the model never read?">
+
+    You do not, so you validate it: assert every cited id was present in the prompt and that the quoted span is a substring. That check is microseconds and catches most fabrication.
+
+  </Accordion>
+  <Accordion title="11. Why does a chunk boundary break numbers specifically, and what fixes it?">
+
+    A table split across chunks loses its header, so the model reads an orphan cell. Dedupe child hits to the parent span and hand over the surrounding window.
+
+  </Accordion>
+  <Accordion title="12. What is the adversarial suite and where does it run?">
+
+    Questions whose only correct answer sits in another tenant, asserting empty retrieval and a refusal. It runs in CI on every pull request, because filter regressions are otherwise silent.
+
+  </Accordion>
+  <Accordion title="13. Which part of the cost dominates at 24,000 queries a day, and what is the first lever?">
+
+    Generation, about 70 percent of spend at these volumes. The first lever is prompt structure: stable system and policy prefixes first, variable user text last, so vendor prompt caching applies.
+
+  </Accordion>
+  <Accordion title="14. Why canary by tenant instead of by user?">
+
+    A user who gets two retrieval configurations mid-conversation produces an experience you cannot reproduce and a bug report you cannot triage.
+
+  </Accordion>
+  <Accordion title="15. A customer asks for an SLA that a revoked employee must lose access in five minutes. What does that rule out architecturally?">
+
+    Any design where permissions are embedded into vectors or rebuilt nightly, and any answer cache keyed only by query text without an ACL component in the key.
+
+  </Accordion>
+</Accordions>

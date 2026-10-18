@@ -1,0 +1,352 @@
+---
+title: CI/CD for AI Systems
+description: 'Golden-dataset evaluation gates on every pull request, shadow deployments, canary rollouts, A/B tests for models and prompts, and atomic rollback.'
+---
+
+A classic ML pipeline has one artifact and one owner: training produces a model, deployment ships it. An LLM system has six things that change independently, three of which nobody reviews, and the test oracle is a stochastic judge rather than an assertion.
+
+That is the difference CI/CD has to absorb. Everything else, including canaries and rollback, is the same discipline you would apply to any service.
+
+---
+
+## The change surface
+
+| What changed               | Who edits it               | Detected by a normal test suite | Gate that catches it                 |
+| :------------------------- | :------------------------- | :------------------------------ | :----------------------------------- |
+| Application code           | Engineers                  | Yes                             | Unit plus integration tests          |
+| Prompt text                | Anyone with console access | Never                           | Golden eval plus review              |
+| Model version              | Registry alias move        | Never                           | Golden eval on the new alias         |
+| Decoding parameters        | Config, sometimes env vars | Rarely                          | Fixed values in the eval run         |
+| Retrieval index and corpus | Data team, self-serve      | Never                           | Retrieval metrics on labeled queries |
+| Router or tool config      | Product, via a flag        | Never                           | Scenario tests per route             |
+
+Only the first row has a compiler. Treating the other five as configuration rather than code is how a team ends up with a production incident whose root cause is a sentence someone reworded on Tuesday.
+
+<Callout type="warn">
+  ### The release unit is the combination, not the component
+
+A prompt tested against model A is not the same program as that prompt against model B. If your CI pins nothing, a vendor model deprecation silently re-runs every prompt against new weights. Put the model id, decoding parameters, prompt version, index build id, and code SHA into one release manifest, and make every gate evaluate that tuple. Rollback then moves one pointer instead of four.
+
+</Callout>
+
+---
+
+## The test stack, bottom up
+
+| Tier                  | Count per change | Runtime    | Catches                                           | Needs a judge |
+| :-------------------- | :--------------- | :--------- | :------------------------------------------------ | :------------ |
+| Static                | Every commit     | Seconds    | Missing template vars, schema drift, secret leaks | No            |
+| Deterministic unit    | Hundreds         | Seconds    | Parsers, chunkers, filters, tool argument shapes  | No            |
+| Retrieval eval        | 100-300 queries  | 1-2 min    | Recall loss, permission leakage, ranking decay    | No            |
+| Golden-set eval       | 150-400 cases    | 3-15 min   | End-to-end answer quality regressions             | Yes or exact  |
+| Scenario tests        | 10-40 journeys   | 5 min      | Multi-turn behaviour, refusal, escalation         | Yes           |
+| Human review          | 20-50 samples    | Hours      | Tail behaviour, tone, the metric you forgot       | Human         |
+| Production monitoring | All traffic      | Continuous | Anything the suite never contained                | Yes, async    |
+
+The first four tiers fit inside a pull request. The last two are the ones that catch what a synthetic suite never contained, and they are the ones teams skip, which produces a green pipeline and unhappy users.
+
+---
+
+## The golden dataset
+
+A curated set of inputs with expected behavior, versioned as an artifact, owned by a named person, and treated as production code.
+
+| Property        | Right                                             | Wrong                           |
+| :-------------- | :------------------------------------------------ | :------------------------------ |
+| Size            | 150-400 cases                                     | 50,000 scraped prompts          |
+| Composition     | Stratified by intent and difficulty               | Whatever was easy to label      |
+| Failure-derived | Half the set is real production failures          | All synthetic, written up front |
+| Ownership       | One owner, review required to edit                | A folder nobody will delete     |
+| Versioning      | Immutable artifact, version in CI logs            | An editable spreadsheet         |
+| Freshness       | New slices added quarterly, none deleted silently | Frozen at launch                |
+
+Size is bounded by the judge, not by ambition. A 200-case suite scored by an LLM judge at 4 samples each is 800 calls; that fits in a pull request check. A 20,000-case suite does not, so it gets run weekly, which means it stops being a gate.
+
+Two rules keep it honest. Cases that come from production failures are worth several synthetic ones, because they encode the distribution your users actually sample. And nothing gets deleted without a diff in review, because the fastest way to make a suite green is to remove the case that was failing.
+
+**Contamination** is the specific hazard for fine-tuned models: a case that leaked into the training corpus measures memorization. If a model was trained on tickets and the eval uses tickets from the same period, the score is not a generalization estimate. Deduplicate the eval set against training data by exact match and near-duplicate detection, and record which set was used.
+
+---
+
+## The pull request gate
+
+```yaml
+# .github/workflows/eval.yml
+name: eval-gate
+on:
+  pull_request:
+    paths:
+      - 'prompts/**'
+      - 'src/**'
+      - 'pyproject.toml'
+
+jobs:
+  golden-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -e ".[dev]"
+      - name: Resolve release manifest
+        run: python tools/manifest.py --prompt-dir prompts/ --out manifest.json
+      - name: Retrieval eval
+        run: pytest -q tests/retrieval --golden-set golden-retrieval:v7
+      - name: Golden eval against candidate alias
+        run: |
+          python tools/run_eval.py \
+            --target models:/copilot@candidate \
+            --golden golden-eval:v12 \
+            --concurrency 8 --samples-per-case 3
+      - name: Compare with baseline and enforce gates
+        run: python tools/gate.py --candidate results.json --baseline main-results.json
+```
+
+`gate.py` is where the policy lives. Four checks, in order of strictness:
+
+| Gate                | Rule                                              | Why                                |
+| :------------------ | :------------------------------------------------ | :--------------------------------- |
+| Absolute floor      | Metric ≥ stated threshold                         | Stop nonsense shipping             |
+| Relative regression | Metric ≥ baseline − tolerance                     | Stop slow decay                    |
+| Slice floors        | No intent slice drops more than its own tolerance | Stop averages hiding a broken path |
+| Safety              | Zero new violations on red-team cases             | Harm has no acceptable rate        |
+
+Tolerance comes from measured judge variance, not from a round number. Run the same 200 cases against the same model three times; if the metric moves 1.5 points, a 1-point regression threshold is noise. Anything inside that band passes, and the gate says "within variance" rather than lying with a green check.
+
+| Cost control               | How                                                            |
+| :------------------------- | :------------------------------------------------------------- |
+| Run only affected suites   | Diff the changed paths, select retrieval or generation         |
+| Subset on PR, full nightly | Stratified 20 percent sample for the fast check                |
+| Cache by content hash      | Skip evaluation when prompt plus model plus data are unchanged |
+| Batch judge calls          | One judge call grades several cases; cheaper, slightly noisier |
+| Budget stop                | Abort when estimated spend exceeds the pull-request cap        |
+
+---
+
+## Shadow, canary, A/B
+
+Three production experiments with different risk profiles, and people constantly name the wrong one.
+
+```text
+shadow    candidate receives copied traffic, results discarded    users unaffected
+canary    candidate serves a hashed slice of live users           users see it, rollback fast
+A/B       two arms serve randomised users, compared statistically users see it, measured
+```
+
+<Mermaid
+  chart={`
+flowchart TD
+    PR["Pull request"] --> BUILD["Build plus unit tests"]
+    BUILD --> GATE["Golden eval gate on candidate alias"]
+    GATE -->|fail| STOP["Block merge"]
+    GATE -->|pass| MERGE["Merge, register version"]
+    MERGE --> SHADOW["Shadow: copied traffic, logged only"]
+    SHADOW -->|metrics hold| CANARY["Canary 1 to 5 to 25 percent"]
+    SHADOW -->|regression| ROLLBACK["Drop candidate, keep version for triage"]
+    CANARY -->|auto-rollback clear| AB["A/B: two arms, measured"]
+    CANARY -->|breach| REVERT["Revert to champion alias"]
+    AB -->|significant| PROMOTE["Move champion alias"]
+    AB -->|inconclusive| RETIRE["Keep champion, log the result"]
+    PROMOTE --> WATCH["Monitor for one full weekly cycle"]
+`}
+/>
+
+### Shadow
+
+Send a copy of live traffic to the candidate and log the response without returning it. It is the only experiment that tests the real input distribution with zero user risk, which makes it the right first move for a model swap.
+
+| Concern         | Answer                                                                      |
+| :-------------- | :-------------------------------------------------------------------------- |
+| How to copy     | Replay from the trace store, or double-write at the router                  |
+| What you learn  | Error rate, latency, token spend, and judge scores on real inputs           |
+| What you do not | Anything downstream of the answer: adoption, satisfaction, escalation       |
+| Cost            | Two calls per request while it runs                                         |
+| Duration        | Enough to cover a weekly and a diurnal cycle, so 3-10 days                  |
+| Traps           | Sampling bias if you replay only 1 percent; side effects if the tool writes |
+
+Side effects are the sharp edge. A shadowed agent that creates tickets, sends email, or executes SQL is not safe to shadow. Gate shadow traffic at the tool boundary: run the model, log the tool call, do not execute it.
+
+Replay timing matters too. Replaying yesterday's traffic today against a live index tests the index as it is now, not as it was, so corpus changes get attributed to the model unless you pin both.
+
+### Canary
+
+Route a stable, hashed slice of traffic to the candidate. Stable hashing by user or session, not random per request, so one person does not get served by both arms and see inconsistent answers.
+
+| Step  | Duration   | Watch                                            | Auto-rollback trigger                 |
+| :---- | :--------- | :----------------------------------------------- | :------------------------------------ |
+| 1 %   | 1-2 hours  | Errors, timeouts, refusal rate                   | Error rate above champion plus 0.5 pp |
+| 5 %   | half a day | Latency percentiles, token spend, guardrail hits | p95 TTFT above SLO                    |
+| 25 %  | one day    | Deflection or adoption, per-slice quality        | Guardrail violation of any kind       |
+| 50 %  | one day    | Anything that needs a full day of traffic        | Cost per request above budget         |
+| 100 % | done       | Keep the old alias as the rollback target        | Manual                                |
+
+A canary detects gross breakage, not 1 percent effects. At 5 percent traffic for a day you have perhaps 2,000 observations of a rare failure mode, which is enough to catch a broken tool call and not enough to conclude anything about satisfaction. Use it as a fuse, then run the A/B.
+
+### A/B
+
+The only pattern that answers "is the new prompt better". Randomize by user, pre-register one primary metric plus guardrails, and compute the sample size before turning it on.
+
+For a proportion metric, the per-arm size approximation is `n ≈ 16 * p * (1 - p) / delta^2` at alpha 0.05 and 80 percent power.
+
+| Baseline p | Minimum detectable delta | n per arm     | Days at 10k/arm/day |
+| :--------- | :----------------------- | :------------ | :------------------ |
+| 0.12       | 1 pp                     | about 17,000  | 2 days              |
+| 0.55       | 1 pp                     | about 39,700  | 4 days              |
+| 0.55       | 0.5 pp                   | about 158,500 | 16 days             |
+| 0.12       | 2 pp                     | about 4,200   | under a day         |
+
+Three things fall out of that table. Detecting small effects needs a lot of traffic, so pick a primary metric with low variance. Continuous metrics like rating scores need fewer samples than binary ones when the scale is used consistently. And halving the effect you care about quadruples the time.
+
+| Threat               | What it looks like                          | Defense                                                         |
+| :------------------- | :------------------------------------------ | :-------------------------------------------------------------- |
+| Peeking              | Stopping at day 2 because it looks positive | Fix the horizon, use sequential tests if early stop is required |
+| Novelty              | Big week one, decay by week three           | Run at least a full weekly cycle                                |
+| Multiple comparisons | One of nine slices is significant           | Pre-register one primary metric                                 |
+| Leakage              | Agents see which model answered             | Hide the arm from the human in the loop                         |
+| Simpson's paradox    | Mixed arms across a routing change          | Stratify randomization by the same unit you analyze             |
+
+Interleaving is the variant worth knowing for retrieval and RAG. Show one user results merged from two rankers in a single list and measure which ranker's documents were clicked first. It compares rankers at the document level, needs a fraction of the traffic an A/B demands, and it cannot measure anything except relative ranking, so it does not replace the A/B for deflection or satisfaction.
+
+---
+
+## Continuous training
+
+Retraining is the one CI/CD pattern an LLM app may not have at all, but a classic ML system should automate it, and the trigger is the interesting part.
+
+| Trigger                    | Fires when                               | Validation before promotion                |
+| :------------------------- | :--------------------------------------- | :----------------------------------------- |
+| Scheduled                  | Fixed cadence, e.g. weekly               | Full suite plus drift report               |
+| Data drift                 | Feature or embedding distribution shifts | Retrain, then compare on the old eval set  |
+| Metric decay               | Live judge or human score trends down    | Add the failing slice before retraining    |
+| New data volume threshold  | Labeled set grew by a factor             | Split audit, contamination check           |
+| Manual                     | A bad week, a new label                  | Same gate as any other run                 |
+| Upstream model deprecation | Vendor retires the base                  | Treat as a full re-validation, not a rerun |
+
+Automation without a promotion gate is a pipeline that ships whatever the data said last week. The gate is the same golden eval, and the registry alias is the only lever that moves traffic.
+
+---
+
+## Rollback
+
+For a compound release, rollback has to be atomic across components.
+
+| Component       | Rollback mechanism             | Trap                                       |
+| :-------------- | :----------------------------- | :----------------------------------------- |
+| Model           | Move the `champion` alias back | In-flight requests keep the old version    |
+| Prompt          | Move the prompt label          | Caches still hold the new rendering        |
+| Index           | Point at the previous build id | Two full indexes temporarily, plus memory  |
+| Decoding config | Redeploy the previous manifest | Env vars set out of band, invisible to git |
+| Code            | Redeploy the previous SHA      | Migrations that are not reversible         |
+
+The mechanism that makes this single-step is the release manifest: one immutable version of the tuple, resolved at request time. Rollback is then a pointer move plus a cache flush, and the operation is fast enough to be worth rehearsing.
+
+---
+
+## What CI cannot catch
+
+A gate measures the distribution it contains. It will not tell you that a new injection pattern works on your agent, that a user asks in a language you never sampled, or that the model now refuses a category you forgot to include. Those are caught by rails at request time and by async review of production traces, which is the reason the eval loop feeds a dataset pipeline rather than ending at merge.
+
+---
+
+## Failure modes
+
+| Symptom                                       | Cause                                     | Fix                                                     |
+| :-------------------------------------------- | :---------------------------------------- | :------------------------------------------------------ |
+| Suite is green, users are angry               | Golden set does not resemble traffic      | Add production failures to the set                      |
+| Gate flaps between runs                       | Judge variance exceeds the tolerance      | Measure variance, widen the band, pin decoding          |
+| Every PR fails the gate after a vendor update | Model id not pinned                       | Put the model id in the release manifest                |
+| Eval cost dominates CI bill                   | Full suite on every PR                    | Stratified subset plus nightly full run                 |
+| Regressions ship anyway                       | Someone edited the golden set to pass     | Make it an immutable artifact, require review           |
+| Canary shows nothing                          | 1 percent traffic for 20 minutes          | Cover a daily and weekly cycle, ramp deliberately       |
+| Shadow doubled spend with no signal           | Replayed a biased 1 percent sample        | Sample by stratum or run the full copy briefly          |
+| A/B never converges                           | Effect smaller than the achievable MDE    | Compute n first; if the horizon is months, do not start |
+| Rollback takes 40 minutes                     | Components rolled back separately         | Atomic alias move on a single manifest                  |
+| Retraining pipeline ships a worse model       | Trigger automation with no promotion gate | Same gate as manual runs, no exceptions                 |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. Which parts of an LLM system can change without a code review?">
+
+    Prompt text, model alias, decoding parameters, index and corpus contents, and router or feature-flag config. Only application code has a compiler behind it.
+
+  </Accordion>
+  <Accordion title="2. Why should the release unit be a tuple rather than a component?">
+
+    Because behavior is a function of all of them. Pinning the prompt without the model means a vendor change re-runs your tested prompt against different weights, and rollback cannot restore a known-good combination.
+
+  </Accordion>
+  <Accordion title="3. How large should a golden evaluation set be, and what bounds it?">
+
+    150-400 cases, bounded by judge cost inside a pull request check. A 20,000-case suite gets demoted to weekly, and a weekly suite stops being a gate.
+
+  </Accordion>
+  <Accordion title="4. What makes a golden case worth more than a synthetic one?">
+
+    Origin. A case captured from a production failure encodes the real input distribution, which is the part a hand-written suite always under-samples.
+
+  </Accordion>
+  <Accordion title="5. What is contamination and which setups suffer most?">
+
+    Eval examples present in training data, so the score measures memorization. It bites fine-tuned models trained on the same corpus period as the eval set, and it is checked by exact and near-duplicate matching.
+
+  </Accordion>
+  <Accordion title="6. Name the four checks a pull-request gate should apply.">
+
+    An absolute floor, a relative regression check against the baseline, per-slice floors, and zero new safety violations on red-team cases.
+
+  </Accordion>
+  <Accordion title="7. Where does the tolerance on a regression gate come from?">
+
+    Measured judge variance. Run the same set three times against the same model; differences inside that band are noise and must pass.
+
+  </Accordion>
+  <Accordion title="8. What can a shadow deployment learn that a canary cannot?">
+
+    Nothing about users, because a shadow has none. It learns error rate, latency, token spend, and quality on real traffic with zero user risk, which makes it the right first step for a model swap.
+
+  </Accordion>
+  <Accordion title="9. What is the specific danger of shadowing an agent?">
+
+    Side effects. A shadowed agent that writes tickets or runs SQL is not shadow-safe, so the copy must stop at the tool boundary and log rather than execute.
+
+  </Accordion>
+  <Accordion title="10. Why hash canary assignment by user instead of randomizing per request?">
+
+    Consistency. Per-request randomness serves one person from both arms, producing contradictory answers and an experience you cannot debug.
+
+  </Accordion>
+  <Accordion title="11. Why is a canary the wrong tool for a 1 percent effect?">
+
+    At 5 percent traffic for a day you collect too few observations of a rare outcome. A canary is a fuse for gross breakage; measurement is the A/B's job.
+
+  </Accordion>
+  <Accordion title="12. Estimate the per-arm sample size for a 12 percent baseline detecting a 1 percentage-point change.">
+
+    `16 * 0.12 * 0.88 / 0.01^2` is about 17,000 per arm at alpha 0.05 and 80 percent power.
+
+  </Accordion>
+  <Accordion title="13. Why does detecting a 0.5 point change on a 55 percent metric take sixteen days instead of four?">
+
+    Sample size scales as the inverse square of the effect. Halving the minimum detectable difference quadruples n, and a 55 percent baseline already has higher variance than a 12 percent one.
+
+  </Accordion>
+  <Accordion title="14. What is interleaving and what can it not measure?">
+
+    One user sees a merged list from two rankers and clicks decide the winner at document level, at a fraction of A/B traffic. It measures relative ranking only, never deflection or satisfaction.
+
+  </Accordion>
+  <Accordion title="15. How do you roll back a prompt plus model plus index change atomically?">
+
+    Resolve all three from one immutable release manifest and move a single alias, then flush caches. Anything else is four rollbacks and a window where no known-good state exists.
+
+  </Accordion>
+  <Accordion title="16. What triggers automated retraining, and what stops it from shipping a worse model?">
+
+    Schedule, drift, metric decay, new labeled volume, or an upstream deprecation. The same golden-eval promotion gate as a manual run is what stops the pipeline shipping whatever the data said.
+
+  </Accordion>
+</Accordions>

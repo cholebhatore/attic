@@ -1,0 +1,354 @@
+---
+title: Dataset and Prompt Versioning
+description: 'DVC for dataset lineage and reproducible pipelines, plus prompt versioning: templates, registries, and treating a prompt as a deployable artifact.'
+---
+
+Two inputs decide what a model outputs, and both sit outside git by default. Datasets are too large for it, and prompts often live in a database or a config file that nobody diffs. Versioning them is the difference between "the eval got worse" and "the eval got worse after the chunking stage started reading a corpus snapshot with 4,000 duplicate documents in it".
+
+DVC handles the data half. The prompt half is a naming and review problem more than a storage problem.
+
+---
+
+## Why not git
+
+| Tool                | Versioning unit        | Large files          | Pipeline reruns  | Best at                                  |
+| :------------------ | :--------------------- | :------------------- | :--------------- | :--------------------------------------- |
+| Git                 | Commits                | No                   | No               | Code, small config                       |
+| Git LFS             | Commits, pointer file  | Yes, in-repo         | No               | Assets a designer edits                  |
+| DVC                 | Content hash           | Yes, out-of-repo     | Yes, `dvc repro` | Reproducible ML pipelines on a team      |
+| git-lfs + snapshots | Timestamp              | Yes                  | Manual           | One-off corpus freezes                   |
+| Delta / Iceberg     | Table snapshot         | Yes, on object store | No               | Structured tables with row-level history |
+| lakeFS              | Branch on object store | Yes                  | No               | Copy-on-write sandboxes over a lake      |
+
+LFS keeps bytes in the repository's infrastructure, so cloning an LFS repo pulls the data. DVC keeps only a pointer file in git and stores the payload on S3, GCS, Azure Blob, or SSH, so a clone is instant and `dvc pull` is opt-in.
+
+---
+
+## DVC mechanics
+
+The whole tool is content addressing plus a git pointer.
+
+```bash
+git init copilot-corpus && dvc init
+# dvc init writes .dvc/config, .dvcignore, and .dvc/.gitignore
+
+echo "support_tickets/*.parquet" >> .gitignore   # dvc add does this for you
+dvc add data/tickets-2026-09.parquet
+git add data/tickets-2026-09.parquet.dvc .dvc
+git commit -m "data: september ticket corpus"
+
+dvc remote add -d s3store s3://acme-ml-artifacts/copilot/dvc
+dvc push
+```
+
+`dvc add` hashes the file, copies it into the local cache under `.dvc/cache`, appends the path to `.gitignore`, and writes a pointer. The pointer is short and reviewable in a pull request.
+
+```yaml
+# data/tickets-2026-09.parquet.dvc
+outs:
+  - md5: 1a7b3c9d4e5f60718293a4b5c6d7e8f9
+    size: 812345678
+    path: tickets-2026-09.parquet
+```
+
+Because the pointer holds a hash and not a timestamp, two people who add the same bytes get the same pointer, so a merge conflict on identical data resolves to no change.
+
+| Command                      | What it does                                                  |
+| :--------------------------- | :------------------------------------------------------------ |
+| `dvc status`                 | Local tree versus cache: what would be pushed                 |
+| `dvc status -c`              | Cache versus remote: what would be downloaded                 |
+| `dvc pull` / `dvc push`      | Sync cache with the configured remote                         |
+| `dvc diff HEAD~1`            | Which data changed between two commits, and its size delta    |
+| `dvc import-url https://...` | Track an external file by hash, refreshable with `dvc update` |
+| `dvc checkout`               | Restore the workspace data recorded in the current commit     |
+| `dvc cache dir /fast/nvme`   | Move the cache off a slow home volume                         |
+
+<Callout type="warn">
+  ### Do not version what you can regenerate in seconds
+
+Tracking a 40 GB raw dump gives you a hash and a push cost. Tracking the 2 GB cleaned output gives you the same lineage for a twentieth of the storage. Track the boundary: raw inputs that cannot be reconstructed, plus derived artifacts expensive enough to be worth caching.
+
+</Callout>
+
+---
+
+## The pipeline file
+
+`dvc.yaml` is the part that makes DVC more than a hash store. Each stage declares its dependencies, and `dvc repro` reruns exactly the stages whose inputs changed.
+
+```yaml
+stages:
+  prepare:
+    cmd: python src/prepare.py
+    deps:
+      - data/tickets-2026-09.parquet
+      - src/prepare.py
+    params:
+      - min_ticket_chars
+      - dedupe.threshold
+    outs:
+      - data/clean.parquet:
+          cache: false
+    metrics:
+      - reports/prepare.json:
+          cache: false
+
+  embed:
+    cmd: python src/embed.py
+    deps:
+      - data/clean.parquet
+      - src/embed.py
+    params:
+      - embedding.model
+      - chunk.size
+    outs:
+      - data/vectors-v3/
+
+  index:
+    cmd: python src/build_index.py
+    deps:
+      - data/vectors-v3/
+      - src/build_index.py
+```
+
+`params` come from `params.yaml`, which lives in git, so a parameter change is a normal code review. `cache: false` on a metric or report stops DVC duplicating files that change every run.
+
+| Trigger                    | Stages that rerun            |
+| :------------------------- | :--------------------------- |
+| `src/prepare.py` edited    | prepare, embed, index        |
+| `params.yaml` chunk size   | embed, index                 |
+| New corpus file added      | prepare and everything after |
+| Metric file edited by hand | nothing, it is an output     |
+
+That cascade is the reproducibility guarantee. A commit is a whole pipeline state, and `dvc repro` on it rebuilds the index that is currently serving traffic.
+
+Other commands worth knowing: `dvc dag` prints the stage graph, `dvc queue status` shows cluster jobs, and `dvc exp run -S chunk.size=256` runs an experiment in an isolated git namespace so a sweep does not dirty your branch.
+
+---
+
+## Lineage end to end
+
+Versioned data is only useful if the version is recorded on the thing it produced.
+
+```text
+corpus git commit 4f2a91
+  -> dvc hash 1a7b...  (tickets-2026-09.parquet)
+  -> clean.parquet     (prepare stage output hash)
+  -> vectors-v3/       (embed stage, params: chunk 512, model bge-m3)
+  -> index snapshot    (pgvector table tag, or Qdrant collection + build id)
+  -> adapter v14       (trained on clean.parquet hash)
+  -> eval report 2026-10-02 on golden-set:v3
+```
+
+Put the upstream hash in the downstream artifact's metadata at build time, not in a wiki afterwards. The question it answers is asked at 2 a.m.: "the corpus had duplicates for six days, which indexes and which models need rebuilding".
+
+For a retrieval index there is a second rule. A change in chunk size, embedding model, or normalization invalidates every stored vector, because similarity is only meaningful within one embedding space. The version tag on an index has to include the embedding model id, or a rollback restores an index built with vectors that no longer match the query encoder.
+
+---
+
+## Prompt versioning
+
+A prompt is code that runs on a nondeterministic interpreter with no compiler. It gets worse for two reasons: it is often edited directly in a vendor console, and its behavior depends on the model and decoding parameters it is paired with, none of which are in the same file.
+
+The unit worth versioning is not the prompt string. It is the prompt program: template, variables, few-shot examples, model id, decoding parameters, and output schema. Change any of the six and the behavior changes.
+
+```text
+prompts/
+  triage/
+    v1.prompt.j2
+    v2.prompt.j2
+    schema.json            # constrained output shape
+    examples/few_shot.jsonl
+    eval/golden-v3.jsonl
+    meta.yaml              # owner, model, params, status, lineage
+  citation/
+    ...
+```
+
+```yaml
+# prompts/triage/meta.yaml
+name: triage
+version: 2.1.0
+owner: support-ai
+model: claude-sonnet-4-5
+params:
+  temperature: 0.2
+  max_tokens: 800
+schema: schema.json
+examples: examples/few_shot.jsonl
+eval: eval/golden-v3.jsonl
+status: champion # draft | candidate | champion | retired
+```
+
+A template is a file with declared variables, so the review diff shows exactly what changed.
+
+```jinja
+{# prompts/triage/v2.prompt.j2 #}
+You are a support triage assistant. Classify the ticket into exactly one category.
+
+Categories: {{ categories | join(", ") }}
+
+Rules:
+- If the ticket mentions billing, prefer "billing" over "account".
+- Return only JSON matching the schema.
+
+Ticket:
+{{ ticket_text }}
+```
+
+The loader resolves a version, and the version goes into the trace, so a production request can be replayed exactly.
+
+```python
+import json
+from pathlib import Path
+
+import yaml
+from jinja2 import Environment, FileSystemLoader
+
+PROMPTS = Path("prompts")
+env = Environment(loader=FileSystemLoader(PROMPTS), keep_trailing_newline=True)
+
+
+def load_prompt(name: str, version: str) -> dict:
+    major, minor = version.split(".")
+    meta = yaml.safe_load((PROMPTS / name / "meta.yaml").read_text())
+    text = (PROMPTS / name / f"v{major}.{minor}.prompt.j2").read_text()
+    return {
+        "name": name,
+        "version": version,
+        "meta": meta,
+        "template": env.from_string(text),
+        "schema": json.loads((PROMPTS / name / meta["schema"].split("/")[-1]).read_text()),
+    }
+
+
+p = load_prompt("triage", "2.1")
+rendered = p["template"].render(categories=["billing", "bug", "account"], ticket_text=text)
+```
+
+Three things this buys you:
+
+| Without prompt versions               | With prompt versions                         |
+| :------------------------------------ | :------------------------------------------- |
+| "It worked yesterday"                 | A diff between two rendered variants         |
+| Silent edits in the vendor console    | Console prompts are exports, reviewed in git |
+| Regression unknown until users notice | The golden suite runs against every version  |
+| Rollback means retyping               | Rollback is a pointer change                 |
+
+### Semantics of a prompt version
+
+| Bump  | Meaning                                          | Example                        |
+| :---- | :----------------------------------------------- | :----------------------------- |
+| Patch | Wording with no behavioral claim, same eval pass | Typo, added a synonym          |
+| Minor | New variable, new category, new few-shot example | Added `escalation_history`     |
+| Major | Output schema or model changed                   | JSON shape, or swap base model |
+
+The eval suite is what makes the bump honest. A minor bump that drops accuracy on a slice is a major bump wearing a costume, and only the numbers say so.
+
+### Registries
+
+A prompt registry stores versions, labels them, and serves them by label so the application never hardcodes a string. Langfuse, W&B Weave, and the vendor consoles all offer some version of this, and they differ on whether the registry is the source of truth or a mirror of git.
+
+| Concern               | Git as source of truth | Registry as source of truth       |
+| :-------------------- | :--------------------- | :-------------------------------- |
+| Review and diff       | Native                 | Depends on the UI                 |
+| Non-engineers editing | Needs a pull request   | Direct, with labels and history   |
+| Runtime fetch         | Bundle at deploy time  | Pull by label at request time     |
+| Rollback              | Revert plus redeploy   | Move the label                    |
+| A/B in production     | Two refs               | Two labels plus a router          |
+| Prompt leakage risk   | Repository access      | Registry access plus network path |
+
+The hybrid that survives contact with a real team: git holds the canonical templates, a CI job publishes each merged version into the registry with a label, and the runtime reads the label. Editing in the registry without a matching commit becomes an alert rather than a mystery.
+
+---
+
+## Failure modes
+
+| Symptom                                        | Cause                                                   | Fix                                                   |
+| :--------------------------------------------- | :------------------------------------------------------ | :---------------------------------------------------- |
+| Two clones of the repo, different data         | `dvc pull` never ran, cache diverged                    | CI runs `dvc status -c` and fails on missing data     |
+| Merge conflict on a `.dvc` file every week     | Everyone regenerates the same output with unstable sort | Make the pipeline deterministic: fixed seed and order |
+| Rebuilt index serves stale results             | Index output marked `cache: false` then deleted         | Keep index builds as versioned artifacts              |
+| Eval score jumps with no model change          | Corpus version advanced silently                        | Pin the corpus hash in the eval job                   |
+| Prompt change ships without review             | Edited in a vendor console                              | Mirror console prompts into git, diff on schedule     |
+| Same prompt, different behavior across deploys | Model or temperature moved out of sync with the version | Version the whole prompt program, not the string      |
+| Few-shot examples drift between environments   | Examples hardcoded in application code                  | Load examples from a versioned file                   |
+| Rollback takes an hour                         | Prompt version resolved at build time only              | Resolve by label at request time, cache briefly       |
+| Storage bill grows every month                 | Old corpus snapshots never expire                       | Retention policy: keep the last twelve monthly        |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="1. What does DVC store in git and what does it store elsewhere?">
+
+    Git gets a pointer file holding a content hash, size, and path. The bytes go to the DVC cache and then to a configured remote such as S3.
+
+  </Accordion>
+  <Accordion title="2. Why does that split beat Git LFS for a training dataset?">
+
+    Cloning does not fetch the data, and multiple derived datasets that share bytes deduplicate by hash in the cache. LFS stores the payload in the repository's own infrastructure.
+
+  </Accordion>
+  <Accordion title={<>3. What does <code>dvc repro</code> decide to rerun?</>}>
+
+    The stages whose declared `deps`, `params`, or upstream `outs` changed. Unchanged stages are skipped from the cache, which is the whole point of declaring them.
+
+  </Accordion>
+  <Accordion title={<>4. Why should parameters live in <code>params.yaml</code> rather than in the script?</>}>
+
+    So a parameter change is a reviewable git diff that DVC can watch as a declared dependency and use to invalidate stages.
+
+  </Accordion>
+  <Accordion title="5. A chunking change lands. Which artifacts are invalid?">
+
+    Everything downstream of embedding: the vectors, the index, and any eval run against that index. Similarity scores are only comparable inside one embedding space.
+
+  </Accordion>
+  <Accordion title="6. What has to be in an index's version tag, and why?">
+
+    The embedding model id plus the chunking parameters, because a rollback that restores vectors built by a different encoder produces silently wrong recall.
+
+  </Accordion>
+  <Accordion title="7. What is a prompt program?">
+
+    Template, variables, few-shot examples, model id, decoding parameters, and output schema. Behavior depends on all six, so a version that names only the string is incomplete.
+
+  </Accordion>
+  <Accordion title="8. Why does a prompt version bump need an eval run to be meaningful?">
+
+    Because patch and minor are behavioral claims. A wording change that drops accuracy on a slice is a major change regardless of how small the diff looks.
+
+  </Accordion>
+  <Accordion title="9. What is the concrete failure of keeping prompts in a vendor console?">
+
+    No diff, no review, no rollback pointer, and no record of which string produced which production answer. Exports into git restore all four.
+
+  </Accordion>
+  <Accordion title="10. When is registry-as-source-of-truth better than git-as-source-of-truth?">
+
+    When non-engineers iterate on prompts and you need label-based rollback and A/B routing at request time. Pair it with a sync job so drift becomes an alert.
+
+  </Accordion>
+  <Accordion title={<>11. What does <code>dvc diff</code> answer during an incident?</>}>
+
+    Which tracked data changed between two commits and by how much, which is how you bound the blast radius of a bad corpus update.
+
+  </Accordion>
+  <Accordion title={<>12. Why would a <code>.dvc</code> file conflict every week in a healthy team?</>}>
+
+    The pipeline is nondeterministic, so the same logical dataset hashes differently each run. Fix the seed and the sort order, not the merge.
+
+  </Accordion>
+  <Accordion title="13. Why should raw dumps usually not be tracked?">
+
+    They are reconstructible and huge. Track what cannot be regenerated plus the expensive derived outputs, and you get the same lineage for a fraction of the storage.
+
+  </Accordion>
+  <Accordion title="14. How do you tie a model back to its corpus?">
+
+    Write the upstream DVC hash into the model artifact's metadata at build time, and record the eval set version alongside it.
+
+  </Accordion>
+</Accordions>
