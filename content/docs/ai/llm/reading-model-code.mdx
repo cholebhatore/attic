@@ -205,62 +205,62 @@ A uniform histogram sits at `1 / n_experts` for every entry. A collapsed one has
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. What are the four files in a Hugging Face model directory, and which one is the fastest to read?">
+  <Accordion title="What are the four files in a Hugging Face model directory, and which one is the fastest to read?">
 
     `configuration_x.py`, `modeling_x.py`, the tokenizer file or two, and `modular_x.py` when the repo has one, each named after the model. The modular file is the fastest read because it declares only what differs from a parent model instead of restating the whole architecture.
 
   </Accordion>
-  <Accordion title={<>2. What does <code>trust_remote_code=True</code> do, and what is the risk?</>}>
+  <Accordion title={<>What does <code>trust_remote_code=True</code> do, and what is the risk?</>}>
 
     It lets `from_pretrained` import and execute Python that shipped inside the model repository, which is how most custom architectures from Chinese labs load at all. The risk is arbitrary code running at import time with your filesystem and credentials, so treat it like piping a curl into a shell: read the file or pin a revision before enabling it on a machine that matters.
 
   </Accordion>
-  <Accordion title={<>3. Which class do you start from when reading a new <code>modeling_*.py</code>, and why not the top of the file?</>}>
+  <Accordion title={<>Which class do you start from when reading a new <code>modeling_*.py</code>, and why not the top of the file?</>}>
 
     `*ForCausalLM.forward`. It is short: embed, run the trunk, project to `vocab_size`, optionally compute cross-entropy, and it names the submodules to descend into next. The top of the file is imports, `PreTrainedModel` boilerplate and `_supports_*` flags, none of which say anything about the architecture.
 
   </Accordion>
-  <Accordion title="4. Given only a tensor name list from a safetensors index, how would you determine the number of routed experts, whether the model uses attention bias, and whether a layer is dense?">
+  <Accordion title="Given only a tensor name list from a safetensors index, how would you determine the number of routed experts, whether the model uses attention bias, and whether a layer is dense?">
 
     The largest integer index in `mlp.experts.N.down_proj.weight`, plus one, is the routed expert count. Whether `self_attn.k_proj.bias` exists alongside the weight answers `attention_bias` without reading the config. A layer whose tensors go from `self_attn` to `mlp.gate_proj.weight` with no `experts` segment is dense.
 
   </Accordion>
-  <Accordion title={<>5. What does <code>num_key_value_heads</code> tell you when it equals <code>num_attention_heads</code>, when it is 1, and when it is between?</>}>
+  <Accordion title={<>What does <code>num_key_value_heads</code> tell you when it equals <code>num_attention_heads</code>, when it is 1, and when it is between?</>}>
 
     Equal to `num_attention_heads`: every query head has its own key and value head, which is multi-head attention and the largest cache. Equal to 1: multi-query, one shared key-value head, smallest cache and the most quality loss. Anything between: grouped-query attention, with that many key-value heads shared across groups of query heads.
 
   </Accordion>
-  <Accordion title={<>6. Why does the absence of <code>shared_expert_intermediate_size</code> in Qwen3-30B-A3B's config matter?</>}>
+  <Accordion title={<>Why does the absence of <code>shared_expert_intermediate_size</code> in Qwen3-30B-A3B's config matter?</>}>
 
     It means there is no always-active expert, unlike Qwen 2-MoE and DeepSeek-V3. Every token's feed-forward work goes through 8 of 128 routed experts with no unconditional baseline, which changes the per-token FLOP count and leaves the load-balancing loss as the only thing preventing every expert from having to relearn common linguistic behaviour.
 
   </Accordion>
-  <Accordion title="7. How do you read the parameter shapes of a 30B model on a laptop?">
+  <Accordion title="How do you read the parameter shapes of a 30B model on a laptop?">
 
     Do not read the weights. Fetch `model.safetensors.index.json`, a small JSON file, to get every tensor name and `metadata.total_size` in bytes, then open a shard with `safe_open` and use `get_slice` to print shapes and dtypes. It reads only the header, so it works on a file larger than RAM.
 
   </Accordion>
-  <Accordion title={<>8. What does <code>{'attn_implementation="eager"'}</code> give you that <code>{'"sdpa"'}</code> does not, and why would you not serve with it?</>}>
+  <Accordion title={<>What does <code>{'attn_implementation="eager"'}</code> give you that <code>{'"sdpa"'}</code> does not, and why would you not serve with it?</>}>
 
     Eager materializes the attention matrix with explicit `matmul` and `softmax`, so the score tensor is real: you can print it, hook it, and read the arithmetic line by line. SDPA fuses the whole thing into a kernel that never writes the score matrix to memory, which is why you serve with it and inspect without it.
 
   </Accordion>
-  <Accordion title="9. A forward hook on an attention module receives a tuple. What is in it?">
+  <Accordion title="A forward hook on an attention module receives a tuple. What is in it?">
 
     Two tuples. `inputs` holds the positional arguments the module received, for an attention block the normed hidden states and the rotary cos/sin pair. `output` holds what it returned, and Qwen-style attention returns the projected output, the value tensor and the attention weights, so a hook storing `output` gets all three and needs indexing.
 
   </Accordion>
-  <Accordion title="10. Why must an ablation match compute rather than training steps?">
+  <Accordion title="Why must an ablation match compute rather than training steps?">
 
     Because different configs do different amounts of work per iteration. A wider model, or one with more active experts, consumes more FLOPs each step, so comparing at equal steps compares unequal training and the confound is the variable under test. Equal `6 N D` means both arms saw the same number of multiply-adds.
 
   </Accordion>
-  <Accordion title="11. What would you log to detect expert collapse before it appears in the loss curve?">
+  <Accordion title="What would you log to detect expert collapse before it appears in the loss curve?">
 
     The expert-selection histogram every 100 steps: `torch.bincount` over the router's top-k indices, normalized to shares. Collapse shows up as mass concentrating on a few experts long before the loss curve bends, because the loss stays flat while effective capacity silently drops.
 
   </Accordion>
-  <Accordion title="12. Name three things you must hold fixed for an architectural ablation to be interpretable.">
+  <Accordion title="Name three things you must hold fixed for an architectural ablation to be interpretable.">
 
     The tokenizer, since a different vocabulary changes tokens per sample and therefore the effective data budget; total compute; the data order and epoch count; and the seed set, with three seeds rather than two, because two runs at the same config can differ by more than the effect being measured.
 

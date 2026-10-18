@@ -153,52 +153,52 @@ These numbers are the checkpoint size. Serving needs the weights plus the KV cac
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. Name the two files that make up a deployed LLM and say what each one contains.">
+  <Accordion title="Name the two files that make up a deployed LLM and say what each one contains.">
 
     The weights and the code. Weights are the trained tensors plus a config saying how to assemble them; the code is the modeling file that reads that config and builds the graph, or a recipe for an engine like vLLM. A checkpoint without its architecture definition is not a model, which is why the config and the modeling file ship together.
 
   </Accordion>
-  <Accordion title={<>2. What is the difference between <code>parameters.bin</code> and a <code>.safetensors</code> checkpoint?</>}>
+  <Accordion title={<>What is the difference between <code>parameters.bin</code> and a <code>.safetensors</code> checkpoint?</>}>
 
     `parameters.bin` is a pickle: it stores Python objects, so loading it executes arbitrary code from whoever produced the file. `.safetensors` is a header of names, dtypes and shapes followed by raw bytes, so it loads by memory mapping, cannot execute anything, and allows lazy per-tensor access. The format exists because model files became an attack surface.
 
   </Accordion>
-  <Accordion title="3. Write the per-connection formula and explain what the bias term contributes that the weight does not.">
+  <Accordion title="Write the per-connection formula and explain what the bias term contributes that the weight does not.">
 
     `y = w . x + b`. The weight scales how much an input contributes; the bias shifts the output regardless of input, so the layer need not pass through the origin. Without it every hyperplane is pinned through zero, and no stack of such layers can represent a constant.
 
   </Accordion>
-  <Accordion title={<>4. A house model has <code>w1 = 27000</code> for bedrooms, <code>w2 = 94</code> for square feet, <code>w3 = 21000</code> for balconies, and <code>b = 45000</code>. Price a 3-bedroom, 1,625 square foot house with 2 balconies.</>}>
+  <Accordion title={<>A house model has <code>w1 = 27000</code> for bedrooms, <code>w2 = 94</code> for square feet, <code>w3 = 21000</code> for balconies, and <code>b = 45000</code>. Price a 3-bedroom, 1,625 square foot house with 2 balconies.</>}>
 
     `27000 * 3 = 81,000`, `94 * 1,625 = 152,750`, `21000 * 2 = 42,000`, plus the bias 45,000, giving 320,750. The arithmetic is the transformer's: multiply, sum, use the result to decide the next value.
 
   </Accordion>
-  <Accordion title="5. Name three ways an LLM differs from that linear model beyond parameter count.">
+  <Accordion title="Name three ways an LLM differs from that linear model beyond parameter count.">
 
     The inputs are learned distributed representations rather than hand-declared columns. The output is a distribution over a vocabulary that is sampled and fed back in. The function is deep, so features are composed across layers instead of read off once. Attention makes each position's inputs depend on the other positions. And it is trained by next-token prediction on raw text, not by regression on labelled rows.
 
   </Accordion>
-  <Accordion title="6. Which six kinds of tensor live in a transformer checkpoint?">
+  <Accordion title="Which six kinds of tensor live in a transformer checkpoint?">
 
     Token and positional embeddings, the attention projections (`W_Q`, `W_K`, `W_V`, `W_O`), the feed-forward or expert matrices, normalization scales and shifts, and the output head. MoE adds a router matrix per layer, and tied embeddings remove the output head.
 
   </Accordion>
-  <Accordion title="7. Compute the BF16 and INT4 footprint of a 671B-parameter model.">
+  <Accordion title="Compute the BF16 and INT4 footprint of a 671B-parameter model.">
 
     BF16 is 2 bytes, so 671B parameters is about 1.34 TB. INT4 is 0.5 bytes, so about 336 GB. Neither is the serving number; the second one is the point, because it is what puts a model that size within reach of a single node.
 
   </Accordion>
-  <Accordion title="8. Why does training use BF16 rather than FP16?">
+  <Accordion title="Why does training use BF16 rather than FP16?">
 
     BF16 keeps float32's 8-bit exponent, so its dynamic range reaches tiny gradients without rescaling and overflows only near 1e38. FP16 has a 5-bit exponent and a ceiling of 65,504, so an activation or gradient above it becomes inf. That is why FP16 training needs a loss scaler and BF16 does not.
 
   </Accordion>
-  <Accordion title="9. Why can DeepSeek-V3 need 1.3 TB of memory while its per-token compute resembles an 8B model?">
+  <Accordion title="Why can DeepSeek-V3 need 1.3 TB of memory while its per-token compute resembles an 8B model?">
 
     Every expert's weights must stay resident, because any token may route to any subset, so memory tracks the full 671B. Compute per token only touches the routed subset, which is why the FLOPs resemble a far smaller dense model. MoE buys capacity by trading it for memory and cross-GPU expert dispatch.
 
   </Accordion>
-  <Accordion title="10. A 70B model at BF16 loads in 140 GB. What three additional terms push the serving requirement past 160 GB?">
+  <Accordion title="A 70B model at BF16 loads in 140 GB. What three additional terms push the serving requirement past 160 GB?">
 
     The KV cache, which multiplies by concurrent requests and context length. Activations and the prefill workspace, whose peak sits above steady state. Then framework and CUDA context overhead, allocator fragmentation, and the logits buffer, which is `(B, T, V)` against a vocabulary over 100,000.
 

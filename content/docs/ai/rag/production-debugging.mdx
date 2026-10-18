@@ -273,82 +273,82 @@ Work down this list. Each step is cheap and each one rules out a class of failur
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. A RAG system gives a wrong answer. What do you check first?">
+  <Accordion title="A RAG system gives a wrong answer. What do you check first?">
 
     Dump the retrieved chunks and read them. Whether the answer is present in the context separates a generation failure from a retrieval failure, and the two have incompatible fixes. Adding chunks to a grounding problem makes it worse; rewriting prompts for a recall problem wastes the afternoon.
 
   </Accordion>
-  <Accordion title="2. What is the difference between context precision and context recall?">
+  <Accordion title="What is the difference between context precision and context recall?">
 
     Context precision asks whether the relevant chunks are ranked above the irrelevant ones in what was retrieved. Context recall asks whether everything needed to produce the reference answer was retrieved at all. Precision is a ranking property and is improved by reranking; recall is a coverage property and is improved by hybrid search, query transformation, or a larger k.
 
   </Accordion>
-  <Accordion title="3. Why does an LLM-as-judge score need multiple samples?">
+  <Accordion title="Why does an LLM-as-judge score need multiple samples?">
 
     Because the judge scores one trajectory and the variance across runs can exceed the effect being measured. Run each item several times and average, and prefer a judge from a different model family than the generator, since shared failure modes make the score uninformative exactly where it matters.
 
   </Accordion>
-  <Accordion title="4. How does SelfCheckGPT detect hallucination without ground truth?">
+  <Accordion title="How does SelfCheckGPT detect hallucination without ground truth?">
 
     Sample several answers to the same question and check whether they agree. A grounded claim is reproduced across samples because it is copied from the context; a hallucinated one varies because it is generated fresh each time. Disagreement between samples is the hallucination signal.
 
   </Accordion>
-  <Accordion title="5. The context contains the answer and the model still makes something up. Name four fixes.">
+  <Accordion title="The context contains the answer and the model still makes something up. Name four fixes.">
 
     Prune the context so the relevant chunk is not diluted among twenty others, move it to the start or the end to escape the lost-in-the-middle penalty, add an explicit precedence rule plus a `NOT_IN_CONTEXT` refusal path so inventing is not the only legal output, and lower temperature to the 0 to 0.3 range. Structured citations verified against the cited chunks turn the remaining cases into a checkable failure.
 
   </Accordion>
-  <Accordion title="6. Why does asking for citations not solve hallucination?">
+  <Accordion title="Why does asking for citations not solve hallucination?">
 
     Because the model cites confidently regardless. The citations have to be verified: extract the cited chunks, and check with an entailment model or a narrow judge call that the answer follows from only those chunks. Without the verification step, citations are decoration.
 
   </Accordion>
-  <Accordion title="7. Your top-k contains five near-identical chunks. What are the three possible causes?">
+  <Accordion title="Your top-k contains five near-identical chunks. What are the three possible causes?">
 
     Chunk overlap set too wide, so the same passage appears shifted by a sentence. No diversity mechanism, since top-k by similarity returns mutual near-neighbours; MMR with `lambda` around 0.7 fixes that. Duplicate source documents in the corpus, which is the most common cause and needs ingest-time semantic deduplication, since exact hashing only catches byte-identical files.
 
   </Accordion>
-  <Accordion title="8. What does MMR cost and what does it buy?">
+  <Accordion title="What does MMR cost and what does it buy?">
 
     It re-scores the already-retrieved candidate set, so the cost is `k` times the candidate count in similarity computations, with no extra index pass. It buys coverage: each selected chunk is penalized by its similarity to what is already selected, so the top-k spans more distinct content.
 
   </Accordion>
-  <Accordion title="9. Retrieval takes 800 ms. What do you do first?">
+  <Accordion title="Retrieval takes 800 ms. What do you do first?">
 
     Measure the per-stage breakdown. At 1M to 100M vectors, ANN search is usually single-digit milliseconds and generation to first token is usually the largest term, so the search is often not the problem. If the reranker over 100 candidates is the term, cut candidates to 25 after a wide first stage rather than touching the index.
 
   </Accordion>
-  <Accordion title="10. Which HNSW parameter can you change without rebuilding?">
+  <Accordion title="Which HNSW parameter can you change without rebuilding?">
 
     `efSearch`, which controls how wide the query-time traversal is. Lowering it from 200 to 64 cuts latency and costs recall, so measure recall@k on a labeled set at each value. `M` and `efConstruction` are build-time and changing them means reindexing.
 
   </Accordion>
-  <Accordion title="11. What does binary quantization cost in recall and how do you recover it?">
+  <Accordion title="What does binary quantization cost in recall and how do you recover it?">
 
     It reduces each dimension to one bit, a 32x memory reduction against fp32, and the ranking it produces is coarse. The standard recovery is a rescore pass: search with the binary vectors to get a wide candidate set, then re-rank those candidates with the full-precision vectors. Scalar int8 quantization gives 4x with a smaller loss and no rescore.
 
   </Accordion>
-  <Accordion title="12. Why is post-filtering for access control wrong?">
+  <Accordion title="Why is post-filtering for access control wrong?">
 
     Because retrieval happens over the whole corpus first. If most of the top 100 belongs to other users, the requesting user gets poor results rather than good ones, so recall collapses in proportion to how restricted the corpus is. Restricted documents also participate in the vector computation before being discarded. Push the filter into the ANN traversal instead, and raise `efSearch` to compensate for the candidates the filter discards.
 
   </Accordion>
-  <Accordion title="13. Name four access-control leak paths that are not the vector index.">
+  <Accordion title="Name four access-control leak paths that are not the vector index.">
 
     A semantic cache keyed only on the query, which serves one user's answer to another. Observability traces containing retrieved chunk text at a lower protection level than the source. Restricted text sent to an LLM provider without a data agreement. And precomputed summaries such as GraphRAG community reports, which aggregate across ACL boundaries and so need the strictest permission of their inputs.
 
   </Accordion>
-  <Accordion title="14. How do you index a document update correctly?">
+  <Accordion title="How do you index a document update correctly?">
 
     Hash the document and the chunks, insert what is new, skip what is unchanged, tombstone what disappeared from the source, and for a document whose hash changed, delete all chunks under that `doc_id` in the same operation that inserts the new ones. Deleting by document id rather than by a stored chunk-id list means a change in chunk count cannot orphan anything.
 
   </Accordion>
-  <Accordion title="15. Why is a partially updated index worse than a stale one?">
+  <Accordion title="Why is a partially updated index worse than a stale one?">
 
     A stale index gives one consistently wrong answer, which a user can notice. A partially updated index contains two chunks that disagree, and the model either picks one arbitrarily or blends them into a claim that appears in neither source. Supersede atomically and check for cross-document contradictions on the documents where being wrong is expensive.
 
   </Accordion>
-  <Accordion title="16. What metadata makes staleness visible to a user?">
+  <Accordion title="What metadata makes staleness visible to a user?">
 
     Document title, section or page, version or hash, last updated, retrieved at, and a URL or path. Comparing `retrieved at` against `last updated` distinguishes a broken sync from a genuinely old source, which is the first question in any freshness investigation.
 

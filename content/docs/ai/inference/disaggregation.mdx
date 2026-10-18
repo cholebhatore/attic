@@ -112,62 +112,62 @@ Multimodal serving separates the vision encoder from the language model for the 
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. Name the three problems colocation creates.">
+  <Accordion title="Name the three problems colocation creates.">
 
     Hardware mismatch, since one SKU must be sized for a compute-bound phase and a bandwidth-bound phase at once; SLO interference, since a long prefill stalls every decode in its batch; and scaling coupling, since prompt volume and output volume grow independently.
 
   </Accordion>
-  <Accordion title="2. Why do prefill and decode want different parallelism strategies?">
+  <Accordion title="Why do prefill and decode want different parallelism strategies?">
 
     Prefill is compute-bound, so tensor parallelism splits the FLOPs and shortens the pass. Decode is bandwidth-bound per stream, so more replicas each reading their own copy of the weights gives more aggregate bandwidth than splitting one copy.
 
   </Accordion>
-  <Accordion title="3. How much KV does a 32K-token prompt on Llama 3 70B produce?">
+  <Accordion title="How much KV does a 32K-token prompt on Llama 3 70B produce?">
 
     About 10.7 GB, at 320 KiB per token. That is the payload the prefill node must hand to the decode node.
 
   </Accordion>
-  <Accordion title="4. What is the decision rule for whether disaggregation pays?">
+  <Accordion title="What is the decision rule for whether disaggregation pays?">
 
     KV transfer time must be a small fraction of the prefill time that produced it. A 1.34 GB transfer over NDR InfiniBand is 27 ms against roughly 580 ms of prefill, so 5 percent; over 100 Gigabit Ethernet it is 107 ms, so 18 percent.
 
   </Accordion>
-  <Accordion title="5. Why does the ratio improve at longer context?">
+  <Accordion title="Why does the ratio improve at longer context?">
 
     The transfer grows linearly with prompt length while prefill grows superlinearly, because the attention term is quadratic. At 128K tokens the transfer stays near 5 percent of prefill over NDR.
 
   </Accordion>
-  <Accordion title="6. What does DistServe report, and against what?">
+  <Accordion title="What does DistServe report, and against what?">
 
     Up to 4.48x more requests or 10.2x tighter SLO while staying within latency constraints for over 90 percent of requests, against colocated state-of-the-art serving systems.
 
   </Accordion>
-  <Accordion title="7. What does Mooncake add beyond splitting the phases?">
+  <Accordion title="What does Mooncake add beyond splitting the phases?">
 
     A cluster-wide KV cache pool spanning GPU memory, CPU DRAM, and SSD, scheduled against cache locality. A cache entry produced on one node can serve a later request on another, which makes prefix reuse a cluster property rather than a node-local one.
 
   </Accordion>
-  <Accordion title="8. Why is the transfer layer a separate component rather than a socket send?">
+  <Accordion title="Why is the transfer layer a separate component rather than a socket send?">
 
     The cache is paged, so it is a set of non-contiguous blocks described by a block table. Shipping that efficiently needs scatter-gather across NVLink, InfiniBand, and storage, which is what NIXL, LMCache, and the Mooncake transfer engine implement.
 
   </Accordion>
-  <Accordion title="9. When should you not disaggregate?">
+  <Accordion title="When should you not disaggregate?">
 
     Small deployments that cannot fill two pools, short prompts where the transfer is a large fraction of prefill, slow interconnects, roughly balanced prompt and output lengths, and decode that is already KV-memory-bound rather than interference-bound.
 
   </Accordion>
-  <Accordion title="10. What is attention-feed-forward disaggregation?">
+  <Accordion title="What is attention-feed-forward disaggregation?">
 
     Splitting within the decode phase, since attention shards by head and MoE experts shard by expert, and each has a different optimal parallelism degree. MegaScale-Infer runs them in separate node pools.
 
   </Accordion>
-  <Accordion title="11. Chunked prefill already reduces interference. Why disaggregate anyway?">
+  <Accordion title="Chunked prefill already reduces interference. Why disaggregate anyway?">
 
     Chunking bounds the per-iteration stall but the phases still share memory, hardware, and a scaling unit. Disaggregation also lets each pool use a different SKU and a different parallelism strategy, which chunking cannot deliver.
 
   </Accordion>
-  <Accordion title="12. A chat service with 200-token prompts and 400-token outputs is considering disaggregation. What do you advise?">
+  <Accordion title="A chat service with 200-token prompts and 400-token outputs is considering disaggregation. What do you advise?">
 
     Against it. Prefill for 200 tokens is tens of milliseconds, so any transfer is a large fraction of it, and the decode-dominated load means the prefill pool would sit idle. Chunked prefill plus prefix caching is the better lever.
 

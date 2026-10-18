@@ -194,62 +194,62 @@ Control tokens are outside the merge table and are never produced by pre-tokeniz
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. What is the difference between BPE's merge criterion and WordPiece's, and why does the difference matter for rare pairs?">
+  <Accordion title="What is the difference between BPE's merge criterion and WordPiece's, and why does the difference matter for rare pairs?">
 
     BPE merges the most frequent adjacent pair; WordPiece merges the pair with the highest likelihood ratio `P(ab) / (P(a) P(b))`. Frequency rewards pairs whose members are individually common, so a pair that co-occurs only by adjacency still gets merged. WordPiece demands real co-occurrence, which yields a smaller vocabulary and leaves rare words more fragmented.
 
   </Accordion>
-  <Accordion title="2. Is SentencePiece an algorithm? What does it provide that tiktoken does not?">
+  <Accordion title="Is SentencePiece an algorithm? What does it provide that tiktoken does not?">
 
     No. SentencePiece is a wrapper: it supplies the pre-tokenizer, the training script and the encoder, and it works on raw UTF-8 with an explicit whitespace symbol, so no language-specific splitting step is needed. tiktoken is a fast BPE implementation bound to a given merge table. What SentencePiece adds is the ability to train the vocabulary itself from a corpus.
 
   </Accordion>
-  <Accordion title="3. Why can a byte-level BPE tokenizer never emit an unknown token, and what does it emit instead when it splits a multi-byte character?">
+  <Accordion title="Why can a byte-level BPE tokenizer never emit an unknown token, and what does it emit instead when it splits a multi-byte character?">
 
     Its base vocabulary is the 256 byte values, and every string is a sequence of bytes, so every input has a representation. When a multi-byte character is cut, the pieces are the byte tokens for it, which is why non-Latin text costs several tokens per character under an English-heavy vocabulary.
 
   </Accordion>
-  <Accordion title={<>4. What does the pre-tokenization regex prevent, and why are <code>{'" dog"'}</code> and <code>{'"dog"'}</code> different tokens?</>}>
+  <Accordion title={<>What does the pre-tokenization regex prevent, and why are <code>{'" dog"'}</code> and <code>{'"dog"'}</code> different tokens?</>}>
 
     The regex fixes where a word may end before merges are applied, which stops a merge from gluing unrelated words together. Leading whitespace attaches to the following word, so the two spellings are different strings with different ids. That distinction is what makes indentation, JSON and code tokens behave predictably.
 
   </Accordion>
-  <Accordion title={<>5. Walk through three merge rounds of BPE on the string <code>{'"low lower"'}</code>.</>}>
+  <Accordion title={<>Walk through three merge rounds of BPE on the string <code>{'"low lower"'}</code>.</>}>
 
     Round one merges `(l, o)`, which occurs twice, producing `lo` in both words. Round two merges `(lo, w)`, also twice, producing `low`. Round three is a tie between count-one pairs: `(low, boundary)`, `(low, e)`, `(e, r)` and `(r, boundary)`, so the implementation's tie-break decides, typically merging `(e, r)` into `er`. The lesson is in the result: `low` becomes one token while `lower` needs two.
 
   </Accordion>
-  <Accordion title={<>6. A model has <code>d_model = 4096</code> and a 128,256-entry vocabulary. How many parameters are in the embedding table, and what is the shape of the logits tensor for a batch of 8 sequences of length 2048?</>}>
+  <Accordion title={<>A model has <code>d_model = 4096</code> and a 128,256-entry vocabulary. How many parameters are in the embedding table, and what is the shape of the logits tensor for a batch of 8 sequences of length 2048?</>}>
 
     `128,256 * 4096 = 525,367,296` parameters, about 525M, or roughly 1.05 GB in bf16. Logits are `(8, 2048, 128256)`, about 2.1 billion elements, which is 8.4 GB in fp32 and 4.2 GB in bf16. That single tensor is why fused cross-entropy implementations exist.
 
   </Accordion>
-  <Accordion title="7. Name three consequences of rare-word fragmentation beyond token count.">
+  <Accordion title="Name three consequences of rare-word fragmentation beyond token count.">
 
     Language coverage gets spent on fragments rather than concepts, so a multilingual model needs a larger vocabulary for the same breadth. Long words eat the budget, and a thirty-token compound takes a tenth of a 512-token window. Code, mathematics and non-Latin scripts get harder to count, spell or rearrange, because the model never sees their characters.
 
   </Accordion>
-  <Accordion title={<>8. Why does the tokenizer affect a model's ability to count the letters in <code>{'"strawberry"'}</code>?</>}>
+  <Accordion title={<>Why does the tokenizer affect a model's ability to count the letters in <code>{'"strawberry"'}</code>?</>}>
 
     The model only ever sees ids, so it cannot iterate over the letters inside a token. Whether a doubled letter exists depends on where the merge table happened to cut the word, which is arbitrary from the model's point of view. Counting works only when it has memorized the spelled-out form from text where the letters were written separately.
 
   </Accordion>
-  <Accordion title={<>9. Why does <code>len(tokenizer)</code> differ from <code>tokenizer.vocab_size</code>?</>}>
+  <Accordion title={<>Why does <code>len(tokenizer)</code> differ from <code>tokenizer.vocab_size</code>?</>}>
 
     `tokenizer.vocab_size` counts the learned base vocabulary. `len(tokenizer)` also counts tokens registered afterwards, such as special and control tokens added by a chat template. A template referencing a special token outside the base vocabulary is the usual way this gap turns into an error.
 
   </Accordion>
-  <Accordion title="10. What is a chat template, and what breaks if you send raw text to a model trained with one?">
+  <Accordion title="What is a chat template, and what breaks if you send raw text to a model trained with one?">
 
     A chat template is the exact string that wraps role, content and turn boundaries, so the model sees the markers it was trained against. Sending raw text drops those markers, which is out of distribution: turn boundaries blur, the model can keep speaking past its own answer, tool-call syntax stops being triggered, and the assistant behaviour that those markers cue simply is not there.
 
   </Accordion>
-  <Accordion title="11. Where are special tokens inserted, and can the pre-tokenizer produce them?">
+  <Accordion title="Where are special tokens inserted, and can the pre-tokenizer produce them?">
 
     The pipeline writes them at explicit boundaries: a begin-of-sequence token at the front, an end-of-turn token after each message, an end-of-document token at the very end. The pre-tokenizer cannot produce them, because they are not assembled from merges; they are matched as whole literal strings, so text that merely resembles one survives as ordinary bytes instead.
 
   </Accordion>
-  <Accordion title="12. Unigram tokenization starts with too many tokens and prunes. Why is that direction better for multilingual corpora than merging?">
+  <Accordion title="Unigram tokenization starts with too many tokens and prunes. Why is that direction better for multilingual corpora than merging?">
 
     BPE grows a vocabulary greedily from the statistics of the training corpus, so a low-resource script contributes few frequent pairs and ends up fragmented. Unigram LM starts from every candidate substring and removes the ones whose loss increase is smallest, which selects a global subset and assigns a probability to each segmentation. The same table then serves many scripts, and it offers several valid tokenizations instead of one hard path.
 

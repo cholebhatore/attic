@@ -192,52 +192,52 @@ Reward function first, then extraction, then mask, then learning rate. Most repo
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. Why is RLHF harder to implement than supervised fine-tuning?">
+  <Accordion title="Why is RLHF harder to implement than supervised fine-tuning?">
 
     Because it runs two engines with incompatible parallelism layouts. The rollout engine wants a sharded model with a paged KV cache for fast decoding, and the training engine wants the same weights sharded for activations and optimizer state. Resync between them requires actual resharding, and on top of that you may hold a critic, a reference model, and a reward model in memory at the same time.
 
   </Accordion>
-  <Accordion title="2. What is the HybridFlow design in verl?">
+  <Accordion title="What is the HybridFlow design in verl?">
 
     It uses a single-controller programming model for the RL control flow, so the algorithm reads as one linear Python program, and a multi-controller model for the computation, so each shard runs as a native SPMD process with full collective performance. That combination is why verl expresses a full PPO loop in a few hundred lines without giving up GPU utilization at cluster scale.
 
   </Accordion>
-  <Accordion title="3. What is the difference between cleanrl and TRL?">
+  <Accordion title="What is the difference between cleanrl and TRL?">
 
     cleanrl is single-file reference implementations of classical RL algorithms in plain PyTorch, for reading and learning. TRL is a Hugging Face post-training library with trainers for SFT, DPO, GRPO, PPO, and KTO, wired into Accelerate, PEFT, and vLLM, for training language models.
 
   </Accordion>
-  <Accordion title="4. When would you pick TRL over OpenRLHF or verl?">
+  <Accordion title="When would you pick TRL over OpenRLHF or verl?">
 
     When the model fits on one to eight GPUs and you want integration with the Hugging Face stack, PEFT adapters, and a reward function that is a plain Python callable. TRL's `GRPOTrainer` is the fastest path to a working RLVR run. Above roughly two nodes, or when you need Megatron parallelism or MoE expert parallelism, move to OpenRLHF or verl.
 
   </Accordion>
-  <Accordion title="5. Why do rollout and training use different tensor parallel sizes?">
+  <Accordion title="Why do rollout and training use different tensor parallel sizes?">
 
     Generation is memory-bandwidth bound and benefits from a layout that keeps the KV cache paged and the batch large, so a smaller TP degree with more data parallel replicas often wins. Training has to hold activations and optimizer state, so it needs a larger TP or ZeRO shard. They are configured independently in verl, and matching them by default wastes memory.
 
   </Accordion>
-  <Accordion title="6. What is weight resync and why does it dominate at large scale?">
+  <Accordion title="What is weight resync and why does it dominate at large scale?">
 
     After each training step the updated policy weights must be pushed into the inference engine before the next rollout. On a 7B model that is a few seconds per batch. On a 671B MoE model with expert parallelism it is a resharding collective across hundreds of GPUs, and if it is not overlapped with anything the whole cluster sits idle during it.
 
   </Accordion>
-  <Accordion title="7. What role does Ray play in OpenRLHF and verl?">
+  <Accordion title="What role does Ray play in OpenRLHF and verl?">
 
     It is the actor and placement layer. Each model, the generation engine, and the reward function become Ray actors, and the scheduler decides whether to colocate them on the same GPUs or separate them. That is what makes multi-node RL runs expressible without hand-written `torchrun` orchestration.
 
   </Accordion>
-  <Accordion title="8. Name six metrics you would log during a GRPO run.">
+  <Accordion title="Name six metrics you would log during a GRPO run.">
 
     Mean reward, reward std within a group, mean KL to the reference, clip fraction, policy entropy, and response length. Gradient norm and rollout throughput are the next two. A zero within-group std means no learning signal; a clip fraction above about 20 percent means the trust region is not holding.
 
   </Accordion>
-  <Accordion title="9. What is the Ultra-Scale Playbook?">
+  <Accordion title="What is the Ultra-Scale Playbook?">
 
     Hugging Face's written guide to training LLMs on GPU clusters. It covers data, tensor, pipeline, and ZeRO parallelism with the memory arithmetic and communication cost behind each, and where each strategy stops paying for itself. It is prose rather than code, and it is the best single read on the subject.
 
   </Accordion>
-  <Accordion title="10. You are asked to reproduce DeepSeek-R1 on eight nodes. What stack do you choose?">
+  <Accordion title="You are asked to reproduce DeepSeek-R1 on eight nodes. What stack do you choose?">
 
     verl with the Megatron backend, vLLM or SGLang for rollout, GRPO with `adv_estimator=grpo`, a rule-based accuracy reward plus a format reward, and the published pipeline of cold-start SFT, reasoning RL, rejection sampling, and alignment RL. verl is what most open reproductions used, and it is the only one of the five with native expert parallelism at that scale.
 

@@ -202,62 +202,62 @@ The constraints are the ones from the tables above: the weight footprint at your
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. Name the five stages a prompt passes through before the first output token appears.">
+  <Accordion title="Name the five stages a prompt passes through before the first output token appears.">
 
     Tokenization, embedding lookup, forward pass through every block, logits and softmax, then sample and detokenize. The sampled token is appended and the loop returns to the forward pass.
 
   </Accordion>
-  <Accordion title="2. Why is an embedding lookup necessary, and what would break if token IDs were fed to the model directly?">
+  <Accordion title="Why is an embedding lookup necessary, and what would break if token IDs were fed to the model directly?">
 
     An ID like `633` is an index, not a magnitude: `634` is not "one more than" `633` in any sense the network could use. The embedding table maps each ID to a `d_model` vector that layers can do arithmetic on. Feeding raw IDs would inject ordering and distance that the vocabulary does not carry.
 
   </Accordion>
-  <Accordion title="3. How does RoPE encode position differently from a sinusoidal or learned encoding?">
+  <Accordion title="How does RoPE encode position differently from a sinusoidal or learned encoding?">
 
     RoPE rotates the query and key vectors inside each attention layer by an angle proportional to position, so the relative offset between two tokens falls out of their dot product. Sinusoidal and learned encodings add a position vector to the token representation instead; RoPE adds nothing and leaves no positional term in the cache.
 
   </Accordion>
-  <Accordion title="4. What is the shape of the logits tensor for a batch of 8 sequences of length 2048 at a 128,256-entry vocabulary in FP32, and how does decode avoid materializing it?">
+  <Accordion title="What is the shape of the logits tensor for a batch of 8 sequences of length 2048 at a 128,256-entry vocabulary in FP32, and how does decode avoid materializing it?">
 
     `8 * 2048 * 128256 * 4` bytes, about 8.4 GB in FP32. Decode computes only the last position of each sequence, so the logits become one row per sequence: `8 * 1 * 128256`, and the unembedding multiply is that same shape.
 
   </Accordion>
-  <Accordion title="5. Contrast prefill and decode on parallelism, bottleneck, and GPU utilization.">
+  <Accordion title="Contrast prefill and decode on parallelism, bottleneck, and GPU utilization.">
 
     Prefill processes the whole prompt at once, parallel across the sequence dimension, compute-bound, and keeps the GPU busy. Decode processes one token per forward pass, parallelizes only across the batch, is memory-bandwidth-bound, and idles the compute units unless the batch is deep.
 
   </Accordion>
-  <Accordion title="6. Why is decode memory-bandwidth bound, and what does that imply about the maximum tokens per second on a given GPU?">
+  <Accordion title="Why is decode memory-bandwidth bound, and what does that imply about the maximum tokens per second on a given GPU?">
 
     One decode step is a single row of activations multiplied against every weight matrix and every cached KV entry, so bytes moved per operation is enormous and the flop count is trivial. Tokens per second is capped near bandwidth divided by bytes read per step, which is why batching, quantization and a smaller KV cache raise throughput more than a faster clock does.
 
   </Accordion>
-  <Accordion title={<>7. Write the KV-cache size formula and compute bytes per token for a 32-layer model with 8 KV heads and <code>d_head = 128</code> at BF16.</>}>
+  <Accordion title={<>Write the KV-cache size formula and compute bytes per token for a 32-layer model with 8 KV heads and <code>d_head = 128</code> at BF16.</>}>
 
     `bytes per token = 2 * n_layers * n_kv_heads * d_head * bytes_per_element`, the 2 for keys and values. Here `2 * 32 * 8 * 128 * 2 = 131072` bytes, 128 KiB per token, so a 4096-token sequence holds 512 MiB.
 
   </Accordion>
-  <Accordion title="8. Which latency metric does a long prompt hurt, and which does a long output hurt?">
+  <Accordion title="Which latency metric does a long prompt hurt, and which does a long output hurt?">
 
     A long prompt hurts time to first token, because prefill scales with prompt length even though it runs in parallel. A long output hurts inter-token latency and total wall clock, because decode steps are strictly sequential.
 
   </Accordion>
-  <Accordion title="9. What does continuous batching change about the scheduler's unit of work?">
+  <Accordion title="What does continuous batching change about the scheduler's unit of work?">
 
     It changes the unit of work from a batch lifetime to a single decode step. Sequences join and leave the running batch between steps, so no slot sits idle waiting for the slowest request to finish.
 
   </Accordion>
-  <Accordion title="10. Why does paged KV allocation matter, and what does it borrow from operating systems?">
+  <Accordion title="Why does paged KV allocation matter, and what does it borrow from operating systems?">
 
     Reserving one contiguous block per request at maximum length wastes most of HBM and evicts live requests when a long one arrives. Paged KV splits the cache into fixed-size blocks and maps a sequence's logical positions onto non-contiguous physical blocks through a block table, which is virtual memory paging from an operating system applied to attention state.
 
   </Accordion>
-  <Accordion title="11. What does prefix caching skip, and in which deployment pattern does it pay off most?">
+  <Accordion title="What does prefix caching skip, and in which deployment pattern does it pay off most?">
 
     It skips recomputing the KV entries for tokens whose prefix is byte-identical to a prefix already prefilled, so those tokens never re-enter the model. It pays off where a long static prefix is resent every call: agent loops, multi-turn chat, RAG systems with a large instruction block, few-shot prompting.
 
   </Accordion>
-  <Accordion title="12. Why can a stop sequence truncate mid-token while a stop token cannot?">
+  <Accordion title="Why can a stop sequence truncate mid-token while a stop token cannot?">
 
     A stop token is a vocabulary entry, so it always arrives at a token boundary and truncation is exact. A stop sequence is a string matched against decoded text, and the token that completes it can carry extra characters beyond the match, so output is cut mid-token unless the engine checks before emitting.
 

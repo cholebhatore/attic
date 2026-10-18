@@ -170,62 +170,62 @@ Top-1 routing is the most aggressive choice in the table. Each token activates e
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. Which number, total or active parameters, determines FLOPs per token, and which determines VRAM?">
+  <Accordion title="Which number, total or active parameters, determines FLOPs per token, and which determines VRAM?">
 
     Active parameters determine FLOPs per token, because only the `k` experts the router selects run on that token. Total parameters determine VRAM, because every expert's weights must be resident or sharded even when they sit idle — DeepSeek-V3 is 37B of compute per token against 671B of memory.
 
   </Accordion>
-  <Accordion title="2. What is the difference between token-choice and expert-choice routing, and why does expert-choice struggle with autoregressive decoding?">
+  <Accordion title="What is the difference between token-choice and expert-choice routing, and why does expert-choice struggle with autoregressive decoding?">
 
     Token-choice has each token score all experts and take its top `k`, guaranteeing every token a path while leaving experts to compete for tokens and starve. Expert-choice has each expert pick its top `n` tokens, which balances load by construction but can leave a token with zero experts. Autoregressive decoding needs a value for every position at every step, so an unassigned token has nothing to add.
 
   </Accordion>
-  <Accordion title="3. Write the top-k gating computation including renormalization.">
+  <Accordion title="Write the top-k gating computation including renormalization.">
 
     `scores = softmax(W_g x)` over `E` experts, `topk_vals, topk_idx = topk(scores, k)`, then `weights = topk_vals / topk_vals.sum(-1, keepdim=True)` to renormalize so the `k` contributions sum to one, and the output is the weighted sum of the `k` expert feed-forwards.
 
   </Accordion>
-  <Accordion title="4. Why does routing collapse without a load-balancing term, and what is the positive feedback loop that causes it?">
+  <Accordion title="Why does routing collapse without a load-balancing term, and what is the positive feedback loop that causes it?">
 
     The router is trained by gradient through its own selections, so experts that win early receive more gradient and win more often. With no counter-pressure the loop drives most tokens onto a handful of experts, the rest get no gradient and freeze at random initialization, and effective capacity collapses to a few experts plus a large memory bill.
 
   </Accordion>
-  <Accordion title={<>5. State the Switch Transformer auxiliary loss and explain why the product <code>f_e * P_e</code> is minimized at uniform routing.</>}>
+  <Accordion title={<>State the Switch Transformer auxiliary loss and explain why the product <code>f_e * P_e</code> is minimized at uniform routing.</>}>
 
     `L_aux = E * sum_e f_e * P_e`, where `f_e` is the fraction of tokens dispatched to expert `e` and `P_e` is the router's mean probability for it. Both factors are non-negative and sum to one over the experts, so their inner product is smallest when the two vectors are aligned and flat — a uniform load of `1/E` each — and grows as either term concentrates on a few experts.
 
   </Accordion>
-  <Accordion title="6. What does DeepSeek-V3's aux-loss-free balancing do instead, and why is being gradient-free an advantage?">
+  <Accordion title="What does DeepSeek-V3's aux-loss-free balancing do instead, and why is being gradient-free an advantage?">
 
     It adds a bias `b_e` to each expert's router logit before top-k selection and updates it gradient-free: `b_e += gamma` when the expert is under-loaded, `b_e -= gamma` when over-loaded, plus periodic reset of the bias for experts starved for many steps. Because the correction never enters the loss, it cannot trade off against the main objective or distort the representation — DeepSeek-V3 (arXiv:2412.19437) reports the same balance without the aux loss's quality penalty.
 
   </Accordion>
-  <Accordion title="7. What is a capacity factor, and why is it acceptable in training but not in inference?">
+  <Accordion title="What is a capacity factor, and why is it acceptable in training but not in inference?">
 
     `capacity = capacity_factor * (tokens_in_batch / num_experts)`: the hard per-expert token budget in training, where 1.0 is exactly proportional and 1.25 leaves slack. Tokens above it are dropped and never reach that expert. In training a dropped token costs one gradient contribution; at inference it would silently omit part of the user's output, so serving engines remove the cap and run ragged expert loads instead.
 
   </Accordion>
-  <Accordion title="8. Walk through DeepSeek-V3's group-limited top-k: 256 experts, 8 groups, top 4 groups, top 8 experts.">
+  <Accordion title="Walk through DeepSeek-V3's group-limited top-k: 256 experts, 8 groups, top 4 groups, top 8 experts.">
 
     Split 256 routed experts into 8 groups of 32. Score each group by the sum of its top-2 expert scores and keep the top 4 groups, i.e. 128 candidates. Take the global top 8 experts inside those candidates, renormalize their weights, and add the single shared expert that runs for every token. Picking 8 from 256 independently scatters them across groups, which fragments each expert's token batch; confining them to 4 groups keeps the per-expert batches large enough to compute efficiently.
 
   </Accordion>
-  <Accordion title="9. What problem does a shared expert solve that routed experts cannot?">
+  <Accordion title="What problem does a shared expert solve that routed experts cannot?">
 
     Routed experts only see the tokens sent to them, so each must redundantly learn the language basics before it can specialize, and rarely-selected experts learn them badly. A shared expert runs unconditionally on every token and carries that common linguistic knowledge, which lets the routed experts spend their capacity on specialization — the finding behind DeepSeekMoE (Dai et al., arXiv:2401.06066).
 
   </Accordion>
-  <Accordion title="10. Why does DeepSeek-V3 make its first three layers dense?">
+  <Accordion title="Why does DeepSeek-V3 make its first three layers dense?">
 
     Routing decisions in the first layers are unreliable because the representations that feed the router are still forming, so sparse routing early is unstable and its gradient noise propagates through everything downstream. DeepSeek-V3 keeps 3 of 61 layers as ordinary dense feed-forwards at `intermediate_size = 18432` and only then switches to 256 routed experts of `moe_intermediate_size = 2048` plus one shared.
 
   </Accordion>
-  <Accordion title="11. Name three costs MoE adds that a dense model of the same active size does not have.">
+  <Accordion title="Name three costs MoE adds that a dense model of the same active size does not have.">
 
     All parameters must be resident: 671B at bf16 is about 1,342 GB, or sharded across devices with expert parallelism. All-to-all dispatch and combine traffic between GPUs, which dominates and caps the practical parallelism degree. Batch-size sensitivity — sparse routing needs enough tokens per step that every expert gets work, so small batches leave GPUs ragged.
 
   </Accordion>
-  <Accordion title="12. Why does top-1 routing make the router's decision more consequential than top-2?">
+  <Accordion title="Why does top-1 routing make the router's decision more consequential than top-2?">
 
     With top-1 the whole token output is that one expert's, weighted by a single gate value. There is no second expert to average out a mistake, so a wrong routing decision drops the token's contribution entirely, and load balancing rests on one pick per token instead of two. That is why Llama 4's `k = 1` designs need a shared expert and careful balancing, while top-2 models get a hedge for free.
 

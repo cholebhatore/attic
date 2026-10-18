@@ -165,72 +165,72 @@ Every reduction here trades a measurable resource for an unmeasurable one. FP8 c
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. Why are queries not cached?">
+  <Accordion title="Why are queries not cached?">
 
     Because a query is used once, at the step that produces it, and the attention output is carried forward by the residual stream. Only keys and values are needed by future steps.
 
   </Accordion>
-  <Accordion title={<>2. Compute the per-token cache for a 32-layer model with 8 KV heads, <code>d_head</code> 128, in BF16.</>}>
+  <Accordion title={<>Compute the per-token cache for a 32-layer model with 8 KV heads, <code>d_head</code> 128, in BF16.</>}>
 
     `2 * 32 * 8 * 128 * 2 = 131,072` bytes, or 128 KiB. The factor of 2 is K and V.
 
   </Accordion>
-  <Accordion title="3. Why does MLA drop the factor of 2?">
+  <Accordion title="Why does MLA drop the factor of 2?">
 
     It caches one compressed latent vector of 512 dimensions plus a 64-dimensional rotary key, and reconstructs both K and V from that latent. Per token per layer it stores 576 elements, against 32,768 for a 128-head, 128-dimensional MHA layer.
 
   </Accordion>
-  <Accordion title="4. How many concurrent 4,096-token sequences does an 8B BF16 model support on one H100?">
+  <Accordion title="How many concurrent 4,096-token sequences does an 8B BF16 model support on one H100?">
 
     About 112. Sixteen GB of weights and roughly 4 GB of overhead leave 56 GiB, which at 128 KiB per token is 458,752 token slots.
 
   </Accordion>
-  <Accordion title="5. Why is 70B serving cache-starved rather than compute-starved?">
+  <Accordion title="Why is 70B serving cache-starved rather than compute-starved?">
 
     BF16 weights need about 140 GB, so two H100s hold the model with roughly 20 GB left. At 320 KiB per token that is 65,536 slots, or 16 sequences at 4K context. The GPUs have arithmetic to spare and no memory to batch with.
 
   </Accordion>
-  <Accordion title="6. At what total context does the KV cache out-read the weights during decode for an 8B BF16 model?">
+  <Accordion title="At what total context does the KV cache out-read the weights during decode for an 8B BF16 model?">
 
     About 122,000 token slots: 16 GB of weights divided by 131,072 bytes per token. At batch 32 that is roughly 3,800 tokens of context per sequence.
 
   </Accordion>
-  <Accordion title="7. Why do keys need per-channel quantization while values need per-token?">
+  <Accordion title="Why do keys need per-channel quantization while values need per-token?">
 
     Keys carry large outlier channels, so a single per-tensor scale wastes most of the integer range. Values do not have the same channel structure but do vary in magnitude across positions, so per-token scaling fits them. KIVI quantizes keys per channel and values per token at 2 bits.
 
   </Accordion>
-  <Accordion title="8. Why is a key quantization error worse than a value error of the same size?">
+  <Accordion title="Why is a key quantization error worse than a value error of the same size?">
 
     A key error changes the attention distribution, so the model reads from the wrong positions. A value error only perturbs the weighted mixture that was already correctly selected.
 
   </Accordion>
-  <Accordion title="9. What is an attention sink?">
+  <Accordion title="What is an attention sink?">
 
     The first few tokens of a sequence absorb a large share of attention mass regardless of their content. Evicting them collapses the softmax, so StreamingLLM keeps four sink tokens alongside a sliding window to run unbounded-length streams.
 
   </Accordion>
-  <Accordion title="10. When is token eviction the wrong choice?">
+  <Accordion title="When is token eviction the wrong choice?">
 
     When the long context is supplied evidence rather than conversation history. Eviction fails silently: if the supporting passage was dropped, the model answers from the remainder and there is no signal at generation time that anything is missing.
 
   </Accordion>
-  <Accordion title="11. What does PagedAttention fix, and what does it cost in quality?">
+  <Accordion title="What does PagedAttention fix, and what does it cost in quality?">
 
     Internal and external fragmentation in contiguous cache allocation, which wasted 60 to 80 percent of cache memory. It costs nothing in quality, because the same bytes are stored in non-contiguous blocks behind a per-sequence block table.
 
   </Accordion>
-  <Accordion title="12. Why does FP8 E4M3 suit the KV cache specifically?">
+  <Accordion title="Why does FP8 E4M3 suit the KV cache specifically?">
 
     Its maximum representable value is 448, above the range of typical key and value activations, so it does not clip. It halves cache traffic and per-token cache size with no measurable quality change on most evaluations.
 
   </Accordion>
-  <Accordion title="13. Llama 2 7B and Llama 3 8B are similar in size. Why do their caches differ by 4x?">
+  <Accordion title="Llama 2 7B and Llama 3 8B are similar in size. Why do their caches differ by 4x?">
 
     Llama 2 7B uses multi-head attention with 32 KV heads at 512 KiB per token. Llama 3 8B uses GQA-8 with 8 KV heads at 128 KiB per token. Same `d_head`, same layer count, a quarter the KV heads.
 
   </Accordion>
-  <Accordion title="14. A team wants 128K context and high concurrency on 70B. Which reduction should they try first?">
+  <Accordion title="A team wants 128K context and high concurrency on 70B. Which reduction should they try first?">
 
     Layout and precision, since both are near-lossless. FP8 weights free about 70 GB, an FP8 cache halves per-token cost to 160 KiB, and prefix caching removes the repeated system prompt entirely. Eviction is last, because it is the only one that can silently lose the answer.
 

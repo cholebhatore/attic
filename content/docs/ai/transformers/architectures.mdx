@@ -230,62 +230,62 @@ Two thirds of the non-embedding weight is in the FFN, and the embedding itself i
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. What are the three differences between BERT, GPT, and T5, given the same block?">
+  <Accordion title="What are the three differences between BERT, GPT, and T5, given the same block?">
 
     Three, given an identical block. Attention visibility: BERT bidirectional, GPT causal, T5 both (bidirectional encoder, causal decoder with cross-attention). Objective: BERT classifies masked positions, GPT predicts the next token, T5 generates corrupted spans as a sequence. Interface: BERT needs a task head, GPT emits continuations, T5 turns every task into text-to-text with a prefix.
 
   </Accordion>
-  <Accordion title="2. Why does MLM replace 10% of selected tokens with random vocabulary items?">
+  <Accordion title="Why does MLM replace 10% of selected tokens with random vocabulary items?">
 
     So the encoder cannot learn to copy. If a selected token always became `[MASK]`, the prediction head would be trained on a clean signal that the input never contains the answer, and the model would lean on the mask token as a flag. With 10% replaced by a random vocabulary item the label is still the original token while the input is wrong, so the model must recover it from context; the unchanged 10% does the same job more subtly. It also keeps `[MASK]`, which never occurs at inference, off the critical path.
 
   </Accordion>
-  <Accordion title="3. What is the train/inference mismatch in BERT, and how does PET address it?">
+  <Accordion title="What is the train/inference mismatch in BERT, and how does PET address it?">
 
     BERT pre-trains with `[MASK]` in the input and fine-tunes on clean text, so the encoder is accustomed to a token and a masking distribution it never sees again; a `[MASK]`-heavy encoder representation does not transfer perfectly. Perturbed Masking Pre-training (Gupta et al., 2021) inserts a short post-training stage in which the masking policy is perturbed, choosing which positions to hide from the model's own predictions rather than uniformly, so the model keeps predicting while the input distribution drifts toward the clean text it will see downstream.
 
   </Accordion>
-  <Accordion title="4. How many supervised predictions does one pass over a 4096-token sequence give under MLM and under CLM?">
+  <Accordion title="How many supervised predictions does one pass over a 4096-token sequence give under MLM and under CLM?">
 
     MLM supervises 15% of positions, about 614 of 4096. CLM supervises every position except the last, 4095. The gap is `1 / 0.15`, about 6.7x more labels per token of compute for the autoregressive objective.
 
   </Accordion>
-  <Accordion title="5. Why can an encoder-only model not generate text?">
+  <Accordion title="Why can an encoder-only model not generate text?">
 
     Its representations are conditioned on both sides, so position `t` already depends on tokens after `t`. Generation needs a distribution over the next token given only the past, and an MLM-trained model was never asked for that: the objective never created a next-token head, and the input the model expects contains `[MASK]` placeholders rather than its own outputs. You can bolt a head on and iterate, but the model has no training signal for feeding itself.
 
   </Accordion>
-  <Accordion title="6. What does T5's span corruption change relative to single-token masking?">
+  <Accordion title="What does T5's span corruption change relative to single-token masking?">
 
     It masks contiguous spans, averaging about three tokens, and the decoder generates the whole span bounded by sentinel tokens. That turns the task from classifying one position into generating a short sequence, so the model must produce inflected, agreeing text rather than a single lexical item, and the same decoder interface serves every downstream task.
 
   </Accordion>
-  <Accordion title="7. Give four reasons decoder-only models dominate production LLMs.">
+  <Accordion title="Give four reasons decoder-only models dominate production LLMs.">
 
     One interface for every task, since everything is continuation, so no task heads or separate classifier fine-tuning. In-context learning appears with scale under exactly this objective. No artifact mismatch, because `[MASK]` never appears at inference. Simpler serving, one stack and one KV cache. And the scaling laws that set the training recipes (Kaplan et al., arXiv:2001.08361; Hoffmann et al., arXiv:2203.15556) were measured on decoder-only models.
 
   </Accordion>
-  <Accordion title="8. What task class does an encoder-only model still win, and why?">
+  <Accordion title="What task class does an encoder-only model still win, and why?">
 
     Encoding tasks that read the whole input at once and do not generate: classification, retrieval and embedding models, and token labelling. A bidirectional representation of a fixed input is strictly more informative per parameter than a left-to-right one, because the final vector can use the right half of the sentence, which is why embedding leaderboards stay BERT-shaped.
 
   </Accordion>
-  <Accordion title="9. Recite the decoder forward pass from token IDs to logits, naming the shape at each stage.">
+  <Accordion title="Recite the decoder forward pass from token IDs to logits, naming the shape at each stage.">
 
     Token IDs `(B, T)` to token embeddings `(B, T, d)` plus position embeddings; then per layer: LayerNorm, causal multi-head attention where `q`, `k`, `v` are `(B, h, T, d_head)` and the output returns to `(B, T, d)`, add the residual, LayerNorm, FFN through `(B, T, 4d)`, add the residual. After `n_layers`: final LayerNorm, then the LM head to logits `(B, T, V)`.
 
   </Accordion>
-  <Accordion title="10. What is weight tying, what does it save in GPT-2 small, and why do modern models skip it?">
+  <Accordion title="What is weight tying, what does it save in GPT-2 small, and why do modern models skip it?">
 
     The output projection reuses the input embedding matrix, `lm_head.weight = wte.weight`. In GPT-2 small it saves a `(768, 50257)` block, about 38.6M parameters of a 124M model. Large models untie them because a single matrix has to serve two different jobs, addressing input tokens and scoring output candidates, and once the embedding carries positional and semantic structure the shared constraint costs accuracy that the extra parameters can buy.
 
   </Accordion>
-  <Accordion title="11. Which activation tensor dominates memory at long context, and what do inference engines do about it?">
+  <Accordion title="Which activation tensor dominates memory at long context, and what do inference engines do about it?">
 
     The attention activation block `(B, h, T, T)`, one per layer, which grows quadratically and is the reason long-context training needs activation checkpointing and fused kernels. At inference the same information lives in the KV cache, which grows linearly in `T` and per sequence, so engines page it (vLLM), share it across heads (MQA and GQA), and evict or quantize it.
 
   </Accordion>
-  <Accordion title="12. Compute the parameter count of GPT-2 small from its config and explain why the embedding share shrinks with scale.">
+  <Accordion title="Compute the parameter count of GPT-2 small from its config and explain why the embedding share shrinks with scale.">
 
     Embeddings `50257 * 768 * 2 = 77.2M` before tying; per layer `4 * 768^2 = 2.36M` of attention plus `2 * 768 * 3072 = 4.72M` of FFN, so about `7.08M` and `84.9M` over 12 layers; the LM head is free once tied; plus small norms and biases. Total about 124M. Embeddings grow as `V * d` while everything else grows as `n_layers * d^2`, and scale raises depth and width much faster than vocabulary, so the embedding share falls from about 62% here to well under 1% in a 70B model.
 

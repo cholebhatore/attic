@@ -172,47 +172,47 @@ IA3 (Liu et al., arXiv:2205.05638) learns three vectors that rescale keys, value
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. Write the LoRA update and explain the scaling term.">
+  <Accordion title="Write the LoRA update and explain the scaling term.">
 
     `h = W_0 x + (alpha / r) * B A x`. `W_0` is frozen, `A` is `(r, d_in)` initialized from a Gaussian, `B` is `(d_out, r)` initialized to zero. `alpha / r` decouples the strength of the update from its capacity, so you can raise `r` without also raising the effective step size.
 
   </Accordion>
-  <Accordion title={<>2. Why is <code>B</code> initialized to zero but <code>A</code> is not?</>}>
+  <Accordion title={<>Why is <code>B</code> initialized to zero but <code>A</code> is not?</>}>
 
     With `B = 0` the product `BA` is zero, so the model at step one is exactly the pretrained model and training starts from that point instead of a random perturbation of it. If both were zero the gradients would vanish and nothing would learn, which is why `A` must be random.
 
   </Accordion>
-  <Accordion title="3. What rank should you pick?">
+  <Accordion title="What rank should you pick?">
 
     Start at 8 or 16. The LoRA paper sweeps `r = 1, 2, 4, 8, 64` and finds `r = 4` already near full fine-tuning on GPT-3 175B, so the marginal gain from large ranks is small. Raise it only if the task plateaus and you have evidence the capacity is the limit.
 
   </Accordion>
-  <Accordion title={<>4. You doubled <code>r</code> from 16 to 32 and the model got worse. What happened?</>}>
+  <Accordion title={<>You doubled <code>r</code> from 16 to 32 and the model got worse. What happened?</>}>
 
     Holding `alpha` fixed while doubling `r` halves `alpha / r`, which halves the effective magnitude of the update. That reads as underfitting. Sweep rank at a constant `alpha / r` or raise `alpha` alongside it.
 
   </Accordion>
-  <Accordion title="5. Which modules should LoRA target, and which should you avoid?">
+  <Accordion title="Which modules should LoRA target, and which should you avoid?">
 
     Target the attention projections and the MLP projections, since the MLP is where key-value memories live and new associations need it. Avoid the embedding table and the output head: they are the largest matrices, adapting them is expensive, and moving the output head shifts the distribution over the entire vocabulary.
 
   </Accordion>
-  <Accordion title="6. What does DoRA change about LoRA?">
+  <Accordion title="What does DoRA change about LoRA?">
 
     It decomposes the pretrained weight into a magnitude and a direction, applies LoRA to the direction only, and gives the magnitude its own trainable vector. This reproduces the update pattern of full fine-tuning more closely at the same parameter budget, at the cost of a per-layer norm computation.
 
   </Accordion>
-  <Accordion title="7. Why does LoRA dominate prefix tuning and adapters in production?">
+  <Accordion title="Why does LoRA dominate prefix tuning and adapters in production?">
 
     It merges. `W = W_0 + (alpha / r) BA` is a single matrix, so a merged LoRA model is served by an unmodified inference engine at unmodified latency. Prefix tuning, prompt tuning, and adapters add computation to every forward pass permanently.
 
   </Accordion>
-  <Accordion title="8. LoRA cuts GPT-3 175B training VRAM from 1.2 TB to 350 GB. Where does the saving come from?">
+  <Accordion title="LoRA cuts GPT-3 175B training VRAM from 1.2 TB to 350 GB. Where does the saving come from?">
 
     Almost all of it is optimizer state and gradients. Adam keeps two moment buffers per trainable parameter in FP32, plus an FP32 master copy, so full fine-tuning costs roughly 16 bytes per parameter. Freezing the base means those buffers exist only for the adapter, while the frozen weights still have to sit in memory to run the forward pass.
 
   </Accordion>
-  <Accordion title="9. What is IA3 and when would you prefer it?">
+  <Accordion title="What is IA3 and when would you prefer it?">
 
     IA3 learns three elementwise rescaling vectors applied to keys, values, and the feed-forward activation, for well under a million parameters on a large model. Prefer it when memory is the binding constraint and the task is close to the base model's default behavior; it plateaus earlier than LoRA on tasks that need real change.
 

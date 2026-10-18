@@ -126,8 +126,9 @@ additions:
 - Where a page ends with a recall list (interview questions, review prompts, self-checks), make it an
   `<Accordions>` block with one `<Accordion>` per item and a short answer in the body. A prompt the
   reader cannot check is a list of anxieties, not a study tool; collapsing it keeps the page scannable
-  while leaving the answer one click away. Number the titles so the list still reads in order when
-  everything is closed, and give each term its own definition page entry rather than a repeated gloss.
+  while leaving the answer one click away. Leave the titles unnumbered: the order in the file is the
+  reading order, and a leading digit is noise once every panel is closed. Give each term its own
+  definition page entry rather than a repeated gloss.
 
 ## MDX gotchas not covered elsewhere
 

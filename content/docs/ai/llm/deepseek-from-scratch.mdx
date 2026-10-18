@@ -254,62 +254,62 @@ This halves the weight footprint to about 671 GB and is what makes the model ser
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. What does MLA cache per token per layer, and how does that compare to the MHA equivalent at 128 heads?">
+  <Accordion title="What does MLA cache per token per layer, and how does that compare to the MHA equivalent at 128 heads?">
 
     A `kv_lora_rank = 512` content latent plus the shared rotary key `k_R` of `qk_rope_head_dim = 64`: 576 elements per token per layer. The equivalent MHA at 128 heads of 128 dimensions stores `2 * 128 * 128 = 32,768`, so 57x more.
 
   </Accordion>
-  <Accordion title={<>2. Why does MLA need a separate <code>qk_rope_head_dim</code> instead of rotating the compressed latent?</>}>
+  <Accordion title={<>Why does MLA need a separate <code>qk_rope_head_dim</code> instead of rotating the compressed latent?</>}>
 
     A rotary-transformed key depends on its position, and the compressed latent is position-independent, so recovering a rotated key from it would need position stored per head, which puts the cache back. Keeping the rotary part separate leaves the 512 content dimensions compressed and the positional part exact, and it is why the score has two terms: content over the nope dimensions, position over the rope dimensions.
 
   </Accordion>
-  <Accordion title="3. Why are the weights taken from the unbiased scores while selection uses the biased ones?">
+  <Accordion title="Why are the weights taken from the unbiased scores while selection uses the biased ones?">
 
     The bias exists only to steer traffic. If it also scaled the weights, the same number that pushed an expert into the top-k would inflate that expert's contribution, and load control would corrupt the mixture. So selection uses the biased scores and the combination uses `scores.gather` on the unbiased ones.
 
   </Accordion>
-  <Accordion title="4. Walk through group-limited top-k for 256 experts, 8 groups, top 4 groups, top 8 experts.">
+  <Accordion title="Walk through group-limited top-k for 256 experts, 8 groups, top 4 groups, top 8 experts.">
 
     Split the 256 routed experts into 8 groups of 32. Score each group as the sum of its top-2 expert scores and keep the top 4 groups, leaving 128 candidates. Take the global top 8 experts inside those, renormalize their sigmoid scores, multiply the summed routed output by `routed_scaling_factor = 2.5`, and add the one shared expert that runs unconditionally.
 
   </Accordion>
-  <Accordion title="5. What advantage does a gradient-free bias update have over an auxiliary load-balancing loss?">
+  <Accordion title="What advantage does a gradient-free bias update have over an auxiliary load-balancing loss?">
 
     The correction never enters the objective, so it cannot trade generation quality for balance, cannot fight the gradient of the main loss, and needs no coefficient tuning. An auxiliary loss is differentiable and therefore does all three: it pushes the router toward uniform load even where uniform load is wrong for the data.
 
   </Accordion>
-  <Accordion title={<>6. What does <code>first_k_dense_replace = 3</code> do, and why are early layers dense?</>}>
+  <Accordion title={<>What does <code>first_k_dense_replace = 3</code> do, and why are early layers dense?</>}>
 
     It makes the first 3 of 61 blocks ordinary dense feed-forwards at `intermediate_size = 18432` instead of MoE at `moe_intermediate_size = 2048`. The router decides on representations, and early-layer representations are still forming, so routing there is unreliable and its gradient noise propagates through every layer above.
 
   </Accordion>
-  <Accordion title={<>7. What is the shape of the tensor fed into <code>eh_proj</code> in the MTP module, and where does the width come from?</>}>
+  <Accordion title={<>What is the shape of the tensor fed into <code>eh_proj</code> in the MTP module, and where does the width come from?</>}>
 
     `(B, T, 14336)`, which is `2 * hidden_size`. The width comes from concatenating two 7,168-wide inputs: the RMSNormed embedding of token `t+1` and the RMSNormed hidden state at position `t`. `eh_proj` maps that back to 7,168 before the extra block runs.
 
   </Accordion>
-  <Accordion title="8. Why does MTP not change the output distribution when used for speculative decoding at inference?">
+  <Accordion title="Why does MTP not change the output distribution when used for speculative decoding at inference?">
 
     MTP only drafts. The main model still verifies each drafted token against its own distribution, and verification is exact, so the accepted sequence is distributed as if the target model generated it directly. The draft's origin changes the acceptance rate and therefore the speedup, not the output law.
 
   </Accordion>
-  <Accordion title={<>9. Show that 58 MoE layers plus 3 dense layers plus untied embeddings totals 671B, given one expert is <code>3 * 7168 * 2048</code>.</>}>
+  <Accordion title={<>Show that 58 MoE layers plus 3 dense layers plus untied embeddings totals 671B, given one expert is <code>3 * 7168 * 2048</code>.</>}>
 
     One expert is `3 * 7168 * 2048 = 44,040,192`, so 256 routed experts are 11,274,289,152. Add attention at 187,107,328, the shared expert at 44,040,192, the router at 1,835,008 and the norms, giving 11,507,286,272 per MoE layer; 58 of them are 667,422,603,776. The 3 dense layers at 583,483,392 add 1,750,450,176. Untied embedding and output head add `2 * 129280 * 7168 = 1,853,358,080`. Total 671,026,412,032, which is the published figure.
 
   </Accordion>
-  <Accordion title={<>10. Why does <code>weight_block_size = [128, 128]</code> beat per-tensor FP8 for a model with 256 small experts?</>}>
+  <Accordion title={<>Why does <code>weight_block_size = [128, 128]</code> beat per-tensor FP8 for a model with 256 small experts?</>}>
 
     One scale for a whole matrix is too coarse when the same model contains large-magnitude attention projections and 256 small experts: a single outlier raises the scale and destroys resolution everywhere else in that tensor. A scale per 128 by 128 tile keeps calibration local, so each expert slice keeps usable precision.
 
   </Accordion>
-  <Accordion title={<>11. What is the difference between <code>e4m3</code> and <code>e5m2</code>, and which suits weights better?</>}>
+  <Accordion title={<>What is the difference between <code>e4m3</code> and <code>e5m2</code>, and which suits weights better?</>}>
 
     `e4m3` has four exponent bits and three mantissa bits, so a narrower dynamic range and finer resolution. `e5m2` has five exponent bits and two mantissa bits, so a wider range and coarser steps. Weights have bounded magnitude and benefit from resolution, so `e4m3` is the right format for them.
 
   </Accordion>
-  <Accordion title={<>12. <code>num_key_value_heads</code> is 128 in the config but unused. Why does the field exist at all?</>}>
+  <Accordion title={<><code>num_key_value_heads</code> is 128 in the config but unused. Why does the field exist at all?</>}>
 
     It is part of the shared attention field set that the modeling code and every generic tool around it reads to size a KV cache. MLA has no per-head key-value cache to count, so the value is ignored in the attention path and the field survives for schema compatibility.
 

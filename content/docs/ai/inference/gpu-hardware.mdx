@@ -203,62 +203,62 @@ The tension worth naming: high occupancy hides latency but leaves less shared me
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. Walk through the GPU execution hierarchy from a thread up.">
+  <Accordion title="Walk through the GPU execution hierarchy from a thread up.">
 
     A thread runs one scalar instance of the kernel. 32 threads form a warp, issued in lockstep. Up to 1024 threads form a thread block, which shares one shared-memory pool, can synchronize with `__syncthreads()`, and runs entirely on one SM. Every block in a launch forms the grid. An SM is the physical unit holding warp schedulers, the register file, shared memory and tensor cores: 108 on an A100, 132 on an H100.
 
   </Accordion>
-  <Accordion title="2. What is warp divergence and why does it cost?">
+  <Accordion title="What is warp divergence and why does it cost?">
 
     A warp issues one instruction for 32 lanes. When a branch splits the warp, the hardware executes each path in turn with the other lanes masked off, so both paths cost their full time. Kernels are therefore written so a warp's lanes take the same path, typically by making the branch depend on the block index rather than the lane index.
 
   </Accordion>
-  <Accordion title="3. What is memory coalescing?">
+  <Accordion title="What is memory coalescing?">
 
     When a warp's 32 threads access 32 consecutive addresses, the hardware merges them into one memory transaction. Strided or scattered access produces up to 32 separate transactions, cutting effective bandwidth by roughly an order of magnitude. Layout choices that keep a warp reading contiguous memory are usually the single largest win in a hand-written kernel.
 
   </Accordion>
-  <Accordion title="4. Why does the energy cost of a DRAM access matter to an inference engineer?">
+  <Accordion title="Why does the energy cost of a DRAM access matter to an inference engineer?">
 
     Because it sets the bandwidth ceiling inside a power-limited package. Horowitz's ISSCC 2014 measurements put a 32-bit DRAM access at 640 pJ against 3.7 pJ for a 32-bit MAC, a ratio of about 170 to 1. A kernel that spends its energy moving data cannot spend it computing. That is the argument behind kernel fusion, FlashAttention, SRAM-only designs like the Groq LPU, and quantization.
 
   </Accordion>
-  <Accordion title="5. State the roofline model and the ridge point.">
+  <Accordion title="State the roofline model and the ridge point.">
 
     Attainable FLOPs equal the minimum of peak compute and arithmetic intensity times peak bandwidth, where arithmetic intensity is FLOPs performed divided by bytes moved through HBM. The ridge point is `peak_FLOPs / bandwidth`: below it a kernel is memory-bound and reducing bytes moved helps, above it the kernel is compute-bound and reducing FLOPs helps. For an H100 SXM that is `989 TFLOPS / 3.35 TB/s`, about 295 FLOP per byte.
 
   </Accordion>
-  <Accordion title="6. What is the arithmetic intensity of a decode GEMM and why does it matter?">
+  <Accordion title="What is the arithmetic intensity of a decode GEMM and why does it matter?">
 
     For a linear layer with BF16 weights and a batch of `B` tokens, FLOPs are `2 * B * n_in * n_out` while the weight bytes read are `2 * n_in * n_out`, so intensity is approximately `B` FLOP per byte. At batch 1 an H100 runs about 295 times below its ridge and delivers roughly 3.4 of its 989 TFLOPS. Batching is what moves decode toward the ridge, which is why continuous batching is the core serving optimization.
 
   </Accordion>
-  <Accordion title="7. Prefill and decode use the same weights and kernels. Why do they have opposite bottlenecks?">
+  <Accordion title="Prefill and decode use the same weights and kernels. Why do they have opposite bottlenecks?">
 
     Prefill processes the whole prompt as one GEMM with an effective batch equal to the prompt length, putting it far above the ridge and making it compute-bound. Decode processes one token per sequence per step, so its effective batch is the number of concurrent sequences, which is far below the ridge and makes it memory-bandwidth-bound. Same arithmetic, different intensity.
 
   </Accordion>
-  <Accordion title="8. How does quantization speed up a memory-bound kernel if the FLOPs do not change?">
+  <Accordion title="How does quantization speed up a memory-bound kernel if the FLOPs do not change?">
 
     It reduces bytes moved, which raises arithmetic intensity and moves the kernel toward the ridge. INT4 weights are a quarter the bytes of BF16, so intensity quadruples at the same FLOP count, and decode throughput approaches a 4x improvement because decode time is `model_bytes / bandwidth`. The gain is a bandwidth saving, not an arithmetic one.
 
   </Accordion>
-  <Accordion title="9. What does kernel fusion save, and when does it not help?">
+  <Accordion title="What does kernel fusion save, and when does it not help?">
 
     It keeps intermediates in registers or shared memory instead of round-tripping them through HBM. Three elementwise ops over a 64 MB tensor go from six HBM passes to two, saving 128 MB of traffic per call. It does not help kernels that are already above the ridge, since their traffic was never the constraint, and fusing two large GEMMs buys almost nothing.
 
   </Accordion>
-  <Accordion title="10. Why do serving engines use CUDA graphs?">
+  <Accordion title="Why do serving engines use CUDA graphs?">
 
     A kernel launch costs roughly 5 to 10 microseconds of CPU time, and a decode step launches hundreds of small kernels, so the CPU can bottleneck while the GPU reports low utilization. A CUDA graph captures the launch sequence once and replays it as a single submission. The constraint is fixed shapes and fixed pointers, which is why engines bucket by batch size and sequence length before capturing.
 
   </Accordion>
-  <Accordion title="11. What limits occupancy, and is higher always better?">
+  <Accordion title="What limits occupancy, and is higher always better?">
 
     Occupancy is resident warps per SM over the maximum, and it is limited by whichever resource the kernel consumes most per thread: registers, shared memory, or block slots. Higher occupancy hides memory latency better, but it leaves fewer registers and less shared memory per thread, which can force more HBM traffic. FlashAttention deliberately runs at moderate occupancy with large SRAM tiles because on a memory-bound kernel, moving less data beats hiding latency.
 
   </Accordion>
-  <Accordion title="12. An 8B model in BF16 runs at 60 tokens per second on an H100 at batch 1. What is wrong?">
+  <Accordion title="An 8B model in BF16 runs at 60 tokens per second on an H100 at batch 1. What is wrong?">
 
     The bandwidth floor for 16 GB of weights at 3.35 TB/s is 4.8 ms per token, about 209 tokens per second, so 60 is roughly 3.5x off the ceiling. Likely causes are CPU-side launch overhead, an unbatched pipeline doing per-layer host round trips, poor memory coalescing, or the weights not being read once per step because of a cache miss. Measure the per-stage breakdown before changing the kernel.
 

@@ -182,62 +182,62 @@ The head count is also the unit that later optimizations compress. Multi-Query A
 ## Interview questions
 
 <Accordions>
-  <Accordion title={<>1. Why is a causal mask applied with <code>-inf</code> rather than <code>0</code>?</>}>
+  <Accordion title={<>Why is a causal mask applied with <code>-inf</code> rather than <code>0</code>?</>}>
 
     Softmax is shift-invariant, so an additive zero changes nothing: a masked position keeps `exp(0)` equal to `1` and competes with real scores. Negative infinity makes `exp` exactly zero, which is what removing a position means. In practice a large finite negative such as `-1e9` or the dtype minimum is used, because `-inf` inside a fully masked row produces `NaN`.
 
   </Accordion>
-  <Accordion title="2. What does the causal mask enable during training that an RNN cannot do?">
+  <Accordion title="What does the causal mask enable during training that an RNN cannot do?">
 
     Every position gets a supervised target in one forward pass, because each token's causal window is already fixed by the mask and does not depend on the outputs of earlier positions at runtime. An RNN has to unroll step by step, since its hidden state is genuinely sequential, so the same sequence costs `T` dependent steps instead of one batched kernel.
 
   </Accordion>
-  <Accordion title="3. How do causal and padding masks differ, and how do you combine them?">
+  <Accordion title="How do causal and padding masks differ, and how do you combine them?">
 
     A causal mask is about position: it is lower-triangular, identical for every sequence in the batch, and encodes a rule. A padding mask is about content: it depends on each sequence's real length and differs per row. Combine them by broadcasting both to `(B, 1, T, T)` and adding, so a position is masked if either rule says so.
 
   </Accordion>
-  <Accordion title={<>4. What produces <code>NaN</code> in a masked attention row, and how do you avoid it?</>}>
+  <Accordion title={<>What produces <code>NaN</code> in a masked attention row, and how do you avoid it?</>}>
 
     A row in which every entry is masked: all logits go to `-inf`, every `exp` is zero, and the sum is zero, so the division is `0/0`. It happens when a padding mask leaves a padded query row with nothing visible. Avoid it by keeping at least one unmasked column per row (the diagonal, or a sink token), or by masking the weights after softmax instead of the logits before it.
 
   </Accordion>
-  <Accordion title={<>5. Write the multi-head attention equations and state the parameter count as a function of <code>h</code>.</>}>
+  <Accordion title={<>Write the multi-head attention equations and state the parameter count as a function of <code>h</code>.</>}>
 
     `head_i = Attention(x W_Q_i, x W_K_i, x W_V_i)` and `Out = Concat(head_1 ... head_h) W_O`. The parameter count is `4 * d_model^2`, and it does not contain `h`: the three projections cost `d_model * (h * d_head)` each, and `h * d_head = d_model`. Splitting into more heads costs nothing as long as the total width is fixed; only the number of score matrices changes.
 
   </Accordion>
-  <Accordion title={<>6. Why does <code>.view()</code> fail after <code>.transpose()</code>, and what fixes it?</>}>
+  <Accordion title={<>Why does <code>.view()</code> fail after <code>.transpose()</code>, and what fixes it?</>}>
 
     `transpose` produces a strided view whose elements are no longer adjacent in memory, and `view` reinterprets the buffer without moving data, so the requested shape cannot be expressed. Fix it with `.contiguous().view(...)`, or use `reshape`, which copies when it has to.
 
   </Accordion>
-  <Accordion title={<>7. What are the three traps in <code>F.scaled_dot_product_attention</code>?</>}>
+  <Accordion title={<>What are the three traps in <code>F.scaled_dot_product_attention</code>?</>}>
 
     Do not apply `1 / sqrt(d_head)` yourself, because the scale is inside the kernel and you would square it. Do not pass both `is_causal=True` and `attn_mask`, which raises. And note that `nn.MultiheadAttention` uses the opposite boolean polarity: there `True` means not allowed, while a float mask is added to the scores. The third is the one that silently trains a broken model.
 
   </Accordion>
-  <Accordion title={<>8. How does <code>nn.MultiheadAttention</code>'s mask polarity differ from a hand-written implementation?</>}>
+  <Accordion title={<>How does <code>nn.MultiheadAttention</code>'s mask polarity differ from a hand-written implementation?</>}>
 
     `nn.MultiheadAttention` treats a boolean `True` as a position that must not be attended, which is the reverse of the common hand-written convention where you build a `keep` mask of ones and zero out the rest, and the reverse of a float mask being added to the logits. Passing the same tensor to both implementations inverts which positions are visible without raising anything. Test it by asserting that a masked row cannot change an earlier output.
 
   </Accordion>
-  <Accordion title="9. Name three specialized head types found in trained models and the evidence for them.">
+  <Accordion title="Name three specialized head types found in trained models and the evidence for them.">
 
     Induction heads copy a token that followed a pattern last time, evidenced by attention from the current position to the position after an earlier occurrence of the same token. Previous-token heads attend one step back and are visible as a sharp diagonal offset. Negative heads write the opposite of a value into the residual stream, and appear when the attention pattern is broad but the contribution is subtractive. Ablating any one of them produces a specific, measurable loss on the matching task, which is the evidence.
 
   </Accordion>
-  <Accordion title="10. Why is attention weight magnitude weak evidence for causal importance?">
+  <Accordion title="Why is attention weight magnitude weak evidence for causal importance?">
 
     Because attention weights are only the mixing coefficients of one mechanism. The value it multiplies may be near zero, another head may already write the same information, and the residual stream means a low-weight contribution can still dominate the output. A weight of 0.9 proves the token was read, not that the computation depended on it; causal claims need ablation or activation-patching, not a heatmap.
 
   </Accordion>
-  <Accordion title={<>11. Why did large models move from <code>d_head = 64</code> to <code>d_head = 128</code> instead of adding more heads?</>}>
+  <Accordion title={<>Why did large models move from <code>d_head = 64</code> to <code>d_head = 128</code> instead of adding more heads?</>}>
 
     Wider heads raise `d_head`, and with it the rank of each head's score matrix, since a rank-`d_head` approximation of a `T x T` attention pattern gets better as `d_head` grows. FLOPs depend on `h * d_head = d_model`, not on the split, so the change is nearly free in compute and buys sharper retrieval at scale, where a 64-dimensional key space starts to run out of distinguishable directions across long contexts.
 
   </Accordion>
-  <Accordion title={<>12. Which axis does <code>transpose(1, 2)</code> move, and why does that make each head an independent batch entry?</>}>
+  <Accordion title={<>Which axis does <code>transpose(1, 2)</code> move, and why does that make each head an independent batch entry?</>}>
 
     It swaps the sequence axis `1` with the head axis `2`, taking `(B, T, h, d_head)` to `(B, h, T, d_head)`. That puts heads in the batch dimension, where every head runs the same attention routine on its own slice with no interaction, so a single batched kernel does the work of `h` independent attentions.
 

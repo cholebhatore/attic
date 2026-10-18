@@ -116,77 +116,77 @@ A RAG pipeline that sorts retrieved chunks by a per-request score produces a dif
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. Why does static batching waste 74 percent of its compute on a realistic output-length distribution?">
+  <Accordion title="Why does static batching waste 74 percent of its compute on a realistic output-length distribution?">
 
     Because every request is padded to the longest one and the batch runs until the slowest finishes. Eight requests with lengths up to 1,600 produce 3,310 useful token slots inside 12,800 allocated ones.
 
   </Accordion>
-  <Accordion title="2. What is iteration-level scheduling?">
+  <Accordion title="What is iteration-level scheduling?">
 
     The scheduler runs after every forward pass rather than after every request, admitting queued work and retiring finished work mid-batch. Orca introduced it at OSDI 2022 and reports up to 36.9x higher throughput than FasterTransformer at matched latency.
 
   </Accordion>
-  <Accordion title="3. What is selective batching, and why is it necessary?">
+  <Accordion title="What is selective batching, and why is it necessary?">
 
     Batch the shape-uniform operations, the projections, MLP, and normalizations, as one dense multiply over all positions in the batch, and handle attention separately because sequences have different lengths. Without it, attention would force rectangular padding.
 
   </Accordion>
-  <Accordion title="4. Why does continuous batching require paged KV cache?">
+  <Accordion title="Why does continuous batching require paged KV cache?">
 
     Admitting a request mid-batch means allocating cache for it on the fly. A contiguous allocator fragments until nothing fits; fixed-size blocks make admission a block-table update.
 
   </Accordion>
-  <Accordion title={<>5. What do <code>max_num_seqs</code> and <code>max_num_batched_tokens</code> bound, respectively?</>}>
+  <Accordion title={<>What do <code>max_num_seqs</code> and <code>max_num_batched_tokens</code> bound, respectively?</>}>
 
     Concurrent sequences, and positions processed in one iteration. The second is the knob that sets how much prefill fits alongside decode, so it trades TTFT against TPOT directly.
 
   </Accordion>
-  <Accordion title="6. A 32K prompt arrives with an 8,192-token iteration budget and 200 active decodes. What happens?">
+  <Accordion title="A 32K prompt arrives with an 8,192-token iteration budget and 200 active decodes. What happens?">
 
     It is admitted in chunks. 200 decode positions leave 7,992 for prefill, so the prompt takes five iterations, and other users' TPOT stays flat throughout.
 
   </Accordion>
-  <Accordion title="7. When is recompute the right preemption strategy?">
+  <Accordion title="When is recompute the right preemption strategy?">
 
     For short sequences, where re-prefilling a few hundred tokens costs less than two PCIe transfers of the same KV data. Swap wins for long contexts where re-prefill dominates.
 
   </Accordion>
-  <Accordion title="8. What does a rising preemption count tell you?">
+  <Accordion title="What does a rising preemption count tell you?">
 
     The cache is too small for the offered load. The fixes are a lower `max_num_seqs`, a lower KV precision, or more memory, not a scheduler change.
 
   </Accordion>
-  <Accordion title="9. Why does a hash chain over blocks rather than a hash per block?">
+  <Accordion title="Why does a hash chain over blocks rather than a hash per block?">
 
     Because a block's contents are only reusable if everything before it is identical. Including the predecessor's hash makes the key represent the whole prefix, so a match implies the cached KV is valid at those positions.
 
   </Accordion>
-  <Accordion title="10. Why does a radix tree suit agentic workloads better than a flat hash table?">
+  <Accordion title="Why does a radix tree suit agentic workloads better than a flat hash table?">
 
     Branching is native to it. Many conversations sharing a system prompt are one prefix node with many children, and a tree-of-thoughts expansion is a subtree, so shared structure is represented once and evicted by LRU across the whole tree.
 
   </Accordion>
-  <Accordion title="11. List the four conditions a prefix cache hit requires.">
+  <Accordion title="List the four conditions a prefix cache hit requires.">
 
     An exact prefix match, token alignment, whole-block coverage, and residency in memory. Most misses come from variable content placed early in the prompt.
 
   </Accordion>
-  <Accordion title="12. What is the ordering rule for cacheable prompts, and why?">
+  <Accordion title="What is the ordering rule for cacheable prompts, and why?">
 
     Stable content first, variable content last. A single varying token early invalidates every block after it, so a request ID in the system prompt costs the entire cache.
 
   </Accordion>
-  <Accordion title="13. Why is prefix caching a trade against batch size?">
+  <Accordion title="Why is prefix caching a trade against batch size?">
 
     Cached blocks occupy the same memory as live KV cache. Holding 100,000 of 458,752 slots as prefix cache leaves 87 concurrent requests at 4,096 context instead of 112.
 
   </Accordion>
-  <Accordion title="14. When does the trade pay off?">
+  <Accordion title="When does the trade pay off?">
 
     When hit rate times prefix length exceeds the memory cost. A 2,000-token prompt shared across 87 requests saves 174,000 token-slots of prefill per admission round for 4,000 slots of memory. Rarely-reused prefixes save nothing.
 
   </Accordion>
-  <Accordion title="15. A RAG pipeline has a 90 percent prefix cache miss rate despite a fixed system prompt. What is the likely cause?">
+  <Accordion title="A RAG pipeline has a 90 percent prefix cache miss rate despite a fixed system prompt. What is the likely cause?">
 
     Retrieved chunks ordered by a per-request relevance score, which produces a different token sequence each call. Sorting by a stable key such as document ID restores the hits.
 

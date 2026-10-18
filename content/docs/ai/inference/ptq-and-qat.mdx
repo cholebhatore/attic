@@ -197,67 +197,67 @@ Checkpoint formats are not interchangeable. A GPTQ checkpoint, an AWQ checkpoint
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. What is the difference between PTQ and QAT?">
+  <Accordion title="What is the difference between PTQ and QAT?">
 
     PTQ converts an existing checkpoint using statistics gathered from a small calibration set or from the weights alone, with no gradients, and costs minutes to a few GPU hours. QAT puts a fake-quantize node in the forward pass and trains the model so it tolerates the quantizer, using a straight-through estimator for the rounding, and costs a training run. PTQ handles 8-bit and 4-bit well; QAT is what you need below 4 bits.
 
   </Accordion>
-  <Accordion title="2. What is a calibration set and how big is it?">
+  <Accordion title="What is a calibration set and how big is it?">
 
     A few hundred representative sequences, typically 128 to 512 at the model's training sequence length, drawn from a general corpus or from the deployment distribution. It is used to measure activation statistics for choosing scales, not to evaluate the result. Calibrating a domain-specific model on web text is a common and silent error.
 
   </Accordion>
-  <Accordion title="3. How does GPTQ work?">
+  <Accordion title="How does GPTQ work?">
 
     It minimizes the layer's output error `||WX - W_q X||^2` against cached calibration activations, quantizing one column of weights at a time and compensating the not-yet-quantized columns using the inverse Hessian `H = 2 X X^T`. Lazy batch updates over 128 columns keep it bandwidth-efficient and a single Cholesky factorization makes it numerically stable. It quantizes a 175B model to 3 or 4 bits in about four GPU hours.
 
   </Accordion>
-  <Accordion title="4. What is AWQ's core observation?">
+  <Accordion title="What is AWQ's core observation?">
 
     That roughly 1 percent of weight channels are salient, and that salience is determined by the magnitude of the corresponding activation, not the magnitude of the weight. AWQ scales those channels up before quantization, which reduces their relative rounding error, and compensates by scaling the activation down so the product is unchanged. No backpropagation, no output reconstruction.
 
   </Accordion>
-  <Accordion title="5. When does AWQ beat GPTQ?">
+  <Accordion title="When does AWQ beat GPTQ?">
 
     On instruction-tuned and chat models, on domains the calibration set does not represent, and at lower bit widths. GPTQ fits an output-error objective to its calibration set, so it overfits when the deployment distribution differs. AWQ derives scales from activation magnitudes, which transfer better. At 3 bits the gap widens.
 
   </Accordion>
-  <Accordion title="6. What is SmoothQuant and how does it differ from AWQ?">
+  <Accordion title="What is SmoothQuant and how does it differ from AWQ?">
 
     SmoothQuant migrates activation outliers into the weights with a matched per-channel rescale so that W8A8 INT8 becomes viable, targeting the case where activations must be quantized for INT8 tensor-core arithmetic. AWQ protects a small set of salient weights to enable weight-only 4-bit. Both are scale migration; the goal and the target scheme differ.
 
   </Accordion>
-  <Accordion title="7. What do QuaRot and SpinQuant add?">
+  <Accordion title="What do QuaRot and SpinQuant add?">
 
     They multiply weights and activations by orthogonal matrices, which preserves the model's function while rotating outlier dimensions so their magnitude spreads across all dimensions. With outliers dispersed, per-tensor quantization becomes workable and W4A4 becomes feasible. QuaRot uses Hadamard matrices; SpinQuant learns the rotations and reports better results at the same width.
 
   </Accordion>
-  <Accordion title="8. Why is QLoRA not QAT?">
+  <Accordion title="Why is QLoRA not QAT?">
 
     QLoRA freezes the NF4 base weights, dequantizes them to BF16 for the forward pass, and trains FP16 LoRA adapters. Gradients reach only the adapters, so no quantizer sits in the backward path and there is no straight-through estimator. The base model never learns to tolerate quantization; it was quantized once by round-to-nearest-style block scaling.
 
   </Accordion>
-  <Accordion title="9. What is the straight-through estimator and why is it needed?">
+  <Accordion title="What is the straight-through estimator and why is it needed?">
 
     The gradient of `round` is zero almost everywhere, so the backward pass through a fake-quantize node would carry no signal. The straight-through estimator defines the backward pass as the identity, passing the incoming gradient through unchanged. It works because the rounding error is small relative to the gradient magnitude. Clamping still contributes a real zero gradient outside the representable range, which is what teaches the model to stay inside it.
 
   </Accordion>
-  <Accordion title="10. What is double quantization in QLoRA?">
+  <Accordion title="What is double quantization in QLoRA?">
 
     NF4 stores an FP32 scale per block of 64 weights, and those scales are themselves a meaningful fraction of the budget. Double quantization quantizes the FP32 scales to FP8 with a block size of 256, saving about 0.37 bits per parameter. It is a second quantizer applied to the first quantizer's constants.
 
   </Accordion>
-  <Accordion title="11. What does BitNet b1.58 do differently?">
+  <Accordion title="What does BitNet b1.58 do differently?">
 
     It trains ternary weights, `-1`, `0` and `+1`, from initialization rather than compressing a pretrained FP16 model, so matmuls become additions. At the 3B scale the paper reports matching a same-size FP16 LLaMA with lower compute, memory and energy. It is a training recipe for new models, not a conversion path for existing ones.
 
   </Accordion>
-  <Accordion title="12. You quantize a 70B model to 4 bits and perplexity barely moves, but a downstream task regresses. What do you suspect?">
+  <Accordion title="You quantize a 70B model to 4 bits and perplexity barely moves, but a downstream task regresses. What do you suspect?">
 
     That the task depends on capabilities the aggregate metric does not capture. Reasoning and arithmetic degrade first under weight quantization while retrieval and classification hold up, and small models degrade more than large ones at the same width. Check whether the regression concentrates in long chains of computation, then try a finer group size, AWQ instead of GPTQ, or 8-bit, and evaluate on the task set rather than on perplexity.
 
   </Accordion>
-  <Accordion title="13. Why are quantization checkpoint formats not interchangeable?">
+  <Accordion title="Why are quantization checkpoint formats not interchangeable?">
 
     Because each encodes scales, zero-points, group boundaries and bit packing differently, and each needs a matching dequantizing kernel in the serving engine. A GPTQ checkpoint will not load as AWQ, a GGUF file only runs in llama.cpp and its derivatives, and bitsandbytes quantization is a runtime state rather than a portable format. Confirm engine support before choosing the method.
 

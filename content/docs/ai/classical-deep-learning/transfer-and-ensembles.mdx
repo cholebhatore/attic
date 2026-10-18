@@ -237,62 +237,62 @@ The same transfer learning rules apply as for images, with one addition: a Kinet
 ## Interview questions
 
 <Accordions>
-  <Accordion title={<>1. What does <code>requires_grad = False</code> fail to freeze, and how do you fix it?</>}>
+  <Accordion title={<>What does <code>requires_grad = False</code> fail to freeze, and how do you fix it?</>}>
 
     BatchNorm running statistics. Setting `requires_grad = False` stops the weights and biases from receiving updates, but a module still in train mode recomputes and overwrites its running mean and variance on every forward pass, so the frozen backbone slowly drifts. Put the frozen part in `model.eval()`, or freeze the normalization layers explicitly.
 
   </Accordion>
-  <Accordion title="2. When would you choose a linear probe over full fine-tuning?">
+  <Accordion title="When would you choose a linear probe over full fine-tuning?">
 
     Below roughly a thousand labelled images, or when the backbone must stay reusable across several tasks. Low and mid features are task-agnostic, so a head trained on frozen pooled features reaches good accuracy in minutes on one GPU, and with 800 images it is hard to beat because full fine-tuning has nothing to learn from and overfits.
 
   </Accordion>
-  <Accordion title="3. Why use discriminative learning rates instead of one rate for the whole model?">
+  <Accordion title="Why use discriminative learning rates instead of one rate for the whole model?">
 
     Early layers encode edges and textures that transfer as they are and would be damaged by a large step; the new head starts random and needs one. A single rate forces a compromise that is wrong at both ends. The usual setting is the head at, say, `1e-3` and the backbone an order of magnitude lower, with later stages allowed more than earlier ones.
 
   </Accordion>
-  <Accordion title="4. What is catastrophic forgetting in fine-tuning, and what mitigates it?">
+  <Accordion title="What is catastrophic forgetting in fine-tuning, and what mitigates it?">
 
     Fine-tuning on task B overwrites weights tuned for task A, and A's accuracy drops, sharply when B is small or narrow. Mitigations: freeze most of the backbone, keep the learning rate low, train only adapters such as LoRA, interleave a slice of the original data, or regularize the weights toward their pretrained values.
 
   </Accordion>
-  <Accordion title="5. Does averaging logits or averaging probabilities give better ensemble accuracy, and why?">
+  <Accordion title="Does averaging logits or averaging probabilities give better ensemble accuracy, and why?">
 
     Averaging probabilities, which is what the reference implementation does: softmax each member, then take the mean. Independently trained members have different logit scales, so averaging logits lets whichever member is loudest dominate the vote while the others barely register. Probability averaging puts everyone on the same scale, and temperature above `1.0` flattens each distribution first, which further reduces the influence of overconfident members.
 
   </Accordion>
-  <Accordion title="6. Where do snapshot ensembles get their diversity from, and what do they cost?">
+  <Accordion title="Where do snapshot ensembles get their diversity from, and what do they cost?">
 
     A cosine schedule with warm restarts, saving a checkpoint at each cycle minimum. Each minimum is a different local basin reached by a different learning-rate path, so one run yields several usable members. The cost is storage and `M` forward passes at inference; what you avoid is `M` full training runs.
 
   </Accordion>
-  <Accordion title="7. What is the difference between SWA and an ensemble?">
+  <Accordion title="What is the difference between SWA and an ensemble?">
 
     SWA averages weights along one SGD trajectory, in parameter space, and yields a single model costing one forward pass; an ensemble averages predictions from several models and costs `M`. SWA works because the trajectory stays inside one broad basin, so averaging the points finds a wider, flatter solution in it rather than combining different solutions.
 
   </Accordion>
-  <Accordion title={<>8. Explain what <code>vmap(f, in_dims=(0, 0, None))</code> does to a function taking parameters, buffers, and an input batch.</>}>
+  <Accordion title={<>Explain what <code>vmap(f, in_dims=(0, 0, None))</code> does to a function taking parameters, buffers, and an input batch.</>}>
 
     It maps over the leading axis of the stacked parameters and buffers (dimension 0 for each) while broadcasting the input batch unchanged, marked `None`. The result gains a leading axis of size `M`: five members become one batched call instead of five separate sets of kernel launches, which is what makes large ensembles and multi-seed evaluation practical.
 
   </Accordion>
-  <Accordion title={<>9. What shape is a video batch, and what shape is a <code>Conv3d</code> weight?</>}>
+  <Accordion title={<>What shape is a video batch, and what shape is a <code>Conv3d</code> weight?</>}>
 
     Video is 5D: `(B, C, T, H, W)`, for example `4, 3, 16, 112, 112` for four RGB clips of sixteen frames. A `Conv3d` weight is `(C_out, C_in / groups, kT, kH, kW)`, so 64 to 64 channels with a `3 x 3 x 3` kernel is `(64, 64, 3, 3, 3)`.
 
   </Accordion>
-  <Accordion title="10. Why does R(2+1)D outperform C3D at lower cost?">
+  <Accordion title="Why does R(2+1)D outperform C3D at lower cost?">
 
     A full `3 x 3 x 3` kernel spends 27 multiply-adds per connection and one nonlinearity. R(2+1)D factorizes it into a `1 x 3 x 3` spatial convolution followed by a `3 x 1 x 1` temporal one with a ReLU between them, which is fewer operations (9 plus 3) and gains an extra nonlinearity, so it is both cheaper and more accurate.
 
   </Accordion>
-  <Accordion title="11. What does temporal subsampling control, and what breaks if the sampling interval is too large?">
+  <Accordion title="What does temporal subsampling control, and what breaks if the sampling interval is too large?">
 
     The interval between sampled frames sets the temporal frequencies the network can represent, effectively the frame rate it sees, and it also sets compute: `T` frames multiply the spatial cost by `T`. Too large an interval aliases, so a fast action arrives as a jump between unrelated poses and the dynamics cannot be learned.
 
   </Accordion>
-  <Accordion title="12. How would you build a classifier for 800 labelled images with a strong ImageNet backbone available?">
+  <Accordion title="How would you build a classifier for 800 labelled images with a strong ImageNet backbone available?">
 
     Linear probe. Load an ImageNet backbone with `num_classes=0`, set `requires_grad = False` on its parameters and keep it in `eval()` so its BatchNorm statistics do not move, then train a single head on the pooled features with AdamW. At 800 images that lands within a couple of points of fine-tuning with far less overfitting risk. If it falls short, unfreeze only the last stage at a rate ten times smaller than the head's.
 

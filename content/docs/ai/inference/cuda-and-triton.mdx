@@ -252,62 +252,62 @@ After that, read the Triton tutorials' fused-softmax and matrix-multiply example
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. What is the difference between the CUDA and Triton programming models?">
+  <Accordion title="What is the difference between the CUDA and Triton programming models?">
 
     CUDA programs one thread and you describe the grid, block and warp structure explicitly, managing shared memory, barriers, coalescing and shuffle reductions yourself. Triton programs one block: you write what a program instance does to a tile and the compiler derives warp assignment, shared-memory allocation, barriers and coalescing from the tile arithmetic. A block reduction that takes twelve lines of shuffle intrinsics in CUDA is `tl.sum(x, axis=0)` in Triton.
 
   </Accordion>
-  <Accordion title={<>2. Why does <code>BLOCK</code> have to be a <code>tl.constexpr</code> power of two in Triton?</>}>
+  <Accordion title={<>Why does <code>BLOCK</code> have to be a <code>tl.constexpr</code> power of two in Triton?</>}>
 
     Because the compiler allocates registers and shared memory and unrolls the tile operations at compile time, which needs the tile shape known statically. A power of two makes the address arithmetic collapse to shifts. Ragged tails are handled with a mask on `tl.load` and `tl.store`, not with a second kernel.
 
   </Accordion>
-  <Accordion title={<>3. What do <code>num_warps</code> and <code>num_stages</code> control?</>}>
+  <Accordion title={<>What do <code>num_warps</code> and <code>num_stages</code> control?</>}>
 
     `num_warps` sets threads per program at 32 times the value, which trades parallelism inside a tile against register pressure. `num_stages` sets the software-pipelining depth for loops that load then compute, so a later stage's load overlaps an earlier stage's compute; raising it uses more shared memory and can reduce occupancy.
 
   </Accordion>
-  <Accordion title="4. Why is the naive attention implementation memory-bound?">
+  <Accordion title="Why is the naive attention implementation memory-bound?">
 
     It materializes the `T x T` score matrix in HBM, writes it for the softmax, reads it back, writes the probabilities and reads them again for the value product. At `T = 8192` in FP16 that matrix is 128 MB crossing HBM three times, so the traffic is quadratic in sequence length while the useful arithmetic is quadratic in the same term but with a small constant. The kernel is limited by bytes moved, not by FLOPs.
 
   </Accordion>
-  <Accordion title="5. How does FlashAttention compute an exact softmax without the full row?">
+  <Accordion title="How does FlashAttention compute an exact softmax without the full row?">
 
     It keeps a running maximum `m` and a running denominator `l` per output row. When a new key block reveals a larger maximum, it rescales the accumulator built so far by `exp(m_old - m_new)` before adding the new block's contribution. That correction makes single-pass softmax exact, so the `T x T` matrix never has to exist.
 
   </Accordion>
-  <Accordion title="6. What did FlashAttention-2 change?">
+  <Accordion title="What did FlashAttention-2 change?">
 
     It reorders the loops so the sequence dimension is outer and the key dimension inner, which reduces non-matmul operations, avoids dividing by the running denominator at every step, and improves occupancy by lowering per-thread register pressure. Same asymptotic traffic, better utilization of the tensor cores.
 
   </Accordion>
-  <Accordion title="7. When would you use Flash-Decoding rather than FlashAttention?">
+  <Accordion title="When would you use Flash-Decoding rather than FlashAttention?">
 
     When the batch is small and the context is long, so there are not enough query blocks to fill the SMs. Flash-Decoding parallelizes over the key-value dimension and merges partial results with the same rescaling trick, raising occupancy during decode where a single sequence's query blocks would otherwise leave most of the machine idle.
 
   </Accordion>
-  <Accordion title={<>8. What does <code>torch.compile</code> do for an LLM?</>}>
+  <Accordion title={<>What does <code>torch.compile</code> do for an LLM?</>}>
 
     TorchInductor captures the graph and emits fused Triton kernels for pointwise and reduction chains, which removes HBM round trips between elementwise ops. `mode="reduce-overhead"` adds CUDA graphs to cut launch overhead, which matters during decode. It does not replace the attention kernel, which dispatches to FlashAttention through scaled dot-product attention, and it cannot invent a new algorithm.
 
   </Accordion>
-  <Accordion title="9. Why clear the L2 cache between benchmark repetitions?">
+  <Accordion title="Why clear the L2 cache between benchmark repetitions?">
 
     Because a small kernel's entire working set can stay resident in the 50 MB L2, so the measured time reflects cache bandwidth rather than HBM bandwidth and the kernel looks far faster than it is in production. `triton.testing.do_bench` clears it by default for this reason.
 
   </Accordion>
-  <Accordion title="10. How do you know when a memory-bound kernel is finished?">
+  <Accordion title="How do you know when a memory-bound kernel is finished?">
 
     Compute the minimum bytes it must move, divide by the measured time, and compare with the device's peak bandwidth. A well-written memory-bound kernel reaches roughly 80 to 90 percent of peak. Below that, Nsight Compute's stall reasons and achieved occupancy tell you whether the limit is register pressure, shared memory, bank conflicts, or uncoalesced access.
 
   </Accordion>
-  <Accordion title="11. In the fused RMSNorm kernel, what is the cost of pass 2 re-reading the inputs?">
+  <Accordion title="In the fused RMSNorm kernel, what is the cost of pass 2 re-reading the inputs?">
 
     It doubles the HBM traffic for `x` and `residual`. When `cols` divided by the thread count is small enough to hold in registers, for example 16 floats per thread at `cols = 4096` with 256 threads, caching the summed values removes the second read entirely. That is the difference between a correct kernel and a fast one.
 
   </Accordion>
-  <Accordion title="12. Why does Triton recompile when you pass a differently shaped tensor?">
+  <Accordion title="Why does Triton recompile when you pass a differently shaped tensor?">
 
     Triton specializes on `tl.constexpr` values and on divisibility properties of integer arguments, and it inserts guards on tensor shapes. A new shape that fails a guard triggers a fresh compile. Serving engines avoid this by bucketing sequence lengths and batch sizes so a small set of compiled variants covers the traffic.
 

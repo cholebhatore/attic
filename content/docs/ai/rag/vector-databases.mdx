@@ -162,57 +162,57 @@ You can hold two. Concretely:
 ## Interview questions
 
 <Accordions>
-  <Accordion title="1. Why is ANN necessary and what does it cost?">
+  <Accordion title="Why is ANN necessary and what does it cost?">
 
     Exact kNN is `O(N * d)` per query, which at 100 million 1,536-dimensional vectors is 150 billion multiply-adds. ANN trades a measurable recall loss, typically under 5%, for one to three orders of magnitude in latency. The cost is that recall becomes a tunable you must measure rather than a guarantee.
 
   </Accordion>
-  <Accordion title="2. What is recall@k and what should you target?">
+  <Accordion title="What is recall@k and what should you target?">
 
     The fraction of the true top-k nearest neighbours the index returns, measured against a brute-force scan on a few thousand sampled queries. 0.95 is the common production target, and 0.90 is acceptable when a reranker follows, since the reranker only needs the right document in the candidate set.
 
   </Accordion>
-  <Accordion title="3. How does HNSW work?">
+  <Accordion title="How does HNSW work?">
 
     It builds a multi-layer proximity graph where upper layers are sparse with long edges and layer 0 contains every node with short edges. Search enters at the top layer, greedily walks to the closest node, drops a layer, and repeats, finishing with a best-first beam search of width `ef` on layer 0. The upper layers act as skip-list pointers giving `O(log N)` hops to the right region.
 
   </Accordion>
-  <Accordion title={<>4. What do <code>M</code>, <code>efConstruction</code>, and <code>efSearch</code> control?</>}>
+  <Accordion title={<>What do <code>M</code>, <code>efConstruction</code>, and <code>efSearch</code> control?</>}>
 
     `M` is the maximum edges per node, typically 16 to 48, raising recall and memory. `efConstruction` is the build-time beam width, 100 to 500, and improves the graph permanently at index time only. `efSearch` is the query-time beam width, 50 to 400, and trades recall against latency on every request. Spend on `efConstruction` first, because it costs nothing at query time.
 
   </Accordion>
-  <Accordion title="5. How does IVF reduce work and what is its failure mode?">
+  <Accordion title="How does IVF reduce work and what is its failure mode?">
 
     K-means partitions the space into `nlist` cells; a query probes the `nprobe` nearest centroids, so work is roughly `N * nprobe / nlist`. At `nlist = 65,536` and `nprobe = 64` on 100 million vectors that is about 98,000 distance computations. The failure mode is a query near a cell boundary whose true neighbour sits in an unprobed cell, which makes IVF recall more distribution-sensitive than HNSW recall.
 
   </Accordion>
-  <Accordion title="6. Explain product quantization and why it is fast.">
+  <Accordion title="Explain product quantization and why it is fast.">
 
     Split each vector into `m` subvectors, run k-means with 256 centroids per subspace, and store one byte per subvector. At `m = 192` a 6,144-byte vector becomes 192 bytes, a 32x compression. Distance computation precomputes the query-to-centroid distances into an `m * 256` table, so scanning a database vector is `m` lookups and additions with no floating-point multiply.
 
   </Accordion>
-  <Accordion title="7. Why does binary quantization work as well as it does?">
+  <Accordion title="Why does binary quantization work as well as it does?">
 
     Storing the sign of each dimension and comparing with Hamming distance gives the same 32x compression as PQ but uses a `popcount` instruction. In 1,536 dimensions the sign pattern carries most of the angular information, so recall loss is 5 to 15%, and rescoring the top 100 candidates with exact fp32 distances recovers nearly all of it.
 
   </Accordion>
-  <Accordion title="8. What is the quantize-to-search, rescore-to-rank pattern?">
+  <Accordion title="What is the quantize-to-search, rescore-to-rank pattern?">
 
     Use the compressed index to fetch a wide candidate set cheaply, then recompute exact distances on those candidates and return the top few. You get the memory and latency of the compressed index with recall close to fp32. It is the standard production configuration.
 
   </Accordion>
-  <Accordion title="9. Why does post-filtering break retrieval, and what is the arithmetic?">
+  <Accordion title="Why does post-filtering break retrieval, and what is the arithmetic?">
 
     If the filter passes 1% of the corpus and you request `k = 10`, a top-10 ANN search yields 0.1 usable results on average. Over-fetching by `1 / selectivity` fixes the expectation but makes the search 1,000 vectors wide, which is no longer cheap. Pre-filtering inside the index, or partitioning per filter value, is the correct answer.
 
   </Accordion>
-  <Accordion title="10. Why must access control filters be applied before the vector search?">
+  <Accordion title="Why must access control filters be applied before the vector search?">
 
     Because a post-filter means unauthorized chunks were fetched, ranked, and possibly logged before being discarded, and in a streamed or paginated response they can leak. The predicate has to be enforced inside the index so an unauthorized chunk can never enter the candidate set, let alone the LLM context.
 
   </Accordion>
-  <Accordion title={<>11. When would you use <code>pgvector</code> over a dedicated vector database?</>}>
+  <Accordion title={<>When would you use <code>pgvector</code> over a dedicated vector database?</>}>
 
     When you already run Postgres, the corpus is under roughly 10 million vectors, and your filters are relational. You remove a system from the architecture and can join embeddings against your real tables in one query. Move to a dedicated engine when you need billion-scale, GPU indexing, DiskANN, or native hybrid search.
 
