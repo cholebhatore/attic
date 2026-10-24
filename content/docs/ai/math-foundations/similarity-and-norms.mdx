@@ -5,15 +5,19 @@ description: Dot products, vector projections, cosine similarity, unit-normalize
 
 Retrieval, attention, and regularization all reduce to two questions: how much do these vectors point the same way, and how large is this vector. The dot product answers the first. Norms answer the second.
 
+Symbols on this page are decoded in [Notation and Symbols](/ai/math-foundations/notation-and-symbols).
+
 ---
 
 ## The dot product
 
-For two vectors of equal length, the dot product (inner product) multiplies matching entries and sums the results:
+For two vectors of equal length, the dot product (also called the **inner product**) multiplies matching entries and sums the results:
 
-```
-a . b = a1*b1 + a2*b2 + ... + an*bn
-```
+$$
+\mathbf{a} \cdot \mathbf{b} = \sum_{i=1}^{n} a_i b_i = a_1 b_1 + a_2 b_2 + \dots + a_n b_n
+$$
+
+Three entries in, three products, one number out. Nothing about the operation mixes positions: entry 1 pairs with entry 1, entry 2 with entry 2.
 
 ```python title="dot_product.py"
 import numpy as np
@@ -28,11 +32,13 @@ print(np.sum(a * b))    # 12, element-wise multiply then reduce
 
 The same quantity has a geometric form:
 
-```
-a . b = ||a|| * ||b|| * cos(theta)
-```
+$$
+\mathbf{a} \cdot \mathbf{b} = \|\mathbf{a}\|_2 \|\mathbf{b}\|_2 \cos(\theta)
+$$
 
-where `theta` is the angle between the two vectors. This identity is the bridge between arithmetic and geometry, and it gives you the sign rules that make similarity work:
+Read that as: the length of $\mathbf{a}$, times the length of $\mathbf{b}$, times the <Tip term="cosine of the angle between them">For an angle theta: 1 when theta is 0 degrees, 0 at 90 degrees, -1 at 180 degrees. It turns an angle into a number in [-1, 1].</Tip>. $\theta$ is the angle between the two arrows, and $\|\mathbf{a}\|_2 \|\mathbf{b}\|_2$ is just the two lengths multiplied together.
+
+The arithmetic version and the geometric version are the same number computed two ways, and that is what makes the dot product so useful: you never have to measure an angle, but the result behaves as if you did. The lengths are always positive, so the sign of a dot product comes entirely from `cos(theta)`, which gives the rules that make similarity work:
 
 | `a . b`  | Angle       | Meaning                         |
 | :------- | :---------- | :------------------------------ |
@@ -44,32 +50,44 @@ where `theta` is the angle between the two vectors. This identity is the bridge 
 
 ## Projection
 
-The **projection** of `a` onto `b` is the component of `a` that lies along `b`. It answers: how much of `a` is explained by the direction of `b`?
+The **projection** of `a` onto `b` is the component of `a` that lies along `b`. It answers: how much of `a` is explained by the direction of `b`? Picture a light shining perpendicular to `b`: the <Tip term="shadow">The projection of one vector onto a direction: the part of the first vector that lies along the second.</Tip> `a` casts on the line through `b` is the projection.
 
-The scalar projection (a length) is:
+Two versions of that answer get used, and the difference is only whether you keep the direction:
 
-```
-comp_b(a) = (a . b) / ||b||
-```
+The scalar projection (a scalar length along $\mathbf{b}$) is:
 
-The vector projection (an actual vector along `b`) is:
+$$
+\operatorname{comp}_{\mathbf{b}}(\mathbf{a}) = \frac{\mathbf{a} \cdot \mathbf{b}}{\|\mathbf{b}\|_2}
+$$
 
-```
-proj_b(a) = ((a . b) / ||b||^2) * b
-```
+The vector projection (an actual vector pointing along $\mathbf{b}$) is:
+
+$$
+\operatorname{proj}_{\mathbf{b}}(\mathbf{a}) = \left(\frac{\mathbf{a} \cdot \mathbf{b}}{\|\mathbf{b}\|_2^2}\right) \mathbf{b}
+$$
+
+Both start with $\mathbf{a} \cdot \mathbf{b}$, which measures the alignment. Dividing once by $\|\mathbf{b}\|_2$ removes $\mathbf{b}$'s length so the answer is a plain number of units. Dividing by $\|\mathbf{b}\|_2^2$ and then multiplying by the vector $\mathbf{b}$ re-attaches $\mathbf{b}$'s direction while cancelling its length, so the result is an arrow along $\mathbf{b}$.
 
 ```python title="projection.py"
-a = np.array([3.0, 4.0])
-b = np.array([1.0, 0.0])
+a = np.array([3.0, 4.0])        # points up and to the right
+b = np.array([1.0, 0.0])        # points straight right
 
 scalar = (a @ b) / np.linalg.norm(b)
 vector = ((a @ b) / np.linalg.norm(b) ** 2) * b
 
-print(scalar)   # 3.0
-print(vector)   # [3. 0.]
+print(scalar)   # 3.0   - 3 of a's 5 units point along b
+print(vector)   # [3. 0.]  - that same answer, written as an arrow on b's line
 ```
 
-The residual `a - proj_b(a)` is orthogonal to `b`, which is the geometric content of least-squares fitting: you have removed everything the direction `b` can explain.
+Subtract the shadow from the original and you get the part `b` cannot explain. That leftover is called the **residual**:
+
+```python title="residual.py"
+residual = a - ((a @ b) / np.linalg.norm(b) ** 2) * b
+print(residual)              # [0. 4.]
+print(residual @ b)          # 0.0  - orthogonal to b, exactly
+```
+
+Splitting a vector into "explained by `b`" plus "orthogonal to `b`" is the geometric content of least-squares fitting. The direction `b` gets all the credit it can claim, and the residual is whatever is genuinely left over.
 
 Projections are the mechanism inside attention. A query vector is effectively projected against key vectors, and the dot product score measures how much of the query lies along each key.
 
@@ -79,11 +97,11 @@ Projections are the mechanism inside attention. A query vector is effectively pr
 
 The dot product mixes direction with magnitude. A vector of length 1000 pointing roughly your way out-scores a vector of length 2 pointing exactly your way. **Cosine similarity** removes magnitude and keeps only the angle:
 
-```
-cos_sim(a, b) = (a . b) / (||a|| * ||b||)
-```
+$$
+\operatorname{sim}(\mathbf{a}, \mathbf{b}) = \cos(\theta) = \frac{\mathbf{a} \cdot \mathbf{b}}{\|\mathbf{a}\|_2 \|\mathbf{b}\|_2} = \frac{\sum_{i=1}^n a_i b_i}{\sqrt{\sum_{i=1}^n a_i^2} \sqrt{\sum_{i=1}^n b_i^2}}
+$$
 
-It is bounded in `[-1, 1]`:
+It is bounded in $[-1, 1]$:
 
 | Value | Angle | Interpretation      |
 | :---- | :---- | :------------------ |
@@ -108,13 +126,13 @@ A raw dot product would have ranked `doc_a` enormously higher purely on length. 
 
 ### Why unit normalization makes cosine free
 
-If both vectors are normalized to length 1, then `||a|| = ||b|| = 1` and the denominator disappears:
+If both vectors are normalized to unit length ($\|\mathbf{a}\|_2 = \|\mathbf{b}\|_2 = 1$), the denominator becomes 1 and disappears:
 
-```
-cos_sim(a, b) = a . b        when ||a|| == ||b|| == 1
-```
+$$
+\operatorname{sim}(\mathbf{a}, \mathbf{b}) = \mathbf{a} \cdot \mathbf{b} \quad \text{when } \|\mathbf{a}\|_2 = \|\mathbf{b}\|_2 = 1
+$$
 
-This is why vector databases normalize embeddings at index time. Every retrieval query then costs one dot product instead of a dot product plus two norm computations, and the same hardware instruction path serves both inner-product and cosine indexes.
+This is why vector databases normalize embeddings at index time, meaning when the documents are first stored rather than when a query arrives. Every retrieval query then costs one dot product instead of a dot product plus two length computations, and the database can run the identical code path whether the collection was declared as cosine or as inner product.
 
 ```python title="normalized_index.py"
 embeddings = np.random.randn(10000, 768)
@@ -126,6 +144,8 @@ query /= np.linalg.norm(query)
 scores = embeddings @ query           # one matrix-vector product
 top_5 = np.argsort(scores)[-5:][::-1]
 ```
+
+The division on the second line normalizes every row independently: `axis=1` walks across the 768 entries of each row, and `keepdims=True` leaves the result shaped `(10000, 1)` so it divides each row rather than the whole array. The broadcasting page covers that rule in full. The last line sorts the 10000 scores ascending, slices the final 5, and reverses them with `[::-1]` so the best match comes first.
 
 <Callout type="info">
   Magnitude is not always noise. Some embedding models encode confidence or frequency in vector
@@ -146,34 +166,46 @@ Cosine similarity measures angle. Distances measure separation. They are related
 | L1 (Manhattan)  | `sum(abs(ai - bi))`      | `[0, inf)`    | Yes                 |
 | Dot product     | `sum(ai * bi)`           | `(-inf, inf)` | Yes                 |
 
-For unit-normalized vectors, L2 distance and cosine distance rank identically. Expanding the L2 formula:
+Each formula starts the same way: `ai - bi` is the difference in coordinate `i`. L2 combines those differences by squaring, summing, and taking the root. L1 adds their absolute values instead, which is why it is called Manhattan: you travel along the axes in blocks, never diagonally. The last column says whether stretching one vector by 10 changes the score, which is the practical difference between the similarity measures.
 
-```
-||a - b||^2 = ||a||^2 + ||b||^2 - 2 * (a . b)
-            = 2 - 2 * (a . b)
-```
+For unit-normalized vectors, squared L2 distance and cosine similarity measure the same thing with the numbers rearranged. Expanding $\|\mathbf{a} - \mathbf{b}\|_2^2$ follows the algebraic identity:
 
-Since the first two terms are constant at 1, minimizing L2 distance is the same as maximizing the dot product. That equivalence is why HNSW and IVF indexes in Phase 9 can serve cosine queries using an L2 or inner-product kernel without changing results.
+$$
+\|\mathbf{a} - \mathbf{b}\|_2^2 = \|\mathbf{a}\|_2^2 + \|\mathbf{b}\|_2^2 - 2(\mathbf{a} \cdot \mathbf{b}) = 1 + 1 - 2(\mathbf{a} \cdot \mathbf{b}) = 2 - 2(\mathbf{a} \cdot \mathbf{b})
+$$
+
+The first two terms are constants, so the only part that varies between pairs is `a . b`, and it carries a minus sign. A larger dot product means a smaller distance. The two numbers are not equal to each other, cosine 0.9 gives squared L2 of 0.2 and cosine 0.5 gives 1.0, but they move in lockstep, so ranking candidates by one ranks them identically by the other. That is the "rank identically" claim, and it is why HNSW and IVF indexes in Phase 9 can serve cosine queries using an L2 or inner-product kernel without changing results.
 
 ---
 
 ## L1 and L2 norms
 
-A **norm** assigns a length to a vector. The two that matter in machine learning are:
+A **norm** assigns a length to a vector. Any function that behaves like length does is a norm, and the two that matter in machine learning are:
 
-```
-L1: ||v||_1 = |v1| + |v2| + ... + |vn|
-L2: ||v||_2 = sqrt(v1^2 + v2^2 + ... + vn^2)
-```
+$$
+\text{L1 norm}\colon \quad \|\mathbf{v}\|_1 = \sum_{i=1}^n |v_i| = |v_1| + |v_2| + \dots + |v_n|
+$$
+
+$$
+\text{L2 norm}\colon \quad \|\mathbf{v}\|_2 = \sqrt{\sum_{i=1}^n v_i^2} = \sqrt{v_1^2 + v_2^2 + \dots + v_n^2}
+$$
+
+The `_1` and `_2` subscripts name which norm, nothing more.
 
 ```python title="norms.py"
 v = np.array([3.0, -4.0])
-print(np.linalg.norm(v, 1))    # 7.0
-print(np.linalg.norm(v, 2))    # 5.0
-print(np.abs(v).sum())         # 7.0
+print(np.linalg.norm(v, 1))    # 7.0   = |3| + |-4|
+print(np.linalg.norm(v, 2))    # 5.0   = sqrt(3^2 + 4^2)
+print(np.abs(v).sum())         # 7.0   L1 written out by hand
 ```
 
+The second argument to `np.linalg.norm` picks the norm, and leaving it off gives L2.
+
+The two norms disagree about what "big" means, and that disagreement is the entire story of regularization. `||[1, 1]||_1` is 2 while `||[1, 1]||_2` is 1.41. Spreading the same total weight across two coordinates costs 2 in L1 and only 1.41 in L2, whereas concentrating it in one coordinate as `[2, 0]` costs 2 in both. L2 punishes concentration, L1 does not.
+
 Their unit circles have different shapes, and the shape explains everything about how they regularize.
+
+Set a budget on the norm and ask which weight vectors are allowed to be used. The allowed set, `||w|| <= t`, is a **ball**: in two dimensions the L1 ball is a diamond with its corners on the axes, and the L2 ball is a circle. A "unit circle" is the edge of that region when the budget is 1.
 
 <Mermaid
   chart={`
@@ -187,16 +219,30 @@ flowchart LR
 `}
 />
 
-The L1 ball has sharp corners sitting on the coordinate axes. When you minimize a loss subject to `||w||_1 <= t`, the optimal point lands on a corner with high probability, and a corner has some coordinates equal to exactly zero. The L2 ball is smooth, so the optimum lands somewhere along a curve and shrinks every weight a little without zeroing any.
+The other half of the picture is the loss. Every set of weights that produce the same loss form a ring around the best answer, and those rings are the **contours**. Training settles on the lowest contour that still reaches inside the allowed region, so the solution is wherever a contour first touches the ball's edge.
+
+The L1 ball has sharp corners sitting on the coordinate axes, so the contour usually makes contact at a corner, and a corner has some coordinates equal to exactly zero. The L2 ball is smooth, so the optimum lands somewhere along a curve and shrinks every weight a little without zeroing any.
 
 ### Lasso and Ridge
 
-That geometry becomes two regularization schemes. Adding a norm penalty to a loss function:
+That geometry becomes two regularization schemes. Adding a norm penalty to an unconstrained loss function $\mathcal{L}_0$:
 
-```
-Lasso (L1):  loss + lambda * sum(|w|)
-Ridge (L2):  loss + lambda * sum(w^2)
-```
+$$
+\mathcal{L}_{\text{Lasso}} = \mathcal{L}_0 + \lambda \|\mathbf{w}\|_1 = \mathcal{L}_0 + \lambda \sum_i |w_i|
+$$
+
+$$
+\mathcal{L}_{\text{Ridge}} = \mathcal{L}_0 + \lambda \|\mathbf{w}\|_2^2 = \mathcal{L}_0 + \lambda \sum_i w_i^2
+$$
+
+Lasso and Ridge are the names from statistics for L1- and L2-penalized linear regression, and the names stuck. $\lambda$ is the penalty strength: raise it and weights shrink more; set it to zero and the penalty disappears.
+
+<Callout type="info">
+  ### Why charge for weight size at all
+
+A model reaches very large weights by leaning hard on whichever features happened to be reliable in the training set, which is <Tip term="overfitting">Fitting the training data so closely that the model also memorizes its noise, so it performs worse on data it has not seen.</Tip>. A norm penalty trades a slightly worse training fit for smaller, more distributed weights that hold up outside the training set.
+
+</Callout>
 
 | Property          | L1 / Lasso                   | L2 / Ridge                    |
 | :---------------- | :--------------------------- | :---------------------------- |
@@ -205,13 +251,19 @@ Ridge (L2):  loss + lambda * sum(w^2)
 | Gradient at zero  | Constant, does not vanish    | Proportional to `w`, vanishes |
 | Solved in         | Linear models, sparse coding | Weight decay in deep learning |
 
-L1's derivative is a constant `lambda * sign(w)` regardless of how small `w` is, so it keeps pushing weights all the way to zero. L2's derivative is `2 * lambda * w`, which weakens as `w` shrinks, so weights settle at small non-zero values.
+"Sparse" means many weights are exactly 0.0, so those connections might as well not exist. "Dense" means all of them survive at small values.
+
+The mechanism is visible in the penalty's own derivative, which is what pushes on a weight during training:
+
+- L1 contributes `lambda * sign(w)`, where `sign(w)` is `+1` for a positive weight and `-1` for a negative one. The push has the same strength whether `w` is 3.0 or 0.0001, so it drives small weights all the way to zero.
+- L2 contributes `2 * lambda * w`, which shrinks in step with `w` itself. As the weight approaches zero the push fades, and the weight parks at some small non-zero value.
 
 <Callout type="warn">
   Modern LLM training uses **decoupled weight decay** in AdamW, which is L2-style shrinkage applied
   directly to the parameters rather than added to the loss. The distinction matters: adding it to
-  the loss makes the penalty interact with Adam's adaptive per-parameter scaling, which weakens it
-  unevenly. Phase 3 covers the AdamW formulation.
+  the loss makes the penalty pass through Adam's per-parameter rescaling, which divides each
+  gradient by an estimate of its own size, and that weakens the penalty unevenly across weights.
+  Phase 3 covers the AdamW formulation.
 </Callout>
 
 ---

@@ -5,6 +5,8 @@ description: Basis vectors, dimensionality, matrices as linear transformations, 
 
 A vector is an ordered list of numbers. A matrix is a function that maps one vector to another. Those two statements cover almost everything a neural network does with data: it stores meaning as vectors and transforms them with matrices.
 
+Every symbol on this page (`shape`, `@`, `.T`, `||v||`, `lambda`) is decoded in [Notation and Symbols](/ai/math-foundations/notation-and-symbols). Keep that page open.
+
 ---
 
 ## Vectors as data and as geometry
@@ -15,7 +17,7 @@ A vector `v` in `n` dimensions is written `v = [v1, v2, ..., vn]`. It has two re
 
 **Geometric reading.** An arrow from the origin to the point `(v1, v2, ..., vn)`. Its length is its magnitude and its orientation is its direction.
 
-Machine learning uses the geometric reading constantly. A word embedding is a 4096-dimensional arrow, and semantic similarity is a claim about the angle between two arrows rather than about their individual coordinates.
+Machine learning uses the geometric reading constantly. A <Tip term="word embedding">A word, sentence, or token turned into a fixed-length list of numbers, so that meaning can be compared with arithmetic.</Tip> is a 4096-dimensional arrow, and semantic similarity is a claim about the angle between two arrows rather than about their individual coordinates.
 
 ```python title="vectors.py"
 import numpy as np
@@ -42,9 +44,9 @@ same = np.linalg.norm(v)              # 5.0, the L2 norm
 
 A **unit vector** has magnitude 1. You get one by dividing a vector by its own norm, an operation called normalization:
 
-```
-u = v / ||v||
-```
+$$
+\mathbf{u} = \frac{\mathbf{v}}{\|\mathbf{v}\|_2}
+$$
 
 ```python title="normalize.py"
 v = np.array([3.0, 4.0])
@@ -52,9 +54,19 @@ u = v / np.linalg.norm(v)     # [0.6, 0.8]
 np.linalg.norm(u)             # 1.0
 ```
 
-Normalization strips magnitude and keeps direction. Vector databases do this at index time so that retrieval ranks by direction alone, which is why cosine similarity collapses into a plain dot product.
+Normalization strips magnitude and keeps direction. Vector databases do this at index time so that retrieval ranks by direction alone, which is why <Tip term="cosine similarity">A similarity score based on the angle between two vectors, ignoring how long they are.</Tip> collapses into a plain dot product.
 
-A **basis** is a set of vectors that is linearly independent (none is a combination of the others) and spans the space (any vector can be written as a combination of them). The **standard basis** in 3D is:
+A **linear combination** scales each vector in a set and adds the results. `2 * [1, 0] + 5 * [0, 1]` is a combination of `[1, 0]` and `[0, 1]`, and it works out to `[2, 5]`.
+
+A **basis** is a set of vectors that is linearly independent (no vector in the set is a combination of the others) and spans the space (every vector in the space is a combination of the set). Both halves of that sentence are testable, and the failures are quick to see in 2D:
+
+| Set of vectors            | Independent                                | Spans 2D                    | Basis?               |
+| :------------------------ | :----------------------------------------- | :-------------------------- | :------------------- |
+| `[1,0]`, `[0,1]`          | yes, neither is a multiple of the other    | yes, any `[a,b]` reaches it | Yes                  |
+| `[1,0]`, `[2,0]`          | no, the second is 2 times the first        | no, stuck on the x axis     | No                   |
+| `[1,0]`, `[0,1]`, `[1,1]` | no, the third is the first plus the second | yes                         | No, one is redundant |
+
+The **standard basis** in 3D is:
 
 ```
 e1 = [1, 0, 0]
@@ -66,15 +78,16 @@ Any vector `[a, b, c]` equals `a*e1 + b*e2 + c*e3`. The coordinates you write do
 
 <Callout type="info">
   Changing the basis changes the coordinates but not the vector. Eigen-decomposition and SVD are
-  both searches for a basis in which a transformation becomes simple, meaning diagonal. That is the
-  entire reason they matter.
+  both searches for a basis in which a transformation becomes simple, meaning **diagonal**: the
+  matrix stretches along the new axes and mixes nothing between them. That is the entire reason they
+  matter.
 </Callout>
 
 ---
 
 ## Dimensionality
 
-Dimensionality is the count of values in a vector, and it is the number that dominates cost calculations in every later phase.
+Dimensionality is the count of values in a vector. The house vector `[3, 1625, 2]` is 3-dimensional, a token embedding of length 4096 is 4096-dimensional. It is also the number that dominates cost calculations in every later phase.
 
 | Where it appears          | Symbol    | Typical value     |
 | :------------------------ | :-------- | :---------------- |
@@ -86,26 +99,68 @@ Dimensionality is the count of values in a vector, and it is the number that dom
 
 A 70B parameter model stores roughly 70 billion floats. Nearly all of them are entries in weight matrices whose shapes are built from the numbers above.
 
-High dimensionality has one consequence worth internalizing early: in high-dimensional space, randomly sampled vectors are almost always nearly orthogonal. Cosine similarity between random 4096-dimensional embeddings concentrates near zero, so a measured similarity of 0.7 is meaningful signal rather than coincidence.
+High dimensionality has one consequence worth internalizing early: two randomly drawn vectors in a high-dimensional space almost always sit at nearly right angles, a property called <Tip term="orthogonality">Two vectors are orthogonal when their dot product is 0 and the angle between them is exactly 90 degrees.</Tip>.
+
+The reason is room to point. In 2D, two random arrows are frequently well aligned: about two thirds of the time they sit within 60 degrees of each other or of the opposite direction. Add dimensions and that band shrinks fast, because a dot product of `d`-dimensional vectors sums `d` independent products, while the two lengths in the denominator grow at the same rate. The average absolute cosine between random unit vectors lands near `1 / sqrt(d)`.
+
+```python title="near_orthogonal.py"
+d = 4096
+rng = np.random.default_rng(0)
+A = rng.normal(size=(20000, d))
+B = rng.normal(size=(20000, d))
+A /= np.linalg.norm(A, axis=1, keepdims=True)   # unit length
+B /= np.linalg.norm(B, axis=1, keepdims=True)
+
+cos = np.abs((A * B).sum(axis=1))               # |cosine| for 20000 random pairs
+print(f"mean {cos.mean():.4f}   expected 1/sqrt(d) {1 / np.sqrt(d):.4f}")
+print(f"largest of all {cos.max():.4f}")         # nothing random gets close to aligned
+```
+
+```text
+mean 0.0125   expected 1/sqrt(d) 0.0156
+largest of all 0.0620
+```
+
+That is why a measured similarity of 0.7 between two 4096-dimensional embeddings is signal rather than coincidence. Random vectors in that space do not reach 0.07, let alone 0.7.
 
 ---
 
 ## Matrices as linear transformations
 
-A matrix `A` of shape `(m, n)` maps an `n`-dimensional input vector to an `m`-dimensional output vector:
+A matrix is a recipe for producing new numbers out of old ones. A matrix $A \in \mathbb{R}^{m \times n}$ maps an $n$-dimensional input vector to an $m$-dimensional output vector:
 
-```
-y = A @ x        # A is (m, n), x is (n,), y is (m,)
+$$
+\mathbf{y} = A\mathbf{x} \quad \Longleftrightarrow \quad \begin{bmatrix} y_1 \\ y_2 \\ \vdots \\ y_m \end{bmatrix} = \begin{bmatrix} A_{11} & A_{12} & \cdots & A_{1n} \\ A_{21} & A_{22} & \cdots & A_{2n} \\ \vdots & \vdots & \ddots & \vdots \\ A_{m1} & A_{m2} & \cdots & A_{mn} \end{bmatrix} \begin{bmatrix} x_1 \\ x_2 \\ \vdots \\ x_n \end{bmatrix}
+$$
+
+The two numbers in the shape say two different things. $n$ is how many values the matrix reads, $m$ is how many it writes. A $(3, 2)$ matrix consumes a length-2 vector and produces a length-3 one, because each output entry is one row of $A$ dotted with $\mathbf{x}$:
+
+```python title="shape_means.py"
+A = np.array([[1.0, 2.0],      # row 0 writes output entry 0
+              [0.0, 1.0],      # row 1 writes output entry 1
+              [3.0, 1.0]])     # row 2 writes output entry 2
+x = np.array([10.0, 20.0])     # length 2, matching the 2 columns
+
+print(A.shape)                  # (3, 2)  - reads 2, writes 3
+print(A @ x)                    # [50. 20. 50.]
+                                # 1*10 + 2*20 = 50, 0*10 + 1*20 = 20, 3*10 + 1*20 = 50
 ```
 
-The map is **linear**, meaning it satisfies both of these for all vectors `x`, `z` and all scalars `c`:
+The agreement between $n$ and the input's length is not a style preference. Matrix multiplication requires the inner numbers to match, so a $(3, 2)$ matrix raises an error on a length-3 input. A neural network layer is exactly this object: $W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$ is a function from $d_{\text{in}}$-dimensional space to $d_{\text{out}}$-dimensional space.
 
-```
-A @ (x + z) == A @ x + A @ z
-A @ (c * x) == c * (A @ x)
-```
+The map is **linear**, meaning it satisfies additivity and homogeneity for all vectors $\mathbf{x}, \mathbf{z}$ and all scalars $c$:
 
-Geometrically, a linear transformation rotates, scales, shears, or projects space. It never bends it, and it always keeps the origin fixed.
+$$
+A(\mathbf{x} + \mathbf{z}) = A\mathbf{x} + A\mathbf{z}
+$$
+
+$$
+A(c\mathbf{x}) = c(A\mathbf{x})
+$$
+
+In plain words: every output entry is a weighted sum of the input entries and nothing more. A linear map cannot multiply two inputs together, square one, or add a constant.
+
+Geometrically, a linear transformation rotates, scales, <Tip term="shears">Slides each layer of space sideways by an amount proportional to where it sits, turning a rectangle into a parallelogram.</Tip>, or <Tip term="projects">Flattens space onto a smaller subspace, like casting a shadow onto a wall. The squashed direction is gone for good.</Tip> It never bends it, and it always keeps the origin fixed.
 
 ```python title="transform.py"
 A = np.array([[2.0, 0.0],
@@ -116,19 +171,39 @@ print(A @ x)                        # [2. 3.]
 R = np.array([[0.0, -1.0],
               [1.0,  0.0]])          # 90 degree rotation
 print(R @ x)                        # [-1.  1.]
+
+S = np.array([[1.0, 1.0],
+              [0.0, 1.0]])          # shear
+print(S @ x)                        # [2. 1.]
+
+P = np.array([[1.0, 0.0],
+              [0.0, 0.0]])          # project onto the x axis
+print(P @ x)                        # [1. 0.]
 ```
 
 The columns of `A` are where the standard basis vectors land. Column `j` of `A` is `A @ e_j`.
+
+```python title="columns.py"
+A = np.array([[1.0, 2.0, 3.0],
+              [4.0, 5.0, 6.0]])     # shape (2, 3)
+e2 = np.array([0.0, 1.0, 0.0])      # the second standard basis vector
+
+print(A @ e2)                       # [2. 5.]  - column 1 of A
+```
+
+Feeding in a basis vector picks out one column, and feeding in a combination of basis vectors returns the same combination of columns. The columns are the whole story of the matrix, which is why rank, SVD, and LoRA are all stated in terms of them.
 
 ### The affine layer
 
 Neural network layers add a bias, which makes them **affine** rather than purely linear:
 
-```
-y = x @ W.T + b
-```
+$$
+\mathbf{y} = \mathbf{x} W^T + \mathbf{b}
+$$
 
-The bias translates the output, so the origin is no longer fixed. This is the exact formula behind every `nn.Linear` in PyTorch, and the `W` and `b` here are the weights and biases from the LLM foundations module.
+`b` holds one number per output entry. Adding it <Tip term="translates">Moves every point by the same amount, without rotating or stretching anything.</Tip> the output space, so the origin stops being fixed. A purely linear map always sends the zero vector to the zero vector, which would forbid a layer from ever producing a constant answer for an all-zero input. The bias removes that restriction.
+
+`x @ W.T` is the shape `(8, 512) @ (512, 256)`, and `b` has length 256, so the `+` spreads one bias value across all 8 rows. That spread is broadcasting, and the Tensor Broadcasting page gives the rules.
 
 ```python title="linear_layer.py"
 batch = np.random.randn(8, 512)      # 8 tokens, d_model = 512
@@ -138,20 +213,36 @@ b = np.zeros(256)
 out = batch @ W.T + b                # shape (8, 256)
 ```
 
+This is the exact formula behind every `nn.Linear` in PyTorch, and the `W` and `b` here are the weights and biases from the LLM foundations module.
+
 ---
 
 ## Rank and invertibility
 
-The **rank** of a matrix is the number of linearly independent columns, which equals the dimension of the output space it can reach. A `(5, 3)` matrix has rank at most 3, so its outputs live in a 3-dimensional subspace of 5-dimensional space.
+The columns of a matrix are the directions it can send data into. The **rank** counts how many of those directions are genuinely new: it is the number of linearly independent columns, which equals the dimension of the output space the matrix can reach.
 
-A matrix is **invertible** (non-singular) when all of these hold:
+The consequence is easiest to see when rank falls short of the shape. This `(2, 2)` matrix has rank 1 rather than 2:
+
+```python title="rank_deficient.py"
+A = np.array([[1.0, 2.0],
+              [2.0, 4.0]])       # column 1 is exactly 2 times column 0
+
+for x in [np.array([1.0, 0.0]), np.array([0.0, 1.0]), np.array([3.0, -1.0])]:
+    print(A @ x)                 # [1. 2.]  [2. 4.]  [1. 2.]
+```
+
+Both columns point along the line through `[1, 2]`, so every output points along that line too. The matrix takes the entire 2D plane and crushes it onto a single line. No input whatsoever produces `[1, 0]`.
+
+That line is a <Tip term="subspace">A smaller flat space sitting inside a bigger one, always containing the origin. A line through the origin is a 1-dimensional subspace of 2D space; a plane through the origin is a 2-dimensional subspace of 3D space.</Tip>. Read the `(5, 3)` case the same way: the matrix has 3 columns, so at most 3 independent directions, so everything it can output sits inside a 3-dimensional subspace of 5-dimensional space. Targets outside that slice are unreachable, and outside is where nearly all of 5-dimensional space lives.
+
+A matrix is **invertible** (<Tip term="non-singular">A square matrix whose determinant is not zero, meaning it crushed nothing and can therefore be undone.</Tip>) when all of these hold:
 
 - It is square, shape `(n, n)`
 - It has full rank `n`
-- Its determinant is non-zero
+- Its <Tip term="determinant">A single number summarizing how much a square matrix scales area or volume. Zero means it flattened space onto a lower dimension.</Tip> is non-zero
 - Its columns are linearly independent
 
-The inverse `A^-1` undoes the transformation: `A^-1 @ A @ x == x`.
+All four say the same thing from a different angle: the matrix crushed nothing, so the transformation can be undone. The inverse `A^-1` undoes the transformation: `A^-1 @ A @ x == x`.
 
 ```python title="inverse.py"
 A = np.array([[4.0, 7.0],
@@ -162,34 +253,57 @@ A_inv = np.linalg.inv(A)
 print(A_inv @ A)                    # identity, up to float error
 ```
 
+`matrix_rank` returns 2, which equals the shape's `n`, so this matrix is full rank and invertible. The `[[1.0, 2.0], [2.0, 4.0]]` matrix above has rank 1, and `np.linalg.inv` raises an error on it.
+
 <Callout type="warn">
   Weight matrices in real networks are almost never square and almost never invertible. A `(4096,
-  11008)` feed-forward matrix compresses and expands, destroying information in one direction. Do
-  not reach for `np.linalg.inv` in model code; it is a diagnostic tool, and it is numerically
-  unstable on ill-conditioned matrices.
+  11008)` feed-forward weight reads 11008 numbers and writes 4096, so at least 6912 input dimensions
+  are erased on the way through and no inverse exists. Do not reach for `np.linalg.inv` in model
+  code; it is a diagnostic tool, and it is numerically unstable on ill-conditioned matrices, the
+  unevenly-stretched kind the eigenvalue section below describes.
 </Callout>
 
-**Rank deficiency** is the useful case. When a large matrix has much lower rank than its shape allows, a low-rank approximation captures most of its behavior with far fewer numbers. LoRA in Phase 7 exploits exactly this by training a rank-16 update instead of a full `4096 x 4096` matrix.
+**Rank deficiency** is the useful case. When a large matrix has much lower rank than its shape allows, only a few of its directions carry anything, so a low-rank approximation reproduces most of its behavior from far fewer numbers. LoRA in Phase 7 exploits exactly this by training a rank-16 update instead of a full `4096 x 4096` matrix.
 
 ---
 
 ## Eigen-decomposition
 
-An **eigenvector** of a square matrix `A` is a non-zero vector that `A` only scales, never rotates:
+Start with what a matrix does to a direction. Most vectors change direction when a matrix is applied to them: the output points somewhere the input did not. A handful of special directions come out the same way they went in, only longer or shorter.
 
+An **eigenvector** of a square matrix $A$ is one of those directions: a non-zero vector that $A$ only scales, never rotates:
+
+$$
+A\mathbf{v} = \lambda \mathbf{v}
+$$
+
+Read that out loud as "$A$ applied to $\mathbf{v}$ equals $\lambda$ times $\mathbf{v}$." The left side is a matrix meeting a vector, which is the whole transformation. The right side is one plain number multiplying that same vector, which is a resize and nothing else. Claiming the two are equal says the matrix did nothing to $\mathbf{v}$ except change its length.
+
+"Only scales, never rotates" is the same claim in geometry words. `v` points along a line through the origin, and if `A @ v` lands on that same line, no turning happened. Two lines of code settle it for any candidate:
+
+```python title="eigen_reading.py"
+A = np.array([[2.0, 1.0],
+              [1.0, 2.0]])
+
+v = np.array([1.0, 1.0])      # A @ v = [3.0, 3.0], which is 3 * v
+w = np.array([1.0, 0.0])      # A @ w = [2.0, 1.0], which is not c * w for any c
+
+print(A @ v)                  # [3. 3.]
+print(3 * v)                  # [3. 3.]   same line, stretched 3x: v is an eigenvector
+print(A @ w)                  # [2. 1.]   w's direction moved: not an eigenvector
 ```
-A @ v = lambda * v
-```
 
-`lambda` is the **eigenvalue** paired with `v`. Every direction except the eigenvectors gets rotated by `A`; the eigenvectors are the directions that survive the transformation intact.
+`[1, -1]` is the other eigen-direction of that matrix, and its stretch factor is 1: `A @ [1, -1]` returns `[1, -1]` untouched. Those two factors, 3 and 1, are what `np.linalg.eig` prints below.
 
-If `A` has `n` linearly independent eigenvectors, it can be factored as:
+`lambda` is the **eigenvalue** paired with `v`, and it is just that resize factor: above 1 stretches, between 0 and 1 shrinks, negative flips the direction to the opposite side of the origin. Every direction that is not an eigenvector gets rotated by `A`, which is what makes eigenvectors informative. They are the axes the matrix genuinely works along.
 
-```
-A = V @ diag(lambda) @ V^-1
-```
+If $A$ has $n$ linearly independent eigenvectors, it can be factored into its **eigen-decomposition**:
 
-where the columns of `V` are the eigenvectors and `lambda` holds the eigenvalues. Read from right to left: change into the eigenbasis, scale each axis independently, change back.
+$$
+A = V \Lambda V^{-1}
+$$
+
+The columns of $V$ are the eigenvectors, $\Lambda = \operatorname{diag}(\lambda_1, \dots, \lambda_n)$ holds the eigenvalues on the diagonal, and $V^{-1}$ inverts the eigenbasis. Read from right to left: change into the eigenbasis ($V^{-1}$), scale each axis independently ($\Lambda$), and change back ($V$). Pick the right coordinates and a tangled matrix becomes $n$ separate scalar multiplications.
 
 ```python title="eigen.py"
 A = np.array([[2.0, 1.0],
@@ -203,19 +317,21 @@ v = eigenvectors[:, 0]
 print(np.allclose(A @ v, eigenvalues[0] * v))   # True
 ```
 
-Eigenvalues also describe conditioning. The ratio of the largest to smallest eigenvalue magnitude tells you how much a matrix stretches space unevenly, and that ratio drives both numerical instability and slow gradient descent.
+Eigenvalues also describe <Tip term="conditioning">How unevenly a matrix stretches different directions. A badly conditioned matrix makes gradients tiny in one direction and huge in another.</Tip>. The ratio of the largest to smallest eigenvalue magnitude is the **condition number**, and it says how uneven that stretching is. Eigenvalues 3 and 1 give condition number 3. Eigenvalues 100 and 1 give 100, and a loss surface built on such a matrix becomes a long narrow valley: gradient steps bounce across the steep short axis while creeping along the gentle long one. Large condition numbers drive both numerical instability and slow gradient descent.
 
 ---
 
 ## Singular value decomposition
 
-Eigen-decomposition needs a square matrix. **SVD** works on any shape, which is why it is the workhorse of applied linear algebra.
+Eigen-decomposition needs a square matrix, and real weight matrices rarely are one. **SVD** works on any shape, which is why it is the workhorse of applied linear algebra.
 
-Any matrix `A` of shape `(m, n)` factors as:
+Any matrix $A$ of shape $(m, n)$ factors as:
 
-```
-A = U @ Sigma @ V.T
-```
+$$
+A = U \Sigma V^T
+$$
+
+Three factors, three jobs, read right to left: $V^T$ rotates the input onto a convenient set of axes, $\Sigma$ stretches each axis by its own singular value, and $U$ rotates the result into place in the output space. Every matrix of every shape is a rotate, then stretch, then rotate. Nothing more is going on.
 
 | Factor  | Shape    | Contents                                                      |
 | :------ | :------- | :------------------------------------------------------------ |
@@ -223,7 +339,11 @@ A = U @ Sigma @ V.T
 | `Sigma` | `(m, n)` | Diagonal, singular values sorted descending, all non-negative |
 | `V.T`   | `(n, n)` | Orthonormal right singular vectors, input-space directions    |
 
-The singular values `sigma_i` are the square roots of the eigenvalues of `A.T @ A`. Each one measures how much `A` stretches space along the matching direction in `V`.
+The columns of `U` and `V` are <Tip term="orthonormal">Mutually perpendicular and each of length 1. An orthonormal set of axes is a perfectly square grid, so a matrix made of them rotates without stretching.</Tip>, which means those two factors only rotate and never resize. All the resizing lives in `Sigma`.
+
+Each singular value `sigma_i` is the stretch factor for one axis pair: `sigma_i` says how far `A` pushes a unit vector along input direction `V[:, i]`, and how far it lands in output direction `U[:, i]`. The largest is the maximum stretch the matrix applies anywhere, the smallest is the minimum, and a zero means that direction is flattened out of existence.
+
+The formal link is that the singular values are the square roots of the eigenvalues of `A.T @ A`, which is a square matrix and therefore eligible for eigen-decomposition. That identity is how the values get computed. The rotate-stretch-rotate reading is what to keep.
 
 ```python title="svd.py"
 A = np.random.randn(6, 4)
@@ -234,9 +354,13 @@ reconstructed = U @ np.diag(S) @ Vt
 print(np.allclose(A, reconstructed))            # True
 ```
 
+`full_matrices=False` returns the reduced form: `S` comes back as a flat vector of 4 values rather than a `(6, 4)` matrix of mostly zeros, so `np.diag` rebuilds the diagonal before multiplying. The shapes in the table above are the full version. Both multiply back to the same `A`.
+
 ### Low-rank approximation
 
-Keep only the top `k` singular values and you get the best possible rank-`k` approximation of `A` in the least-squares sense. This is the Eckart-Young theorem.
+Drop every singular value past the first `k`, along with the input and output directions attached to them. The result is a rank-`k` matrix: it can only reach a `k`-dimensional subspace, the same crushed-space situation from the rank section, except chosen on purpose.
+
+Keep only the top `k` singular values and you get the best possible rank-`k` approximation of `A` in the <Tip term="least-squares sense">Measured by the sum of squared differences between the original and the approximation, entry by entry.</Tip>. This is the <Tip term="Eckart-Young theorem">A proven result: truncating the SVD to the top k values is never worse than any other rank-k approximation you could pick.</Tip>.
 
 ```python title="low_rank.py"
 k = 2
@@ -248,12 +372,13 @@ error = np.linalg.norm(A - A_approx) / np.linalg.norm(A)
 print(f"relative error with rank {k}: {error:.4f}")
 ```
 
-The storage saving is the reason this matters. A full `(m, n)` matrix needs `m * n` numbers. A rank-`k` factorization needs `k * (m + n)`. For `m = n = 4096` and `k = 16`, that is 16.7 million numbers down to 131 thousand.
+The storage saving is the reason this matters. A full `(m, n)` matrix needs `m * n` numbers. A rank-`k` factorization needs `k * (m + n)`. For `m = n = 4096` and `k = 16`, that is 16,777,216 numbers down to 131,072, a 128-fold reduction.
 
 <Callout type="info">
-  Hold this shape in mind: `dW = B @ A` where `B` is `(4096, 16)` and `A` is `(16, 4096)`. It is
-  exactly a rank-16 approximation of an update matrix, and it is the whole of LoRA. Phase 7 builds
-  on it directly.
+  Hold this shape in mind: `dW = B @ A` where `B` is `(4096, 16)` and `A` is `(16, 4096)`. The inner
+  16s match and drop out, so `(4096, 16) @ (16, 4096) -> (4096, 4096)`: the product is full-sized
+  while the stored numbers are not. It is exactly a rank-16 approximation of an update matrix, and
+  it is the whole of LoRA. Phase 7 builds on it directly.
 </Callout>
 
 ---
@@ -303,6 +428,16 @@ The storage saving is the reason this matters. A full `(m, n)` matrix needs `m *
   <Accordion title="What do the largest and smallest singular values of a weight matrix tell you?">
 
     The largest is the spectral norm, the maximum stretch the transform applies to a unit vector. The ratio `sigma_max / sigma_min` is the condition number: a large one means gradients scale differently along different directions, so plain gradient descent zigzags, which is why adaptive optimizers and preconditioning exist.
+
+  </Accordion>
+  <Accordion title="Say `A @ v = lambda * v` in words, and explain why the vectors that satisfy it are worth finding.">
+
+    Applying `A` to `v` returns `v` resized by the factor `lambda`, with no change of direction. Most vectors do not survive `A` that way. The ones that do are the axes the matrix actually works along, and rewriting a problem in those coordinates turns a fully mixed matrix product into independent one-dimensional scalings.
+
+  </Accordion>
+  <Accordion title="Why are two random 4096-dimensional vectors nearly perpendicular, and what does that buy a retrieval system?">
+
+    A dot product sums one term per dimension while the two norms in the cosine denominator grow in step, so the angle concentrates: the mean absolute cosine sits near `1 / sqrt(d)`, about 0.016 at `d = 4096`. Because unrelated embeddings almost never score above that, a similarity of 0.7 is a real claim of relatedness rather than an artifact of the geometry, and a threshold on it means something.
 
   </Accordion>
 </Accordions>

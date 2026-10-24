@@ -3,7 +3,9 @@ title: Tensor Broadcasting
 description: Implicit dimension expansion rules, strides and contiguity, zero-copy views, and writing vectorized array code instead of Python loops.
 ---
 
-Broadcasting lets arrays of different shapes combine element-wise without copying data. Every bias addition, positional encoding injection, and attention mask in a transformer depends on it. Misreading a broadcast rule is the single most common source of silent shape bugs in numerical code.
+Broadcasting lets arrays of different shapes combine element-wise without copying data. Every bias addition, positional encoding injection, and attention mask in a transformer depends on it. Misreading the rules is a routine way to get code that runs, produces numbers, and is wrong.
+
+"Element-wise" means one operation per number, position matched against position: two arrays of 100 numbers produce 100 additions, not a sum of everything. Shapes on this page are written as tuples like `(8, 512)` and read as "8 by 512"; `axis=-1` means the last axis. Both are decoded in [Notation and Symbols](/ai/math-foundations/notation-and-symbols).
 
 ---
 
@@ -37,11 +39,11 @@ Both produce identical results. The broadcast version runs in compiled C over co
 
 ## The three rules
 
-Broadcasting aligns shapes from the **trailing** dimension forward and checks each pair:
+The **trailing dimension** is simply the last number in the shape tuple: for `(2, 128, 512)` it is 512, and the one before it is 128. Broadcasting compares shapes from that end, walking left, the way you line up numbers on the right when adding them by hand. Three rules decide whether a pair of shapes is legal:
 
-1. **Right-align the shapes.** Pad the shorter shape with leading 1s.
-2. **Each dimension pair must match, or one of them must be 1.** A dimension of size 1 is stretched (virtually) to match the other.
-3. **Missing leading dimensions count as 1.**
+1. **Right-align the shapes.** Pad the shorter shape with 1s at the front, so both have the same number of entries.
+2. **Each dimension pair must match, or one of them must be 1.** A dimension of size 1 gets re-read at every position of the other size. No data is copied to make that happen.
+3. **Missing leading dimensions count as 1.** This is rule 1 restated from the other side: a shape with fewer entries is treated as if 1s were there.
 
 ```
 X.shape = (8, 512)
@@ -53,7 +55,7 @@ dim 0:    8 vs   1   one of them is 1, stretch to 8
 result: (8, 512)
 ```
 
-No memory is allocated for the stretch. NumPy and PyTorch adjust the stride so the same 512 floats are read repeatedly.
+No memory is allocated for the stretch. NumPy and PyTorch adjust the stride so the same 512 floats are read repeatedly. `stride` is the "how far to jump in memory to move one step along this axis" number, and the next-to-last section shows how a stride of 0 produces the stretch for free.
 
 ### Worked shape examples
 
@@ -86,7 +88,7 @@ X + col.reshape(-1, 1)        # identical
 
 ## The unsqueeze idiom
 
-`None` in an index (equivalently `np.newaxis` or `torch.unsqueeze`) inserts a length-1 axis. This is how you choose which dimension broadcasts.
+`None` in an index (equivalently `np.newaxis`, or `torch.unsqueeze` in PyTorch) inserts a length-1 axis. This is how you choose which dimension broadcasts, and `:` in the other slot means "take every element along that axis".
 
 ```python title="unsqueeze.py"
 v = np.arange(6)          # shape (6,)
@@ -98,19 +100,33 @@ v[None, None, :]          # shape (1, 1, 6)
 # pairwise difference matrix without a loop
 diff = v[:, None] - v[None, :]     # (6, 6)
 print(diff.shape)                  # (6, 6)
+print(diff)
 ```
 
-That last line builds a full `6 x 6` difference matrix in one operation. The same idiom at scale is how attention computes all pairwise query-key scores.
+Read the subtraction as two operands aimed at different axes: `v[:, None]` is a column of shape `(6, 1)`, `v[None, :]` is a row of shape `(1, 6)`. Both stretch to `(6, 6)`, and the entry at `(i, j)` is `v[i] - v[j]`:
+
+```
+[[ 0 -1 -2 -3 -4 -5]
+ [ 1  0 -1 -2 -3 -4]
+ [ 2  1  0 -1 -2 -3]
+ [ 3  2  1  0 -1 -2]
+ [ 4  3  2  1  0 -1]
+ [ 5  4  3  2  1  0]]
+```
+
+The diagonal is zero because each element is compared against itself, and the matrix is antisymmetric because swapping `i` and `j` flips the sign. That last line builds a full `6 x 6` difference matrix in one operation. The same idiom at scale is how attention computes all pairwise query-key scores.
 
 ---
 
 ## Strides, contiguity, and views
 
-A tensor in memory is a flat buffer plus a **shape** and a **stride**. The stride says how many elements to skip in the buffer to advance one step along each axis.
+Computer memory is one long line of numbered slots, and a 2D array is an illusion layered on top of it. What makes a flat run of 12 numbers look like a 3 by 4 grid is two pieces of metadata: a **shape** and a **stride**. The stride says how many elements to skip in the line to advance one step along each axis.
 
-For a contiguous `(3, 4)` float array holding `[0..11]`:
+A **contiguous** array is one whose numbers sit in memory in the same order the nesting reads: all of row 0, then all of row 1, then all of row 2. That is the ordinary layout, and it is what "contiguous" means when it appears in an error message. For a contiguous `(3, 4)` float array holding the numbers 0 through 11:
 
 ```
+memory:  0  1  2  3 | 4  5  6  7 | 8  9  10  11
+
 shape  = (3, 4)
 stride = (4, 1)      # skip 4 elements to move one row, 1 element to move one column
 ```
@@ -120,6 +136,7 @@ Element `(i, j)` sits at flat offset `i * 4 + j * 1`.
 ```python title="strides.py"
 a = np.arange(12).reshape(3, 4)
 print(a.strides)        # (32, 8) in bytes for int64 -> (4, 1) elements
+print(a[1, 2])          # 6, which is 1 * 4 + 2 * 1 = offset 6 in the flat line
 
 t = a.T                 # transpose
 print(t.shape)          # (4, 3)
@@ -127,7 +144,13 @@ print(t.strides)        # (8, 32) -> strides swapped
 print(t.flags['C_CONTIGUOUS'])   # False
 ```
 
-The transpose did not move any data. It swapped the strides, producing a **view** onto the same buffer. That is why it is free, and also why the result is no longer contiguous: walking down a column now jumps backwards through memory.
+`np.arange(12).reshape(3, 4)` builds the example: 12 counting numbers laid into 3 rows of 4, and `a[1, 2] = 6` confirms the offset arithmetic. Strides are reported in bytes, so `(32, 8)` is `(4, 1)` elements at 8 bytes each for `int64`. `C_CONTIGUOUS` is NumPy's flag for "the data is in the ordinary row-by-row order", and `C` is historical, from the C language's layout convention.
+
+The transpose did not move any data. It swapped the strides, producing a **view** onto the same buffer: a second way to read memory that is already owned by someone else. That is why it is free, and also why the result is no longer contiguous: walking down a column now jumps backwards through memory.
+
+### View versus copy, in one paragraph
+
+A view shares storage, so writing through it changes the original. A copy allocates fresh memory, and the two then drift apart. The whole `reshape` / `view` / `contiguous` discussion below is about which one you got, because the answer changes both correctness and memory use.
 
 ### When views are impossible
 
@@ -148,9 +171,11 @@ w = y2.view(12)                # now works, no further copy
 
 <Callout type="warn">
   Prefer `.reshape()` in PyTorch when you do not care about aliasing, and `.view()` when you want an
-  error instead of an unexpected allocation. A silent copy inside a training loop shows up as a
+  error instead of an unexpected allocation. Aliasing is the case where two tensors point at the same
+  memory, so a change to one appears in the other. A silent copy inside a training loop shows up as a
   mysterious memory and throughput regression, and it is easy to miss because the numbers stay
   correct.
+
 </Callout>
 
 ### Broadcasting reads with zero stride
@@ -181,16 +206,25 @@ out = act + pos                        # (2, 128, 512)
 **Attention masking.** A causal mask of shape `(seq, seq)` applied to scores of shape `(batch, heads, seq, seq)`:
 
 ```python title="causal_mask.py"
-seq = 8
+seq = 4
 scores = np.random.randn(2, 4, seq, seq)          # batch 2, 4 heads
 mask = np.triu(np.full((seq, seq), -np.inf), k=1) # upper triangle is -inf
 
-masked = scores + mask                            # broadcasts to (2, 4, 8, 8)
+masked = scores + mask                            # broadcasts to (2, 4, 4, 4)
 ```
 
-The mask has no batch or head dimension, so one `(8, 8)` matrix serves all 8 attention planes. Phase 5 builds exactly this.
+`np.triu` means "take the upper triangle", and `k=1` says start one diagonal above the main one, so the strictly-above part is kept and everything on or below the diagonal becomes 0. `np.inf` is infinity, and `-inf` added to any finite score makes it `-inf`. On a `4 x 4` example the mask is:
 
-**Normalization.** RMSNorm divides each vector by its own root-mean-square, computed per row with `keepdims`:
+```
+[[  0. -inf -inf -inf]
+ [  0.   0. -inf -inf]
+ [  0.   0.   0. -inf]
+ [  0.   0.   0.   0.]]
+```
+
+Row `i` is the view from token `i`, and the `-inf` entries are the tokens further along the sequence. A score of `-inf` turns into a probability of 0 at the softmax step, so token `i` cannot read anything after itself. That is the whole of causal masking, expressed as one broadcast. The mask has no batch or head dimension, so one `(4, 4)` matrix serves all 8 attention planes, where a plane is one `(seq, seq)` slab: one batch element, one head. Phase 5 builds exactly this.
+
+**Normalization.** RMSNorm divides each vector by its own <Tip term="root-mean-square">Square every value, take the mean of those squares, then take the square root. It is the typical size of the numbers in the group, ignoring sign.</Tip> computed per row with `keepdims`:
 
 ```python title="rmsnorm.py"
 x = np.random.randn(2, 128, 512)
@@ -212,11 +246,11 @@ out = x / rms                                            # (2, 128, 512)
 
 Broadcasting is not only shorter, it is faster, for three reasons:
 
-1. **The loop runs in compiled code** rather than in the Python interpreter, which costs tens of nanoseconds per iteration.
-2. **Memory access stays contiguous**, so CPU caches and GPU memory coalescing work as designed.
+1. **The loop runs in compiled code** rather than in the Python interpreter, which has to look up names, box every number into an object, and dispatch every `+` on every iteration.
+2. **Memory access stays contiguous**, so CPU caches work as designed. The CPU fetches memory in blocks called cache lines, and a straight pass through a row uses each block it fetches; jumping down a column touches a different block every step. On a GPU the same idea is called <Tip term="memory coalescing">When the threads in one GPU warp read neighbouring addresses in one shot, the hardware can fetch them together instead of one at a time.</Tip>.
 3. **No intermediate Python objects** are created per element.
 
-A rough measurement on a `(1024, 1024)` matrix:
+A measurement on a `(1024, 1024)` matrix:
 
 ```python title="timing.py"
 import time
@@ -240,20 +274,28 @@ print(f"loop: {loop_time*1e3:.2f} ms   vectorized: {vec_time*1e3:.2f} ms")
 print(np.allclose(loop_out, vec_out))
 ```
 
-The scalar double loop is roughly 100x to 500x slower on typical hardware, because it runs a million Python interpreter iterations instead of one compiled pass. Even a partially vectorized row loop (`loop_out[i] = X[i] + b`) is measurably slower than the single expression. On a GPU the gap widens further, since a Python loop forces per-element kernel launches or a transfer back to host memory.
+```
+loop: 621.60 ms   vectorized: 3.42 ms
+True
+```
+
+That is 182x on the machine that ran it, and the ratio varies a lot with hardware and NumPy build. Treat 100x to 500x as the honest range for a per-element Python double loop versus one vectorized expression. What does not vary is the reason: the loop runs a million interpreter iterations, the expression runs one compiled pass. Even a partially vectorized row loop (`loop_out[i] = X[i] + b`) is measurably slower than the single expression. On a GPU the gap widens further, since a Python loop means one tiny <Tip term="kernel launch">One instruction to the GPU telling it to run a compiled function. Setting it up costs more time than the arithmetic it performs.</Tip> per element instead of one launch for the whole array.
 
 ### Accidental memory blowups
 
-Broadcasting can also allocate more than you expect. `(1000, 1)` against `(1, 1000)` produces a `(1000, 1000)` result, a million elements from two thousand inputs:
+The two rules only govern legality, not size. Nothing stops a legal broadcast from producing an output far bigger than either input, because the output shape takes the largest non-1 entry at each position. `(1000, 1)` against `(1, 1000)` produces a `(1000, 1000)` result, a million elements out of two thousand inputs:
 
 ```python title="outer_product.py"
 a = np.random.randn(1000, 1)
 b = np.random.randn(1, 1000)
 c = a * b
-print(c.nbytes / 1e6)     # 8.0 MB for float64
+print(c.shape)          # (1000, 1000)
+print(c.nbytes / 1e6)   # 8.0 MB for float64
 ```
 
-That is legitimate when you want an outer product. In attention, the same expansion over `(batch, heads, seq, seq)` is the reason attention memory grows as `O(N^2)` and why Phase 6 discusses context window limits. FlashAttention exists specifically to avoid materializing that broadcast result.
+Two thousand input numbers became one million output numbers and 8 MB of memory. That is legitimate when you want an outer product, which is the same pairwise grid as the difference matrix above.
+
+In attention, the same expansion over `(batch, heads, seq, seq)` is the reason attention memory grows as `O(N^2)`. That notation means the cost scales with the square of the input size: double the sequence length `N` and you quadruple the number of score entries, because there is one entry per pair of tokens. Cut `N` in half and the same array shrinks fourfold. This is why Phase 6 treats context window limits as a memory problem before treating them as a quality problem. FlashAttention exists specifically to avoid <Tip term="materialize">To build the full result array in memory rather than computing it piece by piece and discarding it.</Tip> that broadcast result.
 
 ---
 

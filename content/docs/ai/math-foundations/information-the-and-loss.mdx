@@ -5,15 +5,17 @@ description: Entropy, cross-entropy, KL divergence, and perplexity, plus why cro
 
 Cross-entropy is the loss that trains every language model in this curriculum. It comes from information theory, and understanding where it comes from explains why the gradient is so clean, what perplexity measures, and how distillation and RLHF reuse the same quantity.
 
+`log` on this page means the natural logarithm (base `e`, about 2.71828) unless a base is written. `sum over i of` means add up one term per index position. Both are decoded in [Notation and Symbols](/ai/math-foundations/notation-and-symbols).
+
 ---
 
 ## Surprise and information content
 
-Start with one event. If something has probability `p`, observing it carries:
+Start with one event. If something has probability $p$, observing it carries:
 
-```
-I(p) = -log(p)
-```
+$$
+I(p) = -\log(p) = \log\left(\frac{1}{p}\right)
+$$
 
 units of information. The negative log turns probability into surprise:
 
@@ -24,21 +26,30 @@ units of information. The negative log turns probability into surprise:
 | `0.01` | 4.605            | Very surprising                |
 | `1e-6` | 13.816           | Extraordinary                  |
 
+Read the table as: the less likely a thing was, the more the observation tells you. A coin flip that comes up heads teaches you 0.693 nats; a one-in-a-million event teaches you 13.816.
+
 Two properties make the logarithm the right choice. Independent events have multiplied probabilities, and information should add, which a log converts automatically. And rare events should carry more information than common ones, which the negative sign provides.
 
-Using the natural log gives units of **nats**. Using base 2 gives **bits**. Deep learning uses natural log throughout, so losses and perplexities are in nats unless stated otherwise.
+The multiplicative-to-additive swap is worth seeing as numbers, because it is the same reason log probabilities are used everywhere later. Two independent events at `p = 0.01` each have joint probability `0.0001`:
+
+```
+I(0.01) + I(0.01)   = 4.605 + 4.605 = 9.210
+I(0.0001)           = 9.210          same
+```
+
+Using the natural log gives units of **nats** ("n" from natural). Using base 2 gives **bits**. One nat is about 1.443 bits, since `1 / log(2) = 1.4427`. Deep learning uses natural log throughout, so losses and perplexities are in nats unless stated otherwise.
 
 ---
 
 ## Entropy
 
-**Entropy** is the expected surprise of a distribution `p`, averaged over its own outcomes:
+**Entropy** is the <Tip term="expected">The average of a quantity, where each possible value is weighted by how likely it is. Not the maximum, not the most common value.</Tip> surprise of a distribution $p$, averaged over its own outcomes:
 
-```
-H(p) = -sum over i of p_i * log(p_i)
-```
+$$
+H(p) = -\sum_{i=1}^K p_i \log(p_i) = \mathbb{E}_{x \sim p}[-\log p(x)]
+$$
 
-It measures how uncertain or spread out a distribution is.
+Each outcome $i$ contributes its surprise $-\log(p_i)$, weighted by how often it happens, $p_i$. Read the whole formula as "how surprised you are on average by draws from this distribution", which is the same as "how uncertain the distribution is".
 
 ```python title="entropy.py"
 import numpy as np
@@ -55,17 +66,21 @@ print(np.log(3))                          # 1.0986  - matches
 
 Entropy is maximized by the uniform distribution and equals zero for a one-hot distribution. For `K` possible outcomes, the maximum is `log(K)`.
 
-For a language model with vocabulary `V = 50257`, a uniform predictor has entropy `log(50257) = 10.82` nats. That is the worst possible model, and it gives you the baseline every real loss is measured against.
+For a language model with vocabulary `V = 50257`, a uniform predictor has entropy `log(50257) = 10.82` nats. That is the worst possible model, and it gives you the baseline every real loss is measured against. A loss of 10.82 means the model learned nothing; anything below it is information.
 
 ---
 
 ## Cross-entropy
 
-**Cross-entropy** measures the expected surprise when the true distribution is `p` but you encode outcomes using a model's distribution `q`:
+**Cross-entropy** measures the expected surprise when the true distribution is $p$ but you encode outcomes using a model's distribution $q$:
 
-```
-H(p, q) = -sum over i of p_i * log(q_i)
-```
+$$
+H(p, q) = -\sum_{i=1}^K p_i \log(q_i) = \mathbb{E}_{x \sim p}[-\log q(x)]
+$$
+
+The two distributions have different jobs in that formula. $p$ supplies the weights, how often each outcome really happens. $q$ supplies the surprise, how shocked your model is when it does. It is the same sum as entropy with the model's probabilities swapped in for the real ones.
+
+The classical reading is about message encoding: you design your code lengths for `q`, but messages arrive with the frequencies of `p`, and `H(p, q)` is the average cost per symbol you end up paying. The reading that matters for training is the same arithmetic with `p` as the data and `q` as the model.
 
 The weights come from `p`, the log terms come from `q`. If `q` matches `p` exactly, cross-entropy equals entropy, its minimum. If `q` assigns low probability to events that actually happen, the penalty grows without bound as `log(q_i)` heads toward `-inf`.
 
@@ -90,11 +105,13 @@ print(cross_entropy(p, q_bad))    # 1.9694  - much worse
 
 ## KL divergence
 
-Subtracting entropy from cross-entropy gives the **Kullback-Leibler divergence**, the extra cost of using `q` instead of `p`:
+Subtracting entropy from cross-entropy gives the **Kullback-Leibler divergence**, the extra cost of using $q$ instead of $p$:
 
-```
-D_KL(p || q) = H(p, q) - H(p) = sum over i of p_i * log(p_i / q_i)
-```
+$$
+D_{\text{KL}}(p \parallel q) = H(p, q) - H(p) = \sum_{i=1}^K p_i \log\left(\frac{p_i}{q_i}\right)
+$$
+
+The $\parallel$ in the middle is a separator, not an operator. It is not a norm and not a logical OR; $D_{\text{KL}}(p \parallel q)$ is just the notation for "divergence of $q$ from $p$, with $p$ as the reference". Which side is which changes the answer, so the order is part of the meaning.
 
 | Property       | Behavior                                            |
 | :------------- | :-------------------------------------------------- |
@@ -102,6 +119,8 @@ D_KL(p || q) = H(p, q) - H(p) = sum over i of p_i * log(p_i / q_i)
 | Zero condition | Equals 0 if and only if `p == q` almost everywhere  |
 | Symmetric      | No. `D_KL(p \|\| q)` differs from `D_KL(q \|\| p)`  |
 | A metric       | No. Asymmetric and violates the triangle inequality |
+
+Gibbs' inequality is the proven result that the third row rests on: no distribution is closer to another than it is to itself, so the extra cost is never negative. "Almost everywhere" allows the two distributions to disagree on outcomes of probability zero, where nothing is ever observed. The <Tip term="triangle inequality">The rule a distance must obey: going from A to C directly is never longer than going through B, so `d(A,C) <= d(A,B) + d(B,C)`.</Tip> fails, which is why KL is called a divergence and not a distance.
 
 Because `H(p)` does not depend on the model, **minimizing cross-entropy and minimizing KL divergence are the same optimization problem**. Training a language model on next-token prediction is fitting the model distribution to the data distribution in the KL sense.
 
@@ -118,25 +137,44 @@ print(cross_entropy(p, q_good) - entropy(p))    # 0.0072, same value
 
 ### The asymmetry matters
 
+Swapping the arguments gives a different number, and the gap is not small in the cases that matter:
+
+```python title="kl_asymmetry.py"
+pa = np.array([0.8, 0.1, 0.1])
+qa = np.array([0.4, 0.4, 0.2])
+
+print(kl_divergence(pa, qa))    # 0.3466
+print(kl_divergence(qa, pa))    # 0.4159
+```
+
 The direction of the KL divergence produces different behaviors, which is why it shows up in two very different places later in this curriculum.
 
-**Forward KL**, `D_KL(p_true || q_model)`, is what maximum likelihood minimizes. It is mean-seeking: `q` must cover everywhere `p` has mass, or the `log(p/q)` term explodes. This is why language models trained on cross-entropy spread probability across plausible continuations rather than collapsing to one.
+**Forward KL**, `D_KL(p_true || q_model)`, is what maximum likelihood minimizes. It is <Tip term="mean-seeking">The optimiser is pushed to cover every region the target has probability in, so it settles between the modes rather than committing to one.</Tip>: `q` must cover everywhere `p` has mass, or the `log(p/q)` term explodes. This is why language models trained on cross-entropy spread probability across plausible continuations rather than collapsing to one.
 
-**Reverse KL**, `D_KL(q_model || p_true)`, is mode-seeking and appears in variational inference and some RL objectives. It tolerates missing modes but avoids placing mass where the target has none.
+**Reverse KL**, `D_KL(q_model || p_true)`, is <Tip term="mode-seeking">The optimiser is pushed onto one of the target's high-probability regions and stays off the low ones, so a bimodal target yields a model that commits to one mode.</Tip> and appears in variational inference and some RL objectives. It tolerates missing modes but avoids placing mass where the target has none.
+
+The two behave oppositely on a target with two peaks. Say `p_true` puts 0.5 on outcome A, 0.5 on outcome C, and 0 on B, and the model is the flat `[0.25, 0.5, 0.25]`:
+
+```
+D_KL(p_true || q_flat) = 0.6931    finite: covering B is wasteful, not punished
+D_KL(q_flat || p_true) = inf       q has mass on B, where p_true has none
+```
+
+Forward KL accepts the flat model and asks it to be flatter still. Reverse KL rejects it outright and pushes the model to pick A or C and go all in. The `inf` is exact, not numerical noise: the term is `q_B * log(q_B / 0)`, and dividing by zero probability is the formula saying "you assigned weight to something impossible".
 
 ---
 
 ## Cross-entropy as the language modeling loss
 
-Language modeling training data is a sequence of one-hot targets. At each position the correct next token has probability 1 and every other token has probability 0.
+Language modeling training data is a sequence of one-hot targets. A one-hot vector is all zeros with a single 1, and the position of the 1 is the index of the token that actually came next. At each position the correct next token has probability 1 and every other token has probability 0.
 
-Plug a one-hot `y` into the cross-entropy formula:
+Plug a one-hot $\mathbf{y}$ into the cross-entropy formula:
 
-```
-H(y, q) = -sum over i of y_i * log(q_i) = -log(q_correct)
-```
+$$
+H(\mathbf{y}, \mathbf{q}) = -\sum_{i=1}^V y_i \log(q_i) = -\log(q_{\text{correct}})
+$$
 
-Every term with `y_i = 0` vanishes. The loss for one token is the negative log probability the model assigned to the token that actually came next. This reduced form is called **negative log-likelihood** (NLL).
+Every term with $y_i = 0$ vanishes. The loss for one token is the negative log probability the model assigned to the token that actually came next. This reduced form is called **negative log-likelihood** (NLL).
 
 ```python title="nll.py"
 vocab = 5
@@ -154,27 +192,27 @@ y = np.zeros(vocab); y[target] = 1.0
 print(np.isclose(nll, -(y * np.log(probs)).sum()))     # True
 ```
 
-Over a sequence of `T` tokens, training minimizes the mean:
+Over a sequence of $T$ tokens, training minimizes the empirical cross-entropy loss:
 
-```
-loss = -(1/T) * sum over t of log q_t(correct_token)
-```
+$$
+\mathcal{L}_{\text{CE}} = -\frac{1}{T} \sum_{t=1}^T \log q_t(y_t)
+$$
 
 ### The gradient is p minus y
 
 Differentiating cross-entropy with respect to the **logits** (not the probabilities) gives an unusually clean result:
 
-```
-d(loss)/d(z_i) = q_i - y_i
-```
+$$
+\frac{\partial \mathcal{L}_{\text{CE}}}{\partial z_i} = q_i - y_i
+$$
 
-The softmax quotient rule and the log in cross-entropy cancel almost completely. For a one-hot target this means the gradient on the correct token is `q_correct - 1`, negative, pushing its logit up, and on every other token it is `q_i`, positive, pushing those logits down. Every framework's autograd produces this same expression, and Phase 3 derives it by hand.
+$\frac{\partial \mathcal{L}}{\partial z_i}$ is read "how the loss changes as logit $z_i$ moves", $z_i$ is raw logit $i$ before softmax, $q_i$ is the softmax output at $i$, and $y_i$ is the target at $i$. The softmax quotient rule and the log in cross-entropy cancel almost completely, leaving the error itself as the gradient. For a one-hot target this means the gradient on the correct token is $q_{\text{correct}} - 1$ (negative, pushing its logit up), and on every other token it is $q_i$ (positive, pushing those logits down). Every framework's autograd produces this same expression, and Phase 3 derives it by hand.
 
 <Callout type="info">
   This cancellation is the practical reason softmax and cross-entropy are always paired. Using
-  mean-squared error on softmax probabilities instead gives a gradient with an extra `q_i * (1 -
-  q_i)` factor that vanishes exactly when the model is confidently wrong, so learning stalls in the
-  worst possible place.
+  mean-squared error on softmax probabilities instead gives a gradient with an extra $q_i(1 - q_i)$
+  factor that vanishes exactly when the model is confidently wrong, so learning stalls in the worst
+  possible place.
 </Callout>
 
 ---
@@ -183,11 +221,13 @@ The softmax quotient rule and the log in cross-entropy cancel almost completely.
 
 **Perplexity** exponentiates cross-entropy to make it interpretable:
 
-```
-perplexity = exp(H)  =  exp(-(1/T) * sum over t of log q_t(correct_token))
-```
+$$
+\text{PPL} = \exp(H) = \exp\left(-\frac{1}{T} \sum_{t=1}^T \log q_t(y_t)\right)
+$$
 
 It answers: on average, how many tokens does the model consider equally plausible at each step?
+
+A cross-entropy of `H` means the model behaves as if it were picking uniformly out of `exp(H)` options, so the exponent turns a log-scale number back into a count you can picture. Perplexity 20 is "roughly a twenty-way choice each token", and the number is on a ratio scale: 40 is twice as uncertain as 20, which is not true of the loss itself.
 
 | Cross-entropy (nats) | Perplexity | Interpretation                                     |
 | :------------------- | :--------- | :------------------------------------------------- |
@@ -218,7 +258,7 @@ Two caveats when reading reported perplexity numbers. It depends on the tokenize
 
 The same three formulas do work well beyond pretraining.
 
-**Knowledge distillation (Phase 7).** A student model trains against a teacher's soft probability distribution rather than one-hot labels. The loss is `D_KL(p_teacher || q_student)` computed at an elevated temperature so the teacher's relative preferences between wrong answers stay visible. Those inter-class relationships are the "dark knowledge" the student absorbs. The total objective is usually a weighted sum of that KL term and standard hard-label cross-entropy.
+**Knowledge distillation (Phase 7).** A student model trains against a teacher's soft probability distribution rather than one-hot labels. The loss is `D_KL(p_teacher || q_student)` computed at an elevated temperature so the teacher's relative preferences between wrong answers stay visible. Those inter-class relationships are the "dark knowledge" the student absorbs: which wrong answers the teacher thought nearly as good, which a one-hot label erases. The name is from _Distilling the Knowledge in a Neural Network_ (Hinton, Vinyals, Dean, arXiv:1503.02531). The total objective is usually a weighted sum of that KL term and standard hard-label cross-entropy.
 
 **RLHF and DPO (Phase 8).** Both add a KL penalty between the policy being trained and a frozen reference model:
 
@@ -226,7 +266,7 @@ The same three formulas do work well beyond pretraining.
 objective = reward - beta * D_KL(policy || reference)
 ```
 
-Without it the policy drifts until it exploits the reward model, producing fluent nonsense. The KL term is a leash, and `beta` sets its length.
+Without it the policy drifts until it exploits the reward model, producing fluent nonsense. That failure is called <Tip term="reward hacking">The trained policy finds an output that scores high with the reward model without actually being good, such as an endlessly long confident answer.</Tip>, and it is the reason the term exists. The KL term is a leash, and `beta` sets its length.
 
 **Evaluation metrics (Phase 11).** Perplexity is one of the automatic reference metrics. Others like `BERTScore` replace token probability with embedding similarity, but the underlying question, how far is the generated distribution from the target, is the same one.
 
@@ -258,6 +298,21 @@ Without it the policy drifts until it exploits the reward model, producing fluen
   <Accordion title="Why is a KL penalty added during RLHF?">
 
     It constrains the trained policy to stay near the reference model, preventing reward hacking and mode collapse into degenerate high-reward text.
+
+  </Accordion>
+  <Accordion title="Cross-entropy on a one-hot target, log-likelihood, and NLL: are these three different losses?">
+
+    One loss written three ways. Cross-entropy with a one-hot `y` collapses to `-log(q_correct)`, which is the negative log of the probability assigned to the observed token, which is the negative log-likelihood of the data. The names differ by field, not by formula.
+
+  </Accordion>
+  <Accordion title="Why is forward KL used for training but reverse KL used in variational inference?">
+
+    Forward KL `D_KL(p_true || q_model)` is infinite wherever the data has mass and the model does not, so it forces coverage of every real outcome, which is what a generative model needs. Reverse KL `D_KL(q_model || p_true)` is infinite wherever the model puts mass that the target does not, so it forces the model to commit to one real mode rather than spread across several.
+
+  </Accordion>
+  <Accordion title="Two models report perplexity 40, one on a 50257-token vocabulary and one on 128256. Is that the same achievement?">
+
+    No. Perplexity is measured per token, and a larger vocabulary packs more text into each token, so the same 40 covers a different amount of content per step. Compare nats or bits per byte, or hold the tokenizer fixed, before drawing a conclusion.
 
   </Accordion>
 </Accordions>

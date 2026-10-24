@@ -126,6 +126,14 @@ export const curriculumData: CurriculumGroup[] = [
             interview: false,
           },
           {
+            id: 'p1-notation-symbols',
+            title: 'Notation and Symbols',
+            url: '/ai/math-foundations/notation-and-symbols',
+            desc: 'Shape tuples, axis indexing, operators, Greek letters, size letters, and the vocabulary terms used across the phase.',
+            status: 'written',
+            interview: false,
+          },
+          {
             id: 'p1-vectors-matrices',
             title: 'Vectors and Matrices',
             url: '/ai/math-foundations/vectors-and-matrices',

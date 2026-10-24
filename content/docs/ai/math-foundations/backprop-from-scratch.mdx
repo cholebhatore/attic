@@ -5,11 +5,15 @@ description: Building a computational graph, running reverse-mode automatic diff
 
 Backpropagation is a bookkeeping scheme for applying the chain rule. Every deep learning framework implements it, and none of them implement anything more complicated than what fits on this page. Building it once removes the mystery from `.backward()`, `zero_grad()`, gradient accumulation, and gradient checking.
 
+Notation on this page (`d(loss)/d(x)`, `.T`, `@`, `axis=0`, `O(eps^2)`) is decoded in [Notation and Symbols](/ai/math-foundations/notation-and-symbols).
+
 ---
 
 ## The computational graph
 
-Every arithmetic operation in a forward pass produces a new value from old ones. Record each operation as a node and each value as an edge, and you get a directed acyclic graph.
+Every arithmetic operation in a forward pass produces a new value from old ones. Record each operation as a **node** and each value as an **edge**, and you get a **directed acyclic graph**: arrows that all point one way (`directed`) with no route that returns to where it started (`acyclic`). The words matter later, because the backward pass depends on both properties.
+
+The vocabulary used in this section: a **leaf** is a node with no incoming edge, so it holds a number nobody computed, an input or a parameter. A node's **children** are the values it was built from, upstream of it. **Order** means a sequence in which every node appears after all the nodes it depends on.
 
 Take a single neuron with two inputs:
 
@@ -38,6 +42,14 @@ The forward pass builds this graph left to right and stores the result at the fi
 
 The backward pass walks the same graph in reverse. Each node knows one thing: how its output changes with respect to each of its inputs. That local derivative, multiplied by the gradient arriving from downstream, is the gradient the node passes to its own inputs.
 
+Two of those words need pinning down. **Downstream** means closer to the output, so on the loss the whole graph is downstream of a weight. The number labelled `grad` on each node below is the derivative of the final output with respect to that node's value, accumulated from everything that consumes it. It is not the local derivative, and it is not the node's own gradient with respect to itself; it is "how much the loss moves when this value moves".
+
+```
+node.grad = (local derivative) * (out.grad)     sent to each input
+```
+
+The last node, `o`, starts with `grad 1.0` because the output changes with respect to itself at rate 1. That is the seed, and everything else multiplies down from it.
+
 <Mermaid
   chart={`
 flowchart LR
@@ -61,7 +73,9 @@ Three local rules cover this entire graph:
 | `*`       | `d(a*b)/da = b`                | Each input receives the _other_ input's value times `out.grad` |
 | `tanh`    | `d tanh(n)/dn = 1 - tanh(n)^2` | The input receives `(1 - out.data^2) * out.grad`               |
 
-Addition distributes the incoming gradient equally. Multiplication swaps the operands. That asymmetry is the whole of the chain rule at work.
+`out.data` and `out.grad` in the table are the two fields every node carries: the number the node computed, and the accumulated gradient arriving at it.
+
+Addition passes the arriving gradient through unchanged to both inputs. Multiplication multiplies it by the _other_ operand's value. Following `w1` in the diagram shows what that buys: `w1.grad` is `x1 = 2.0` times the `0.5` arriving at the multiply, so `1.0`, because doubling the weight doubles a product whose other factor is 2.
 
 ---
 
@@ -86,16 +100,18 @@ A language model has one scalar loss and tens of billions of parameters. Forward
 <Callout type="info">
   Reverse mode is not free. It has to store every intermediate activation from the forward pass so
   the backward pass can use them as local-derivative coefficients. That stored state is why training
-  uses several times more memory than inference, and why **gradient checkpointing** exists:
-  recompute intermediates during the backward pass instead of keeping them, trading roughly 30%
-  extra compute for a large memory saving.
+  uses several times more memory than inference, and why **gradient checkpointing** exists: throw the
+  intermediates away, then recompute the ones you need while walking back. The cost is roughly one
+  extra forward pass on top of the usual one forward plus one backward, so about a third more
+  compute in exchange for a large memory saving.
+
 </Callout>
 
 ---
 
 ## A scalar autograd engine
 
-The engine is a class that holds a value, its gradient, its children, and a closure that knows how to propagate gradient backward.
+The engine is a class that holds a value, its gradient, its children, and a function that knows how to propagate gradient backward. That function is a <Tip term="closure">A function that remembers the variables from the scope where it was created, even after that scope is gone. In Python, a nested `def` that refers to names from its enclosing function.</Tip>, and it is the trick that makes the whole design small.
 
 ```python title="value.py"
 import math
@@ -172,7 +188,7 @@ class Value:
 
 Four details carry the design:
 
-1. **`_backward` is a closure, not a dispatch table.** Each operation captures its own inputs and output at construction time, so the rule and the data it needs travel together.
+1. **`_backward` is a closure, not a dispatch table.** A dispatch table would look up the rule by operation name, then be handed the data to apply it to. Instead each operation captures its own inputs and output at construction time, so the rule and the numbers it needs travel together, and adding a new operation means adding a method rather than editing a central switch.
 2. **Gradients accumulate with `+=`.** A parameter used in three places receives three contributions. The multivariable chain rule says partial derivatives through parallel paths add, and `+=` implements exactly that.
 3. **Coercion lets numbers mix with `Value`s.** Without `isinstance(other, Value) else Value(other)`, writing `w * 2.0` raises an `AttributeError`.
 4. **`backward()` seeds the output gradient at `1.0`.** Everything downstream is a chain of multiplications by local derivatives; the seed is what those multiply into.
@@ -181,9 +197,30 @@ Four details carry the design:
 
 ## Why topological order matters
 
-The `build` function is a depth-first post-order traversal. A node is appended only after all of its children, which is the definition of topological order. Reversing it gives an order where every node is processed strictly after all the nodes that consume its output.
+The `build` function is a depth-first <Tip term="post-order traversal">Walk a tree or graph so that a node is recorded only after everything below it has been recorded. Pre-order records the parent first, post-order records it last.</Tip>. A node is appended only after all of its children, which is the definition of <Tip term="topological order">An ordering of a graph's nodes in which every node comes after all the nodes it depends on.</Tip>. Reversing it gives an order where every node is processed strictly after all the nodes that consume its output.
 
-Skipping the sort and walking the graph naively produces wrong answers. Consider `w` used twice in `loss = (w * a) + (w * b)`. If the second multiply's backward runs before the first has contributed to `w.grad`, then `a.grad` and `b.grad` are correct but any node downstream of `w` in a deeper graph sees a partial gradient. The topological sort guarantees each node has its complete incoming gradient before it propagates.
+The one requirement is that a node's `.grad` is complete before its `_backward` runs, because that function reads `.grad` and hands pieces of it away. Here is the smallest graph that breaks when the order is wrong, a weight used twice:
+
+```python title="topo_matters.py"
+w = Value(-3.0)
+b = Value(4.0)
+s = w * 2.0            # path 1 through w
+p = w * b              # path 2 through w
+loss = s + p
+loss.grad = 1.0        # the seed, as backward() would set it
+
+# wrong order: the two multiplies run before the add has fed them
+s._backward(); p._backward()
+print(w.grad)          # 0.0  - each multiply saw s.grad = 0 and p.grad = 0
+
+# right order: the add runs first and feeds both multiplies
+w.grad = 0.0
+loss._backward()       # now s.grad = 1.0 and p.grad = 1.0
+s._backward(); p._backward()
+print(w.grad)          # 6.0  - which is 2 + b, matching d(s + p)/dw = 2 + 4
+```
+
+The gradient is wrong by the entire contribution of both paths, and no exception is raised. `w.grad` is simply `0.0`, so the weight does not move, and the loss stops decreasing.
 
 This is also why the graph must be acyclic. A cycle has no valid topological order, and `build()` would recurse forever.
 
@@ -278,7 +315,9 @@ step  80  loss 0.006619  preds [0.953, -0.991, -0.954, 0.952]
 step 100  loss 0.005043  preds [0.959, -0.992, -0.96, 0.958]
 ```
 
-The model has 41 parameters, and the graph for a single training step holds 406 nodes. Loss falls from `6.005` to `0.005` and predictions move from the initialization range toward the targets. Nothing here knows what a neural network is. It is the chain rule, applied repeatedly, plus a subtraction.
+The model has 41 parameters, and the graph for a single training step holds 406 nodes. Loss falls from `6.005` to `0.005` and predictions move from the initialization range toward the targets. Nothing here knows what a neural network is: it is the chain rule, applied repeatedly, plus a subtraction.
+
+Three plain Python idioms carry most of that code. `zip(self.w, x)` walks two equal-length lists side by side, pairing the first weight with the first input. `[p for n in self.neurons for p in n.parameters()]` is a nested loop on one line, read left to right: for each neuron, for each of its parameters, collect it. `MLP([3, 4, 4, 1], seed=1337)` builds a network with 3 inputs, a 4-neuron hidden layer, a second 4-neuron hidden layer, and 1 output, and `sizes[i], sizes[i + 1]` pairs each layer with the one after it. Seeding `random.Random` rather than using the global `random` module is what makes the run reproducible.
 
 Note that this is **full-batch gradient descent**: the loss sums over all four examples before `backward()` runs once. That is why the gradients are exact rather than noisy, and why one `zero_grad` per step suffices.
 
@@ -293,6 +332,10 @@ For a linear layer with input `X` of shape `(B, d_in)`, weight `W` of shape `(d_
 ```
 Y  = X @ W.T + b          # (B, d_out)
 ```
+
+`B` is the batch size, `d_in` the width going in and `d_out` the width coming out. `W` is stored one row per output unit, which is why the transpose appears: `W.T` is `(d_in, d_out)`, so `(B, d_in) @ (d_in, d_out)` gives `(B, d_out)`. This is exactly PyTorch's `nn.Linear`.
+
+The `d` prefix on `dY`, `dX`, `dW`, `db` names the gradient of the loss with respect to that quantity, so `dY` is "how the loss changes as `Y` changes", arriving from whatever layer is above this one. It is not a differential and not a delta.
 
 Given the incoming gradient `dY` of shape `(B, d_out)`, the three parameter gradients follow from shape algebra alone:
 
@@ -332,27 +375,29 @@ dX (4, 3)  dW (2, 3)  db (2,)
 
 Every gradient has the same shape as the thing it is the gradient of. When a shape does not line up that way, the expression is wrong, and shape algebra is usually enough to derive the right one without any calculus.
 
-`dW = dY.T @ X` is the single most reused line in deep learning. It says the weight update is a correlation between what came in and what the error asked to change. Layers that get large activations paired with large error signals move the most.
+`dW = dY.T @ X` is the most reused line in deep learning. It says the weight update is a correlation between what came in and what the error asked to change: entry `(i, j)` of `dW` is a sum over the batch of "input `j` times the error signal for output `i`". Weights that connect a loud input to a demanding output move the most.
 
-PyTorch computes exactly these three expressions. `torch.autograd` stores `X`, `W`, and `dY` in the graph node for the matmul, and the backward kernel is a pair of GEMM calls.
+PyTorch computes exactly these three expressions. `torch.autograd` stores `X`, `W`, and `dY` on the graph node for the matmul, and the backward pass is two <Tip term="GEMM">General Matrix Multiply: the BLAS routine computing `C = alpha * A @ B + beta * C`. Every dense layer gradient in every framework reduces to it.</Tip> calls, one for `dX` and one for `dW`, plus a reduction for `db`.
 
 ---
 
 ## Gradient checking
 
-Backprop implementations have bugs, and a wrong gradient still trains the model. It just trains it toward the wrong place, slowly, and the loss curve looks plausible. Gradient checking catches this by comparing analytic gradients against finite differences.
+A hand-written backward pass can be wrong and still train the model. It trains toward the wrong place, slowly, and the loss curve still goes down, so nothing looks broken. Gradient checking catches this by comparing the gradients your code produces against the ones a definition-of-derivative finite difference produces. If they disagree, one of them is wrong, and the finite difference is the one you trust.
 
 The centered difference estimator:
 
-```
-df/dx ~= (f(x + eps) - f(x - eps)) / (2 * eps)
-```
+$$
+\frac{df}{dx} \approx \frac{f(x + \epsilon) - f(x - \epsilon)}{2\epsilon}
+$$
 
-has truncation error `O(eps^2)`, versus `O(eps)` for the one-sided form. Compare using **relative** error, because absolute error scales with the magnitude of the gradient:
+has truncation error $\mathcal{O}(\epsilon^2)$, versus $\mathcal{O}(\epsilon)$ for the one-sided form. Both $\mathcal{O}(\dots)$ notations describe how the error shrinks as $\epsilon$ shrinks: halving $\epsilon$ halves an $\mathcal{O}(\epsilon)$ error but quarters an $\mathcal{O}(\epsilon^2)$ one. $\mathcal{O}(\epsilon^2)$ error comes from the higher-order Taylor series terms the formula throws away, and it vanishes quadratically as the step gets small. Compare using **relative** error, because absolute error scales with the magnitude of the gradient:
 
-```
-rel_err = |analytic - numeric| / max(|analytic| + |numeric|, 1e-8)
-```
+$$
+\text{Error}_{\text{rel}} = \frac{|\text{analytic} - \text{numeric}|}{\max(|\text{analytic}| + |\text{numeric}|, 10^{-8})}
+$$
+
+`|...|` is the absolute value of the number inside. The `max(..., 1e-8)` in the denominator stops a division by zero when both gradients happen to be near 0, and dividing by the sum of the magnitudes rather than one of them keeps the ratio symmetric.
 
 ```python title="grad_check.py"
 import numpy as np
@@ -382,13 +427,15 @@ rel = np.abs(analytic - numeric) / np.maximum(np.abs(analytic) + np.abs(numeric)
 print("max relative error:", rel.max())     # ~3e-9
 ```
 
+`loss(W_)` is a stand-in for a real training loss: it is the sum of element-wise products of `Y` with a fixed `dY`, which is exactly what "how much does `Y` move in the direction the error asked for" means, and whose true gradient with respect to `W` is `dY.T @ X`. That makes `analytic` correct by construction, so any disagreement is a bug in the checker rather than the layer. `np.maximum` is element-wise `max` between two arrays; `np.max` would reduce one array to a single number.
+
 The layer above is deliberately tiny. Scaling it to anything production-shaped makes the double loop the bottleneck, for the reason in the callout below.
 
-Relative error below `1e-7` in float64 means the implementation is correct. Above `1e-4` something is wrong. In between, suspect float32 arithmetic or a badly conditioned function.
+Relative error below `1e-7` in float64 means the implementation is correct. Above `1e-4` something is wrong. In between, suspect float32 arithmetic or a <Tip term="badly conditioned function">One whose output changes enormously for a tiny input change, so the finite-difference estimate itself is unreliable. The condition number from the vectors and matrices page is the measure.</Tip>.
 
 ### Choosing `eps`
 
-Smaller is not better. As `eps` shrinks, `f(x+eps)` and `f(x-eps)` become nearly identical, and subtracting them cancels the leading digits. Round-off error takes over. Measured on `d/dy tanh(y+2)` at `y = -4`, whose true value is `0.07065082485316443`:
+Smaller is not better. As `eps` shrinks, `f(x+eps)` and `f(x-eps)` become nearly identical, and subtracting them cancels the leading digits, a loss called <Tip term="catastrophic cancellation">Subtracting two nearly equal rounded numbers. The digits that agree carry no information, so what survives the subtraction is mostly rounding noise.</Tip>. <Tip term="round-off error">The error introduced because a floating-point number cannot hold the exact real value. float64 keeps about 16 decimal digits; every arithmetic operation loses a few more.</Tip> takes over below the sweet spot. Measured on `d/dy tanh(y+2)` at `y = -4`, whose true value is `0.07065082485316443`:
 
 | `eps`   | Numeric     | Relative error | Dominant error |
 | :------ | :---------- | :------------- | :------------- |
@@ -399,17 +446,15 @@ Smaller is not better. As `eps` shrinks, `f(x+eps)` and `f(x-eps)` become nearly
 | `1e-10` | 0.070650708 | 1.7e-06        | round-off      |
 | `1e-12` | 0.070665696 | 2.1e-04        | round-off      |
 
-The error curve is U-shaped. For a centered difference in float64 the minimum sits near `eps = cbrt(2.22e-16) ~= 6e-6`, which is why `1e-5` is the conventional default.
+The error curve is U-shaped: truncation dominates on the left, cancellation on the right, and the minimum sits between them. `2.22e-16` is <Tip term="machine epsilon">The smallest number `eps` such that `1.0 + eps` is greater than `1.0` in a given float type. For float64 it is `2.220446049250313e-16`, for float32 `1.19e-7`.</Tip> for float64, and `cbrt` is the cube root. For a centered difference in float64 the minimum sits near `eps = cbrt(2.22e-16) ~= 6e-6`, which is why `1e-5` is the conventional default.
 
 <Callout type="warn">
-  ### Gradient checking does not scale A finite-difference check costs two forward passes **per
-  parameter**. On a single `512 x 256` layer that is `131,072` parameters, so `262,144` forward
-  passes. Measured on this machine: backprop computes `dW` in `0.84 ms`, the equivalent full
-  finite-difference check takes about `530 s`. Roughly six orders of magnitude apart.
-  <br />
-  <br />
-  In practice, check a truncated model (a few layers, a tiny vocabulary) on a small batch, once,
-  during development. Never check a full model, and never leave checking enabled during training.
+  ### Gradient checking does not scale
+
+A finite-difference check costs two forward passes **per parameter**. On a single `512 x 256` layer that is `131,072` parameters, so `262,144` forward passes. Measured on the machine that produced this page: backprop computes `dW` in `0.84 ms`, the equivalent full finite-difference check takes about `530 s`, roughly six orders of magnitude apart.
+
+In practice, check a truncated model (a few layers, a tiny vocabulary) on a small batch, once, during development. Never check a full model, and never leave checking enabled during training.
+
 </Callout>
 
 ---
@@ -451,31 +496,30 @@ without zero_grad
   step 3: w= -0.016000  grad=    +8.928000
 ```
 
-Without the reset, the gradient at step 1 is `7.2` instead of `3.2`, the update overshoots past the minimum, and `w` starts oscillating and growing. Extended to twelve steps, the correctly-zeroed run reaches `w = 0.172` while the buggy run ends at `w = 0.938` and never settles.
+Without the reset, the gradient at step 1 is `7.2` instead of `3.2`, the update overshoots past the minimum, and `w` starts oscillating and growing. Extend the printout to twelve lines and the difference is stark. The correct run obeys `w = w - 0.1 * 2w = 0.8 * w`, so it decays as `2 * 0.8^n` and reaches `w = 0.172` by line twelve. The buggy run swings to `-2.01`, crosses `+0.938` on its way back, and never settles: the accumulated gradient keeps pushing in a direction the current position no longer supports.
+
+In a real training loop the same bug shows up as a loss that plateaus high, or diverges, with no error message. `optimizer.zero_grad()` exists because the engine has no way to know a new step began.
 
 <Callout type="info">
-  ### Accumulation is a feature The same `+=` behavior powers **gradient accumulation**, the
-  standard workaround when a batch does not fit in memory. Run `k` micro-batches, calling
-  `backward()` on each without zeroing, then step the optimizer once and zero. The accumulated
-  gradient equals the gradient of a batch `k` times larger, scaled by `1/k` if you divide each
-  micro-batch loss accordingly.
-  <br />
-  <br />
-  This is also why `optimizer.zero_grad()` sits in the training loop rather than inside
-  `backward()`: the framework cannot know whether you intend to accumulate.
+  ### Accumulation is a feature
+
+The same `+=` behavior powers **gradient accumulation**, the standard workaround when a batch does not fit in memory. Run `k` micro-batches, calling `backward()` on each without zeroing, then step the optimizer once and zero. The accumulated gradient equals the gradient of a batch `k` times larger, scaled by `1/k` if you divide each micro-batch loss accordingly.
+
+This is also why `optimizer.zero_grad()` sits in the training loop rather than inside `backward()`: the framework cannot know whether you intend to accumulate.
+
 </Callout>
 
 ---
 
 ## Where this shows up later
 
-**Phase 3 (Neural Networks).** Vanishing and exploding gradients are properties of the local derivatives multiplied along the backward path. A `tanh` node contributes at most `1.0`; a `sigmoid` at most `0.25`. Ninety-six stacked `sigmoid` layers multiply to `0.25^96 ~= 1.6e-58`. Residual connections add an identity path whose local derivative is exactly `1`, giving the gradient a route that does not decay.
+**Phase 3 (Neural Networks).** Vanishing and exploding gradients are properties of the local derivatives multiplied along the backward path. A `tanh` node contributes at most `1.0`; a `sigmoid` at most `0.25`. Ninety-six stacked `sigmoid` layers multiply to `0.25^96 ~= 1.6e-58`. A <Tip term="residual connection">A skip path that adds a block's input to its output, `y = x + f(x)`. The `x` term has derivative 1, so the gradient gets one factor along the path that never shrinks.</Tip> is a `+` node, and the table on this page says `+` passes the arriving gradient through unchanged, which is the entire reason it rescues deep networks.
 
 **Phase 5 (Transformers).** Attention, layer norm, and the feed-forward block are all matrix multiplications with the gradient rules above. `torch.autograd.Function` exists so custom CUDA kernels (FlashAttention) can hand-write their backward pass while still plugging into the same topological traversal.
 
 **Phase 7 (Fine-Tuning).** LoRA freezes `W` and trains two small matrices `A` and `B` where `dW = B @ A`. No gradient flows into `W`, which is what makes the memory saving possible. The chain rule still runs through `B` and `A` unchanged.
 
-**Phase 10 (Inference).** There is no backward pass. Inference builds the same forward graph and discards it, which is why `torch.no_grad()` and `model.eval()` cut memory use so sharply and why KV caching can store activations that training would have had to keep anyway.
+**Phase 10 (Inference).** There is no backward pass. Inference builds the same forward graph and discards it, which is why `torch.no_grad()` cuts memory so sharply: it tells the engine not to record the graph or retain activations for a backward pass that will never run. `model.eval()` is a different switch, turning off dropout and switching batch-norm to stored statistics; it saves no memory.
 
 ---
 
@@ -515,6 +559,16 @@ Without the reset, the gradient at step 1 is `7.2` instead of `3.2`, the update 
   <Accordion title={<>When would you deliberately skip <code>zero_grad()</code>?</>}>
 
     During gradient accumulation, to build the gradient of a batch larger than memory allows.
+
+  </Accordion>
+  <Accordion title="A node's local derivative is 0.5 and the gradient arriving at it is 3.0. What does it send to each input?">
+
+    It depends on the operation. For `+` it sends `3.0` to both inputs unchanged, because the local derivative of addition is 1 and the 0.5 was never part of the rule. For `*` it sends the other operand's value times `3.0`. The arriving gradient is multiplied by each input's own local derivative, so a node with two different inputs sends two different numbers.
+
+  </Accordion>
+  <Accordion title="Separate what these three do: torch.no_grad(), model.eval(), optimizer.zero_grad().">
+
+    `zero_grad()` clears accumulated `.grad` buffers so the next step starts fresh. `no_grad()` stops autograd from building the graph and retaining activations, which is a memory effect. `eval()` only switches module behaviour, turning off dropout and making batch-norm use running statistics; it allocates nothing and frees nothing. Confusing the last two is the standard version of this mistake.
 
   </Accordion>
 </Accordions>

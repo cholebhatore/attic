@@ -5,17 +5,31 @@ description: Partial derivatives, the chain, product, and quotient rules, gradie
 
 Training a model means finding parameters that make a loss small. The only scalable way to do that is to ask the loss which direction increases it, then step the other way. Derivatives answer that question for one variable, gradients answer it for millions.
 
+Symbols on this page are decoded in [Notation and Symbols](/ai/math-foundations/notation-and-symbols).
+
 ---
 
 ## The derivative
 
-The derivative of `f` at `x` is its instantaneous rate of change, defined as the limit of the average rate over a shrinking interval:
+The derivative of $f$ at $x$ is its instantaneous rate of change, defined as the limit of the average rate over a shrinking interval:
 
-```
-f'(x) = lim (h -> 0) of [f(x + h) - f(x)] / h
-```
+$$
+f'(x) = \lim_{h \to 0} \frac{f(x + h) - f(x)}{h}
+$$
 
-The expression `[f(x + h) - f(x)] / h` is a **slope**. As `h` shrinks toward zero it stops being an average over an interval and becomes the slope at a single point, which is the slope of the tangent line.
+Piece by piece: $f$ is the function, $x$ is the point you are standing at, and $h$ is a small step sideways. $f(x + h) - f(x)$ is how much the output moved, and dividing by $h$ turns that into "output change per unit of input change". $f'(x)$, pronounced "f prime of x", is the name of the derivative function. $\lim_{h \to 0}$ means: compute it for smaller and smaller $h$ and take the value the results converge to.
+
+The word "instantaneous" is doing real work, because a plain average over an interval is not what you want. For `f(x) = x^2` at `x = 3`, the average slope over a step of size `h` works out to exactly `6 + h`:
+
+| `h`     | average slope over `[3, 3 + h]` |
+| :------ | :------------------------------ |
+| `1`     | 7.0                             |
+| `0.1`   | 6.1                             |
+| `0.01`  | 6.01                            |
+| `0.001` | 6.001                           |
+| `0`     | 6.0, the limit                  |
+
+As `h` shrinks, the interval stops being an average over a stretch of curve and becomes the slope at a single point. That point slope is the slope of the **tangent line**, the straight line that just grazes the curve at `x` and points in the direction the curve is heading there.
 
 Two readings that both matter:
 
@@ -38,14 +52,31 @@ The centered difference `(f(x+h) - f(x-h)) / 2h` is more accurate than the one-s
 
 ## Partial derivatives
 
-A function of several variables, like `f(x, y) = x^2 * y + sin(y)`, has one **partial derivative** per variable. To take the partial with respect to `x`, treat `y` as a constant and differentiate normally.
+A function of several variables, like `f(x, y) = x^2 * y + sin(y)`, has one **partial derivative** per variable. Each answers a separate question: if I nudge only `x` and leave everything else alone, how fast does `f` move?
 
-```
-f(x, y)  = x^2 * y + sin(y)
+To take the partial with respect to $x$, treat $y$ as a constant and differentiate normally:
 
-df/dx    = 2x * y              (y held constant, sin(y) is a constant so it vanishes)
-df/dy    = x^2 + cos(y)        (x held constant, x^2 is a coefficient)
-```
+$$
+f(x, y) = x^2 y + \sin(y)
+$$
+
+$$
+\frac{\partial f}{\partial x} = 2xy \quad (y \text{ held constant, } \sin(y) \text{ is constant so it vanishes})
+$$
+
+$$
+\frac{\partial f}{\partial y} = x^2 + \cos(y) \quad (x \text{ held constant, } x^2 \text{ is a coefficient})
+$$
+
+"Vanishes" means becomes zero. Nudge $x$ and $\sin(y)$ does not move at all, so that term contributes nothing to $\frac{\partial f}{\partial x}$. Evaluating both partials at $(x=1, y=2)$ gives ordinary arithmetic:
+
+$$
+\frac{\partial f}{\partial x} = 2(1)(2) = 4.0
+$$
+
+$$
+\frac{\partial f}{\partial y} = 1^2 + \cos(2) = 1 - 0.4161 = 0.5839
+$$
 
 ```python title="partials.py"
 import numpy as np
@@ -70,58 +101,69 @@ A neural network loss is a function of every parameter in the model. Each partia
 
 ## Differentiation rules
 
-Three rules generate almost every gradient in deep learning.
+Three rules generate almost every gradient in deep learning:
+
+| Rule              | Operation                                    | Formula                                                       |
+| :---------------- | :------------------------------------------- | :------------------------------------------------------------ |
+| **Product Rule**  | $\frac{d}{dx}[u(x)v(x)]$                     | $u'(x)v(x) + u(x)v'(x)$                                       |
+| **Quotient Rule** | $\frac{d}{dx}\left[\frac{u(x)}{v(x)}\right]$ | $\frac{u'(x)v(x) - u(x)v'(x)}{[v(x)]^2}$                      |
+| **Chain Rule**    | $\frac{d}{dx}[g(h(x))]$                      | $g'(h(x)) \cdot h'(x)$ or $\frac{dg}{dh} \cdot \frac{dh}{dx}$ |
+
+The prime notation `'` means "the derivative of", so $u'$ is the derivative of $u$ with respect to $x$.
 
 ### Product rule
 
-For `f(x) = u(x) * v(x)`:
+For $f(x) = u(x)v(x)$:
 
-```
-f'(x) = u'(x) * v(x) + u(x) * v'(x)
-```
+$$
+\frac{d}{dx}[u(x)v(x)] = u'(x)v(x) + u(x)v'(x)
+$$
 
-Example with `u = x^2`, `v = sin(x)`:
+Read it as: derivative of the first times the second, plus the first times derivative of the second. Both factors depend on $x$, so nudging $x$ moves both of them, and each one's contribution gets counted.
 
-```
-d/dx [x^2 * sin(x)] = 2x * sin(x) + x^2 * cos(x)
-```
+Example with $u = x^2$, $v = \sin(x)$:
 
-Gated activations use this directly. SwiGLU computes `gate * up` where both are learned projections, so its backward pass is a product rule application.
+$$
+\frac{d}{dx}[x^2 \sin(x)] = 2x \sin(x) + x^2 \cos(x)
+$$
+
+Gated activations use this directly. SwiGLU computes $\text{gate} \odot \text{up}$ where both are learned projections, so its backward pass is a product rule application.
 
 ### Quotient rule
 
-For `f(x) = u(x) / v(x)`:
+For $f(x) = \frac{u(x)}{v(x)}$:
 
-```
-f'(x) = [u'(x) * v(x) - u(x) * v'(x)] / v(x)^2
-```
+$$
+f'(x) = \frac{u'(x)v(x) - u(x)v'(x)}{[v(x)]^2}
+$$
+
+Read it as: bottom times derivative of top, minus top times derivative of bottom, all over bottom squared. It is the product rule applied to $u \cdot (1 / v)$, which is why the numerator looks like the product rule with one term flipped.
 
 Example:
 
-```
-d/dx [sin(x) / x] = [cos(x) * x - sin(x)] / x^2
-```
+$$
+\frac{d}{dx}\left[\frac{\sin(x)}{x}\right] = \frac{x\cos(x) - \sin(x)}{x^2}
+$$
 
-Softmax differentiation produces a quotient rule, since softmax is `exp(zi) / sum(exp(zj))`.
+Softmax differentiation produces a quotient rule, since softmax is $\frac{e^{z_i}}{\sum_j e^{z_j}}$.
 
 ### Chain rule
 
-For a composition `f(x) = g(h(x))`:
+For a composition $f(x) = g(h(x))$, meaning $h$ runs first and $g$ takes its output as input:
 
-```
-f'(x) = g'(h(x)) * h'(x)
-```
+$$
+f'(x) = g'(h(x)) \cdot h'(x) \quad \Longleftrightarrow \quad \frac{df}{dx} = \frac{df}{dh} \cdot \frac{dh}{dx}
+$$
 
-Worked example with `g(u) = u^3` and `h(x) = 2x + 1`:
+Read it as: derivative of the outer function, evaluated at what the inner produced, times the derivative of the inner. Rates of change multiply rather than add, because the inner change is measured in the inner's own units.
 
-```
-f(x)  = (2x + 1)^3
-g'(u) = 3u^2
-h'(x) = 2
-f'(x) = 3 * (2x + 1)^2 * 2 = 6 * (2x + 1)^2
-```
+Worked example with $g(u) = u^3$ and $h(x) = 2x + 1$:
 
-At `x = 1`: `f'(1) = 6 * 9 = 54`.
+$$
+f(x) = (2x + 1)^3 \implies f'(x) = 3(2x + 1)^2 \cdot 2 = 6(2x + 1)^2
+$$
+
+At $x = 1$: $f'(1) = 6 \cdot (3)^2 = 54$.
 
 ```python title="chain_rule.py"
 x = 1.0
@@ -148,20 +190,30 @@ Notice the structure of that code: compute the forward values, store intermediat
 
 The **gradient** collects every partial derivative into one vector:
 
-```
-grad f(x, y) = [df/dx, df/dy]
-```
+$$
+\nabla f(\mathbf{x}) = \begin{bmatrix} \frac{\partial f}{\partial x_1} \\ \frac{\partial f}{\partial x_2} \\ \vdots \\ \frac{\partial f}{\partial x_n} \end{bmatrix} \quad \text{or for } 2\text{D}\colon \nabla f(x, y) = \begin{bmatrix} \frac{\partial f}{\partial x} \\ \frac{\partial f}{\partial y} \end{bmatrix}
+$$
 
-For `n` inputs it is an `n`-dimensional vector. Two properties make it the core object of optimization:
+For $n$ inputs it is an $n$-dimensional vector, one entry per input. Back to $f(x, y) = x^2 y + \sin(y)$ at $(1, 2)$, where the partials were 4.0 and 0.5839:
 
-1. **It points in the direction of steepest ascent.** Moving a small step along `grad f` increases `f` faster than moving in any other direction.
-2. **Its magnitude is the steepness in that direction.** A large norm means a sharp slope, a near-zero norm means flat terrain.
+$$
+\nabla f(1, 2) = \begin{bmatrix} 4.0 \\ 0.5839 \end{bmatrix}
+$$
 
-Therefore `-grad f` points downhill, and gradient descent is one line:
+The first coordinate is about 7 times the second, so at that point $x$ is the axis that moves $f$: nudge $x$ by 0.001 and $f$ rises by roughly 0.004, nudge $y$ by the same amount and it rises by roughly 0.0006.
 
-```
-w = w - lr * grad f(w)
-```
+Two properties make the gradient the core object of optimization:
+
+1. **It points in the direction of steepest ascent.** Moving an infinitesimal step along $\nabla f$ increases $f$ faster than moving in any other direction.
+2. **Its magnitude $\|\nabla f\|_2$ is the steepness in that direction.** A large norm means a sharp slope, a near-zero norm means flat terrain.
+
+Therefore $-\nabla f$ points downhill, and gradient descent update is:
+
+$$
+\mathbf{w}_{t+1} = \mathbf{w}_t - \eta \nabla f(\mathbf{w}_t)
+$$
+
+$\mathbf{w}$ is the parameter vector and $\eta$ (or `lr`) is the learning rate, controlling how far you step. A derivative says which way is down; the learning rate decides how much of that information you act on.
 
 ```python title="gradient.py"
 def grad_f(point):
@@ -177,55 +229,59 @@ for step in range(5):
     print(f"step {step}: w={w.round(4)}  |grad|={np.linalg.norm(g):.4f}")
 ```
 
+`|grad|` in that output is the gradient's norm, its length.
+
 The gradient norm shrinking toward zero is the signal that you are approaching a stationary point. Monitoring it during training is standard practice, and gradient clipping in Phase 4 caps it to stop exploding values from wrecking a step.
 
 ---
 
 ## Directional derivatives
 
-The gradient points uphill, but you often want the rate of change along an arbitrary direction `u` (a unit vector). That is the **directional derivative**:
+The gradient points uphill, but you often want the rate of change along an arbitrary direction $\mathbf{u}$ (a unit vector, $\|\mathbf{u}\|_2 = 1$). That is the **directional derivative**, written $D_{\mathbf{u}} f$ or $\nabla_{\mathbf{u}} f$:
 
-```
-D_u f = grad f . u
-```
+$$
+D_{\mathbf{u}} f = \nabla f(\mathbf{x}) \cdot \mathbf{u} = \|\nabla f(\mathbf{x})\|_2 \|\mathbf{u}\|_2 \cos(\theta) = \|\nabla f(\mathbf{x})\|_2 \cos(\theta)
+$$
 
 It is a dot product, which explains the geometric behavior:
 
-| Angle between `u` and `grad f` | `D_u f` | Meaning                      |
-| :----------------------------- | :------ | :--------------------------- |
-| 0°                             | Max     | Steepest ascent              |
-| 90°                            | 0       | Moving along a level contour |
-| 180°                           | Min     | Steepest descent             |
+| Angle $\theta$ between $\mathbf{u}$ and $\nabla f$ | $D_{\mathbf{u}} f$          | Meaning                           |
+| :------------------------------------------------- | :-------------------------- | :-------------------------------- |
+| $0^\circ$                                          | $\|\nabla f\|_2$ (Maximum)  | Steepest ascent                   |
+| $90^\circ$                                         | $0$                         | Moving tangent to a level contour |
+| $180^\circ$                                        | $-\|\nabla f\|_2$ (Minimum) | Steepest descent                  |
 
-Since `grad f . u = ||grad f|| * cos(theta)`, the value is largest at `theta = 0`. This is the same cosine relationship from the previous page doing the same work.
+Walking straight up the gradient maximizes $\cos(\theta) = 1$. Walking perpendicular to it ($\theta = 90^\circ$) changes nothing at all, which is what "along a level contour" means.
 
 ---
 
 ## Jacobians
 
-When a function outputs a **vector** rather than a scalar, one gradient is not enough. You need every output's derivative with respect to every input, arranged in a matrix. That is the **Jacobian**.
+When a function outputs a **vector** rather than a scalar, one gradient vector is not enough. You need every output's derivative with respect to every input, arranged in a matrix. That is the **Jacobian**.
 
-For `f: R^n -> R^m`, the Jacobian `J` has shape `(m, n)`:
+For a vector-valued function $\mathbf{f}\colon \mathbb{R}^n \to \mathbb{R}^m$, the Jacobian matrix $J \in \mathbb{R}^{m \times n}$ contains all first-order partial derivatives:
 
-```
-        [ df1/dx1  df1/dx2  ...  df1/dxn ]
-    J = [ df2/dx1  df2/dx2  ...  df2/dxn ]
-        [   ...                           ]
-        [ dfm/dx1  dfm/dx2  ...  dfm/dxn ]
-```
+$$
+J = \frac{\partial \mathbf{f}}{\partial \mathbf{x}} = \begin{bmatrix}
+\frac{\partial f_1}{\partial x_1} & \frac{\partial f_1}{\partial x_2} & \cdots & \frac{\partial f_1}{\partial x_n} \\[6pt]
+\frac{\partial f_2}{\partial x_1} & \frac{\partial f_2}{\partial x_2} & \cdots & \frac{\partial f_2}{\partial x_n} \\[6pt]
+\vdots & \vdots & \ddots & \vdots \\[6pt]
+\frac{\partial f_m}{\partial x_1} & \frac{\partial f_m}{\partial x_2} & \cdots & \frac{\partial f_m}{\partial x_n}
+\end{bmatrix}
+$$
 
-Row `i` is the gradient of output `i`.
+One entry $J_{ij} = \frac{\partial f_i}{\partial x_j}$ per output-input pair. Row $i$ is the transpose of the gradient of output component $f_i$: $\nabla f_i^T$.
 
 ```python title="jacobian.py"
 def f(v):
     x, y = v
-    return np.array([x ** 2 + y, x * y])
+    return np.array([x ** 2 + y, x * y])      # 2 in, 2 out
 
 # analytic Jacobian
 def J(v):
     x, y = v
-    return np.array([[2 * x, 1.0],
-                     [y,     x]])
+    return np.array([[2 * x, 1.0],     # d(x^2 + y)/dx, d(...)/dy
+                     [y,     x]])      # d(x*y)/dx,     d(...)/dy
 
 v = np.array([1.0, 2.0])
 print(J(v))    # [[2. 1.]
@@ -238,17 +294,21 @@ numeric = np.column_stack([(f(v + np.eye(2)[i] * h) - f(v - np.eye(2)[i] * h)) /
 print(np.allclose(J(v), numeric, atol=1e-5))   # True
 ```
 
+The two lines of `J(v)` are the two outputs' partials: output 1 is `x^2 + y`, so its derivatives are `2x = 2` and `1`. Output 2 is `x * y`, so `y = 2` and `x = 1`.
+
 A scalar-valued loss over a vector-valued layer is the common case, and the gradient is just a `1 x n` Jacobian.
 
 ### Jacobian-vector products
 
-Backpropagation never materializes full Jacobians. For a layer with `n` inputs and `m` outputs, the Jacobian is `m x n`, which for a `4096 x 11008` feed-forward layer is 45 million entries. Instead, frameworks compute a **vector-Jacobian product** (VJP): they take the incoming gradient from downstream (shape `m`) and multiply it by the Jacobian to produce the gradient for the inputs (shape `n`).
+Backpropagation never materializes full Jacobians. Materializing means building the whole object in memory, and for a layer with `n` inputs and `m` outputs, the Jacobian is `m x n`, which for a `4096 x 11008` feed-forward layer is 45 million entries. Instead, frameworks compute a **vector-Jacobian product** (VJP): they take the incoming gradient from downstream (shape `m`) and multiply it by the Jacobian to produce the gradient for the inputs (shape `n`).
 
 ```
 grad_input = J.T @ grad_output
 ```
 
-This costs one matrix multiplication instead of building and storing a matrix, and it is the reason reverse-mode autodiff scales to billions of parameters. Phase 3 derives the same identity layer by layer.
+The trick is that the multiplication is all anyone ever needs. Chain rule says the downstream gradient times the local derivative gives the upstream gradient, and the local derivative here is `J`. Computing that product directly costs one matrix multiplication, never a stored `J`, so the memory stays at the size of the vectors instead of the size of the grid between them.
+
+This is the reason reverse-mode autodiff scales to billions of parameters. Phase 3 derives the same identity layer by layer.
 
 ---
 
@@ -262,15 +322,45 @@ A **stationary point** has zero gradient. Three kinds exist, and telling them ap
 | Local maximum | Negative             | Curves down in every direction               |
 | Saddle point  | Mixed signs          | Curves down in some directions, up in others |
 
-For a single-variable function, `f''(x) > 0` at a stationary point confirms a minimum. For many variables, the equivalent test uses the **Hessian** matrix of second partial derivatives: all eigenvalues positive means a local minimum, all negative means a maximum, mixed signs means a saddle.
+`f'(x)` is the slope. `f''(x)` is the derivative of `f'(x)`: how fast the slope itself is changing, which is the <Tip term="curvature">How sharply a curve bends. Positive curvature means the curve opens upward like a cup; negative means it opens downward like a dome.</Tip> of the curve. A stationary point is where the slope is zero, and the sign of the curvature there says whether you are sitting in a bowl or on top of a hill:
+
+```
+f(x)  = x^2       f'(x) = 2x      f''(x) = 2      at x=0: slope 0, curvature +2 -> minimum
+f(x)  = -x^2      f'(x) = -2x     f''(x) = -2     at x=0: slope 0, curvature -2 -> maximum
+```
+
+For many variables, the equivalent test uses the **Hessian**: the matrix of second partial derivatives. Take every partial you already have, differentiate it again with respect to every variable, and arrange the results in an `(n, n)` matrix. For `f(x, y) = x^2 - y^2` that is
+
+```
+df/dx = 2x        df/dy = -2y
+
+H = [ d2f/dx2    d2f/dxdy ] = [ 2   0 ]
+    [ d2f/dydx   d2f/dy2  ]   [ 0  -2 ]
+```
+
+Reading `d2f/dxdy` is "differentiate twice, first with respect to `y`, then with respect to `x`". The two mixed entries usually end up equal, so `H` is symmetric. The eigenvalues of `H` at a stationary point are the curvatures along the directions that the <Tip term="eigenvectors">Directions that a matrix only stretches, never turns. On the vectors-and-matrices page, `A @ v = lambda * v` names exactly those directions.</Tip> name, so `H`'s eigenvalues `2` and `-2` say the point curves up along one axis and down along the other:
+
+```python title="hessian.py"
+H = np.array([[2.0, 0.0], [0.0, -2.0]])
+print(np.linalg.eigvalsh(H))   # [-2.  2.]  mixed signs -> saddle
+```
+
+`f(x, y) = x^2 - y^2` at the origin is the standard saddle, and it is checkable by hand. The gradient is `[2x, -2y]`, which is `[0, 0]` at `(0, 0)`, so it is stationary. Walk along `x` with `y = 0` and `f` rises: `0.0, 0.01, 0.04`. Walk along `y` with `x = 0` and `f` falls: `0.0, -0.01, -0.04`. Same point, zero gradient, opposite verdicts, which is what a pass over a mountain looks like from above: up in one direction, down in the other.
+
+So the rule is: all eigenvalues of `H` positive means a local minimum, all negative means a maximum, mixed signs means a saddle.
 
 <Callout type="warn">
   The popular fear that gradient descent gets trapped in bad local minima is largely misplaced for
-  deep networks. With `n` parameters, a stationary point is a local minimum only if all `n` Hessian
-  eigenvalues are positive. For large `n` that is combinatorially unlikely, so most stationary
-  points are saddles. The practical problem is not getting stuck in a wrong minimum, it is crawling
-  through flat saddle regions where the gradient is near zero. Momentum in Adam exists to keep
-  moving when the local gradient provides almost no signal.
+  deep networks. Here is the counting argument. A stationary point needs every one of the `n`
+  gradient entries to be zero at once, and then it is a local minimum only if all `n` Hessian
+  eigenvalues come out positive. If those curvatures were roughly coin flips, the odds of `n`
+  agreeing are `0.5^n`: for a million-parameter model that is about `10^-301030`, a number with no
+  room left for a real model to hit. (Coins is an idealization; the argument is that the count of
+  required agreements grows with `n`, not that each curvature actually flips.) So almost every
+  stationary point is a saddle. The practical problem is not a wrong minimum, it is crawling through
+  flat saddle regions where the gradient is near zero. Momentum in Adam exists to keep moving when
+  the local gradient provides almost no signal.
+
 </Callout>
 
 ---
