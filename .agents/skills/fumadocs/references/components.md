@@ -46,6 +46,91 @@ Highlights important information with colored left border and icon.
 
 ---
 
+## Tip
+
+Inline tooltip: a dotted-underline term inside a sentence that reveals a short plain-language explanation on hover or keyboard focus. This is the **inline** counterpart to `<Callout>`, which is block-level.
+
+> [!IMPORTANT]
+> **Not a Fumadocs built-in.** `Tip` is a project-local component. It needs `@base-ui/react` (already present as a `fumadocs-ui` dependency — no install required at `^1.8.0`), a `src/components/tip.tsx` file, and registration as `Tip` in `getMDXComponents`. If the target repo lacks it, create all three before using it in MDX.
+
+### Props
+
+| Prop       | Type        | Default  | Description                             |
+| :--------- | :---------- | :------- | :-------------------------------------- |
+| `term`     | `string`    | Required | Visible trigger text, rendered in place |
+| `children` | `ReactNode` | —        | The explanation shown in the popup      |
+
+### Component Implementation (`src/components/tip.tsx`)
+
+```tsx title="src/components/tip.tsx"
+'use client';
+
+import { Tooltip } from '@base-ui/react/tooltip';
+
+export function Tip({ term, children }: { term: string; children?: React.ReactNode }) {
+  return (
+    <Tooltip.Root>
+      <Tooltip.Trigger
+        delay={150}
+        render={
+          <span
+            tabIndex={0}
+            className="cursor-default underline decoration-dotted decoration-fd-muted-foreground underline-offset-4"
+          />
+        }
+      >
+        {term}
+      </Tooltip.Trigger>
+      <Tooltip.Portal>
+        <Tooltip.Positioner side="top" align="start" sideOffset={8} className="z-50 max-w-72">
+          <Tooltip.Popup className="rounded-xl border bg-fd-popover/60 p-3 text-sm text-fd-popover-foreground shadow-lg backdrop-blur-lg data-open:animate-fd-popover-in data-closed:animate-fd-popover-out">
+            {children}
+          </Tooltip.Popup>
+        </Tooltip.Positioner>
+      </Tooltip.Portal>
+    </Tooltip.Root>
+  );
+}
+```
+
+Register it in `getMDXComponents` alongside `Callout`, `Tabs`, and `Mermaid`.
+
+Three implementation details that are easy to get wrong:
+
+1. **`render={<span tabIndex={0} />}` is required.** `Tooltip.Trigger` renders a `<button>` by default. A focusable button mid-sentence shifts the baseline and reads as a control rather than as prose.
+2. **`fd-popover` tokens, not hardcoded colors.** `bg-fd-popover`, `text-fd-popover-foreground`, and the `animate-fd-popover-in`/`-out` utilities are the same ones `fumadocs-ui/components/ui/popover.js` uses, so the popup inherits the theme and dark mode for free.
+3. **Use `cursor-pointer`, never `cursor-help`.** On Windows `cursor-help` renders the arrow-with-question-mark cursor, which is visually noisy and reads as a help widget. `cursor-pointer` plus the dotted underline signals clickable without the `?`.
+
+### Usage
+
+Keep the whole element on **one line** inside the paragraph:
+
+```mdx
+Eigenvalues also describe <Tip term="conditioning">How unevenly a matrix stretches different directions. A badly conditioned matrix makes gradients tiny in one direction and huge in another.</Tip>.
+```
+
+### Rules
+
+- **Term goes in the `term` attribute, explanation goes in `children`.** MDX parses markdown inside JSX children but **not** inside attributes, so an explanation written as an attribute would lose emphasis, lists, and inline code. This direction also keeps the fragile part (the trigger) immune to line wrapping.
+- **One line, always.** A single-line element stays inline inside the existing `<p>`. Splitting the children across lines risks MDX block-wrapping them and breaking the sentence. Prettier leaves long MDX prose lines untouched, so a long line is safe.
+- **Short trigger text.** `term` is an attribute; a multi-word phrase is fine, a sentence is not.
+- Keep explanations to 1–2 sentences. Longer belongs in a `<Callout>` or an `<Accordion>`.
+
+### When to Use
+
+- Jargon the page **uses before it defines** — the case a reader actually stalls on
+- A named theorem or concept that deserves a plain-language restatement
+- Terms appearing mid-sentence, where a `<Callout>` would shatter the reading flow
+
+### When NOT to Use
+
+- Terms the surrounding sentence already defines — the tooltip becomes a duplicate of the prose
+- Explanations needing code blocks, links, or other interactive content — Base UI tooltips are for non-interactive content; use a Popover
+- Anything a reader must not miss. Hover content is absent from the rendered DOM until opened, so a required definition has to be visible prose
+- Body-wide emphasis → use bold text
+
+---
+
 ## Tabs / Tab
 
 Organize content into switchable tabbed panels. Great for showing alternatives.
@@ -514,22 +599,30 @@ flowchart LR
 
 ---
 
-## Math & Complexity Notation
+## Math & LaTeX Notation
 
-> [!WARNING]
-> **Avoid Raw LaTeX Dollar Signs (`$O(n)$`, `$k$`)**:
-> MDX without `remark-math` and `rehype-katex` does not compile LaTeX equations. Using single dollar signs results in:
+LaTeX math is enabled in this project via `remark-math` and `rehype-katex` (with KaTeX CSS).
+
+### When to Use LaTeX
+
+- **Mathematical formulas and equations**: Loss functions, attention equations, Taylor expansions, probabilities.
+- **Vectors, matrices, and linear transformations**: $\mathbf{y} = A\mathbf{x} + \mathbf{b}$, $W \in \mathbb{R}^{d_{\text{out}} \times d_{\text{in}}}$.
+- **Calculus and gradients**: $\nabla_{\mathbf{w}} \mathcal{L}$, $\frac{\partial f}{\partial x}$, $\lim_{h \to 0}$.
+- **Greek parameters**: $\alpha, \beta, \gamma, \lambda, \epsilon, \sigma, \theta$.
+
+### Math Syntax Guide
+
+| Pattern                     | Syntax                                             | Output Example                                                   |
+| :-------------------------- | :------------------------------------------------- | :--------------------------------------------------------------- |
+| **Inline Math**             | `$E = mc^2$` or `$\nabla f(\mathbf{x})$`           | Renders inline formula smoothly within text flow                 |
+| **Block / Display Math**    | `$$\mathcal{L} = -\sum y_i \log(\hat{y}_i)$$`      | Centered display equation on its own line                        |
+| **Fenced Math Block**       | ` ```math\n\int_0^\infty e^{-x^2} dx\n``` `        | Alternate block syntax for multiline math                        |
+| **Matrices**                | `$$\begin{bmatrix} a & b \\ c & d \end{bmatrix}$$` | Clean bracketed matrix                                           |
+| **Simple Code Identifiers** | `` `O(1)` ``, `` `k` ``, `` `d_model` ``           | Use backticks when referring to code variables or API signatures |
+
+### MDX Guardrails for Math
+
+> [!IMPORTANT]
 >
-> 1. Raw dollar signs rendered on the page (e.g. `$O(1)$`, `$O(n)$`).
-> 2. Build crashes when braces like `${...}` or `2^{h+1}` are parsed by Acorn as JSX JavaScript expressions (`ReferenceError`).
-> 3. Parser errors when `<` or `>` in math expressions (e.g. `$p < curr$`) are misinterpreted as unclosed JSX elements.
-
-### Correct Formatting Guide
-
-| Concept                    | Do NOT Use          | Correct Syntax                  | Rendered Output      |
-| :------------------------- | :------------------ | :------------------------------ | :------------------- |
-| **Big-O Time Complexity**  | `$O(1)$`, `$O(n)$`  | `` `O(1)` ``, `` `O(n)` ``      | `O(1)`, `O(n)` badge |
-| **Logarithmic Complexity** | `$O(\log n)$`       | `` `O(log n)` ``                | `O(log n)` badge     |
-| **Variables / Sizes**      | `$k$`, `$n$`, `$h$` | `` `k` ``, `` `n` ``, `` `h` `` | `k`, `n`, `h` badge  |
-| **Inequalities**           | `$\le$`, `$\ge$`    | `` `<=` ``, `` `>=` ``          | `<=`, `>=`           |
-| **Arrows / Pointers**      | `$\rightarrow$`     | `->`                            | `->`                 |
+> - **Always wrap LaTeX formulas in `$...$` or `$$...$$`**: Never leave raw LaTeX macros like `\frac` or unescaped braces like `{h+1}` in markdown prose outside math delimiters, or MDX's Acorn parser will attempt to parse them as JSX JavaScript expressions and fail the build.
+> - **Inside JSX Components (`<Callout>`, `<Accordion>`)**: LaTeX math (`$...$` and `$$...$$`) works seamlessly inside Fumadocs JSX components. Keep delimiters tightly bound to content (`$x$` not `$ x $`).

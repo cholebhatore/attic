@@ -30,9 +30,10 @@ Five things determine more about the output than any rule below:
 - **The route shape under `src/app`.** A route group such as `(docs)` does not appear in the URL, so
   `content/docs/guides/setup.mdx` may serve at `/guides/setup`. Read the catch-all page to find out
   before you curl anything.
-- **Whether a math plugin is configured.** Grep for `rehype-katex` and `remark-math`. Without one,
-  `$...$` renders as literal dollar signs and braces like `2^{h+1}` throw Acorn JSX parse errors.
-  Write math in inline backticks instead.
+- **Whether a math plugin is configured.** Grep for `rehype-katex` and `remark-math`. This app has
+  `remark-math` and `rehype-katex` configured (with KaTeX CSS), so `$formula$` and `$$equation$$` are
+  fully supported. If working in an app without one, `$...$` renders as literal dollar signs and braces
+  like `2^{h+1}` throw Acorn JSX parse errors, in which case write math in inline backticks instead.
 - **Two or three existing pages in the same section.** They define depth, tone, and structure better
   than this file does. If the user explicitly asks to write in a specific tone, then you can skip this part.
 
@@ -76,6 +77,7 @@ Breadth over depth. There is no limit to the number of code lines, but avoid wri
 - Highlight common developer mistakes and practical interview pitfalls.
 - Use bullet points when appropriate, bold key phrases, and direct headings. No fluff, no robotic introductions.
 - First lay out the hierarchy, then dive into the subtopics. For example, if a topic has four subtopics, list all four before you start explaining each one, instead of jumping straight into the first and then the second and so on.
+- Use tooltips, callouts, and accordions to provide additional information without overwhelming the main content.
 
 The reason to hold a line budget is that a reader scanning for one term should find it. Length is
 not a proxy for rigor, and padding buries the thing they came for.

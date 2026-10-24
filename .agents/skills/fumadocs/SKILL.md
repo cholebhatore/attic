@@ -21,14 +21,14 @@ description: >
 
 Read these companion files **before writing any docs**:
 
-| File                                   | Purpose                                                                                                                                                                                                                                   |
-| :------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `references/components.md`             | Component usage guide — `<Callout>`, `<Tabs>`, `<Steps>`, `<Cards>`, `<Accordions>`, `<Files>`, `<InlineTOC>`, and `<Mermaid>` with props, examples, and when-to-use guidance. **Always cross-check against official docs** before using. |
-| `references/setup-fumadocs.md`         | Fumadocs (Next.js) setup guidance — high-level architecture and what to fetch from official docs                                                                                                                                          |
-| `references/setup-fumapress.md`        | Fumapress (Waku) setup guidance — high-level architecture and what to fetch from official docs                                                                                                                                            |
-| `references/folder-group-root-tabs.md` | Official folder group root tabs pattern (default subject at root `/`) — native `(framework)` folder groups, automatic sidebar scoping, and zero-hack layout                                                                               |
-| `references/setup-section-switcher.md` | **(Strictly for Fumapress — may be stale)** Fumapress `press.config.tsx` section switcher workaround. For standard Fumadocs (Next.js), use `references/folder-group-root-tabs.md` instead.                                                |
-| `examples/page-templates.md`           | Copy-paste MDX templates for section indexes, guides, specs, concept pages, and API references                                                                                                                                            |
+| File                                   | Purpose                                                                                                                                                                                                                                            |
+| :------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `references/components.md`             | Component usage guide — `<Callout>`, `<Tip>`, `<Tabs>`, `<Steps>`, `<Cards>`, `<Accordions>`, `<Files>`, `<InlineTOC>`, and `<Mermaid>` with props, examples, and when-to-use guidance. **Always cross-check against official docs** before using. |
+| `references/setup-fumadocs.md`         | Fumadocs (Next.js) setup guidance — high-level architecture and what to fetch from official docs                                                                                                                                                   |
+| `references/setup-fumapress.md`        | Fumapress (Waku) setup guidance — high-level architecture and what to fetch from official docs                                                                                                                                                     |
+| `references/folder-group-root-tabs.md` | Official folder group root tabs pattern (default subject at root `/`) — native `(framework)` folder groups, automatic sidebar scoping, and zero-hack layout                                                                                        |
+| `references/setup-section-switcher.md` | **(Strictly for Fumapress — may be stale)** Fumapress `press.config.tsx` section switcher workaround. For standard Fumadocs (Next.js), use `references/folder-group-root-tabs.md` instead.                                                         |
+| `examples/page-templates.md`           | Copy-paste MDX templates for section indexes, guides, specs, concept pages, and API references                                                                                                                                                     |
 
 ---
 
@@ -46,18 +46,20 @@ Read these companion files **before writing any docs**:
 > Never default to raw paragraphs or plain markdown lists when a richer component
 > exists. The component library is there to make docs **visually excellent**.
 
-| Content Pattern                                       | Correct Component                                                                      | Do NOT Use                                                                 |
-| :---------------------------------------------------- | :------------------------------------------------------------------------------------- | :------------------------------------------------------------------------- |
-| **Navigation hub** (section index linking sub-pages)  | `<Cards>` with `<Card>` per sub-page, each with `icon`, `title`, `description`, `href` | Bulleted link lists                                                        |
-| **Warnings / important notes / info**                 | `<Callout type="info\|warn\|error">`                                                   | Bold text or blockquotes                                                   |
-| **Step-by-step instructions**                         | `<Steps>` with `<Step>` per numbered step                                              | Ordered lists `1. 2. 3.`                                                   |
-| **Parallel alternatives** (e.g., npm vs pnpm vs yarn) | `<Tabs items={[...]}>` with `<Tab>` per variant                                        | Multiple code blocks stacked                                               |
-| **FAQs or collapsible detail**                        | `<Accordions>` with `<Accordion>` per item                                             | Static paragraphs or Card grids                                            |
-| **Architecture / flow diagrams**                      | `<Mermaid chart={`...`} />` JSX component (**NEVER** fenced code blocks)               | Fenced ` ```mermaid ` blocks, ASCII diagrams                               |
-| **Tabular data, comparisons, API params**             | Markdown `\| table \|` syntax                                                          | Nested lists or cards                                                      |
-| **Time & Space Complexities, Variables**              | Inline code `` `O(1)` ``, `` `O(n)` ``, `` `k` ``                                      | Raw LaTeX math `$...$` (renders literal dollar signs without math plugins) |
-| **KPIs / metrics / status values**                    | Inline `<code>` with `font-mono tabular-nums`                                          | Plain text numbers                                                         |
-| **Long page with many headings**                      | `<InlineTOC>` at the top after intro paragraph                                         | No TOC at all                                                              |
+| Content Pattern                                         | Correct Component                                                                      | Do NOT Use                                                                       |
+| :------------------------------------------------------ | :------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------- |
+| **Navigation hub** (section index linking sub-pages)    | `<Cards>` with `<Card>` per sub-page, each with `icon`, `title`, `description`, `href` | Bulleted link lists                                                              |
+| **Warnings / important notes / info**                   | `<Callout type="info\|warn\|error">`                                                   | Bold text or blockquotes                                                         |
+| **Inline term definition** (jargon used before defined) | `<Tip term="...">explanation</Tip>`, kept on one line                                  | Block `<Callout>` mid-sentence, or a glossary the reader must leave the page for |
+| **Step-by-step instructions**                           | `<Steps>` with `<Step>` per numbered step                                              | Ordered lists `1. 2. 3.`                                                         |
+| **Parallel alternatives** (e.g., npm vs pnpm vs yarn)   | `<Tabs items={[...]}>` with `<Tab>` per variant                                        | Multiple code blocks stacked                                                     |
+| **FAQs or collapsible detail**                          | `<Accordions>` with `<Accordion>` per item                                             | Static paragraphs or Card grids                                                  |
+| **Architecture / flow diagrams**                        | `<Mermaid chart={`...`} />` JSX component (**NEVER** fenced code blocks)               | Fenced ` ```mermaid ` blocks, ASCII diagrams                                     |
+| **Tabular data, comparisons, API params**               | Markdown `\| table \|` syntax                                                          | Nested lists or cards                                                            |
+| **Math, Loss Functions, Equations, Vectors**            | LaTeX `$inline$` or `$$block$$` (KaTeX enabled)                                        | Clunky ASCII equations or plain text formulas                                    |
+| **Simple Complexities, Code Variables**                 | Inline code `` `O(1)` ``, `` `O(n)` ``, `` `k` ``                                      | Heavy math notation when simple code font suffices                               |
+| **KPIs / metrics / status values**                      | Inline `<code>` with `font-mono tabular-nums`                                          | Plain text numbers                                                               |
+| **Long page with many headings**                        | `<InlineTOC>` at the top after intro paragraph                                         | No TOC at all                                                                    |
 
 ### 1.3 Icon Usage in Cards
 

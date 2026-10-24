@@ -1,4 +1,5 @@
 import { RootProvider } from 'fumadocs-ui/provider/next';
+import 'katex/dist/katex.min.css';
 import './global.css';
 import { Inter, JetBrains_Mono, Geist } from 'next/font/google';
 
