@@ -1,6 +1,7 @@
 import defaultMdxComponents from 'fumadocs-ui/mdx';
 import type { MDXComponents } from 'mdx/types';
 import { Mermaid } from './mermaid';
+import { Tip } from './tip';
 import { Callout as BaseCallout } from 'fumadocs-ui/components/callout';
 import { Tabs, Tab } from 'fumadocs-ui/components/tabs';
 import { Steps, Step } from 'fumadocs-ui/components/steps';
@@ -85,6 +86,7 @@ export function getMDXComponents(components?: MDXComponents) {
     img: (props) => <MdxImageZoom {...(props as any)} />,
     ImageZoom: (props) => <MdxImageZoom {...(props as any)} />,
     Mermaid,
+    Tip,
     Tabs,
     Tab,
     Steps,
