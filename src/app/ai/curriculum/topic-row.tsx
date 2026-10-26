@@ -1,16 +1,29 @@
 'use client';
 
 import Link from 'next/link';
-import { Check, ArrowRight } from 'lucide-react';
+import { Check, ChevronDown, ArrowRight } from 'lucide-react';
 import type { Topic } from './types';
+import type { GroupStat } from './topic-tree';
 
 interface TopicRowProps {
   topic: Topic;
   isCovered: boolean;
   onToggle: (id: string) => void;
+  expandable?: boolean;
+  open?: boolean;
+  onToggleOpen?: (id: string) => void;
+  badge?: GroupStat;
 }
 
-export function TopicRow({ topic, isCovered, onToggle }: TopicRowProps) {
+export function TopicRow({
+  topic,
+  isCovered,
+  onToggle,
+  expandable,
+  open,
+  onToggleOpen,
+  badge,
+}: TopicRowProps) {
   return (
     <div
       onClick={() => onToggle(topic.id)}
@@ -25,6 +38,7 @@ export function TopicRow({ topic, isCovered, onToggle }: TopicRowProps) {
         type="button"
         role="checkbox"
         aria-checked={isCovered}
+        aria-label={`Mark ${topic.title} as ${isCovered ? 'uncovered' : 'covered'}`}
         onClick={(e) => {
           e.stopPropagation();
           onToggle(topic.id);
@@ -51,6 +65,19 @@ export function TopicRow({ topic, isCovered, onToggle }: TopicRowProps) {
             {topic.title}
           </span>
 
+          {badge && (
+            <span
+              className={`font-mono tabular-nums rounded border px-1.5 py-0.5 text-[9.5px] font-semibold ${
+                badge.total > 0 && badge.covered === badge.total
+                  ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
+                  : 'border-zinc-200 bg-zinc-50 text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400'
+              }`}
+              title={`${badge.covered} of ${badge.total} topics in ${topic.title} covered`}
+            >
+              {badge.covered}/{badge.total}
+            </span>
+          )}
+
           {topic.interview && (
             <span className="rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[9.5px] font-semibold text-amber-600 dark:text-amber-400">
               ⭐ INTERVIEW-CORE
@@ -63,16 +90,40 @@ export function TopicRow({ topic, isCovered, onToggle }: TopicRowProps) {
             </span>
           )}
 
-          {topic.url && (
-            <Link
-              href={topic.url}
-              onClick={(e) => e.stopPropagation()}
-              className="ml-auto inline-flex items-center gap-1 rounded border border-zinc-200 bg-zinc-50 px-2 py-0.5 text-[10.5px] font-medium text-zinc-600 transition hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
-              title="Open documentation page"
-            >
-              <span>Read</span>
-              <ArrowRight className="h-3 w-3" />
-            </Link>
+          {(expandable || topic.url) && (
+            <div className="ml-auto flex shrink-0 items-center gap-1.5">
+              {expandable && (
+                <button
+                  type="button"
+                  aria-expanded={open}
+                  aria-controls={open ? `topic-children-${topic.id}` : undefined}
+                  aria-label={
+                    open ? `Collapse ${topic.title} topics` : `Expand ${topic.title} topics`
+                  }
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onToggleOpen?.(topic.id);
+                  }}
+                  className="flex h-6 w-6 items-center justify-center rounded-md text-zinc-400 transition hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200 cursor-pointer"
+                >
+                  <ChevronDown
+                    className={`h-3.5 w-3.5 transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
+                  />
+                </button>
+              )}
+
+              {topic.url && (
+                <Link
+                  href={topic.url}
+                  onClick={(e) => e.stopPropagation()}
+                  className="inline-flex items-center gap-1 rounded border border-zinc-200 bg-zinc-50 px-2 py-0.5 text-[10.5px] font-medium text-zinc-600 transition hover:border-zinc-300 hover:bg-zinc-100 hover:text-zinc-900 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+                  title="Open documentation page"
+                >
+                  <span>Read</span>
+                  <ArrowRight className="h-3 w-3" />
+                </Link>
+              )}
+            </div>
           )}
         </div>
 

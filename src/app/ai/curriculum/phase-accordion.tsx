@@ -1,23 +1,30 @@
 'use client';
 
 import { ChevronDown } from 'lucide-react';
-import { TopicRow } from './topic-row';
-import type { Phase, Topic } from './types';
+import { TopicGroup } from './topic-group';
+import type { GroupStat } from './topic-tree';
+import type { Phase, TreeNode } from './types';
 
 interface PhaseAccordionProps {
   phase: Phase;
-  filteredTopics: Topic[];
+  nodes: TreeNode[];
+  groupStats: Map<string, GroupStat>;
+  expandedGroups: ReadonlySet<string>;
   isExpanded: boolean;
   onToggleExpand: (phaseId: string) => void;
+  onToggleGroup: (id: string) => void;
   coveredSet: Set<string>;
   onToggleTopic: (topicId: string) => void;
 }
 
 export function PhaseAccordion({
   phase,
-  filteredTopics,
+  nodes,
+  groupStats,
+  expandedGroups,
   isExpanded,
   onToggleExpand,
+  onToggleGroup,
   coveredSet,
   onToggleTopic,
 }: PhaseAccordionProps) {
@@ -26,7 +33,7 @@ export function PhaseAccordion({
   const pct = totalInPhase > 0 ? Math.round((coveredInPhase / totalInPhase) * 100) : 0;
   const isPhaseComplete = totalInPhase > 0 && coveredInPhase === totalInPhase;
 
-  if (filteredTopics.length === 0) {
+  if (nodes.length === 0) {
     return null;
   }
 
@@ -87,13 +94,16 @@ export function PhaseAccordion({
       {/* Accordion Body */}
       {isExpanded && (
         <div className="border-t border-zinc-100 p-3 sm:p-4 dark:border-zinc-900 bg-zinc-50/30 dark:bg-zinc-950/20">
-          <div className="grid gap-2">
-            {filteredTopics.map((topic) => (
-              <TopicRow
-                key={topic.id}
-                topic={topic}
-                isCovered={coveredSet.has(topic.id)}
-                onToggle={onToggleTopic}
+          <div className="space-y-2">
+            {nodes.map((node) => (
+              <TopicGroup
+                key={node.topic.id}
+                node={node}
+                coveredSet={coveredSet}
+                expandedGroups={expandedGroups}
+                groupStats={groupStats}
+                onToggleTopic={onToggleTopic}
+                onToggleGroup={onToggleGroup}
               />
             ))}
           </div>

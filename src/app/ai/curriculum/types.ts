@@ -22,4 +22,15 @@ export interface CurriculumGroup {
   phases: Phase[];
 }
 
+export interface TreeNode {
+  topic: Topic;
+  children: TreeNode[];
+  ancestorTitles: string[];
+  totalDescendants: number;
+  /** True when this topic passes the active filter on its own. */
+  matched: boolean;
+  /** True when a descendant is visible, so the group has to render open. */
+  forcedOpen: boolean;
+}
+
 export type FilterType = 'all' | 'uncovered' | 'covered' | 'interview' | 'written';

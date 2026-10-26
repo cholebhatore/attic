@@ -7,9 +7,30 @@ import { FilterBar } from './filter-bar';
 import { PhaseAccordion } from './phase-accordion';
 import { Toast } from './toast';
 import { curriculumData } from './curriculum-data';
-import type { FilterType } from './types';
+import {
+  allGroupIds,
+  buildTopicTree,
+  collectDescendantIds,
+  collectGroupStats,
+  filterTopicTree,
+  topicHaystack,
+  type GroupStat,
+} from './topic-tree';
+import type { FilterType, TreeNode } from './types';
 
 const STORAGE_KEY = 'ai-curriculum-progress-v1';
+
+const phaseTrees = new Map<string, TreeNode[]>();
+for (const group of curriculumData) {
+  for (const phase of group.phases) {
+    phaseTrees.set(phase.id, buildTopicTree(phase));
+  }
+}
+
+const allGroupIdsList = Array.from(phaseTrees.values()).flatMap((nodes) => allGroupIds(nodes));
+
+const descendantIds = new Map<string, string[]>();
+for (const nodes of phaseTrees.values()) collectDescendantIds(nodes, descendantIds);
 
 function subscribeToStorage(callback: () => void) {
   window.addEventListener('storage', callback);
@@ -65,6 +86,7 @@ export function CurriculumView() {
   const allPhaseIds = useMemo(() => curriculumData.flatMap((g) => g.phases.map((p) => p.id)), []);
 
   const [expandedPhases, setExpandedPhases] = useState<Set<string>>(() => new Set(allPhaseIds));
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set(allGroupIdsList));
 
   const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
@@ -73,14 +95,14 @@ export function CurriculumView() {
     }, 2800);
   }, []);
 
-  // Toggle single topic
+  // Toggle single topic; a group parent carries its descendants to the same state
   const handleToggleTopic = useCallback(
     (topicId: string) => {
       const next = new Set(coveredSet);
-      if (next.has(topicId)) {
-        next.delete(topicId);
-      } else {
-        next.add(topicId);
+      const cover = !next.has(topicId);
+      for (const id of [topicId, ...(descendantIds.get(topicId) ?? [])]) {
+        if (cover) next.add(id);
+        else next.delete(id);
       }
       updateStorage(next);
     },
@@ -100,12 +122,26 @@ export function CurriculumView() {
     });
   }, []);
 
+  const handleToggleGroup = useCallback((topicId: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(topicId)) {
+        next.delete(topicId);
+      } else {
+        next.add(topicId);
+      }
+      return next;
+    });
+  }, []);
+
   const handleExpandAll = useCallback(() => {
     setExpandedPhases(new Set(allPhaseIds));
+    setExpandedGroups(new Set(allGroupIdsList));
   }, [allPhaseIds]);
 
   const handleCollapseAll = useCallback(() => {
     setExpandedPhases(new Set());
+    setExpandedGroups(new Set());
   }, []);
 
   const handleMarkAll = useCallback(() => {
@@ -199,37 +235,38 @@ export function CurriculumView() {
     };
   }, [coveredSet]);
 
+  const groupStats = useMemo(() => {
+    const acc = new Map<string, GroupStat>();
+    for (const nodes of phaseTrees.values()) collectGroupStats(nodes, coveredSet, acc);
+    return acc;
+  }, [coveredSet]);
+
   // Filter & Search logic
   const query = searchQuery.trim().toLowerCase();
+  const isFiltering = query.length > 0 || activeFilter !== 'all';
 
   const filteredGroups = useMemo(() => {
     return curriculumData
       .map((group) => {
         const filteredPhases = group.phases
           .map((phase) => {
-            const matchingTopics = phase.topics.filter((t) => {
-              // Filter by search query
-              if (query) {
-                const matchesTitle = t.title.toLowerCase().includes(query);
-                const matchesDesc = t.desc.toLowerCase().includes(query);
-                const matchesPhase = phase.title.toLowerCase().includes(query);
-                if (!matchesTitle && !matchesDesc && !matchesPhase) return false;
-              }
+            const tree = phaseTrees.get(phase.id) ?? [];
+            if (!isFiltering) {
+              return { phase, nodes: tree };
+            }
 
-              // Filter by pill
-              if (activeFilter === 'covered') return coveredSet.has(t.id);
-              if (activeFilter === 'uncovered') return !coveredSet.has(t.id);
-              if (activeFilter === 'interview') return t.interview;
-              if (activeFilter === 'written') return t.status === 'written';
-              return true;
-            });
-
-            return {
-              phase,
-              filteredTopics: matchingTopics,
+            const matches = (node: TreeNode) => {
+              const t = node.topic;
+              if (activeFilter === 'covered' && !coveredSet.has(t.id)) return false;
+              if (activeFilter === 'uncovered' && coveredSet.has(t.id)) return false;
+              if (activeFilter === 'interview' && !t.interview) return false;
+              if (activeFilter === 'written' && t.status !== 'written') return false;
+              return topicHaystack(node, phase.title).includes(query);
             };
+
+            return { phase, nodes: filterTopicTree(tree, matches) };
           })
-          .filter((item) => item.filteredTopics.length > 0);
+          .filter((item) => item.nodes.length > 0);
 
         return {
           groupName: group.group,
@@ -237,7 +274,7 @@ export function CurriculumView() {
         };
       })
       .filter((group) => group.phases.length > 0);
-  }, [query, activeFilter, coveredSet]);
+  }, [query, activeFilter, coveredSet, isFiltering]);
 
   return (
     <div className="min-h-screen bg-zinc-50/50 text-zinc-900 transition-colors dark:bg-black dark:text-zinc-100">
@@ -288,13 +325,16 @@ export function CurriculumView() {
                 </div>
 
                 <div className="space-y-3">
-                  {group.phases.map(({ phase, filteredTopics }) => (
+                  {group.phases.map(({ phase, nodes }) => (
                     <PhaseAccordion
                       key={phase.id}
                       phase={phase}
-                      filteredTopics={filteredTopics}
+                      nodes={nodes}
+                      groupStats={groupStats}
+                      expandedGroups={expandedGroups}
                       isExpanded={expandedPhases.has(phase.id)}
                       onToggleExpand={handleToggleExpand}
+                      onToggleGroup={handleToggleGroup}
                       coveredSet={coveredSet}
                       onToggleTopic={handleToggleTopic}
                     />
