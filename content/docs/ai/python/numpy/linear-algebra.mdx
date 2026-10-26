@@ -1,0 +1,518 @@
+---
+title: Linear Algebra
+description: 'Matrix products and shape rules, norms, solvers, decompositions, condition numbers, einsum, and the BLAS threads underneath NumPy.'
+---
+
+`A * x` and `A @ x` are both legal NumPy expressions on the same operands, and only one of them is a linear map. The typo survives any test that does not check a shape, which is why the product family, its shape rules, and its error messages come first.
+
+`np.linalg` is a thin wrapper over BLAS and LAPACK: the [`numpy.linalg` module docstring](https://numpy.org/doc/stable/reference/routines.linalg.html) says its functions "rely on BLAS and LAPACK", and names `dot`, `vdot`, `inner`, `outer`, `matmul`, `tensordot`, `einsum`, `einsum_path`, and `kron` as the most-used linear algebra functions, which live in the main `numpy` namespace instead. What the symbols mean is on [Vectors and Matrices](/ai/math-foundations/vectors-and-matrices); L1, L2, and cosine are on [Similarity and Norms](/ai/math-foundations/similarity-and-norms). This page is the API: which call, which shape, what it costs, where it fails quietly.
+
+---
+
+## The product family
+
+| Call                 | 1-D inputs                        | 2-D inputs                     | N-D inputs                                          |
+| :------------------- | :-------------------------------- | :----------------------------- | :-------------------------------------------------- |
+| `a * b`              | elementwise, broadcast the shapes | elementwise, shapes must agree | elementwise                                         |
+| `a @ b`, `np.matmul` | inner product, a scalar           | matrix product                 | last two axes are matrices, leading axes broadcast  |
+| `np.dot`             | inner product, a scalar           | matrix product                 | last axis of `a` against second-to-last axis of `b` |
+| `np.vdot`            | conjugates the first argument     | flattens both, inner product   | flattens both                                       |
+| `np.inner`           | inner product                     | inner products of row pairs    | sum over the last axis of each                      |
+| `np.outer`           | `(a.size, b.size)`                | flattens both first            | flattens both first                                 |
+| `np.tensordot`       | inner product at `axes=1`         | matrix product at `axes=1`     | contract exactly the axes you name                  |
+| `np.kron`            | length `m * n`                    | block-wise scaled blocks       | same, blockwise                                     |
+
+The PyTorch spelling, the `einsum` pattern table, and FLOP counting are on [Matrix Multiplication](/ai/pytorch/matrix-multiplication).
+
+```python title="products.py"
+import numpy as np
+
+A = np.array([[1.0, 2.0], [3.0, 4.0]])
+B = np.array([[10.0, 20.0], [30.0, 40.0]])
+u = np.array([1.0, 2.0, 3.0])
+v = np.array([4.0, 5.0, 6.0])
+X = np.ones((2, 3, 4))
+Y = np.ones((3, 4, 5))
+
+print((A * B).tolist())          # [[10.0, 40.0], [90.0, 160.0]] - nothing summed
+print((A @ B).tolist())          # [[70.0, 100.0], [150.0, 220.0]]
+print(np.dot(u, v), np.dot(A, B).tolist() == (A @ B).tolist())   # 32.0 True - 2-D agrees
+print(np.outer(u, v).shape, np.inner(A, B).shape, np.kron(u, v).shape)   # (3, 3) (2, 2) (9,)
+print(np.vdot(np.array([1 + 2j, 3 + 0j]), np.array([1 + 1j, 1 + 0j])))   # (6-1j)
+print(np.dot(X, Y).shape, np.tensordot(X, Y, axes=2).shape)   # (2, 3, 3, 5) (2, 5)
+try:
+    np.tensordot(X, Y, axes=1)
+except ValueError as exc:
+    print(f"ValueError: {exc}")  # ValueError: shape-mismatch for sum
+```
+
+`np.vdot` conjugates its first argument, so it is the inner product for complex vectors while `np.dot` and `@` are not. `np.dot` on two 3-D operands returns a 4-D array: it pairs the last axis of `a` with the second-to-last of `b` and outer-products the rest, which is where a stray batch axis comes from. `np.tensordot` takes the contracted axes as an argument and raises instead of guessing one.
+
+---
+
+## Shape rules and batching
+
+Two rules decide every `@` result:
+
+1. Only the last two axes are matrices, so the inner numbers must match: `(..., m, k) @ (..., k, n)`.
+2. Leading axes are batch axes and follow the [broadcasting rules](/ai/math-foundations/tensor-broadcasting), right-aligned.
+
+A 1-D operand is read as a matrix with a missing axis of length 1: prepended on the left, appended on the right, and the inserted 1 is dropped from the result.
+
+```python title="matmul_shapes.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+n, m, k, b = 5, 3, 4, 2
+x = rng.normal(size=n)             # shape (5,)
+W = rng.normal(size=(n, m))        # shape (5, 3)
+Xs = rng.normal(size=(b, m, n))    # shape (2, 3, 5)
+Ws = rng.normal(size=(b, n, k))    # shape (2, 5, 4)
+flat = rng.normal(size=(m, n))     # shape (3, 5), no batch axis of its own
+
+print((x @ x).shape)                       # ()
+print((x @ W).shape)                       # (3,)
+print((W.T @ x).shape)                     # (3,)
+print((Xs @ Ws).shape)                     # (2, 3, 4)
+print((flat @ Ws).shape)                   # (2, 3, 4) - a missing batch axis is free
+print((Xs @ x).shape)                      # (2, 3) - x became (5, 1)
+
+for label, left, right in [("core", np.ones((5, 3)), np.ones((5, 3))),
+                           ("batch", np.ones((2, 3, 5)), np.ones((3, 5, 4)))]:
+    try:
+        print(label, (left @ right).shape)
+    except ValueError as exc:
+        print(label, str(exc).splitlines()[0].partition(", with")[0].partition(" [")[0])
+# core matmul: Input operand 1 has a mismatch in its core dimension 0
+# batch operands could not be broadcast together with remapped shapes
+```
+
+`x @ W` and `W.T @ x` are the same `(3,)` answer reached two ways, and `Xs @ x` collapses a batch of inner products into `(2, 3)`; write `x[:, None]` to keep the axis. A vector stacked as `(1, 5)` instead of `(5,)` is the second failure mode, and it is the one people misread: the inner `5` matched, so the complaint is about batch axes `2` and `3`, which are neither equal nor `1`. A 1-D operand is promoted to a matrix by inserting a length-1 axis; a 2-D one is taken at face value.
+
+<Callout type="warn">
+  ### Elementwise is silent, matmul is not
+
+For stacks, `X * W` broadcasts whenever the shapes line up and returns element products, while
+`X @ W` contracts and raises when they do not. A broadcast that succeeds elementwise multiplies the
+wrong numbers with no signal at all. When both operands are stacks and the intent is a contraction,
+name the axes with `einsum`.
+
+</Callout>
+
+---
+
+## Norms
+
+`np.linalg.norm(x, ord=..., axis=...)` selects the norm by `ord`, and the table below is the one in the [`numpy.linalg.norm` notes](https://numpy.org/doc/stable/reference/generated/numpy.linalg.norm.html).
+
+| `ord`     | Vector                            | Matrix                  | Needs SVD |
+| :-------- | :-------------------------------- | :---------------------- | :-------- |
+| `None`    | 2-norm                            | Frobenius norm          | no        |
+| `1`       | sum of abs                        | max column sum of abs   | no        |
+| `-1`      | general formula                   | min column sum of abs   | no        |
+| `2`       | Euclidean length                  | largest singular value  | yes       |
+| `-2`      | general formula                   | smallest singular value | yes       |
+| `np.inf`  | max abs                           | max row sum of abs      | no        |
+| `-np.inf` | min abs                           | min row sum of abs      | no        |
+| `0`       | count of nonzero entries          | not supported           | no        |
+| `'fro'`   | not supported                     | root of sum of squares  | no        |
+| `'nuc'`   | not supported                     | sum of singular values  | yes       |
+| other     | `sum(abs(x) ** ord) ** (1 / ord)` | not supported           | no        |
+
+On matrices the SVD orders `2`, `-2`, and `'nuc'` are the expensive ones; the rest are sums of absolute values, linear in the entries. On a vector every numeric order except `0` and the two infinities comes from the one formula in the last row, so a negative order is dominated by the smallest entries. The docstring notes that `ord` below 1 is no longer a norm in the mathematical sense, and that `'fro'` and `'nuc'` raise when `x.ndim` is not 2.
+
+```python title="norms.py"
+import numpy as np
+
+v = np.array([3.0, -4.0, 0.0])
+print(np.linalg.norm(v), np.linalg.norm(v, 1), np.linalg.norm(v, 2))   # 5.0 7.0 5.0
+print(np.linalg.norm(v, np.inf), np.linalg.norm(v, -np.inf), np.linalg.norm(v, 0))   # 4.0 0.0 2.0
+w = np.array([3.0, -4.0])
+print(np.linalg.norm(w, -1), np.linalg.norm(w, -2), np.linalg.norm(v, 3))   # 1.7142857142857144 2.4 4.497941445275415
+
+M = np.array([[1.0, 9.0], [2.0, 3.0]])
+print(np.linalg.norm(M), np.linalg.norm(M, "fro"))    # 9.746794344808963 9.746794344808963
+print(np.linalg.norm(M, 1), np.linalg.norm(M, -1), np.linalg.norm(M, np.inf), np.linalg.norm(M, -np.inf))
+# 12.0 3.0 10.0 5.0
+print(np.linalg.norm(M, 2), np.linalg.norm(M, -2), np.linalg.norm(M, "nuc"))
+# 9.621298817898749 1.559041069600199 11.180339887498949
+print(np.linalg.svd(M, compute_uv=False).tolist())
+# [9.621298817898749, 1.559041069600199]
+
+for label, call in [("vector fro", lambda: np.linalg.norm(v, "fro")),
+                    ("matrix 0", lambda: np.linalg.norm(M, 0))]:
+    try:
+        print(label, call())
+    except ValueError as exc:
+        print(label, "->", exc)
+# vector fro -> Invalid norm order 'fro' for vectors
+# matrix 0 -> Invalid norm order for matrices.
+
+batch = np.random.default_rng(0).normal(size=(8, 64))
+print(np.linalg.norm(batch, axis=1, keepdims=True).shape)   # (8, 1)
+unit = batch / np.linalg.norm(batch, axis=1, keepdims=True)
+print(np.linalg.norm(unit, axis=1).tolist()[:2])            # [1.0, 0.9999999999999999]
+stack = np.random.default_rng(0).normal(size=(4, 5, 6))
+print(np.linalg.norm(stack, ord=2, axis=(-2, -1)).shape)    # (4,)
+print(np.linalg.vector_norm(batch, axis=1).shape, np.linalg.matrix_norm(stack, ord=1).shape)
+# (8,) (4,)
+```
+
+`np.linalg.norm(M, 2)` is the spectral norm: the largest singular value on the line below it, not the length of the entries. `keepdims=True` is what makes the dividing line up with no reshape, since the norm stays `(8, 1)` and divides each row while a bare `(8,)` would broadcast against `(8, 64)` and raise. `vector_norm` and `matrix_norm` are the Array API spellings NumPy 2 added, and their argument names match `torch.linalg`.
+
+---
+
+## Solving systems
+
+Both calls below solve the same system. One computes the answer; the other computes the entire inverse, stores it, and then uses a `1 / n` slice of it.
+
+```python title="solve_versus_inv.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 300
+A = rng.normal(size=(n, n))
+x_true = rng.normal(size=n)
+b = A @ x_true
+
+x_solve = np.linalg.solve(A, b)
+x_inv = np.linalg.inv(A) @ b
+
+def rel(x):
+    return np.linalg.norm(x - x_true) / np.linalg.norm(x_true)
+
+print(f"solve error    {rel(x_solve):.3e}")    # solve error    4.002e-14
+print(f"inv error      {rel(x_inv):.3e}")      # inv error      4.335e-13
+print(f"solve residual {np.linalg.norm(A @ x_solve - b):.3e}")   # solve residual 1.448e-12
+print(f"inv residual   {np.linalg.norm(A @ x_inv - b):.3e}")     # inv residual   9.516e-11
+print(np.linalg.inv(A).nbytes, x_solve.nbytes)   # 720000 2400
+print(rel(x_solve) < 1e-13, rel(x_inv) < 1e-13)  # True False
+```
+
+`np.linalg.solve` calls LAPACK `_gesv`: one LU factorization and two triangular sweeps. `np.linalg.inv` computes all `n * n` entries of the inverse, allocates them (720000 bytes against 2400 here), and then does a second product, so every step adds rounding: an order of magnitude more solution error and two orders more residual on a well-conditioned random matrix. The `inv` docstring states the same warning in words, adds the rule that `cond(a) = 10 ** k` can cost up to `k` digits of accuracy, and notes that for an ill-conditioned `a` a `LinAlgError` may or may not be raised at all. Timing, best of eight after warm-up on this machine at `OMP_NUM_THREADS=4`: 0.9 ms against 2.5 ms.
+
+`b` may carry several right-hand sides and stacks of systems work too. NumPy 2 changed the rule, stated in the `solve` docstring: only an exactly 1-D `b` is a column vector, and everything else is a stack of `(m, k)` matrices.
+
+```python title="solve_and_det.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+A = rng.normal(size=(4, 4))
+print(np.linalg.solve(A, rng.normal(size=(4, 3))).shape)    # (4, 3)
+print(np.linalg.solve(rng.normal(size=(5, 4, 4)), rng.normal(size=(5, 4, 2))).shape)   # (5, 4, 2)
+try:
+    np.linalg.solve(A, rng.normal(size=(3, 4)))
+except ValueError as exc:
+    print(str(exc).splitlines()[0].partition(", with")[0])
+# solve: Input operand 1 has a mismatch in its core dimension 0
+
+S = np.array([[1.0, 2.0], [2.0, 4.0]])
+for name, call in [("solve", lambda: np.linalg.solve(S, np.ones(2))),
+                   ("inv", lambda: np.linalg.inv(S)),
+                   ("cholesky", lambda: np.linalg.cholesky(S))]:
+    try:
+        call()
+    except np.linalg.LinAlgError as exc:
+        print(f"{name}: {type(exc).__name__}: {exc}")
+# solve: LinAlgError: Singular matrix
+# inv: LinAlgError: Singular matrix
+# cholesky: LinAlgError: Matrix is not positive definite
+print(np.linalg.matrix_rank(S), np.linalg.cond(S))   # 1 2.517588727560788e+16
+
+D = 10.0 * np.eye(400)
+with np.errstate(over="ignore"):
+    print(np.linalg.det(D), np.linalg.det(0.01 * D))   # inf 0.0
+print(*np.linalg.slogdet(D), 400 * np.log(10))   # 1.0 921.0340371976151 921.0340371976183
+print(*np.linalg.slogdet(0.01 * D))   # 1.0 -921.0340371976151
+print(*np.linalg.slogdet(S))   # 0.0 -inf
+```
+
+Rank deficiency and why a singular matrix has no inverse are on [Vectors and Matrices](/ai/math-foundations/vectors-and-matrices). Two things to read out of that output. `cond` reports `2.5e16` for the singular matrix, not infinity, because it comes from SVD roundoff rather than from an exact test. And `det` is the slowest way to ask whether a system is solvable and the least reliable: it returns one float, so `10 ** 400` overflows to `inf` and `0.1 ** 400` underflows to an exact `0.0` indistinguishable from a singular matrix (left unsuppressed, the overflow also prints `RuntimeWarning: overflow encountered in det` to stderr). Both routines run the same LU factorization, LAPACK `z/dgetrf`, and `slogdet`'s docstring is explicit that `det` "may overflow or underflow", so use sign-and-log whenever the determinant feeds a log: Gaussian log-likelihoods, normalizing constants, determinant ratios. Branching on `det(A) == 0.0` or on any magnitude threshold tests the units you chose, since scaling every entry by `1e-6` multiplies the determinant by `1e-6 ** n`; `matrix_rank` and `cond` answer the question that was asked.
+
+---
+
+## Least squares and pseudo-inverse
+
+`np.linalg.lstsq` minimizes the <Tip term="residual">The part of the target the fit cannot reproduce: `b - A @ x`, whose squared length is the least-squares loss.</Tip> `||A @ x - b||` and returns four things.
+
+```python title="least_squares.py"
+import numpy as np
+
+x = np.array([0.0, 1.0, 2.0, 3.0])
+y = np.array([-1.0, 0.2, 0.9, 2.1])
+X = np.vstack([x, np.ones(x.size)]).T        # (4, 2) design matrix
+coef, residuals, rank, s = np.linalg.lstsq(X, y, rcond=None)
+print(X.shape, coef.shape, residuals.shape, rank, s.shape)
+# (4, 2) (2,) (1,) 2 (2,)
+print(coef.tolist())     # [0.9999999999999999, -0.9499999999999997]
+print(residuals.tolist(), float(np.linalg.norm(X @ coef - y) ** 2))
+# [0.049999999999999864] 0.050000000000000024
+X2 = np.column_stack([x, 2.0 * x, np.ones(x.size)])   # (4, 3) with rank 2
+coef2, residuals2, rank2, s2 = np.linalg.lstsq(X2, y, rcond=None)
+print(residuals2.size, rank2, s2.tolist())
+# 0 2 [8.521914471591097, 1.173445243241562, 0.0]
+
+rng = np.random.default_rng(0)
+A = rng.normal(size=(100, 10))
+w_true = np.array([1.0, -2.0, 0.5, 3.0, -1.0, 0.25, -0.75, 2.0, 0.1, -0.1])
+b = A @ w_true + rng.normal(scale=0.1, size=100)
+P = np.linalg.pinv(A[:6])
+print(P.shape, np.allclose(A[:6], A[:6] @ P @ A[:6]), np.allclose(P @ b[:6], np.linalg.lstsq(A[:6], b[:6], rcond=None)[0]))
+# (10, 6) True True
+D = np.diag([1.0, 1e-8, 1e-14])
+print(np.linalg.matrix_rank(D), np.linalg.pinv(D).diagonal().tolist())
+# 3 [1.0, 100000000.0, 100000000000000.0]
+print(np.linalg.pinv(D, rcond=1e-6).diagonal().tolist(), np.linalg.pinv(D, rtol=1e-6).diagonal().tolist())
+# [1.0, 0.0, 0.0] [1.0, 0.0, 0.0]
+G = A.T @ A
+w_ols = np.linalg.solve(G, A.T @ b)
+w_ridge = np.linalg.solve(G + 1.0 * np.eye(A.shape[1]), A.T @ b)
+print(np.allclose(w_ols, np.linalg.lstsq(A, b, rcond=None)[0]), f"{np.linalg.norm(w_ridge - w_ols):.4f}")
+# True 0.0552
+print(f"cond(A) {np.linalg.cond(A):.2f}  cond(A.T @ A) {np.linalg.cond(G):.2f}")
+# cond(A) 1.95  cond(A.T @ A) 3.79
+```
+
+`residuals` holds the squared 2-norm per column of `b`, and its documented shape is `(1,)` for a 1-D `b`, `(K,)` for a `K`-column `b`, and empty when the system is rank-deficient: the `lstsq` docstring states the condition as `rank(a) < N` or `M <= N`. Code that reads `residuals[0]` dies on a rank-deficient fit, while `np.linalg.norm(A @ coef - b) ** 2` is always there. `rank` and `s` come from the SVD the routine ran anyway, `rank` being the count of singular values above the cutoff, and the `rcond=None` default is machine precision times `max(M, N)`; the `versionchanged` note records that before 2.0 the default was `-1`, with a warning that it would change.
+
+`np.linalg.pinv` writes the same solution as a matrix: invert the singular values above a cutoff, zero the rest, where the cutoff is `rcond * largest_singular_value` and the default `rcond` is `1e-15`. A direction `1e-14` of the dominant one is therefore still inverted and its noise amplified `1e14` times, which is the third line printed, and `rtol` is the same argument under its Array API name, added in 2.0.0, with a docstring note that only one of the two can be set. Raising the cutoff is a regularization choice. `G + lam * I` is ridge regression, the L2 penalty of [Similarity and Norms](/ai/math-foundations/similarity-and-norms) written as a shift of the eigenvalues, which makes `G` invertible when it was not. The last line is the reason to prefer `lstsq` over the normal equations: forming `A.T @ A` squares the condition number.
+
+---
+
+## Decompositions
+
+| Call                 | Returns                                      | Requires               | Relative cost |
+| :------------------- | :------------------------------------------- | :--------------------- | :------------ |
+| `np.linalg.cholesky` | `L` with `A = L @ L.T`                       | SPD                    | cheapest      |
+| `np.linalg.qr`       | `Q` with orthonormal columns, `R` triangular | none                   | moderate      |
+| `np.linalg.svd`      | `U`, singular values, `Vt`                   | none                   | most          |
+| `np.linalg.eig`      | eigenvalues, possibly complex                | square                 | moderate      |
+| `np.linalg.eigh`     | real eigenvalues ascending, orthonormal `V`  | symmetric or Hermitian | cheap         |
+
+```python title="cholesky_qr.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+A = rng.normal(size=(6, 4))
+C = A.T @ A + 4.0 * np.eye(4)        # SPD by construction
+
+L = np.linalg.cholesky(C)
+print(L.shape, np.allclose(L @ L.T, C))          # (4, 4) True
+print(np.allclose(L, np.tril(L)), np.allclose(L.T, np.linalg.cholesky(C, upper=True)))
+# True True
+print(f"{np.linalg.det(C):.4f} {np.exp(2.0 * np.log(np.abs(L.diagonal())).sum()):.4f}")
+# 3844.5368 3844.5368
+Q, R = np.linalg.qr(A)
+print(Q.shape, R.shape, np.allclose(A, Q @ R))   # (6, 4) (4, 4) True
+print(np.allclose(Q.T @ Q, np.eye(4)), np.allclose(R, np.triu(R)))   # True True
+Qc, Rc = np.linalg.qr(A, mode="complete")
+print(Qc.shape, Rc.shape)                        # (6, 6) (6, 4)
+```
+
+Cholesky needs a symmetric positive definite matrix, the <Tip term="SPD">Symmetric positive definite: every eigenvalue strictly positive, so the matrix factors as `L @ L.T` with a real triangular `L`.</Tip> case, and raises `Matrix is not positive definite` otherwise, which makes it the cheapest available SPD test. Summing `2 * log(abs(diag(L)))` gives the log-determinant with none of `det`'s overflow, the form a Gaussian log-likelihood wants. NumPy ships no triangular solver, so a Cholesky-based solve still calls `np.linalg.solve` on `L` and pays for an LU it does not need; `scipy.linalg.solve_triangular` is the one that does not. QR's default `mode="reduced"` gives `Q` of shape `(6, 4)` with columns spanning the same subspace as `A`, and `mode="complete"` pads it square; the signs come from the Householder reflections in LAPACK `dgeqrf` and `dorgqr`, so comparing two implementations entry by entry fails while comparing the reconstruction holds.
+
+```python title="svd_eigh.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+A = rng.normal(size=(6, 4))
+U, s, Vt = np.linalg.svd(A, full_matrices=False)
+print(U.shape, s.shape, Vt.shape)                 # (6, 4) (4,) (4, 4)
+print(np.allclose(A, U @ np.diag(s) @ Vt), np.allclose(A, (U * s[None, :]) @ Vt))
+# True True
+Uf, _, Vtf = np.linalg.svd(A)
+print(Uf.shape, Vtf.shape)                        # (6, 6) (4, 4)
+k = 2
+Ak = (U[:, :k] * s[:k]) @ Vt[:k]
+print(f"rank {k} relative error {np.linalg.norm(A - Ak) / np.linalg.norm(A):.4f}")
+# rank 2 relative error 0.4913
+print(A.size, k * (A.shape[0] + A.shape[1]))      # 24 20
+
+cov = np.cov(rng.normal(size=(200, 6)).T)         # symmetric by construction
+w, V = np.linalg.eigh(cov)
+print(w.dtype, V.dtype, np.all(w == np.sort(w)))   # float64 float64 True
+print(w.round(3).tolist())
+# [0.773, 0.809, 0.878, 0.968, 1.104, 1.164]
+print(np.allclose(cov, V @ np.diag(w) @ V.T), np.allclose(V.T @ V, np.eye(6)))
+# True True
+print(np.all(np.linalg.eig(cov)[0] == np.sort(np.linalg.eig(cov)[0])))   # False
+R = np.array([[0.0, 1.0], [-1.0, 0.0]])     # a 90 degree rotation
+print(np.linalg.eig(R)[0].tolist())         # [1j, -1j]
+print(np.linalg.eigh(R)[0].tolist())        # [-1.0, 1.0]
+```
+
+`full_matrices=False` keeps only the `min(M, N)` directions that carry data and leaves `s` a flat vector, so the reconstruction scales columns by broadcasting instead of building a diagonal matrix; LAPACK `_gesdd` returns the singular values descending. The truncated sum is the best rank-2 approximation available, and the Eckart-Young statement and the LoRA connection are on [Vectors and Matrices](/ai/math-foundations/vectors-and-matrices). The storage trade is the last number: 20 entries for a rank-2 factor of a 24-entry matrix pays off only when the true rank is low. `eigh` is the right call for the covariance matrix because `X.T @ X` is symmetric to rounding error and LAPACK `_syevd` uses that: real eigenvalues, orthonormal eigenvectors, ascending order, less work than the general routine. `eig` promises none of it and returns eigenvalues unsorted, which is why the same array fails the sorted check. The rotation is the trap: its true eigenvalues are the imaginary pair `1j` and `-1j`, `eig` finds them, and `eigh` returns `[-1.0, 1.0]` because it reads only the lower triangle by default (`UPLO='L'`) and symmetrizes a non-symmetric input without complaint. Check `np.allclose(A, A.T)` when you did not build `A` yourself.
+
+---
+
+## Condition number and what it costs
+
+The <Tip term="condition number">How much relative input error a matrix can amplify: the norm of the matrix times the norm of its inverse.</Tip> is `np.linalg.cond(x, p)`. With `p=None`, `2`, or `-2` it goes straight to the singular values as `s[0] / s[-1]`; the other orders skip the SVD and multiply `norm(x, p)` by `norm(invx, p)` on an inverse the call forms internally.
+
+```python title="condition_rank_float32.py"
+import numpy as np
+
+A = np.array([[1.0, 2.0], [2.0, 3.9999]])
+print(f"cond p=None {np.linalg.cond(A):.3e}")     # cond p=None 2.500e+05
+print(f"cond p=1    {np.linalg.cond(A, 1):.3e}")  # cond p=1    3.600e+05
+print(f"identity    {np.linalg.cond(np.eye(4)):.1f}")   # identity    1.0
+
+rng = np.random.default_rng(1)
+B = rng.normal(size=(50, 50))
+s = np.linalg.svd(B, compute_uv=False)
+tol = s.max() * max(B.shape) * np.finfo(B.dtype).eps
+print(f"s.max {s.max():.3f}  s.min {s.min():.3e}  tol {tol:.3e}")
+# s.max 14.263  s.min 2.223e-02  tol 1.584e-13
+print(s.min() > tol, np.linalg.matrix_rank(B))    # True 50
+
+exact = B.copy()
+exact[:, -1] = 2.0 * exact[:, 0]
+near = B.copy()
+near[:, -1] = 2.0 * near[:, 0] + 1e-9
+print(np.linalg.matrix_rank(exact), np.linalg.svd(exact, compute_uv=False).min())
+# 49 1.2389577135192366e-16
+print(np.linalg.matrix_rank(near), np.linalg.svd(near, compute_uv=False).min())
+# 50 1.9773507390844255e-10
+print(np.linalg.matrix_rank(near, rtol=1e-6))     # 49
+
+i = np.arange(1, 9)
+H = 1.0 / (i[:, None] + i[None, :] - 1.0)     # 8 by 8 Hilbert matrix
+x_true = np.ones(8)
+b = H @ x_true
+x64 = np.linalg.solve(H, b)
+H32 = H.astype(np.float32)
+x32 = np.linalg.solve(H32, b.astype(np.float32))
+print(f"cond float64 {np.linalg.cond(H):.3e}  cond float32 {np.linalg.cond(H32):.3e}")
+# cond float64 1.526e+10  cond float32 1.499e+09
+print(f"float64 error {np.linalg.norm(x64 - x_true) / np.linalg.norm(x_true):.3e}  float32 error {np.linalg.norm(x32 - x_true) / np.linalg.norm(x_true):.3e}")
+# float64 error 6.124e-08  float32 error 3.552e+00
+print([round(float(x), 2) for x in x32])
+# [1.0, 1.04, 0.51, 3.29, -4.41, 7.8, -3.33, 2.1]
+```
+
+The rule the numbers follow, stated in the `inv` docstring: a solve keeps about `log10(1 / eps) - log10(cond)` digits, so every factor of ten in the condition number spends one digit of the answer. `matrix_rank` is the same warning in another form, and with `tol=None` its threshold is the formula printed above, `S.max() * max(M, N) * eps`, described in its docstring notes as the MATLAB rule, designed to detect rank deficiency caused by SVD roundoff. A column copied exactly is reported rank 49; the same column copied plus `1e-9` of noise is reported full rank, because `1e-9` is enormous next to `1.6e-13`. That is correct numerically and wrong semantically if the question was how many independent directions the data has, so pass `tol=` or the keyword-only `rtol=` when you know the noise floor.
+
+The cost lands when the dtype cannot afford it. `float64` carries about 16 digits and Hilbert spends 10, so a few survive. `float32` carries about 7 and the same matrix spends 9, so the answer comes back with no correct digits, several wrong signs, and no warning. Hilbert is pathological on purpose, and the same arithmetic applies to any Gram matrix of nearly-collinear features, which is what an embedding matrix is. The float64 gradient check in [Backpropagation from Scratch](/ai/math-foundations/backprop-from-scratch) exists for this reason, and the bit layouts are on [Tensor Fundamentals](/ai/pytorch/tensor-fundamentals).
+
+---
+
+## `einsum` in NumPy
+
+Give every axis a letter, then write the letters you want to keep. A letter missing from the output is summed over; a letter repeated within one operand takes that operand's diagonal.
+
+```python title="einsum_cases.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+M = rng.normal(size=(4, 4))
+stack = rng.normal(size=(3, 4, 4))
+B = rng.normal(size=(5, 4))
+Xs = rng.normal(size=(3, 4, 5))
+Ws = rng.normal(size=(3, 5, 2))
+
+print(np.einsum("ii->", M) == np.trace(M))            # True
+print(np.einsum("ii->i", M).tolist() == np.diagonal(M).tolist())   # True
+print(np.allclose(np.einsum("bii->b", stack), [m.trace() for m in stack]))   # True
+print(np.allclose(B @ B.T, np.einsum("ij,kj->ik", B, B)))   # True
+print(np.einsum("ij,ji->i", np.ones((2, 3)), np.ones((3, 2))))   # [3. 3.]
+print(np.allclose(Xs @ Ws, np.einsum("bmi,bio->bmo", Xs, Ws)))   # True
+print(np.allclose(np.einsum("...ij,...jk->...ik", Xs, Ws), Xs @ Ws))   # True
+
+chain = [np.ones((60, 70)), np.ones((70, 80)), np.ones((80, 90)), np.ones((90, 50))]
+path, report = np.einsum_path("ij,jk,kl,lm->im", *chain, optimize=True)
+print(path)   # ['einsum_path', (2, 3), (1, 2), (0, 1)]
+print(np.allclose(np.einsum("ij,jk,kl,lm->im", *chain, optimize=True), np.linalg.multi_dot(chain)))   # True
+print([line.strip() for line in report.splitlines() if "FLOP" in line])
+# ['Naive FLOP count:  6.048e+09', 'Optimized FLOP count:  1.700e+06']
+print(np.linalg.multi_dot(chain).shape)   # (60, 50)
+```
+
+`ii->`, `ii->i`, and `bii->b` are the trace, the diagonal, and a per-slice trace, three operations with no plain `@` spelling. `ij,kj->ik` is the Gram matrix of rows, which otherwise needs a transpose plus a product, and `ij,ji->i` is the row-wise trace of a product, the contraction that appears when a matrix meets its own transpose. The attention spellings and the pattern table are on [Matrix Multiplication](/ai/pytorch/matrix-multiplication).
+
+`optimize=True` chooses the contraction order, which only matters beyond two operands. The path contracts the third matrix against the fourth first, then works leftward, because these shapes shrink right to left, and `einsum_path` prices the two orders at `6.048e+09` against `1.700e+06`. The search costs time itself, so with two operands there is no order to choose and `optimize=True` buys nothing; it pays on real chains, and most when one chain recurs at the same shapes and a path can be reused. `np.linalg.multi_dot` does the same job for plain matrix chains, and its docstring prices the classic case: for `10 x 100`, `100 x 5`, and `5 x 50` matrices, `(A @ B) @ C` costs 7500 multiply-adds against 75000 for `A @ (B @ C)`.
+
+---
+
+## BLAS, threads, and dtypes
+
+```python title="blas_config.py"
+import numpy as np, os
+
+cfg = np.show_config(mode="dicts")
+blas = cfg["Build Dependencies"]["blas"]
+print(blas["name"], blas["version"])     # scipy-openblas 0.3.30
+print(blas["openblas configuration"])
+# OpenBLAS 0.3.30  USE64BITINT DYNAMIC_ARCH NO_AFFINITY Haswell MAX_THREADS=24
+print(cfg["Build Dependencies"]["lapack"]["name"])   # scipy-openblas
+print(cfg["SIMD Extensions"]["found"])
+# ['SSSE3', 'SSE41', 'POPCNT', 'SSE42', 'AVX', 'F16C', 'FMA3', 'AVX2']
+print(cfg["SIMD Extensions"]["not found"][:2], os.cpu_count())   # ['AVX512F', 'AVX512CD'] 12
+
+rng = np.random.default_rng(0)
+n = 2048
+A64 = rng.normal(size=(n, n))
+A32 = A64.astype(np.float32)
+print(A32.nbytes, A64.nbytes)      # 16777216 33554432
+print((A32 @ A32).dtype, (A64 @ A64).dtype, (A32 @ A64).dtype)   # float32 float64 float64
+```
+
+`np.matmul` and `np.dot` say in their own docstrings that they use "an optimized BLAS library when possible", and the `numpy.linalg` module docstring names OpenBLAS, MKL, and ATLAS as what it looks for and points at `threadpoolctl` to control the thread count. The LAPACK side is listed in [`numpy/linalg/_linalg.py`](https://github.com/numpy/numpy/blob/main/numpy/linalg/_linalg.py), which calls the submodule a lite version of SciPy's that "only accesses the following LAPACK functions": `dgesv` for `solve`, `dgetrf` for `det` and `slogdet`, `dpotrf` for `cholesky`, `dgeqrf` and `dorgqr` for `qr`, `dgesdd` for `svd`, `dsyevd` and `zheevd` for `eigh`, `dgeev` for `eig`, `dgelsd` for `lstsq`, each with a `z` complex twin. Here BLAS and LAPACK both come from one bundled OpenBLAS, and `MAX_THREADS=24` is how many threads a single call may use on a 12-core box.
+
+One call does want the whole machine. A `2048 x 2048` float32 GEMM on this box, best of four after two warm-up products, rounded to the nearest millisecond:
+
+| Setting                                         | Time   |
+| :---------------------------------------------- | :----- |
+| unset                                           | 46 ms  |
+| `OMP_NUM_THREADS=4`                             | 60 ms  |
+| `OMP_NUM_THREADS=2`                             | 95 ms  |
+| `OMP_NUM_THREADS=1` or `OPENBLAS_NUM_THREADS=1` | 200 ms |
+
+Both variables change this build's thread count, which is the whole <Tip term="oversubscription">More runnable threads than cores, because each process starts its own full-size BLAS thread pool and they contend.</Tip> argument in numbers. A `DataLoader` worker is a separate process, so `num_workers=8` means eight independent pools, each sized from the core count it sees, all contending for twelve cores plus the parent's pool. BLAS threads pay off on one large GEMM and lose on thousands of small ones inside a loading loop, so cap them before the workers exist:
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python train.py
+```
+
+OpenBLAS reads those variables when the library starts up, so setting them after the first BLAS call is too late; `threadpoolctl` is the way to change the count mid-process. The PyTorch side of the same problem is on [Data Pipelines](/ai/pytorch/data-pipelines). Half the width halves the footprint and the traffic, and mixed inputs follow the array-array promotion rule from [The ndarray](/ai/python/numpy/the-ndarray): one `float64` operand drags the whole product to `float64` and doubles both. At equal size on this build the float32 GEMM took 49 ms against 98 ms for float64, roughly the AVX2 lane count above, eight `float32` values per register against four `float64`.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>What does <code>A * x</code> compute, and why does it sometimes not raise?</>}>
+
+    The Hadamard product: elementwise multiplication with broadcasting. It raises only when the shapes cannot broadcast, so a transposed weight multiplied instead of contracted computes the wrong numbers silently. `A @ x` is the matrix product and raises whenever the inner dimensions disagree.
+
+  </Accordion>
+  <Accordion title={<>How do <code>np.dot</code>, <code>@</code>, and <code>np.tensordot</code> differ on 3-D inputs?</>}>
+
+    `@` treats the last two axes as matrices and broadcasts the batch axes, so `(2,3,4) @ (3,4,5)` raises. `np.dot` sums the last axis of the first operand against the second-to-last of the second and outer-products the rest, turning two 3-D operands into a 4-D result. `np.tensordot` contracts the axes you name and raises on a mismatch instead of guessing.
+
+  </Accordion>
+  <Accordion title={<>Why is <code>np.linalg.inv(A) @ b</code> worse than <code>np.linalg.solve(A, b)</code>?</>}>
+
+    `solve` runs one LU factorization and two triangular sweeps. `inv` computes all `n` squared entries of the inverse, allocates them, and then does a second product, so every step adds rounding. Measured here at `n=300`: 12 times the solution error, 66 times the residual, 300 times the allocated bytes.
+
+  </Accordion>
+  <Accordion title={<>When does <code>np.linalg.lstsq</code> return an empty residuals array?</>}>
+
+    Whenever the rank of the design matrix is below its number of columns, or the number of rows does not exceed them. It is documented behavior, so `residuals[0]` crashes on a rank-deficient fit. `np.linalg.norm(A @ coef - b) ** 2` always gives the loss.
+
+  </Accordion>
+  <Accordion title={<>Why <code>eigh</code> instead of <code>eig</code> for a covariance matrix, and what does <code>eigh</code> hide?</>}>
+
+    A covariance matrix is symmetric, so its eigenvalues are real and its eigenvectors orthonormal. `eigh` uses that structure for a cheaper solve with eigenvalues sorted ascending, while `eig` makes no promises and can return complex pairs. `eigh` reads only the lower triangle, so a non-symmetric input is silently symmetrized instead of rejected.
+
+  </Accordion>
+  <Accordion title={<>What is the default tolerance in <code>np.linalg.matrix_rank</code>, and when is it the wrong answer?</>}>
+
+    `S.max() * max(M, N) * eps`, the MATLAB rule from its docstring notes. It detects rank loss caused by roundoff. A column copied from another plus `1e-9` of noise still counts as full rank at `float64` precision, which is numerically right and semantically wrong if the question was how many independent directions the data carries.
+
+  </Accordion>
+  <Accordion title={<>The condition number is 1e10. What does that mean for a <code>float32</code> solve?</>}>
+
+    A solve loses about `log10(cond)` digits, so 10 of them. `float32` carries about 7, so nothing correct is left and entries can come back with the wrong sign. Verified on an 8 by 8 Hilbert system: `float64` relative error 6.1e-08, `float32` 3.6e+00, neither raising.
+
+  </Accordion>
+</Accordions>

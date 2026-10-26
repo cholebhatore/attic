@@ -1,0 +1,571 @@
+---
+title: I/O and Memory
+description: 'Saving and loading .npy, .npz, and text, memory-mapping a dataset that does not fit in RAM, and stopping a numeric pipeline from allocating copies.'
+---
+
+[The ndarray](/ai/python/numpy/the-ndarray) sized the ImageNet training split at 180 GiB as `uint8` and showed NumPy refusing it outright. Two moves answer that refusal: keep the bytes on disk and read the slice you need, and stop the pipeline from making a second copy of everything it touches. Both depend on knowing what each file format actually stores and what each operation allocates.
+
+Everything here is measured against NumPy 2.3.2 on one Windows 11 box, 12 logical cores, 15.7 GiB of RAM. Treat the byte counts as reusable and the timings as this machine's.
+
+---
+
+## The format table
+
+| Format                    | Stores                                         | Multiple arrays | Read by other libraries                        | Relative read cost              | Pick it when                                      |
+| :------------------------ | :--------------------------------------------- | :-------------- | :--------------------------------------------- | :------------------------------ | :------------------------------------------------ |
+| `.npy`                    | One array: 128-byte header plus the raw buffer | No              | Yes, with a npy reader (Julia, xarray, OpenCV) | Baseline, one `read` call       | One array, and you want `mmap_mode` later         |
+| `.npz`                    | Zip archive of `.npy` members under names      | Yes             | Zip yes, members need a npy reader             | About 2x baseline               | A few named arrays that travel together           |
+| `.npz` compressed         | Same, deflate per member                       | Yes             | Same                                           | About 12x baseline              | Storage-bound archives of low-entropy data        |
+| Text, `savetxt`/`loadtxt` | Formatted decimal digits, dtype discarded      | No              | Anything that reads text                       | About 120x baseline             | A human or a non-Python tool has to read the file |
+| Mapped `.npy`             | Identical bytes to `.npy`, opened lazily       | No              | Same as `.npy`                                 | Pages touched, not pages stored | The file is larger than what you read from it     |
+
+The measurement behind the last two columns, one local run on this machine, warm page cache, best of three reads, for 200,000 `float32` features plus 200,000 `int8` labels:
+
+| Format             | Bytes on disk |  Write |    Read |
+| :----------------- | ------------: | -----: | ------: |
+| `.npy`             |     6,400,128 | 5.3 ms |  4.8 ms |
+| `.npz`             |     6,600,514 | 9.0 ms | 11.0 ms |
+| `.npz` compressed  |     5,821,663 | 446 ms | 57.9 ms |
+| Text, `fmt='%.9g'` |    19,400,007 | 2.11 s |  578 ms |
+
+Compressed `.npz` is 9% smaller here because deflate has nothing to repeat in random floats; the same archive written from a mostly-zero mask or a low-alphabet `uint8` label vector shrinks much further. Text costs 3x the bytes and two orders of magnitude the read time for the same numbers.
+
+```python title="round_trip.py"
+import numpy as np
+import os
+import tempfile
+
+rng = np.random.default_rng(0)
+feat = rng.random((200_000, 8), dtype=np.float32)
+lab = rng.integers(0, 10, size=200_000, dtype=np.int8)
+
+with tempfile.TemporaryDirectory() as d:
+    single = os.path.join(d, 'feat')          # no extension: save appends one
+    np.save(single, feat)
+    print(os.listdir(d))                      # ['feat.npy']
+    print(open(single + '.npy', 'rb').read(10))   # b'\x93NUMPY\x01\x00v\x00'
+
+    arch = os.path.join(d, 'ds.npz')
+    np.savez(arch, features=feat, labels=lab)
+    z = np.load(arch)
+    print(type(z).__name__, isinstance(z, np.ndarray))   # NpzFile False
+    print(z.files)                                       # ['features', 'labels']
+    first = z['labels']
+    print(type(first).__name__, first.dtype, first.shape)  # ndarray int8 (200000,)
+    print('second access re-decodes:', not np.shares_memory(z['labels'], first))
+    z.close()
+
+    with np.load(arch) as ctx:               # the file object is the context manager
+        print(ctx['features'].shape)         # (200000, 8)
+    print(np.array_equal(np.load(single + '.npy'), feat))   # True
+```
+
+`np.load` on a `.npz` hands back an `NpzFile`, a `Mapping` of names to arrays, not an array. Nothing is decoded until you index a key, and each indexing decodes again into a fresh buffer. An `NpzFile` left open holds the archive's file handle: on Windows that is enough to make deleting or renaming the file fail, so close it with `with` or `close()`.
+
+`np.savez` takes keyword arguments as names; positional ones become `arr_0`, `arr_1`. `np.savez_compressed` is the same call with deflate on.
+
+---
+
+## `allow_pickle`
+
+`np.load` defaults to `allow_pickle=False`. The flag only matters for `object` arrays, which have no fixed-width encoding and are therefore written with `pickle`, and unpickling is an interpreter: it calls whatever `__reduce__` tells it to.
+
+```python title="object_array_guard.py"
+import numpy as np
+import os
+import tempfile
+
+def plant(marker):
+    with open(marker, 'w') as f:
+        f.write('ran during unpickle\n')
+    return 7
+
+class Payload:
+    marker = None
+    def __reduce__(self):
+        return (plant, (Payload.marker,))
+
+with tempfile.TemporaryDirectory() as d:
+    Payload.marker = os.path.join(d, 'side_effect.txt')
+    path = os.path.join(d, 'meta.npy')
+    np.save(path, np.array([Payload()], dtype=object))
+
+    try:
+        np.load(path)
+    except ValueError as exc:
+        print(exc)
+    print('side effect:', os.path.exists(Payload.marker))    # False
+
+    unsafe = np.load(path, allow_pickle=True)
+    print('side effect:', os.path.exists(Payload.marker))    # True
+    print(unsafe.dtype, unsafe[0])                           # object 7
+```
+
+The exact message on 2.3.2 is `Object arrays cannot be loaded when allow_pickle=False`. Inside an `.npz` the same error surfaces at key access rather than at `np.load`, because members decode lazily.
+
+The guard is worth having and is not a sandbox: turning it on hands the file's bytes to `pickle.loads`, which runs the code above before the array is ever returned. Real datasets carry this in the metadata arrays that `savez` writes alongside features, which is why a downloaded `.npz` is a code-execution surface. Pickling itself and the alternatives are covered under [Pitfalls and Interop](/ai/python/numpy/pitfalls-and-interop).
+
+---
+
+## Text files
+
+```python title="savetxt_log.py"
+import numpy as np
+import os
+import tempfile
+
+step = np.arange(1, 6)
+loss = np.array([0.6931, 0.5123, 0.4012, 0.3350, 0.2901])
+lr = np.array([1e-3, 1e-3, 5e-4, 5e-4, 2.5e-4])
+
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, 'run.csv')
+    np.savetxt(path, np.column_stack([step, loss, lr]), delimiter=',',
+               header='step,loss,lr', comments='', fmt=['%d', '%.4f', '%.2e'])
+    print(open(path).read())
+    oned = os.path.join(d, 'step.txt')
+    np.savetxt(oned, step, fmt='%d')
+    print(np.loadtxt(oned).shape)     # (5,)
+```
+
+`fmt` takes one format string per column, `comments=''` keeps the `# ` prefix off the header line, and a 1-D input writes one value per row rather than one row, so it comes back with the same shape it went in with.
+
+```python title="loadtxt_log.py"
+import numpy as np
+import os
+import tempfile
+
+step = np.arange(1, 6)
+loss = np.array([0.6931, 0.5123, 0.4012, 0.3350, 0.2901])
+lr = np.array([1e-3, 1e-3, 5e-4, 5e-4, 2.5e-4])
+
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, 'run.csv')
+    np.savetxt(path, np.column_stack([step, loss, lr]), delimiter=',',
+               header='step,loss,lr', comments='', fmt=['%d', '%.4f', '%.2e'])
+
+    whole = np.loadtxt(path, delimiter=',', skiprows=1, dtype=np.float32)
+    print(whole.shape, whole.dtype)              # (5, 3) float32
+    ids = np.loadtxt(path, delimiter=',', skiprows=1, usecols=(0,), dtype=np.int64)
+    print(ids.dtype, ids.tolist())               # int64 [1, 2, 3, 4, 5]
+    x, y = np.loadtxt(path, delimiter=',', skiprows=1, usecols=(0, 1), unpack=True)
+    print(x.dtype, x.tolist())                   # float64 [1.0, 2.0, 3.0, 4.0, 5.0]
+    print(np.loadtxt(path, delimiter=',', skiprows=1, max_rows=2).shape)   # (2, 3)
+
+    big_ids = np.array([9007199254740993, 9007199254740995], dtype=np.int64)
+    ipath = os.path.join(d, 'ids.txt')
+    np.savetxt(ipath, big_ids, fmt='%d')
+    loose = np.loadtxt(ipath)
+    strict = np.loadtxt(ipath, dtype=np.int64)
+    print(loose.tolist(), np.array_equal(strict, big_ids))
+    # [9007199254740992.0, 9007199254740996.0] True
+```
+
+Text is the wrong container for numeric arrays, and the cost is not only bytes.
+
+| Problem              | What happens                                                                                                                 |
+| :------------------- | :--------------------------------------------------------------------------------------------------------------------------- |
+| Parsing              | Every element is a decimal string converted in Python-level loops: 578 ms versus 4.8 ms for the same 6.1 MiB on this machine |
+| dtype is not stored  | `loadtxt` defaults to `float64`, so pass `dtype=np.float32` or double the buffer                                             |
+| Silent rounding      | `savetxt` defaults to `%.18e`; `float32` needs `%.9g` to round-trip exactly                                                  |
+| Integer ids flatten  | Two ids above 2^53 read back as `float64` as `9007199254740992.0` and `9007199254740996.0`, one off from the file            |
+| Whole file in memory | `loadtxt` builds the array before returning it; there is no streaming read and no `mmap_mode`                                |
+
+`np.genfromtxt` is the same reader with per-column converters and a `filling_values=` for ragged or missing cells, at another round of parse cost. For anything genuinely tabular, read it with pandas (`pd.read_csv`, `pyarrow` engine) or Polars and take `.to_numpy()` from there; both parse faster and keep column dtypes honest.
+
+---
+
+## Memory-mapped datasets
+
+<Tip term="mmap">
+  A mapping that makes a range of a file addressable as process memory, so a read of one byte faults
+  in that page instead of loading the file.
+</Tip>
+
+<Tip term="page cache">
+  The OS cache of file pages in RAM. A mapped read hits it directly, which is why a second pass over
+  the same slice is faster than the first and why two mappings of one file see each other's writes.
+</Tip>
+
+```python title="mmap_read.py"
+import numpy as np
+import os
+import tempfile
+
+stack = np.arange(20_000 * 32 * 32 * 3, dtype=np.uint8).reshape(20_000, 32, 32, 3)
+
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, 'train.npy')
+    np.save(path, stack)
+    print(round(os.path.getsize(path) / 2**20, 1), 'MiB on disk')   # 58.6 MiB
+    del stack
+
+    mm = np.load(path, mmap_mode='r')
+    print(type(mm).__name__, isinstance(mm, np.ndarray))   # memmap True
+    print(mm.dtype, mm.shape, round(mm.nbytes / 2**20, 1))  # uint8 (20000, 32, 32, 3) 58.6
+    print(type(mm.base).__name__)                          # mmap
+
+    batch = mm[7_500:7_504]
+    print(batch.shape, batch[0, 0, 0].tolist())            # (4, 32, 32, 3) [0, 1, 2]
+    print(np.shares_memory(batch, mm))                     # True
+
+    scaled = batch.astype(np.float32) / 255.0
+    print(scaled.dtype, scaled.flags['OWNDATA'], round(scaled.nbytes / 2**10, 1))
+    del batch, scaled, mm
+```
+
+`numpy.memmap` is an `ndarray` subclass, so a mapped array passes every `isinstance` check and reaches every function that takes an array. Its `base` is the Python `mmap` object, and `nbytes` describes the logical size, not what is resident. Only the pages `batch` touches get read; the scaling step is the one real allocation, 48 KiB for four images. Reading a mapped array without a slice is the same as loading it, with the page faults on top.
+
+```python title="memmap_explicit.py"
+import numpy as np
+import os
+import tempfile
+
+samples = (np.arange(20, dtype=np.uint16) * 3)
+
+with tempfile.TemporaryDirectory() as d:
+    raw = os.path.join(d, 'capture.bin')
+    with open(raw, 'wb') as f:
+        f.write(bytes(512))              # vendor metadata block
+        f.write(samples.tobytes())
+
+    mm = np.memmap(raw, dtype=np.uint16, mode='r', offset=512, shape=(20,))
+    print(mm[:5].tolist())               # [0, 3, 6, 9, 12]
+    del mm
+
+    dense = os.path.join(d, 'scores.bin')
+    w = np.memmap(dense, dtype=np.float32, mode='w+', shape=(1_000_000,))
+    w[:3] = [1.5, -2.5, 3.5]
+    w.flush()
+    print(w.flags['WRITEABLE'], w.strides)   # True (4,)
+    del w
+
+    r = np.memmap(dense, dtype=np.float32, mode='r+', shape=(1_000_000,))
+    other = np.memmap(dense, dtype=np.float32, mode='r', shape=(1_000_000,))
+    r[0] = 0.0
+    print(other[0])                      # 0.0 - the second mapping sees the write
+    cow = np.memmap(dense, dtype=np.float32, mode='c', shape=(1_000_000,))
+    cow[0] = -1.0
+    print(other[0], cow[0])              # 0.0 -1.0, copy-on-write leaves the file alone
+    try:
+        other[0] = 9.0
+    except ValueError as exc:
+        print(exc)                       # assignment destination is read-only
+    del cow, other, r
+```
+
+Four arguments carry the design: `dtype` and `shape` are the whole description of the file, `offset` skips whatever precedes the data, and `mode` picks the semantics. `'r'` is read-only, `'r+'` writes through, `'w+'` truncates and creates, `'c'` gives you a private copy-on-write view.
+
+<Callout type="warn">
+  ### Constraints that bite
+
+`np.memmap` writes raw bytes with no header, so the extension is yours to choose and reopening needs the same `dtype` and `shape`. Point `np.load` at a headerless file named `.npy` and the error is misleading: `This file contains pickled (object) data. If you trust the file you can load it unsafely using the allow_pickle= keyword argument or pickle.load().`
+
+On Windows the mapping locks the file. Deleting, renaming, or opening it exclusively fails with `PermissionError: [WinError 32] The process cannot access the file because it is being used by another process` until every view of the mapping is dropped, and NumPy's own docs note that there is no API to close the underlying `mmap`, so `del` and reference counting are the release.
+
+The size is fixed at creation: you cannot append to a mapping, so a dataset that grows gets rewritten or sharded. Two writers on one mapping is a race, not a merge, because the ordering of dirty-page writeback is not defined. Under memory pressure the OS drops clean mapped pages and re-reads them later, which is what keeps a 200 GiB mapping alive on a 16 GiB box, and also what turns a random-access pass over it into thrashing.
+
+</Callout>
+
+---
+
+## Slicing a mapped array is not free
+
+[The ndarray](/ai/python/numpy/the-ndarray) established that a row slice of a C-ordered array is contiguous and a column slice is strided. On a mapping that difference is not just a slower loop, it is the number of file pages the read pulls in, and the page is 4096 bytes regardless of how many elements you wanted.
+
+```python title="strided_read.py"
+import numpy as np
+import os
+import tempfile
+
+n_rows, n_cols = 200_000, 256
+row_bytes = n_cols * 4
+
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, 'features.npy')
+    np.save(path, np.arange(n_rows * n_cols, dtype=np.float32).reshape(n_rows, n_cols))
+    mm = np.load(path, mmap_mode='r')
+    print('file MiB', round(os.path.getsize(path) / 2**20, 1))    # 195.3
+
+    rows = mm[:6_250, :]
+    cols = mm[:, :8]
+    print(rows.size, cols.size)                                   # 1600000 1600000
+    print('bytes spanned: rows', round(rows.nbytes / 2**20, 1),
+          'cols', round(cols.shape[0] * row_bytes / 2**20, 1))     # 6.1 195.3
+    print(rows.flags['C_CONTIGUOUS'], cols.flags['C_CONTIGUOUS'], cols.strides)
+    # True False (1024,)
+    dense = np.ascontiguousarray(cols)
+    print(dense.dtype, dense.flags['OWNDATA'], np.shares_memory(dense, mm))
+    # float32 True False
+    del dense, rows, cols, mm
+```
+
+Reading 8 columns out of 200,000 rows asks for 32 useful bytes per row and gets the whole 1,024-byte row, so the amplification is `row_bytes / (k * itemsize)` = 32x, and the arithmetic above says it exactly: 1.6M elements costing 6.1 MiB along the rows or 195.3 MiB across them.
+
+One local measurement of those two reads on this machine, warm page cache, `np.array()` forcing materialization:
+
+| Read            |  Elements | File bytes spanned |    Time |
+| :-------------- | --------: | -----------------: | ------: |
+| `mm[:6_250, :]` | 1,600,000 |            6.1 MiB |  6.0 ms |
+| `mm[:, :8]`     | 1,600,000 |          195.3 MiB | 63.4 ms |
+
+Same element count, ten times the wall time for thirty times the bytes. The gap is narrower than the
+amplification because the kernel reads in whole pages and the page cache absorbs a second pass, so a
+strided mapping is not always slow: it is slow the first time, and slow again once memory pressure
+evicts the pages. `np.ascontiguousarray` does not fix the read; it pays for one gather so that every
+later pass over that buffer is a stream, which is the right trade when a downstream C extension or BLAS
+call wants row-major input.
+
+---
+
+## Structured arrays
+
+```python title="structured.py"
+import numpy as np
+
+dt = np.dtype([('x', 'f4'), ('y', 'i2'), ('split', 'U5')])
+a = np.array([(1.5, 7, 'train'), (2.5, 9, 'val')], dtype=dt)
+print(dt.itemsize, a.dtype.names)          # 26 ('x', 'y', 'split')
+print(a['x'].tolist(), a['y'].dtype)       # [1.5, 2.5] int16
+print(a[0].tolist())                       # (1.5, 7, 'train')
+print(a['x'].strides, a['x'].flags['C_CONTIGUOUS'])   # (26,) False
+r = a.view(np.recarray)
+print(r.split.tolist(), r[0].y)            # ['train', 'val'] 7
+print(np.shares_memory(a, r))              # True
+```
+
+A structured dtype packs several types into one fixed-width record, the array holds one record per row, and `a['x']` is a strided view across those records; `np.recarray` is the same storage with attribute access. That is genuinely useful for sensor logs, event tables, and anything where a record is read as a unit and the types do not agree. It is the wrong shape for a feature matrix: `a['x']` is non-contiguous so every ufunc over it gathers, string fields inflate the record (20 of the 26 bytes above are the `'U5'`), and the whole thing is a single dtype, so features cannot share one float buffer. Keep features in one 2-D `float32` array and labels in a separate `int64` array, which is exactly how [Indexing and Slicing](/ai/python/numpy/indexing-and-slicing) and the loader pipelines are written. A structured array does round-trip through `.npy` because the dtype travels in the header, and `pd.DataFrame(a[['x', 'y']])` converts a field selection with no copy semantics you have to reason about.
+
+---
+
+## Allocation discipline
+
+A numeric pipeline that copies per step holds two working sets at once, and the peak is the sum. The controls are the ones already in the ufunc protocol plus a few habits.
+
+| Pattern                                     | Allocation                                           |
+| :------------------------------------------ | :--------------------------------------------------- |
+| `np.subtract(x, mu, out=buf)`               | none, writes the buffer you own                      |
+| `y = x - mu`                                | one new array per call                               |
+| `buf *= 2` / `np.multiply(buf, 2, out=buf)` | none                                                 |
+| `buf = buf * 2` in a loop                   | new array every iteration, old one freed a step late |
+| `np.empty((n, d))` filled inside a loop     | one array, allocated once                            |
+| `np.array(list_of_rows)`                    | the list plus a second copy of every row             |
+| `np.loadtxt(path, dtype=np.float32)`        | the narrow buffer only                               |
+| `arr.astype(np.float32)`                    | the narrow buffer, while the wide one is still alive |
+| `v = big[:10]`                              | none, and `del big` frees nothing while `v` lives    |
+
+`out=`, `where=`, and `dtype=` are specified in the ufunc call protocol on [Ufuncs and Reductions](/ai/python/numpy/ufuncs-and-reductions); the memory argument is that they are the only elementwise forms that do not allocate. NumPy has no trailing-underscore method convention: `np.add(a, b)` and `a + b` both build a new array unless you pass `out=`, and the true in-place members are augmented assignment plus a short list of ndarray methods (`sort`, `partition`, `resize`) that return `None`.
+
+```python title="inplace_vs_rebind.py"
+import numpy as np
+
+a = np.arange(6, dtype=np.float32)
+b = a.copy()
+before = id(b)
+b = b + 1
+print('rebind allocated:', id(b) != before, np.shares_memory(a, b))   # True False
+c = a.copy()
+before = id(c)
+c += 1
+print('iadd reused    :', id(c) == before, c.tolist())
+# True [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+print(np.add(a, 1, out=a) is a, a.tolist())
+# True [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+i = np.ones(3, dtype=np.int8)
+try:
+    i += np.array([1.5])
+except TypeError as exc:
+    print(exc)
+```
+
+`i += np.array([1.5])` raises rather than corrupting: `Cannot cast ufunc 'add' output from dtype('float64') to dtype('int8') with casting rule 'same_kind'`. An in-place step is only legal when the result fits the buffer, which is the constraint that keeps a hot loop honest about its dtype.
+
+```python title="preallocate_and_fill.py"
+import numpy as np
+
+n, d = 5_000, 64
+rng = np.random.default_rng(0)
+
+out = np.empty((n, d), dtype=np.float32)          # one buffer, allocated up front
+for i in range(n):
+    out[i] = rng.random(d, dtype=np.float32)      # filled in place
+print(out.shape, out.dtype, out.flags['C_CONTIGUOUS'])
+
+chunks = [rng.random(d, dtype=np.float32) for _ in range(n)]   # n objects plus the list
+glued = np.array(chunks)                          # and now a second copy of all of it
+print(glued.shape, glued.dtype, np.shares_memory(glued, chunks[0]))
+```
+
+The loop still runs in Python, which is the real cost, but the allocator is touched once either way and `out[i] = ...` writes through the existing buffer. A list of per-row arrays adds a `np.array` copy at the end, and the row objects stay alive until the list is dropped.
+
+Downcasting at the boundary is cheaper than downcasting later, because the wide buffer is what has to fit in RAM.
+
+```python title="downcast.py"
+import numpy as np
+import os
+import tempfile
+
+wide = np.random.default_rng(0).random((200_000, 8))
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, 'm.txt')
+    np.savetxt(path, wide, fmt='%.9g')
+    as64 = np.loadtxt(path)
+    as32 = np.loadtxt(path, dtype=np.float32)
+    print(as64.dtype, as32.dtype)                        # float64 float32
+    print(round(as64.nbytes / 2**20, 1), round(as32.nbytes / 2**20, 1))   # 12.2 6.1
+    print('exact', np.array_equal(as32, wide.astype(np.float32)))         # True
+    del as64, as32
+```
+
+For images the same rule says keep `uint8` on disk and divide at the last possible moment. `batch.astype(np.float32) / 255.0` allocates twice; `np.divide(batch, 255.0, out=buf)` with a preallocated `float32` buffer allocates once, and mapping the `uint8` file keeps the rest off the heap.
+
+```python title="view_keeps_parent.py"
+import numpy as np
+
+big = np.zeros((2_000_000, 8), dtype=np.float32)
+sample = big[10:14]
+print(sample.base is big, np.shares_memory(sample, big))   # True True
+print('logical', sample.nbytes, 'parent', big.nbytes)      # 128 bytes vs 64 MiB
+del big
+still = sample[0]
+print(still.base is sample, sample.base is None)           # True False
+free = sample.copy()
+print(free.base is None, np.shares_memory(free, still))    # True False
+del free, still, sample
+```
+
+`sample.nbytes` reports 128 while the 64 MiB parent cannot be freed, which is the `nbytes` warning from [The ndarray](/ai/python/numpy/the-ndarray) with a consequence: a sampler that holds small slices of many big arrays holds all of them. `.base` and `np.shares_memory` are the diagnostics; `.copy()` is the release, and on a mapping the same chain is why the file stays locked until the last view goes.
+
+The loop worth rewriting is any accumulator that reads a window of the array each step.
+
+```python title="accumulator_rewrite.py"
+import numpy as np
+
+x = np.arange(1.0, 11.0)
+k = 3
+
+slow = np.empty_like(x)
+for i in range(x.size):
+    slow[i] = x[max(0, i - k + 1):i + 1].mean()     # one strided view plus a reduction per step
+
+idx = np.arange(x.size)
+prefix = np.concatenate(([0.0], np.cumsum(x)))      # one extra buffer, one pass
+starts = np.maximum(idx - k + 1, 0)
+fast = (prefix[idx + 1] - prefix[starts]) / (idx + 1 - starts)
+print(slow[:5].tolist())                            # [1.0, 1.5, 2.0, 3.0, 4.0]
+print(fast[:5].tolist(), np.allclose(slow, fast))   # [1.0, 1.5, 2.0, 3.0, 4.0] True
+```
+
+The loop version allocates a temporary slice and a mean per element; the vectorized one allocates the prefix sum and the result. `np.lib.stride_tricks.sliding_window_view` is the third option: a zero-copy strided view of every window, which allocates nothing until you reduce it. Loop-versus-vectorized timings are on [Tensor Broadcasting](/ai/math-foundations/tensor-broadcasting); the point here is the allocation count, which is visible without a stopwatch.
+
+---
+
+## Build configuration and thread oversubscription
+
+```python title="build_config.py"
+import numpy as np
+
+cfg = np.show_config(mode='dicts')
+blas = cfg['Build Dependencies']['blas']
+print(blas['name'], blas['version'])
+print(blas['openblas configuration'])
+print(list(cfg['Machine Information'].keys()))
+```
+
+```text
+scipy-openblas 0.3.30
+OpenBLAS 0.3.30  USE64BITINT DYNAMIC_ARCH NO_AFFINITY Haswell MAX_THREADS=24
+['host', 'build']
+```
+
+`np.show_config()` answers what the wheels were built against; `np.show_runtime()` additionally prints the loaded BLAS DLL path, the threading layer, and the live `num_threads`, which on this machine reads `openblas`, `pthreads`, `12`. The same output lists the SIMD levels detected at import as `found` against `not_found` (here `AVX2` in, every `AVX512` variant out) and names the kernel OpenBLAS selected, `Haswell`, which is what `DYNAMIC_ARCH` in the build string makes possible.
+
+NumPy itself runs elementwise loops single-threaded. The threads come from BLAS inside `dot`, `matmul`, `svd`, `lstsq`, and friends. NumPy's [Global Configuration Options](https://numpy.org/doc/stable/reference/global_state.html) states both halves: "NumPy itself is normally intentionally limited to a single thread during function calls", and "for performant linear algebra NumPy uses a BLAS backend such as OpenBLAS or MKL, which may use multiple threads that may be controlled by environment variables such as `OMP_NUM_THREADS`". Programmatic control is via [`threadpoolctl`](https://pypi.org/project/threadpoolctl/), which that same page points at.
+
+```python title="blas_threads.py"
+import os
+import re
+import subprocess
+import sys
+
+probe = "import numpy as np; np.show_runtime()"
+
+def reported(code):
+    out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True)
+    return re.search(r"'num_threads': (\d+)", out.stdout).group(1)
+
+print('imported without the variable :', reported(probe))
+print('set before the numpy import   :', reported(
+    "import os; os.environ['OMP_NUM_THREADS'] = '1'; " + probe))
+print('set after the numpy import    :', reported(
+    probe.replace('import numpy as np;', '') +
+    "import os; os.environ['OMP_NUM_THREADS'] = '1'; import numpy as np; np.show_runtime()"))
+```
+
+```text
+imported without the variable : 12
+set before the numpy import   : 1
+set after the numpy import    : 12
+```
+
+The variable is read when NumPy initializes, so the line that sets it has to run before the line that imports NumPy, which in practice means the shell, the launcher, or the top of the entry module:
+
+```bash
+OMP_NUM_THREADS=1 python train.py
+```
+
+Why that matters in a pipeline: eight loader workers on twelve cores is eight BLAS thread pools
+scheduling against each other for work that was never large enough to split, the case measured on
+[Linear Algebra](/ai/python/numpy/linear-algebra). The same collision shows up with `multiprocessing`,
+joblib's loky backend, and scikit-learn's own guidance to bound BLAS threads and parallelize at the
+outer loop instead. Set the inner layer to one thread and keep parallelism in one place;
+[Data Pipelines](/ai/pytorch/data-pipelines) covers the worker side of that decision.
+
+I could not reproduce a large penalty for the pure-matmul case on this machine: four worker processes each doing four 1500x1500 `float32` products took 0.55 s with default BLAS threads and 0.59 s with `OMP_NUM_THREADS=1`, and 20,000 tiny 64x64 products showed no difference either way. The oversubscription cost is real but workload-shaped: it appears when the children do non-BLAS work while a parent pool spins, or on boxes with fewer cores per worker. Treat `OMP_NUM_THREADS=1` in a worker-heavy pipeline as a default to measure, not a free win.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>What does <code>np.load</code> return for a <code>.npz</code>, and what follows from it?</>}>
+
+    An `NpzFile`, a `Mapping` of names to arrays, not an array. Members decode on first key access and again on the next one, so `z['labels'] is z['labels']` is False. It holds an open file handle until you close it, so use `with np.load(path) as z:`; on Windows a leaked handle blocks deleting or renaming the archive.
+
+  </Accordion>
+  <Accordion title={<>Why is <code>allow_pickle=False</code> the default in <code>np.load</code>?</>}>
+
+    Object arrays have no fixed-width encoding, so they are stored with `pickle`, and unpickling executes whatever the bytes say. The flag refuses to run that code and raises `Object arrays cannot be loaded when allow_pickle=False`. Turning it on for a file from elsewhere is arbitrary code execution, not a load.
+
+  </Accordion>
+  <Accordion title="When is text the right format, and what does it cost?">
+
+    When a human or a non-Python tool reads the file, or when the array is small. `loadtxt` converts every element from a decimal string, defaults to `float64` unless you pass `dtype=`, rounds silently unless `fmt` is wide enough to round-trip, and builds the whole array in memory with no streaming or mapped option.
+
+  </Accordion>
+  <Accordion title={<>What is the difference between <code>np.load(path, mmap_mode='r')</code> and <code>np.load(path)</code>?</>}>
+
+    Both return a `numpy.memmap`, which is an `ndarray` subclass. With `mmap_mode` the file is only mapped: `nbytes` reports the logical size, the base is an `mmap` object, and pages enter RAM as they are touched. Without it the full buffer is read into the heap immediately.
+
+  </Accordion>
+  <Accordion title="Name three things you cannot do with a memory-mapped array.">
+
+    Append to it, because the mapping size is fixed at creation. Share one mapping between concurrent writers, because writeback ordering is undefined. Delete or rename the file while any view is alive on Windows, because the mapping locks it until the last reference goes.
+
+  </Accordion>
+  <Accordion title={<>Why does <code>del big</code> not free memory when a slice of it is still referenced?</>}>
+
+    A view points at the parent buffer, so `big[10:14]` keeps all 64 MiB alive while reporting 128 bytes of its own. Check `arr.base` and `np.shares_memory` to find who is holding what, then `.copy()` the slice you intend to keep.
+
+  </Accordion>
+  <Accordion title={<>How do you keep a hot loop from allocating, and where does the trailing underscore go?</>}>
+
+    Allocate the buffer once and write into it: `out=` on a ufunc, augmented assignment for the same-dtype case, indexed assignment inside the loop. NumPy has no `add_`-style methods; `arr = arr + 1` allocates a new array every step, and `i += np.array([1.5])` on an `int8` raises rather than truncating.
+
+  </Accordion>
+  <Accordion title={<>Which environment variable bounds NumPy's BLAS threads, and when does it take effect?</>}>
+
+    `OMP_NUM_THREADS` (or `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`, depending on the linked BLAS), read when NumPy initializes. Setting it after `import numpy` changes nothing, so put it in the shell or above the import. `np.show_runtime()` reports the resulting thread count.
+
+  </Accordion>
+</Accordions>

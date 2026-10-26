@@ -1,0 +1,400 @@
+---
+title: Reshaping and Views
+description: 'reshape order semantics and when a shape change copies, ravel versus flatten, transpose and moveaxis, padding, strided windows, convolution as a reshape.'
+---
+
+A reshape changes how a buffer is read. Sometimes it also changes the buffer. That distinction decides whether a write lands on the array you started with, whether a shape fix copies the whole batch, and whether a rolling window costs nothing or costs a full materialization.
+
+| Move        | What changes                      | Copies when                                                        |
+| :---------- | :-------------------------------- | :----------------------------------------------------------------- |
+| `reshape`   | shape, and the strides reading it | the new shape needs strides the current layout cannot give         |
+| `transpose` | axis order, so the strides        | never                                                              |
+| `pad`       | shape, plus new elements          | always                                                             |
+| window view | shape grows, buffer does not      | never, and read-only unless you ask; `as_strided` skips the checks |
+
+A <Tip term="view">A second array object that reads the buffer owned by another array. Writing through it changes the owner.</Tip> is what to track while reading.
+
+---
+
+## Reshaping is a reinterpretation, not a move
+
+The element count must match, and `-1` asks NumPy to infer one axis. Beyond that, `reshape` re-reads the existing buffer when the existing strides can express the new shape, and writes a new one when they cannot.
+
+```python title="reshape.py"
+import numpy as np
+
+a = np.arange(24)
+print(a.reshape(2, -1).shape, a.reshape(4, 3, -1).shape)   # (2, 12) (4, 3, 2)
+
+m = np.arange(6).reshape(2, 3)
+sm = np.shares_memory
+print(m.reshape(3, 2).tolist(), sm(m, m.reshape(3, 2)))     # [[0, 1], [2, 3], [4, 5]] True
+print(m.T.reshape(6).tolist(), sm(m, m.T.reshape(6)))       # [0, 3, 1, 4, 2, 5] False
+print(np.arange(4).reshape(2, 2, order='F').tolist())       # [[0, 2], [1, 3]]
+
+batch = np.arange(6)
+view = batch.reshape(2, 3)
+view[0, 0] = 99
+print(batch.tolist())                                       # [99, 1, 2, 3, 4, 5]
+own = batch.reshape(3, 2).copy()
+own[0, 0] = 7
+print(batch.tolist())                                       # [99, 1, 2, 3, 4, 5]
+```
+
+A size mismatch raises `cannot reshape array of size 24 into shape (2,4)`, and two `-1` axes are unresolvable, so `a.reshape(2, -1, -1)` raises `can only specify one unknown dimension`. Writing through `view` writes through `batch`: both objects read one buffer, and `np.shares_memory` is the test for which you got.
+
+`.base` names the buffer an array reads, and it is the weaker test. On `np.arange(12).reshape(3, 4)`, taking `f[:, :2].reshape(6)` gives `[0, 1, 4, 5, 8, 9]` with `np.shares_memory(f, flat)` `False`, yet `flat.base.shape` is `(3, 2)`: a reshape that must copy first ravels, so the copy's base is that internal temporary rather than the array you passed in. `base is None` means the array owns its storage, and a non-`None` base only says some buffer is being read.
+
+<Callout type="warn">
+  ### A normalization that writes through to the dataset
+
+Reshape a train slice, subtract its mean in place, and the array the validation slice came from has
+moved too, because both read one buffer. Two defenses: assert `np.shares_memory` in a test, or make
+the copy explicit wherever a function claims not to modify its argument. `arr.copy()` is the only
+spelling of "I want my own buffer".
+
+</Callout>
+
+---
+
+## `order=` and what the buffer actually contains
+
+`order=` picks the index walk that fills the new shape. The walk is over the logical array, so a layout that does not already match the walk forces a copy.
+
+| `order=` | Index walk                                       | Accepted by                                     |
+| :------- | :----------------------------------------------- | :---------------------------------------------- |
+| `'C'`    | row-major, last axis fastest                     | `reshape`, `ravel`, `flatten`                   |
+| `'F'`    | column-major, first axis fastest                 | `reshape`, `ravel`, `flatten`                   |
+| `'A'`    | `'F'` when the input is F-contiguous, else `'C'` | `reshape`, `ravel`, `flatten`                   |
+| `'K'`    | the order elements sit in memory                 | `ravel`, `flatten`, `asarray`; `reshape` raises |
+
+```python title="buffer_order.py"
+import numpy as np
+
+buf = np.arange(6, dtype=np.int8)
+m = buf.reshape(2, 3)
+print(m.base is buf, m.strides, m.T.strides)   # True (3, 1) (1, 3)
+print(repr(m.tobytes()), repr(m.T.tobytes()))   # b'\x00\x01\x02\x03\x04\x05' b'\x00\x03\x01\x04\x02\x05'
+r, rv = m.T.reshape(6, order='A'), m.T.reshape(6)
+print(r.tolist(), np.shares_memory(buf, r), rv.tolist(), np.shares_memory(buf, rv))   # [0, 1, 2, 3, 4, 5] True [0, 3, 1, 4, 2, 5] False
+
+f = np.arange(6, dtype=np.float32).reshape(2, 3, order='F')
+print(f.reshape(3, 2, order='C').tolist(), np.shares_memory(f, f.reshape(3, 2, order='C')))   # [[0.0, 2.0], [4.0, 1.0], [3.0, 5.0]] False
+```
+
+`tobytes()` walks the logical array in C order, so it serializes values rather than dumping the buffer. The six bytes behind `m` and behind `m.T` are identical and only the metadata differs, which is why `transpose` is free and reshaping a transposed array is not. `order='C'` on the Fortran-ordered `f` reads `[[0, 2, 4], [1, 3, 5]]` row by row into a new buffer, while `order='A'` keeps the input's own walk and stays a view.
+
+### Channel-last to channel-first
+
+Images reach NumPy as `(H, W, C)` because that is what a PNG decoder or PIL produces; most vision frameworks want `(C, H, W)`. The conversion is a transpose plus a copy, and naming the two steps is what keeps the copy from being a surprise.
+
+```python title="hwc_to_chw.py"
+import numpy as np
+
+img = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)     # (H, W, C)
+chw = img.transpose(2, 0, 1)                             # (C, H, W), same buffer
+contig = np.ascontiguousarray(chw)
+print(img.strides, chw.strides, contig.strides)          # (6, 3, 1) (1, 6, 3) (4, 2, 1)
+print(np.shares_memory(img, chw), np.shares_memory(img, contig), chw[0].tolist(), contig.tolist()[0])   # True False [[0, 3], [6, 9]] [[0, 3], [6, 9]]
+```
+
+`np.ascontiguousarray` is where the memory is written, so doing it once after all the axis moves beats doing it after each one, and converting at dataset build time does the same work once instead of once per batch.
+
+---
+
+## Flattening: `reshape(-1)`, `ravel`, `flatten`, and `reshape` versus `resize`
+
+| Call              | View or copy            | `order=`           | Returns                          |
+| :---------------- | :---------------------- | :----------------- | :------------------------------- |
+| `a.reshape(-1)`   | view when layout allows | `C`, `F`, `A`      | array or copy                    |
+| `a.ravel()`       | view when layout allows | `C`, `F`, `A`, `K` | always a new array object        |
+| `a.flatten()`     | always a copy           | `C`, `F`, `A`, `K` | fresh array                      |
+| `np.resize(a, s)` | always a copy           | none               | repeats or truncates to fill `s` |
+| `a.resize(s)`     | in place                | `C`, `F`, `A`      | `None`, zero-fills growth        |
+
+```python title="flatten.py"
+import numpy as np
+
+f = np.arange(12).reshape(3, 4)
+sm = np.shares_memory
+print(sm(f, f.reshape(-1)), sm(f, f.ravel()), sm(f, f.flatten()))   # True True False
+print(sm(f, f[:, :2].reshape(-1)), sm(f, f[:, :2].ravel()))         # False False
+print(f.ravel(order='F').tolist())                                  # [0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11]
+print(np.resize(np.arange(6), (4, 3)).tolist(), np.resize(np.arange(6), (2, 2)).tolist())   # [[0, 1, 2], [3, 4, 5], [0, 1, 2], [3, 4, 5]] [[0, 1], [2, 3]]
+
+grown = np.arange(6).reshape(2, 3).copy()
+grown.resize((3, 4))
+print(grown.tolist())                                               # [[0, 1, 2, 3], [4, 5, 0, 0], [0, 0, 0, 0]]
+```
+
+`np.resize` is not a shape tool. It flattens, then repeats the data cyclically or truncates it to reach the requested size, so a resized spectrogram looks plausible and is garbage. The in-place `a.resize(s)` zero-fills grown regions and raises `cannot resize this array: it does not own its data` on a view, and `cannot resize an array that references or is referenced by another array in this way` when a live view of it exists, which is `refcheck=True` protecting the alias.
+
+### Adding and removing axes
+
+```python title="new_axes.py"
+import numpy as np
+
+x = np.arange(6).reshape(1, 2, 1, 3)
+print(np.squeeze(x).shape, np.squeeze(x, axis=(0, 2)).shape, np.shares_memory(x, np.squeeze(x)))   # (2, 3) (2, 3) True
+v = np.arange(3)
+print(None is np.newaxis, v[None].shape, v[np.newaxis, :].shape)          # True (1, 3) (1, 3)
+print(v[:, None].shape, v[..., None].shape, v[None, :].shape)             # (3, 1) (3, 1) (1, 3)
+print(v[None].strides, v[:, None].strides, np.expand_dims(v, 0).strides)  # (0, 8) (8, 0) (24, 8)
+```
+
+`squeeze` drops every axis of length 1, or only the ones you name, and raises `cannot select an axis to squeeze out which has size not equal to one` when a named axis is wider. `expand_dims` inserts one. Both are views. `v[None]` and `v[np.newaxis, :]` are the same object: `np.newaxis` **is** `None`, and a bare `None` in an index tuple means insert an axis here while `:` means keep this axis, so which spelling you use is style. The stride reported on a length-1 axis is arbitrary, since nothing is ever stepped along it: indexing says `0` where `expand_dims` says `24`.
+
+---
+
+## Transposing and moving axes
+
+Every axis reorder here is a permutation of the strides tuple, and none of them copies.
+
+| Call                           | Effect                                                                          |
+| :----------------------------- | :------------------------------------------------------------------------------ |
+| `a.T`, `a.transpose()`         | reverse all axes                                                                |
+| `a.transpose(axes)`            | permute as given; `axes` must cover all of `range(a.ndim)`                      |
+| `a.swapaxes(i, j)`             | exchange two axes, negatives allowed                                            |
+| `np.moveaxis(a, source, dest)` | move one or several axes, the rest keep order, `rollaxis` is the older spelling |
+
+```python title="transpose.py"
+import numpy as np
+
+a = np.arange(24).reshape(2, 3, 4)
+p = a.transpose(2, 0, 1)
+print(a.strides, p.strides, p.shape)                             # (96, 32, 8) (8, 96, 32) (4, 2, 3)
+print(tuple(a.strides[i] for i in (2, 0, 1)) == p.strides)       # True
+print(np.shares_memory(a, p), p.flags['C_CONTIGUOUS'], p.flags['F_CONTIGUOUS'])   # True False False
+print(np.array_equal(np.moveaxis(a, 2, 0), a.transpose(2, 0, 1)), a.swapaxes(0, 2).shape, np.moveaxis(a, 0, -1).shape)   # True (4, 3, 2) (3, 4, 2)
+```
+
+A permuted array is usually neither C- nor F-contiguous, so the next `reshape` that merges two axes which are no longer adjacent in memory will copy.
+
+### Multi-head attention in NumPy
+
+`(B, T, C)` is batch, sequence, and a concatenated feature dimension where `C = H * hd` for `H` heads of width `hd`. Splitting and permuting those axes is two calls.
+
+```python title="multi_head.py"
+import numpy as np
+
+B, T, C, H = 2, 3, 4, 2
+hd = C // H
+x = np.arange(B * T * C).reshape(B, T, C)
+heads = x.reshape(B, T, H, hd).transpose(0, 2, 1, 3).reshape(B, H, T, hd)
+print(heads.shape, heads.strides, np.shares_memory(x, heads))   # (2, 2, 3, 2) (96, 16, 32, 8) True
+print(heads[0, 0].tolist(), heads[0, 1].tolist())   # [[0, 1], [4, 5], [8, 9]] [[2, 3], [6, 7], [10, 11]]
+print(np.array_equal(heads.transpose(0, 2, 1, 3).reshape(B, T, C), x), np.shares_memory(x, heads.reshape(B, H, T * hd)))   # True False
+```
+
+The first `reshape` splits the contiguous last axis, so it is a view; the `transpose` permutes strides, also a view; the second `reshape` matches a shape already present and changes nothing. Merging the sequence axis with the head width after the permute is the case strides cannot express, so the last line copies. PyTorch spells the idiom `permute` and `contiguous`, and [Combining and Permuting](/ai/pytorch/combining-and-permuting) covers those plus `cat`, `stack`, and the `einops` `rearrange` version.
+
+---
+
+## Broadcasting shapes without computing them
+
+Shapes align from the right, an axis is compatible when both sizes are equal or one is 1, and an array with fewer axes is padded with 1s on the left. The rules themselves, the zero-stride mechanics, and the vectorized idioms built on them are on [Tensor Broadcasting](/ai/math-foundations/tensor-broadcasting). The table is the lookup.
+
+| Case                               | Shapes                        | Result                      |
+| :--------------------------------- | :---------------------------- | :-------------------------- |
+| bias after a linear layer          | `(B, T, D) + (D,)`            | `(B, T, D)`                 |
+| positional encoding add            | `(B, T, D) + (T, D)`          | `(B, T, D)`                 |
+| per-token gate, with the singleton | `(B, T, D) + (B, T, 1)`       | `(B, T, D)`                 |
+| per-token gate without it          | `(B, T, D) + (B, T)`          | ValueError                  |
+| causal attention mask              | `(B, H, T, T) + (T, T)`       | `(B, H, T, T)`              |
+| one mask shared across heads       | `(B, H, T, T) + (1, 1, T, T)` | `(B, H, T, T)`              |
+| per-channel affine, channel-first  | `(B, C, H, W) + (C, 1, 1)`    | `(B, C, H, W)`              |
+| the same bias written as `(C,)`    | `(B, C, H, W) + (C,)`         | ValueError, unless `C == W` |
+
+That last row is the dangerous one because it does not always fail. Broadcasting `(4,)` against `(2, 4, 4, 4)` yields strides `(0, 0, 0, 8)`, so the values vary along the width axis; the intended `(4, 1, 1)` yields `(0, 8, 0, 0)`. Reshape the parameter at load time and the ambiguity is gone. `np.broadcast_shapes(a.shape, b.shape)` returns the verdict without computing the array.
+
+---
+
+## Padding
+
+`np.pad` always copies, because the padded region does not exist in the input buffer.
+
+```python title="pad_modes.py"
+import numpy as np
+
+a = np.arange(1, 6)
+for mode in ['constant', 'edge', 'reflect', 'symmetric', 'wrap']:
+    print(f"{mode:<10}", np.pad(a, 2, mode=mode).tolist())
+# constant   [0, 0, 1, 2, 3, 4, 5, 0, 0]
+# edge       [1, 1, 1, 2, 3, 4, 5, 5, 5]
+# reflect    [3, 2, 1, 2, 3, 4, 5, 4, 3]
+# symmetric  [2, 1, 1, 2, 3, 4, 5, 5, 4]
+# wrap       [4, 5, 1, 2, 3, 4, 5, 1, 2]
+
+print(np.pad(a, 2, mode='constant', constant_values=-1).tolist())   # [-1, -1, 1, 2, 3, 4, 5, -1, -1]
+print(np.pad(a, ((2, 1),), mode='edge').tolist())                   # [1, 1, 1, 2, 3, 4, 5, 5]
+print(np.pad(a, 2, mode='mean', stat_length=2).tolist())            # [2, 2, 1, 2, 3, 4, 5, 4, 4]
+print(np.pad(a.astype(float), 2, mode='mean', stat_length=2).tolist())   # [1.5, 1.5, 1.0, 2.0, 3.0, 4.0, 5.0, 4.5, 4.5]
+img = np.arange(6).reshape(2, 3)
+print(np.pad(img, 1, mode='reflect').tolist(), np.pad(img, 1, mode='wrap').tolist())   # [[4, 3, 4, 5, 4], [1, 0, 1, 2, 1], [4, 3, 4, 5, 4], [1, 0, 1, 2, 1]] [[5, 3, 4, 5, 3], [2, 0, 1, 2, 0], [5, 3, 4, 5, 3], [2, 0, 1, 2, 0]]
+```
+
+Compare the middle three lines of the first block. `reflect` mirrors without repeating the edge element, `symmetric` mirrors and repeats it, and `wrap` lifts the tail of the array to the front as though the signal were cyclic. A convolution that must not see a seam wants `reflect`; a periodic signal, such as one padded along the time axis before an FFT, wants `wrap`. Widths go per axis as a `(before, after)` pair, and the 2-D lines show the mode applied to each axis independently.
+
+`stat_values` was the NumPy 1 keyword for the statistics modes and `stat_length` replaced it, so the old name now raises `unsupported keyword arguments for mode 'mean'`. Ask for a float array when the mode is `mean` or `median`: the `int` version rounds the statistic on its way into the output dtype, and `1.5` becomes `2`.
+
+### Batch padding needs a mask, and that is a different job
+
+`np.pad` applies one width per axis to one array. A batch of variable-length sequences needs a different width per row, which `np.pad` cannot express, and you also need to know which cells were real. Build both with `np.full` and slice assignment:
+
+```python title="pad_batch.py"
+import numpy as np
+
+seqs = [np.array([10, 11, 12]), np.array([20, 21])]
+L = max(s.size for s in seqs)
+batch = np.full((len(seqs), L), 0, dtype=np.int64)
+mask = np.zeros((len(seqs), L), dtype=bool)
+for i, s in enumerate(seqs):
+    batch[i, : s.size] = s
+    mask[i, : s.size] = True
+print(batch.tolist(), mask.tolist())   # [[10, 11, 12], [20, 21, 0]] [[True, True, True], [True, True, False]]
+print(batch.mean(axis=1).tolist())                       # [11.0, 13.666666666666666]
+print(((batch * mask).sum(1) / mask.sum(1)).tolist())    # [11.0, 20.5]
+```
+
+Averaging the padded batch drags the second row from 20.5 to 13.67 because one of its three values is the fill. Any reduction over a padded batch needs that mask, or an equivalent `where=` form, or the number is wrong. The masked-assignment mechanics are on [Indexing and Slicing](/ai/python/numpy/indexing-and-slicing).
+
+---
+
+## Strided windows
+
+A sliding window needs no new data. It needs a shape that reports the same element at several positions, which one extra stride does for free.
+
+```python title="rolling_window.py"
+import numpy as np
+
+a = np.arange(10, dtype=np.float64)
+w = 4
+win = np.lib.stride_tricks.as_strided(a, shape=(a.size - w + 1, w), strides=(a.strides[0],) * 2)
+print(win[0].tolist(), win[-1].tolist(), win.shape, win.strides, win.nbytes, a.nbytes, np.shares_memory(a, win))   # [0.0, 1.0, 2.0, 3.0] [6.0, 7.0, 8.0, 9.0] (7, 4) (8, 8) 224 80 True
+```
+
+Building it is `O(1)` in array size and allocates nothing. Both facts are the danger: the strides say how far to step, the shape says how many steps exist, and nothing checks either against the length of the buffer. Note the logical footprint of `224` bytes against a buffer of `80`: the window view reads every element several times, and `nbytes` counts the reads rather than the storage.
+
+<Callout type="error">
+  ### `as_strided` does not bounds-check
+
+`as_strided` never copies and never verifies. Ask for more windows than the buffer can supply, or a
+stride larger than the data, and the array is created: `np.lib.stride_tricks.as_strided(a,
+shape=(10, 4), strides=(8, 8))` on that 10-element array hands back 40 logical elements over 10 real
+ones, and row 9 walks past the end of the allocation. What comes back is whatever the process happens
+to have mapped there, and writing to it corrupts that. Reserve `as_strided` for windows
+`sliding_window_view` cannot express, and pass `writeable=False`.
+
+</Callout>
+
+The checked version lives under `np.lib.stride_tricks` and is not a top-level `np.` function:
+
+```python title="sliding_window_view.py"
+import numpy as np
+
+x = np.array([1.0, 2, 3, 4, 5, 6, 7, 8])
+v = np.lib.stride_tricks.sliding_window_view(x, 3)
+print(v[0].tolist(), v[-1].tolist())                        # [1.0, 2.0, 3.0] [6.0, 7.0, 8.0]
+print(v.shape, v.strides, v.nbytes, x.nbytes)               # (6, 3) (8, 8) 144 64
+print(np.shares_memory(x, v), type(v.base).__name__, v.flags['WRITEABLE'])   # True DummyArray False
+print(v.mean(axis=-1).tolist(), v.max(axis=-1).tolist())   # [2.0, 3.0, 4.0, 5.0, 6.0, 7.0] [3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+print(np.convolve(x, np.ones(3) / 3, 'valid').tolist())   # [2.0, 3.0, 3.9999999999999996, 5.0, 6.0, 7.0]
+print(np.allclose(v.mean(axis=-1), np.convolve(x, np.ones(3) / 3, 'valid')))   # True
+m = np.arange(12.0).reshape(3, 4)
+vm = np.lib.stride_tricks.sliding_window_view(m, (2, 2))
+print(vm.shape, vm.strides, vm[0, 0].tolist())   # (2, 3, 2, 2) (32, 8, 32, 8) [[0.0, 1.0], [4.0, 5.0]]
+```
+
+Two things to take from that output. The window view's `.base` is NumPy's internal `DummyArray` wrapper, so `v.base is x` is `False` even though the view reads `x` byte for byte, and `np.shares_memory` is still the test. The result is also read-only unless you pass `writeable=True`, because each interior element appears in several windows and a write through one would silently change the others. Reducing along the last axis gives the running statistic, and window axes are always appended: `view.shape = x_shape_trimmed + window_shape`. The `np.convolve` route computes the same moving average in one pass and disagrees in the last bit, because `ones(3) / 3` cannot represent a third; that is why the check is `np.allclose`.
+
+---
+
+## Convolution as a reshape
+
+<Tip term="im2col">Windows reshaped into matrix columns, so a convolution is one multiply.</Tip>
+
+`np.convolve` flips the kernel and `np.correlate` does not. Both take the same three modes.
+
+```python title="convolve_modes.py"
+import numpy as np
+
+a = np.array([1.0, 2, 3, 4])
+v = np.array([0.0, 1.0, 0.5])
+print(np.convolve(a, v, 'full').tolist())    # [0.0, 1.0, 2.5, 4.0, 5.5, 2.0]
+print(np.convolve(a, v, 'same').tolist())    # [1.0, 2.5, 4.0, 5.5]
+print(np.convolve(a, v, 'valid').tolist())   # [2.5, 4.0]
+print(np.correlate(a, v, 'full').tolist())   # [0.5, 2.0, 3.5, 5.0, 4.0, 0.0]
+print(np.correlate(a, v, 'valid').tolist())  # [3.5, 5.0]
+print(len(a), len(v), len(a) + len(v) - 1, max(len(a), len(v)), max(len(a), len(v)) - min(len(a), len(v)) + 1)   # 4 3 6 4 2
+print(np.array_equal(np.convolve(a, v, 'full'), np.correlate(a, v[::-1], 'full')))   # True
+```
+
+| Mode      | Output length               | Coverage                                    |
+| :-------- | :-------------------------- | :------------------------------------------ |
+| `'full'`  | `N + M - 1`                 | every overlap, zeros beyond both ends       |
+| `'same'`  | `max(N, M)`                 | centered on the longer of the two arguments |
+| `'valid'` | `max(N, M) - min(N, M) + 1` | positions with no padding at all            |
+
+`'same'` tracks the longer argument, so a kernel wider than the signal returns an output wider than the input. The two functions differ only by that flip, which is the last line above, and the flip is why convolution is commutative and cross-correlation is not. Neural-network convolutions compute cross-correlation, so porting a `Conv1d` layer means `np.correlate`.
+
+Each output position is a dot product between a window and the kernel, so stacking the windows into rows turns a layer into one `@`:
+
+```python title="im2col.py"
+import numpy as np
+
+img = np.arange(20, dtype=np.float64).reshape(4, 5)
+k = np.array([[1.0, 0.0], [0.0, 2.0]])
+kh, kw = k.shape
+oh, ow = img.shape[0] - kh + 1, img.shape[1] - kw + 1
+win = np.lib.stride_tricks.sliding_window_view(img, (kh, kw), axis=(0, 1))
+cols = win.reshape(oh * ow, kh * kw)
+out = (cols @ k.reshape(-1)).reshape(oh, ow)
+loop = np.empty((oh, ow))
+for i in range(oh):
+    for j in range(ow):
+        loop[i, j] = (img[i:i + kh, j:j + kw] * k).sum()
+
+print(win.shape, cols.shape, out.tolist())   # (3, 4, 2, 2) (12, 4) [[12.0, 15.0, 18.0, 21.0], [27.0, 30.0, 33.0, 36.0], [42.0, 45.0, 48.0, 51.0]]
+print(np.allclose(out, loop), np.shares_memory(img, cols), cols.nbytes, img.nbytes)   # True False 384 160
+```
+
+`win` is the strided view and costs nothing. `cols` is the real work: flattening the window axes into one row is not expressible with strides, so that `reshape` copies and the im2col matrix already outweighs the image. With several channels the same two lines apply, and the column order is what to watch. `sliding_window_view` appends the window axes, so a channel-last image gives rows ordered `(C, kh, kw)` with no permutation, while a channel-first view comes out `(C, oh, ow, kh, kw)` and needs `transpose(1, 2, 0, 3, 4)` to move the channel axis between the positions and the window. Either way the rows pair with a kernel stored as `(out_channels, in_channels, kh, kw)`, which is the order torch's `Conv2d.weight` uses, and pairing the columns with a differently ordered kernel permutes the filter bank silently instead of raising.
+
+Padding follows the same route: run `sliding_window_view` over a `np.pad` result and the `'valid'` positions become a same-sized output. [Convolutions](/ai/classical-deep-learning/convolutions) builds the whole thing in torch, with stride, dilation, and receptive fields.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>Does <code>a.reshape(b)</code> copy?</>}>
+
+    Only when the strides cannot express the new shape. `np.shares_memory(a, a.reshape(b))` settles any case. A C-contiguous array reshaped into another C-compatible shape is a view; reshaping a transposed or strided slice usually copies.
+
+  </Accordion>
+  <Accordion title={<>Which is <code>np.resize</code> and which is <code>ndarray.resize</code>?</>}>
+
+    `np.resize(a, shape)` returns a new array with the flattened data repeated cyclically or truncated to reach the requested size. `a.resize(shape)` changes the array in place, zero-fills grown regions, and raises when the array does not own its buffer or something else references it.
+
+  </Accordion>
+  <Accordion title={<>Is <code>a[None]</code> different from <code>a[np.newaxis, :]</code>?</>}>
+
+    No. `np.newaxis` is `None`, so both insert an axis and return a view with shape `(1, n)`. `np.expand_dims(a, 0)` is the same operation spelled as a function, which is the form that accepts a computed axis number.
+
+  </Accordion>
+  <Accordion title={<>What does <code>transpose(0, 2, 1)</code> cost in memory and time?</>}>
+
+    A new array object and nothing else: it permutes the strides tuple and returns a view. The cost appears later, when an operation requires a contiguous buffer or a reshape has to merge axes that are no longer adjacent.
+
+  </Accordion>
+  <Accordion title={<>Difference between <code>reflect</code> and <code>wrap</code> padding?</>}>
+
+    `reflect` mirrors at the boundary without repeating the edge element, so padding `[1, 2, 3]` by 2 gives `[3, 2, 1, 2, 3, 2, 1]`. `wrap` moves the far end to the near side as if the signal were cyclic, giving `[2, 3, 1, 2, 3, 1, 2]`. `symmetric` mirrors and repeats the edge: `[2, 1, 1, 2, 3, 3, 2]`.
+
+  </Accordion>
+  <Accordion title={<>Why is a <code>sliding_window_view</code> result read-only?</>}>
+
+    Each interior element appears in several windows, so a write through one window would change a whole run of them and desynchronize anything already computed. Pass `writeable=True` when you want that and know why.
+
+  </Accordion>
+</Accordions>

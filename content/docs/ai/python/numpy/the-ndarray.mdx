@@ -1,0 +1,554 @@
+---
+title: The ndarray
+description: 'The buffer-and-metadata model, dtype defaults and byte accounting, memory layout, NEP 50 promotion, and every constructor worth knowing.'
+---
+
+A NumPy array is one contiguous block of memory plus the metadata needed to read it as a shape. The Python list you replaced to get here held pointers to boxed objects scattered across the heap; the array holds the values themselves, packed end to end, all encoded the same way.
+
+```python title="what_you_replaced.py"
+import sys
+import numpy as np
+
+py_list = [float(i) for i in range(1_000_000)]
+arr32 = np.arange(1_000_000, dtype=np.float32)
+
+print(sys.getsizeof(py_list))    # 8448728 - the pointer array, before the float objects
+print(arr32.nbytes)              # 4000000 - the values themselves
+```
+
+The list costs 8.4 MB of pointers plus 24 bytes for every `float` object the interpreter allocates, about 32 MB once you count them. The array costs exactly its element count times the element size, and the CPU can walk it without dereferencing anything.
+
+That single difference is why every numeric library in Python either is NumPy, imitates it, or hands data to it.
+
+---
+
+## Anatomy
+
+```python title="anatomy.py"
+import numpy as np
+
+x = np.arange(12, dtype=np.float32).reshape(3, 4)
+
+print(x.shape)        # (3, 4)
+print(x.ndim)         # 2
+print(x.dtype)        # float32
+print(x.strides)      # (16, 4)      bytes to advance one element along each axis
+print(x.itemsize)     # 4            bytes per element
+print(x.size)         # 12           total elements
+print(x.nbytes)       # 48           size * itemsize
+print(x.data)         # <memory at 0x...>   the buffer, as a Python memoryview
+```
+
+| Attribute  | What it answers                                                        |
+| :--------- | :--------------------------------------------------------------------- |
+| `shape`    | Element count along each axis                                          |
+| `ndim`     | Number of axes, equal to `len(shape)`                                  |
+| `dtype`    | Encoding and width of one element                                      |
+| `strides`  | Bytes to skip to move one element along each axis                      |
+| `itemsize` | Bytes per element, equal to `dtype.itemsize`                           |
+| `size`     | Total elements, the product of `shape`                                 |
+| `nbytes`   | Buffer size in bytes: `size * itemsize`, ignoring any shared storage   |
+| `flags`    | Contiguity, writability, and whether the array owns its buffer         |
+| `base`     | The array whose buffer this one reads, or `None` if it owns its memory |
+
+`strides` are reported in **bytes**. PyTorch reports the same concept in elements, so `np.arange(12).reshape(3, 4).strides` is `(32, 8)` while `torch.arange(12).reshape(3, 4).stride()` is `(4, 1)`. Divide by `itemsize` to translate between the two.
+
+<Callout type="warn">
+  ### nbytes is not memory used
+
+`nbytes` describes this array's logical footprint. A view of a large array reports its own smaller
+`nbytes` while keeping the whole parent buffer alive, and two arrays that share storage each count
+the same bytes. Size a process by adding up the buffers it owns, not by summing `nbytes` over every
+array in scope.
+
+</Callout>
+
+---
+
+## dtypes
+
+NumPy names its types by width and signedness, and keeps short single-character kind codes for
+them.
+
+| dtype        | Alias          | Kind | Bytes | Created by default when...                           |
+| :----------- | :------------- | :--- | :---- | :--------------------------------------------------- |
+| `bool_`      | `bool`         | `b`  | 1     | array comes from `True`/`False`                      |
+| `int8`       | —              | `i`  | 1     | never; specify it                                    |
+| `int16`      | `short`        | `i`  | 2     | never                                                |
+| `int32`      | `intc`         | `i`  | 4     | never on this platform                               |
+| `int64`      | `int_`, `long` | `i`  | 8     | array comes from Python ints                         |
+| `uint8`      | `ubyte`        | `u`  | 1     | array comes from `bytes` elements                    |
+| `float16`    | `half`         | `f`  | 2     | never; specify it                                    |
+| `float32`    | `single`       | `f`  | 4     | never; specify it                                    |
+| `float64`    | `double`       | `f`  | 8     | array comes from Python floats                       |
+| `complex64`  | `csingle`      | `c`  | 8     | array comes from complex with float32 parts          |
+| `complex128` | `cdouble`      | `c`  | 16    | array comes from Python `complex`                    |
+| `datetime64` | —              | `M`  | 8     | from an ISO string or explicit unit                  |
+| `str_`       | —              | `U`  | 4 × n | from `str` elements, fixed to the longest element    |
+| `bytes_`     | —              | `S`  | n     | from `bytes` elements, fixed to the longest          |
+| `object_`    | `O`            | `O`  | 8     | only when you ask for it, or shapes defeat inference |
+
+`np.int_` is 64-bit on a 64-bit build, including Windows. It used to follow the C `long`, which is 32-bit on Windows, and code written against that still breaks there. `np.intp` is the pointer-sized integer and the right dtype for indices; `np.long` is still 4 bytes on Windows if you need the old behavior.
+
+Bit layouts for the float formats, and why `bfloat16` and `float16` trade range against precision, are on [Tensor Fundamentals](/ai/pytorch/tensor-fundamentals). NumPy has no `bfloat16`; that format needs [`ml_dtypes`](https://pypi.org/project/ml-dtypes/), and PyTorch and JAX carry it natively.
+
+```python title="dtype_inspection.py"
+import numpy as np
+
+d = np.dtype(np.float32)
+print(d.itemsize, d.kind, d.char, d.name)   # 4 f f float32
+print(np.dtype('float32') is np.dtype(np.float32))   # True - dtype objects are singletons
+print(np.dtype('<f4').byteorder, np.dtype('>f4').byteorder)   # = >
+```
+
+`byteorder` prints `=` when the requested order is the machine's native one, so on a little-endian
+x86 box `'<f4'` and `'f4'` both report `=`. Big-endian data arriving from a file or a network buffer
+is where `>` shows up, and `.byteswap()` is how you fix it.
+
+`dtype` specifiers accept several spellings for the same thing: `np.float32`, `'float32'`, `'f4'`, and `'<f4'` all build the same object. The leading `<` or `>` is the byte order, which matters only when reading files written on a machine with the opposite endianness.
+
+---
+
+## Byte accounting
+
+Three numbers decide whether a batch fits: element count, bytes per element, and the product.
+
+```python title="sizing.py"
+import numpy as np
+
+def sizeof(shape, dtype):
+    n = int(np.prod(shape, dtype=np.int64)) * np.dtype(dtype).itemsize
+    return n, n / 2**20
+
+for name, shape, dtype in [
+    ("token ids", (8, 512), np.int64),
+    ("activations", (8, 512, 4096), np.float32),
+    ("same in float16", (8, 512, 4096), np.float16),
+    ("imagenet uint8", (1_281_167, 3, 224, 224), np.uint8),
+    ("imagenet float32", (1_281_167, 3, 224, 224), np.float32),
+]:
+    n, mib = sizeof(shape, dtype)
+    print(f"{name:<18} {n:>18,} bytes {mib:>12,.1f} MiB")
+```
+
+```text
+token ids                      32,768 bytes          0.0 MiB
+activations                67,108,864 bytes         64.0 MiB
+same in float16            33,554,432 bytes         32.0 MiB
+imagenet uint8        192,851,506,176 bytes    183,917.5 MiB
+imagenet float32      771,406,024,704 bytes    735,670.1 MiB
+```
+
+The last two rows are the instructive ones. ImageNet's 1.28 M training images at `3 x 224 x 224` are about 180 GiB as `uint8` and 718 GiB as `float32`. Try to build either and NumPy states the number for you:
+
+```text
+numpy._core._exceptions._ArrayMemoryError: Unable to allocate 180. GiB for an
+array with shape (1281167, 3, 224, 224) and data type uint8
+```
+
+Keeping pixels as `uint8` and dividing by `255.0` at the last moment is what makes a dataset usable at all, and memory-mapping the file instead of loading it is the other half. Both are on [I/O and Memory](/ai/python/numpy/io-and-memory).
+
+`2**20` is bytes to MiB, `2**30` to GiB. Stay out of decimal `10**6` unless you mean the megabytes on a storage advertisement.
+
+---
+
+## Memory layout
+
+C order (row-major) walks the last axis fastest. Fortran order (column-major) walks the first axis fastest. Same values, different buffers, different strides.
+
+```python title="layout.py"
+import numpy as np
+
+c = np.arange(6, dtype=np.float32).reshape(2, 3)
+f = np.asfortranarray(c)
+
+print(c.strides, c.flags['C_CONTIGUOUS'], c.flags['F_CONTIGUOUS'])   # (12, 4) True False
+print(f.strides, f.flags['C_CONTIGUOUS'], f.flags['F_CONTIGUOUS'])   # (4, 8) False True
+print(c.tolist() == f.tolist())                                      # True - same values
+print(c.flags['OWNDATA'], f.flags['OWNDATA'])                        # False True
+```
+
+`c` reports `OWNDATA` False because `reshape` returned a view of the temporary `arange` buffer. `f` reports True because changing the layout requires writing a new buffer, so `asfortranarray` copied.
+
+The layout changes which slices are cheap:
+
+```python title="slice_contiguity.py"
+import numpy as np
+
+c = np.arange(6, dtype=np.float32).reshape(2, 3)
+
+print(c[0].flags['C_CONTIGUOUS'], c[0].strides)         # True (4,)
+print(c[:, 0].flags['C_CONTIGUOUS'], c[:, 0].strides)   # False (12,)
+```
+
+A row slice reads consecutive memory. A column slice jumps `12` bytes per element, so anything that
+materializes it into a buffer pays a gather. This is why the axis order of a batch matters for
+throughput and not only for correctness: reducing along the last axis is a streaming pass, reducing
+along the first is a strided one.
+
+<Callout type="info">
+  ### Interchange formats pick the layout
+
+BLAS, MATLAB, NetCDF, and most GPU kernels expect column-major input. That is why `np.asfortranarray`
+exists and why a `float64` matrix handed to a Fortran routine is often transposed on the way in and
+the way out rather than converted. `np.ascontiguousarray` is the opposite direction and the one you
+will use more often, typically right before handing an array to PyTorch or to a C extension that
+assumes row-major.
+
+</Callout>
+
+`reshape` does not change layout. It re-reads the existing buffer in C order by default, which is
+why reshaping a Fortran-ordered array copies:
+
+```python title="reshape_order.py"
+import numpy as np
+
+m = np.arange(6).reshape(2, 3)
+print(m.tolist())                                  # [[0, 1, 2], [3, 4, 5]]
+print(m.reshape(3, 2).tolist())                    # [[0, 1], [2, 3], [4, 5]]
+print(np.shares_memory(m, m.reshape(3, 2)))        # True - view, no copy
+print(np.arange(4).reshape(2, 2, order='F').tolist())   # [[0, 2], [1, 3]]
+```
+
+`order='F'` fills the new shape down columns first, and `order='A'` keeps whatever the input already
+used. The default `'C'` is the one that surprises people when the input was transposed.
+
+---
+
+## Type promotion
+
+NumPy 2 implements [NEP 50](https://numpy.org/neps/nep-0050-scalar-promotion.html). Two arrays
+promote by category first and width second. A plain Python number is a <Tip term="weak scalar">An `int` or `float` operand with no dtype of its own. It adapts to the array it meets instead of dragging its own width in.</Tip>,
+and a weak scalar never widens the array it is combined with.
+
+```python title="promotion.py"
+import numpy as np
+
+i64 = np.arange(3, dtype=np.int64)
+f32 = np.ones(3, dtype=np.float32)
+
+print((i64 + f32).dtype)                 # float64  - array + array: category wins, then width
+print((i64 + 1).dtype)                   # int64    - Python int is weak
+print((f32 + 1.5).dtype)                 # float32  - Python float is weak
+print((np.ones(3, dtype=np.float16) + 1.0).dtype)   # float16
+print((np.ones(3, dtype=np.uint8) + np.ones(3, dtype=np.uint8)).dtype)   # uint8
+print(np.result_type(np.bool_, np.int8))            # int8
+print(np.result_type(np.int8, np.int8))             # int8  - narrow stays narrow
+```
+
+The last two rows carry the risk. Same-width integer arithmetic does not widen, so `uint8 + uint8`
+stays `uint8` and wraps:
+
+```python title="overflow.py"
+import numpy as np
+
+a = np.ones(3, dtype=np.uint8)
+print((a - np.uint8(10)).tolist())      # [247, 247, 247] - wrapped modulo 256
+
+with np.errstate(over='print'):
+    print(np.int8(127) + np.int8(1))    # -128
+    # stderr: Warning: overflow encountered in scalar add
+```
+
+The default setting is `over='warn'`, which raises `RuntimeWarning: overflow encountered in scalar
+add` for the scalar case shown. Arrays are worse: the same wrap happens elementwise with no warning
+at all in either NumPy 1 or 2, so `uint8` arithmetic on image data needs an explicit wider
+accumulator.
+
+A Python integer that does not fit the array's dtype raises where NumPy 1 truncated:
+
+```python title="out_of_range.py"
+import numpy as np
+
+b = np.zeros(3, dtype=np.int8)
+b[0] = 300        # OverflowError: Python integer 300 out of bounds for int8
+```
+
+`np.can_cast` answers whether one dtype fits another without losing information, and the `casting=`
+argument chooses how strict that question is:
+
+```python title="can_cast.py"
+import numpy as np
+
+print(np.can_cast(np.int64, np.float32))                        # False - 24 mantissa bits
+print(np.can_cast('int32', 'int64'))                            # True
+print(np.can_cast(np.float64, np.float32))                      # False
+print(np.can_cast(np.float64, np.float32, casting='unsafe'))    # True
+```
+
+<Callout type="warn">
+  ### PyTorch answers the same question differently
+
+`np.int64 + np.float32` promotes to `float64` because not every int64 fits in a float32 mantissa.
+`torch` gives `float32` for the identical pair, because doubling the memory of an activation tensor
+overflows GPUs for a precision nobody asked for. Any port between the two that relies on the
+promotion default should state the dtype explicitly: `x.astype(np.float32)` versus
+`x.to(torch.float32)`. The disagreement is written out on
+[Tensor Fundamentals](/ai/pytorch/tensor-fundamentals).
+
+</Callout>
+
+---
+
+## Scalars and zero-dimensional arrays
+
+Every dtype has a scalar type. It wraps the same bytes as an element of an array and behaves mostly
+like the corresponding Python number.
+
+```python title="scalars.py"
+import numpy as np
+
+s = np.float64(1.5)
+print(type(s).__name__, s.dtype, s.itemsize)      # float64 float64 8
+print(isinstance(s, float))                        # True  - float64 subclasses Python float
+print(isinstance(np.float32(1.5), float))          # False - float32 does not
+print(np.pi, type(np.pi).__name__)                 # 3.141592653589793 float
+
+z = np.array(5)                                    # zero-dimensional
+print(z.shape, z.ndim, bool(z))                    # () 0 True
+print(z + np.ones(3))                              # [6. 6. 6.]
+print(np.asarray(np.pi).ndim)                      # 0
+```
+
+`np.float64` inherits from `float`, so it slips through `isinstance` checks; `np.float32` does not,
+and code that assumes any NumPy float is a `float` breaks when someone changes a dtype. A scalar
+carries no shape, and a 0-d array carries no elements to index, which is why `bool()` on an array of
+size greater than one raises while `bool(np.array(5))` works.
+
+---
+
+## Constructing arrays
+
+### From existing data
+
+```python title="from_data.py"
+import numpy as np
+
+a = [[1, 2, 3], [4, 5, 6]]
+m = np.array(a)                       # copies, dtype inferred: int64
+v = np.asarray(a)                     # also copies here; a list is not an array
+r = np.asarray(m)                     # no copy, m is already an ndarray of the right dtype
+print(np.shares_memory(m, v), np.shares_memory(m, r))    # False True
+```
+
+`np.array` always copies by default. `np.asarray` returns its input untouched when the input is
+already an `ndarray` with the requested dtype and order, and copies otherwise. Passing an existing
+array through `np.asarray` is the standard way to accept either a list or an array in one function
+signature without paying for a needless copy.
+
+NumPy 2 changed what `copy=False` means:
+
+```python title="copy_keyword.py"
+import numpy as np
+
+try:
+    np.array([1, 2, 3], dtype=np.float32, copy=False)
+except ValueError as exc:
+    print(str(exc).splitlines()[0])
+# Unable to avoid copy while creating an array as requested.
+```
+
+`copy=False` now promises never to copy, and raises when that promise cannot be kept; the error text
+itself tells you to use `np.asarray(obj)` instead. `copy=None` is the old best-effort behavior, and
+`copy=True` is the default. Any snippet that reads `np.array(x, copy=False)` as a cheap view is wrong
+on NumPy 2.
+
+### Filled constants and the `_like` family
+
+```python title="constants.py"
+import numpy as np
+
+print(np.zeros((2, 3)).tolist())            # [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+print(np.ones(4, dtype=np.int8).tolist())   # [1, 1, 1, 1]
+print(np.full((2, 2), np.nan).tolist())     # [[nan, nan], [nan, nan]]
+print(np.eye(3, dtype=np.int8).tolist())    # [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
+
+proto = np.ones((2, 3), dtype=np.int16)
+print(np.zeros_like(proto).dtype, np.zeros_like(proto).shape)   # int16 (2, 3)
+print(np.full_like(proto, 7).tolist())      # [[7, 7, 7], [7, 7, 7]]
+```
+
+The `*_like` constructors copy shape and dtype from a prototype instead of restating both, which
+keeps a batch tensor and its mask from drifting apart when the model width changes. `np.empty` and
+`np.empty_like` allocate without writing anything, so the contents are whatever the allocator handed
+back, not zeros. Use them only when every element gets overwritten before the first read.
+
+### Ranges
+
+```python title="ranges.py"
+import numpy as np
+
+print(np.arange(0, 10, 3).tolist())                 # [0, 3, 6, 9]
+print(np.arange(10).dtype, np.arange(0.0, 1.0, 0.1).dtype)   # int64 float64
+print(np.linspace(0, 1, 5).tolist())                # [0.0, 0.25, 0.5, 0.75, 1.0]
+print(np.linspace(0, 1, 5, endpoint=False).tolist())
+# [0.0, 0.2, 0.4, 0.6000000000000001, 0.8]
+print(np.logspace(0, 3, 4).tolist())                # [1.0, 10.0, 100.0, 1000.0]
+```
+
+`arange` takes a step, `linspace` takes a count. Given float arguments, `arange` derives the element
+count from a division, and floating-point representation makes that quotient unstable at the
+boundary:
+
+```python title="arange_boundary.py"
+import numpy as np
+
+print(2.1 / 0.3)             # 7.000000000000001
+a = np.arange(0, 2.1, 0.3)
+print(a.size, a[-1])         # 8 2.1
+print(a.tolist())
+# [0.0, 0.3, 0.6, 0.8999999999999999, 1.2, 1.5, 1.7999999999999998, 2.1]
+```
+
+The stop is documented as exclusive, and the array still contains it. `ceil(2.1 / 0.3)` is `ceil(7.000000000000001)`, which is `8`, and the eighth element `7 * 0.3` rounds back to exactly `2.1`. When you need a specific number of samples, use `linspace`, which computes the step from the count instead of computing the count from the step.
+
+### One-hot and label spreads
+
+The idiom for turning integer labels into indicator rows indexes a fresh zeros array with two
+aligned index arrays:
+
+```python title="one_hot.py"
+import numpy as np
+
+labels = np.array([0, 2, 1, 0])
+onehot = np.zeros((labels.size, labels.max() + 1), dtype=np.int8)
+onehot[np.arange(labels.size), labels] = 1
+print(onehot.tolist())
+# [[1, 0, 0], [0, 0, 1], [0, 1, 0], [1, 0, 0]]
+```
+
+`np.arange(labels.size)` is the row axis and `labels` is the column axis; the pair selects exactly
+one cell per row. See [Indexing and Slicing](/ai/python/numpy/indexing-and-slicing) for why this
+assignment writes where you expect and `+=` there does not.
+
+### Broadcast views
+
+`np.broadcast_to` returns a read-only view with a zero stride on the stretched axis. No memory is
+allocated for the repeated data.
+
+```python title="broadcast_to.py"
+import numpy as np
+
+b = np.broadcast_to(np.arange(3), (2, 3))
+print(b.tolist(), b.strides, b.flags['WRITEABLE'])   # [[0, 1, 2], [0, 1, 2]] (0, 8) False
+print(b.nbytes, b.base.nbytes)                       # 48 24
+```
+
+The zero stride is the same mechanism [Tensor Broadcasting](/ai/math-foundations/tensor-broadcasting)
+describes for `+`. Writing to the result raises, and `np.array(b)` or `b.copy()` is the way to turn
+one into something editable.
+
+### Grids
+
+`meshgrid` builds coordinate matrices from two or more 1-D vectors, and the `indexing=` argument
+decides whether the output is `(rows, columns)` or `(columns, rows)`.
+
+```python title="meshgrid.py"
+import numpy as np
+
+x = np.array([1.0, 2.0, 3.0])   # three positions along the last axis
+y = np.array([4.0, 5.0])        # two positions along the first axis
+
+ij = np.meshgrid(x, y, indexing='ij')
+xy = np.meshgrid(x, y)          # indexing='xy', the default
+
+print([g.shape for g in ij])    # [(3, 2), (3, 2)]
+print(ij[0].tolist())           # [[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]]
+print([g.shape for g in xy])    # [(2, 3), (2, 3)]
+print(xy[0].tolist())           # [[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]]
+```
+
+`indexing='ij'` gives `shape = (len(x), len(y))` and matches array indexing, so `out[i, j]` refers to
+the pair `(x[i], y[j])`. The default `'xy'` gives `shape = (len(y), len(x))`, which matches plotting
+and image conventions where the first axis is rows. Mixing the two is a silent transposition, so name
+the argument whenever it is not for a plot.
+
+`np.ogrid` returns the same grids as broadcastable views with length-1 axes instead of full matrices,
+which is the memory-efficient way to build coordinate arrays for large grids.
+
+---
+
+## Strings, bytes, and objects
+
+A NumPy string array stores fixed-width elements, sized to the longest string at construction.
+
+```python title="strings.py"
+import numpy as np
+
+s = np.array(['a', 'bb', 'ccc'])
+print(s.dtype, s.dtype.itemsize)      # <U3 12 - three UCS-4 code units per element
+print(np.array([b'ab', b'c']).dtype)  # |S2
+```
+
+`U` is Unicode with 4 bytes per code unit, `S` is raw bytes with 1. Appending a longer string to such
+an array does not resize it, and `np.char` operations are Python loops wearing an array's clothing.
+NumPy 2's `np.dtypes.StringDType()` gives variable-width UTF-8 storage, but the ecosystem around it is
+still thin. Text preprocessing belongs in pandas, Polars, or a tokenizer, not in a `U` array.
+
+`object` dtype stores pointers to arbitrary Python objects:
+
+```python title="object_dtype.py"
+import numpy as np
+
+try:
+    np.array([[1, 2], [1, 2, 3]])
+except ValueError as exc:
+    print(exc)
+# setting an array element with a sequence. The requested array has an inhomogeneous
+# shape after 1 dimensions. The detected shape was (2,) + inhomogeneous part.
+
+o = np.array([[1, 2], [1, 2, 3]], dtype=object)
+print(o.dtype, o.shape, o.nbytes)     # object (2,) 16
+```
+
+A ragged sequence raises instead of silently producing an object array, which is the NumPy 2
+behavior; ask for `object` explicitly and you get two pointers, 16 bytes, and no vectorization. That
+is the storage of last resort: useful for holding arrays inside a DataFrame column, rarely useful
+anywhere else.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>What is the difference between <code>np.array(x)</code> and <code>np.asarray(x)</code>?</>}>
+
+    `np.array` copies by default. `np.asarray` returns the input itself when it is already an `ndarray` matching the requested dtype and order, and copies otherwise. Under NumPy 2, `np.array(x, copy=False)` raises when a copy is unavoidable, while `copy=None` restores the old best-effort behavior.
+
+  </Accordion>
+  <Accordion title="Why does NumPy report strides in bytes and PyTorch in elements?">
+
+    Different conventions over the same information. Divide NumPy's strides by `itemsize` to get PyTorch's element counts, so `(32, 8)` bytes at 8 bytes per element is `(4, 1)` elements.
+
+  </Accordion>
+  <Accordion title={<>Under NEP 50, what is <code>int64_array + float32_array</code>, and what is <code>float32_array + 1.5</code>?</>}>
+
+    `float64` for the first, because array-array promotion takes the higher category and then the wider width. `float32` for the second, because a Python `float` is a weak scalar and never widens the array.
+
+  </Accordion>
+  <Accordion title="What does np.empty contain?">
+
+    Whatever the allocator returned. It skips the memset, which is why it is faster than `np.zeros` and why reading it before writing is a bug.
+
+  </Accordion>
+  <Accordion title={<>Why does <code>np.arange(0, 2.1, 0.3)</code> include 2.1?</>}>
+
+    Element count comes from dividing the range by the step, and `2.1 / 0.3` evaluates to `7.000000000000001`, so `ceil` asks for 8 elements. The eighth, `7 * 0.3`, rounds back to exactly `2.1`. `np.linspace` derives the step from a requested count and does not have this problem.
+
+  </Accordion>
+  <Accordion title={<>What is wrong with <code>dtype=object</code>?</>}>
+
+    It stores pointers to Python objects, so you lose the contiguous buffer, the vectorized loop, and the dtype promotion rules. It is the storage of last resort, not a general container.
+
+  </Accordion>
+  <Accordion title={<>Does <code>np.broadcast_to</code> allocate memory?</>}>
+
+    No. It returns a read-only view whose stretched axis has stride zero, so every logical position along it reads the same bytes.
+
+  </Accordion>
+  <Accordion title="How much memory does a batch of 8 x 512 x 4096 float32 activations occupy, and what halves it?">
+
+    16,777,216 elements times 4 bytes is 64 MiB. Storing the same values as `float16` halves it to 32 MiB, at the cost of a narrower exponent range.
+
+  </Accordion>
+</Accordions>

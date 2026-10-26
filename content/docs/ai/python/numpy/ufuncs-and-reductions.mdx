@@ -1,0 +1,455 @@
+---
+title: Ufuncs and Reductions
+description: 'The elementwise loop protocol with out=, where=, and dtype=, plus axis and keepdims rules and the NaN-safe reduction family.'
+---
+
+Writing `x * 2 + 1` over a million elements does not run a Python loop. NumPy resolves it into a <Tip term="ufunc">One compiled loop over array elements, a table of accepted dtype signatures, broadcasting inside the call, and `out=`, `where=`, and `dtype=` as part of its protocol.</Tip>, which handles each element in C with no interpreter round trip and no allocation you did not ask for.
+
+Three keywords decide both speed and correctness. `out=` writes into a buffer you already own, `where=` skips elements instead of building a masked copy, and `dtype=` sets the width of the <Tip term="accumulator">The value a reduction loop carries as it walks the elements; its dtype bounds how much precision survives the walk.</Tip>. On the reduction side, `axis` and `keepdims` are where real bugs live, because a silently dropped axis still produces a number.
+
+The broadcasting rules behind `x + y` are on [Tensor Broadcasting](/ai/math-foundations/tensor-broadcasting), and the buffer-and-metadata model every call here assumes is on [The ndarray](/ai/python/numpy/the-ndarray).
+
+---
+
+## What a ufunc is
+
+A ufunc carries a fixed input and output count and a table of dtype combinations. `np.add` implements 22 signatures, which is why one object handles `bool`, `int8`, `float32`, and `complex128`: NumPy picks a row of that table, casts the operands to it, and runs one tight loop.
+
+```python title="ufunc_anatomy.py"
+import numpy as np
+
+print(np.add.nin, np.add.nout, np.add.identity)            # 2 1 0
+print(np.multiply.identity, np.logaddexp.identity, np.maximum.identity)   # 1 -inf None
+print(np.divmod.nout, len(np.add.types), np.add.types[:3])   # 2 22 ['??->?', 'bb->b', 'BB->B']
+print(np.mod.__name__, np.abs.__name__, np.true_divide.__name__)   # remainder absolute divide
+a = np.ones(3, dtype=np.int8)
+print(np.sqrt(a).dtype, np.true_divide(a, a).dtype)        # float16 float64
+print(np.abs(a).dtype, np.abs(np.int8(-128)))              # int8 -128
+logp = np.array([-1000.0, -999.0, -1002.0])
+print(np.logaddexp.reduce(logp))                           # -998.6509877832318
+with np.errstate(divide='ignore'):
+    print(np.log(np.exp(logp).sum()))                      # -inf
+print(np.log(np.exp(logp - logp.max()).sum()) + logp.max())   # -998.6509877832318
+```
+
+Four attributes describe the loop. `nin` and `nout` are its fixed operand counts, 2 and 1 for `np.add`, 1 and 1 for `np.sqrt`, and `np.divmod` is the 2-output case. `types` is the dtype signature table that `dtype=` and `casting=` are checked against, and `identity` is the value a reduction returns for zero elements.
+
+`identity` is the load-bearing one. `add` has `0` and `multiply` has `1`, so reducing nothing is defined and `np.sum([])` and `np.prod([])` give `0.0` and `1.0`. `maximum` has none, so it refuses instead of guessing: `np.max([])` raises `ValueError: zero-size array to reduction operation maximum which has no identity`, and `np.max(x, where=mask)` fails for the same reason. Three names you type are also not the names a warning prints, which the block above shows: `np.true_divide` reports `divide`, `np.mod` reports `remainder`, `np.abs` reports `absolute`.
+
+Integer inputs land where most people do not expect. `np.sqrt` and `np.log` widen `int8` to `float16`, `int16` to `float32`, and `int32` or `int64` to `float64`, while `np.true_divide` sends every integer kind to `float64` and `np.floor_divide` and `np.abs` keep the input dtype. Two consequences follow: `np.abs(np.int8(-128))` is `-128`, the one value whose negation does not fit, and `np.power(np.array([2, 4]), -1)` raises `ValueError: Integers to negative integer powers are not allowed.` where the same call on floats gives `[0.5, 0.25]`.
+
+`np.logaddexp` computes `log(exp(a) + exp(b))` without materializing the exponentials, the primitive under every log-sum-exp you will write and the reason a row of `log_prob = -1000` does not collapse to `-inf` (see [Softmax and Logits](/ai/math-foundations/softmax-and-logits)). The naive form fails exactly there, and the stabilized version of the same expression returns the identical value.
+
+<Callout type="info">
+  ### Functions that look like ufuncs and are not
+
+`np.clip` and `np.where` are ordinary functions, and `np.clip` reports `numpy._ArrayFunctionDispatcher`, so neither has `nin`, `identity`, or `types`. `np.where` takes no `out=` at all: passing one raises `TypeError: where() got an unexpected keyword argument 'out'`. Use `np.clip(x, lo, hi)` for a range limit and the `where=` keyword on a real ufunc for a masked write into a buffer you own.
+
+</Callout>
+
+---
+
+## Allocation-free pipelines with `out=`
+
+Every ufunc call returns a fresh array unless you tell it where to write, so a three-step chain allocates three full-size buffers, uses each once, and drops them.
+
+```python title="out_pipeline.py"
+import numpy as np
+
+a = np.arange(8, dtype=np.float32)
+buf = np.empty_like(a)
+np.subtract(a, a.mean(), out=buf)
+np.multiply(buf, 0.5, out=buf)
+np.exp(buf, out=buf)
+print([round(v, 4) for v in buf.tolist()])   # [0.1738, 0.2865, 0.4724, 0.7788, 1.284, 2.117, 3.4903, 5.7546]
+print(buf.dtype, buf.nbytes, np.shares_memory(buf, a))   # float32 32 False
+print(np.allclose(buf, np.exp(np.multiply(np.subtract(a, a.mean()), 0.5))))   # True
+
+b = np.array([1.0, 2.0, 3.0])
+np.add(b, np.array([10.0, 20.0, 30.0]), out=b)
+print(b.tolist())                                        # [11.0, 22.0, 33.0]
+```
+
+The `np.allclose` line is the same pipeline written the allocating way: three arrays instead of one. At batch scale that difference is the entire budget, because `125_000` ImageNet images at `3 x 224 x 224` in `float32` are `75_264_000_000` bytes, about 70 GiB, and one extra temporary is a second copy of the batch. The byte arithmetic is on [The ndarray](/ai/python/numpy/the-ndarray); splitting a pipeline that will not fit is on [I/O and Memory](/ai/python/numpy/io-and-memory).
+
+`out=` also covers the case where the buffer is one of the operands, which is what `a += b` compiles to: the loop reads and writes the same offset, so same shape and same dtype is defined. The check happens against the loop the call resolves to and raises instead of corrupting, so `np.add(np.arange(3), 1, out=np.empty(2))` gives `ValueError: operands could not be broadcast together with shapes (3,) () (2,)` and `np.add(np.arange(3.0), 1, out=np.empty(3, dtype=np.int8))` gives `UFuncTypeError: Cannot cast ufunc 'add' output from dtype('float64') to dtype('int8') with casting rule 'same_kind'`, a subclass of `TypeError`. Overlapping a shifted view is a different case, and the documentation calls the result indeterminate: internal buffering made `np.multiply(x[:-1], x[1:], out=x[1:])` match the non-overlapping computation for every array tried here, four elements and one million alike, which is exactly the kind of partial guarantee that breaks when the loop has to be split into blocks. Copy first, or write to a separate buffer.
+
+---
+
+## `where=` masking
+
+`where=` is a per-element predicate and the loop genuinely skips the excluded positions, so a denominator you masked out produces no divide-by-zero and no exception under `errstate(divide='raise')`. Positions where the mask is `False` keep whatever the output buffer already held, and `out=np.empty(...)` means uninitialized memory: what you get is whatever the allocator left at those addresses.
+
+```python title="where_masking.py"
+import numpy as np
+
+v = np.array([0.0, 2.0, 4.0])
+out = np.ones(3)
+with np.errstate(divide='raise'):
+    np.divide(1.0, v, out=out, where=v != 0)
+print(out.tolist())                                      # [1.0, 0.5, 0.25]
+
+x = np.array([1.0, -2.0, 3.0, -4.0], dtype=np.float32)
+buf = np.full(4, -1.0)
+np.multiply(x, 2.0, out=buf, where=x > 0)
+print(buf.tolist())                                      # [2.0, -1.0, 6.0, -1.0]
+
+dst = np.full(4, np.nan)
+np.copyto(dst, [1.0, 2.0, 3.0, 4.0], where=[True, False, True, False])
+print(dst.tolist())                                      # [1.0, nan, 3.0, nan]
+
+c = np.array([1.0, -2.0, 3.0, -4.0])
+pos = c > 0
+print(c.sum(where=pos), c.prod(where=pos), c.max(where=pos, initial=0.0))   # 4.0 3.0 3.0
+try:
+    c.max(where=pos)
+except ValueError as exc:
+    print(str(exc).splitlines()[0])
+# reduction operation 'maximum' does not have an identity, so to use a where mask one has to specify 'initial'
+```
+
+The `np.multiply(x, 2.0, out=buf, where=x > 0)` line is the fused form: multiply into an existing buffer and touch only the selected elements, one allocation-free statement doing the work of `x * 2` plus a masked copy. `sum` and `prod` have an identity, so a mask excluding everything gives `0` and `1`; `min` and `max` do not, so NumPy asks for `initial=`. Every masked ufunc call treats its output buffer the same way, `np.copyto(buf, value, where=m)` included, so the buffer needs pre-setting. `np.where(m, a, b)` is the alternative that allocates a new array on every call, and `np.where(m)` with one argument returns the index tuple of the `True` positions instead of an array.
+
+---
+
+## `dtype=` and the accumulator width
+
+A floating reduction runs in the array's own dtype, which is the trap: a `float32` total carries about seven significant decimal digits no matter how many elements it walks. NumPy sums by <Tip term="pairwise summation">Splitting the array in half, summing each half, and adding the two results, recursively, so rounding error grows like the log of the element count instead of linearly.</Tip>, not left to right, so ten million exact ones sum without drift.
+
+```python title="accumulator.py"
+import numpy as np
+
+ones = np.ones(10_000_000, dtype=np.float32)
+print(ones.sum(), ones.sum().dtype)                        # 1e+07 float32
+print(ones.sum(dtype=np.float64), ones.sum(dtype=np.float64).dtype)   # 10000000.0 float64
+small = np.array([1e8] + [1.0] * 8, dtype=np.float32)
+print(small.sum(), small.sum(dtype=np.float64))            # 1e+08 100000008.0
+tiny = np.full(10_000_000, 1e-4, dtype=np.float32)
+print(float(np.float32(1e-4)))                             # 9.999999747378752e-05
+print(tiny.sum(), tiny.sum(dtype=np.float64))              # 999.9999 999.9999747378752
+d = np.array([1.5, 2.5])
+print(np.add(d, d, dtype=np.float32).dtype)                # float32
+print(np.add(d, d, dtype=np.int8, casting='unsafe').tolist())   # [2, 4]
+print(np.result_type(np.float32, np.int64), np.result_type(np.int8, np.int8))   # float64 int8
+```
+
+The first line prints `1e+07` because the result is a `float32` and NumPy shows eight significant digits by default. `dtype=` changes the accumulator width while leaving the input array alone, costing no memory and no extra pass. Width shows up in the `1e-4` pair: ten million copies of an element actually worth `9.999999747378752e-05` total exactly `999.9999747378752` in `float64` and land on `999.9999` in `float32`, and the `1e8` pair shows the same effect with nine elements. Default widths, measured on this build:
+
+| Input dtype | `sum`, `prod`, `cumsum` | `mean`, `std`, `var` | `min`, `max`, `diff` |
+| :---------- | :---------------------- | :------------------- | :------------------- |
+| `bool`      | `int64`                 | `float64`            | `bool`               |
+| `int8`      | `int64`                 | `float64`            | `int8`               |
+| `int32`     | `int64`                 | `float64`            | `int32`              |
+| `uint8`     | `uint64`                | `float64`            | `uint8`              |
+| `float16`   | `float16`               | `float16`            | `float16`            |
+| `float32`   | `float32`               | `float32`            | `float32`            |
+
+Integers widen to the default integer (`np.int_`, which is `int64` on this build), unsigned stays unsigned (`uint8` sums into `uint64`), and floats keep their width exactly. That asymmetry is why a `float32` feature matrix wants `dtype=np.float64` on every reduction feeding a loss, and why `np.ptp` on a boolean array raises `TypeError` for an unsupported subtraction where the table's other columns return `bool`.
+
+On a ufunc call, `dtype=` sets the loop's dtype and `casting=` sets how strict the operand check is: narrowing inside one kind is silent, crossing from float to int is not, so `np.add(d, d, dtype=np.int8)` raises `UFuncTypeError: Cannot cast ufunc 'add' input 0 from dtype('float64') to dtype('int8') with casting rule 'same_kind'`. `casting='unsafe'` truncates each operand before the loop, so the `[2, 4]` above comes from `1 + 1` and `2 + 2`. It is the escape hatch, and the reason to read a result's dtype instead of assuming it. `np.result_type` predicts the width without running anything, and the promotion rules behind it are on [The ndarray](/ai/python/numpy/the-ndarray). `casting=` belongs to the ufunc call only: `np.add.reduce(d, casting='unsafe')` raises `TypeError: reduce() got an unexpected keyword argument 'casting'`, so `np.sum` and `ndarray.sum` take `dtype=` and no casting rule.
+
+---
+
+## Method forms: `reduce`, `accumulate`, `outer`, `at`
+
+Each ufunc object exposes four methods that reuse the same compiled loop over different shapes. `uf.reduce` collapses axes exactly like `axis=` does, so `np.add.reduce(x)` is `x.sum()`. `uf.accumulate` keeps the axis and returns one output element per input element, the prefix-sum and running-maximum idiom. `uf.outer` produces a result shaped `a.shape + b.shape`, a pairwise table with no broadcast copy. `uf.at` writes into `a[indices]` and accumulates repeats, so it is the scatter-add and histogram idiom.
+
+```python title="method_forms.py"
+import numpy as np
+
+v = np.arange(1, 5)
+print(np.add.reduce(v), v.sum(), np.multiply.reduce(v), np.prod(v))   # 10 10 24 24
+print(np.add.accumulate(np.arange(1, 6)).tolist())                    # [1, 3, 6, 10, 15]
+print(np.maximum.accumulate(np.array([1.0, 5.0, 2.0, 8.0, 3.0])).tolist())   # [1.0, 5.0, 5.0, 8.0, 8.0]
+print(np.subtract.outer(np.array([10.0, 7.0, 3.0]), np.array([10.0, 7.0, 3.0])).tolist())
+# [[0.0, 3.0, 7.0], [-3.0, 0.0, 4.0], [-7.0, -4.0, 0.0]]
+print(np.add.outer(np.arange(3), np.arange(4)).shape)                 # (3, 4)
+
+idx = np.array([0, 0, 1, 3])
+vals = np.array([10, 20, 30, 40])
+lost = np.zeros(4, dtype=np.int64)
+lost[idx] += vals
+counts = np.zeros(4, dtype=np.int64)
+np.add.at(counts, idx, vals)
+print(lost.tolist(), counts.tolist())     # [20, 30, 0, 40] [30, 30, 0, 40]
+```
+
+`outer` generalizes: `np.not_equal.outer(labels, labels)` is an adjacency matrix and `np.divide.outer(counts, totals)` is a rate table, neither needing a `[:, None]`. `reduce` is the same entry point `axis=` uses, so `np.logical_and.reduce(mask, axis=0)` is a per-column all-true test with no extra function. `at` fixes a correctness bug rather than a style problem, because fancy-indexed `+=` reads each target slot once per group and repeated indices lose every update after the first. `at` pays for correctness with an unbuffered scattered loop, so it is slower and needed only where indices repeat. The full scatter story, including `np.bincount` and `np.add.at` on repeated indices, is on [Indexing and Slicing](/ai/python/numpy/indexing-and-slicing).
+
+---
+
+## Axis semantics
+
+The axis argument names the axis that disappears. `axis=1` on a `(2, 3, 4)` array leaves `(2, 4)`. Negative axes count back from the end, so `-1` and `2` are the same call, and `keepdims=True` keeps the reduced axes at length 1 instead of removing them. On `x = np.arange(24, dtype=np.float32).reshape(2, 3, 4)` every row of this table is one `x.sum(axis=...)` call, and `for axis in [None, 0, 1, 2, -1, -2, (0, 2)]: print(axis, x.sum(axis=axis).shape, x.sum(axis=axis, keepdims=True).shape)` regenerates all of them:
+
+| `axis=`  | Result shape | With `keepdims=True` |
+| :------- | :----------- | :------------------- |
+| `None`   | `()`         | `(1, 1, 1)`          |
+| `0`      | `(3, 4)`     | `(1, 3, 4)`          |
+| `1`      | `(2, 4)`     | `(2, 1, 4)`          |
+| `2`      | `(2, 3)`     | `(2, 3, 1)`          |
+| `-1`     | `(2, 3)`     | `(2, 3, 1)`          |
+| `-2`     | `(2, 4)`     | `(2, 1, 4)`          |
+| `(0, 2)` | `(3,)`       | `(1, 3, 1)`          |
+
+`axis=None` flattens to a scalar, and a tuple reduces several axes in one pass, which beats chaining because the second call would re-read the first one's output. An out-of-range axis raises `AxisError`: `np.arange(3).sum(axis=1)` reports `axis 1 is out of bounds for array of dimension 1` and `np.arange(6).reshape(2, 3).sum(axis=(0, 3))` reports `axis 3 is out of bounds for array of dimension 2`. `keepdims` is what lets a statistic broadcast back onto the array it came from:
+
+```python title="keepdims.py"
+import numpy as np
+
+x = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+m = x.mean(axis=1, keepdims=True)
+print(m.shape, (x - m).shape)                              # (2, 1, 4) (2, 3, 4)
+print(np.allclose(x - m, x - x.mean(axis=1)[:, None]))     # True
+print(x.mean(axis=(1, 2)).shape, x.mean(axis=(1, 2)).tolist())   # (2,) [5.5, 17.5]
+
+batch = np.array([[1.0, 5.0, 3.0], [4.0, 5.0, 6.0], [7.0, 5.0, 9.0], [4.0, 5.0, 6.0]],
+                 dtype=np.float32)
+mu = batch.mean(axis=0, keepdims=True)     # (1, 3) one mean per feature
+sd = batch.std(axis=0, keepdims=True)      # middle feature is constant
+print(mu.shape, mu.tolist(), sd.tolist())   # (1, 3) [[4.0, 5.0, 6.0]] [[2.1213202476501465, 0.0, 2.1213202476501465]]
+z = np.zeros_like(batch)
+np.subtract(batch, mu, out=z)
+np.divide(z, sd, out=z, where=sd > 0)
+print([round(v, 4) for v in z[0].tolist()], [round(v, 4) for v in z[2].tolist()])   # [-1.4142, 0.0, -1.4142] [1.4142, 0.0, 1.4142]
+print(batch.argmax(axis=1).tolist(), batch.argmax(axis=0).tolist(), batch.argmax(axis=1).dtype)   # [1, 2, 2, 2] [2, 0, 2] int64
+```
+
+Without `keepdims` the normalization needs `[:, None]`, and the new axis has to go where the reduced one was; leaving it out of `x - x.mean(axis=1)` raises `ValueError: operands could not be broadcast together with shapes (2,3,4) (2,4)`, and the `np.allclose` line shows the two forms otherwise agree. A wrong position is silent where a wrong `axis=` is not. Per-feature statistics are the `axis=0` case, and combining `keepdims`, `out=`, and `where=` gives a standardization that costs one buffer and skips the divide on constant columns: the middle feature stays `0.0` because its `sd` is `0` and the mask excluded it. `argmin` and `argmax` drop their axis like any other reduction, accept `keepdims=`, and always return `intp`, `int64` on this build.
+
+---
+
+## The reduction family
+
+| Function                 | `int8` input | `float32` input | With a `NaN` present     | `axis` tuple | `where=` | `initial=` |
+| :----------------------- | :----------- | :-------------- | :----------------------- | :----------- | :------- | :--------- |
+| `np.sum`                 | `int64`      | `float32`       | result is `NaN`          | yes          | yes      | yes        |
+| `np.mean`                | `float64`    | `float32`       | result is `NaN`          | yes          | yes      | no         |
+| `np.std`, `np.var`       | `float64`    | `float32`       | result is `NaN`          | yes          | yes      | no         |
+| `np.min`, `np.max`       | `int8`       | `float32`       | result is `NaN`          | yes          | yes      | yes        |
+| `np.ptp`                 | `int8`       | `float32`       | result is `NaN`          | yes          | no       | no         |
+| `np.prod`                | `int64`      | `float32`       | result is `NaN`          | yes          | yes      | yes        |
+| `np.argmin`, `np.argmax` | `int64`      | `int64`         | index of the first `NaN` | no           | no       | no         |
+| `np.any`, `np.all`       | `bool`       | `bool`          | `NaN` is truthy          | yes          | yes      | no         |
+| `np.count_nonzero`       | `int64`      | `int64`         | `NaN` counts as nonzero  | yes          | no       | no         |
+
+```python title="family.py"
+import numpy as np
+
+a = np.array([1.0, 2.0, 3.0, 4.0])
+print(a.std(), a.std(ddof=1), a.var(), a.var(ddof=1))   # 1.118033988749895 1.2909944487358056 1.25 1.6666666666666667
+print(np.ptp(a), a.sum(initial=100.0), a.sum(where=a > 2.0))   # 3.0 110.0 7.0
+print(np.count_nonzero([1, 0, 2]), np.any([0, 0]), np.all([1, 1]))   # 2 False True
+print(np.sum([]), np.prod([]))                             # 0.0 1.0
+```
+
+`np.ptp` is a function only: `np.array([1.0, 3.0]).ptp()` raises an `AttributeError` whose message reads "ptp was removed from the ndarray class in NumPy 2.0. Use np.ptp(arr, ...) instead." `mean`, `std`, and `var` take `where=` but no `initial=`, so `np.mean([1.0, 2.0], initial=3.0)` raises `TypeError: mean() got an unexpected keyword argument 'initial'`, because a masked mean still divides by the count of `True` entries. `cumsum` and `ptp` accept neither keyword, and `np.max(np.array([], dtype=np.float64))` raises `ValueError: zero-size array to reduction operation maximum which has no identity`, the same refusal the `where=` section hit. The arg-reductions are the odd row in the table: `np.argmax(np.ones((2, 3, 4)), axis=(0, 2))` raises `TypeError: 'tuple' object cannot be interpreted as an integer`, because they flatten rather than fold. Everything in the table takes `out=` with a matching shape plus `keepdims`, and `dtype=` where the width matters. Chaining two single-axis calls agrees with a tuple only when every remaining slice has the same length; where groups differ, a mean of means weights the small groups too heavily.
+
+<Callout type="warn">
+  ### The default standard deviation is the population one
+
+`ddof=0` is NumPy's default, dividing by `n`, so `np.std([1., 2., 3., 4.])` is `1.118033988749895`. `pandas.Series.std()` defaults to `ddof=1`, dividing by `n - 1` for `1.2909944487358056`, and `torch.std` matches pandas. Any normalization or loss value compared across those libraries needs `ddof=` written out, and a `float32` batch reduced with `std()` inherits the width question from the table.
+
+</Callout>
+
+---
+
+## NaN handling
+
+One `NaN` propagates through every arithmetic loop, so a single bad measurement turns the whole reduction into `NaN`. That is intended; the trouble is that the poisoned value is often the only signal anything was missing.
+
+```python title="nan_family.py"
+import numpy as np
+import warnings
+
+a = np.array([1.0, np.nan, 3.0])
+print(a.sum(), a.mean(), a.std(), a.min(), a.max(), np.ptp(a))   # nan nan nan nan nan nan
+print(a.argmin(), a.argmax())                                    # 1 1
+print(np.nansum(a), np.nanmean(a), np.nanstd(a), np.nanmin(a), np.nanmax(a))   # 4.0 2.0 1.0 1.0 3.0
+print(np.nanargmin(a), np.nanargmax(a), np.nanprod(a))           # 0 2 3.0
+
+allnan = np.array([np.nan, np.nan])
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    vals = [np.nanmean(allnan), np.nansum(allnan), np.nanmax(allnan)]
+    try:
+        np.nanargmax(allnan)
+    except ValueError as exc:
+        print(str(exc).splitlines()[0])     # All-NaN slice encountered
+    print([float(v) for v in vals])     # [nan, 0.0, nan]
+    print([f"{w.category.__name__}: {w.message}" for w in caught])
+# ['RuntimeWarning: Mean of empty slice', 'RuntimeWarning: All-NaN slice encountered']
+
+m = np.array([1.0, np.nan, 3.0, np.inf])
+finite = np.isfinite(m)
+print(finite.tolist(), int(np.count_nonzero(finite)), m[finite].mean())   # [True, False, True, False] 2 2.0
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    print(np.nanmean(m), [str(w.message) for w in caught])       # inf []
+
+b = np.array([np.nan, np.inf, -np.inf, 1.0])
+print(np.nan_to_num(b).tolist())   # [0.0, 1.7976931348623157e+308, -1.7976931348623157e+308, 1.0]
+print(np.nan_to_num(b, nan=-1.0, posinf=1e6, neginf=-1e6).tolist())   # [-1.0, 1000000.0, -1000000.0, 1.0]
+print(np.nan_to_num(b.astype(np.float32)).tolist())
+# [0.0, 3.4028234663852886e+38, -3.4028234663852886e+38, 1.0]
+```
+
+`argmin` and `argmax` return the index of the `NaN`, because every comparison against it is `False` and the search never moves off it: an arg-reduction over a column with one missing value points at the gap instead of the extreme. `nansum` returning `0.0` for a row that was entirely missing is the other one to remember, because downstream a zero sum looks exactly like a measurement.
+
+| Function                       | All-`NaN` slice | Signal                                      |
+| :----------------------------- | :-------------- | :------------------------------------------ |
+| `np.nansum`, `np.nanprod`      | `0.0`, `1.0`    | none                                        |
+| `np.nanmean`, `np.nanstd`      | `NaN`           | `RuntimeWarning: Mean of empty slice`       |
+| `np.nanmin`, `np.nanmax`       | `NaN`           | `RuntimeWarning: All-NaN slice encountered` |
+| `np.nanargmin`, `np.nanargmax` | error           | `ValueError: All-NaN slice encountered`     |
+
+Masking with `np.isfinite` keeps the count of what you dropped visible, and it filters infinities, which the `nan*` family does not: `np.nanmean` on `[1.0, nan, 3.0, inf]` returns `inf` in silence, because the surviving infinity carries the result away. In `np.nan_to_num`, `nan=`, `posinf=`, and `neginf=` pick the replacements, and the default for the two infinity arguments is the largest finite value of the array's dtype, which will dominate every later sum. Sanitizing logits before a reduction wants explicit bounds, and `copy=False` writes through to the input.
+
+<Callout type="info">
+  ### `maximum` versus `fmax`
+
+`np.maximum` propagates `NaN` the way arithmetic does and `np.fmax`, `np.fmin` ignore it: on `np.array([1.0, np.nan])` against `0.0`, `maximum` gives `[1.0, nan]` and `fmax` gives `[1.0, 0.0]`. Clipping a logit tensor with `fmax` keeps a `NaN` from hiding inside the range limit, which changes whether a later reduction reports the gap or returns a number.
+
+</Callout>
+
+---
+
+## Floating-point state and warnings
+
+NumPy reports IEEE conditions through its own warning machinery, keyed by four conditions: `divide`, `over`, `under`, and `invalid`. Each accepts `ignore`, `warn`, `print`, `raise`, `call`, or `log`. `np.errstate` is a context manager that restores on exit and `np.seterr` changes the same keys process-wide.
+
+```python title="fp_state.py"
+import numpy as np
+import warnings
+
+print(np.geterr())     # {'divide': 'warn', 'over': 'warn', 'under': 'ignore', 'invalid': 'warn'}
+with np.errstate(divide='raise', over='ignore'):
+    print(np.geterr())   # {'divide': 'raise', 'over': 'ignore', 'under': 'ignore', 'invalid': 'warn'}
+    try:
+        np.array([1.0]) / 0.0
+    except FloatingPointError as exc:
+        print(type(exc).__name__, str(exc))   # FloatingPointError divide by zero encountered in divide
+print(np.geterr())     # {'divide': 'warn', 'over': 'warn', 'under': 'ignore', 'invalid': 'warn'}
+with np.errstate(over='print'):
+    print(np.int8(127) + np.int8(1))
+# -128
+# stderr: Warning: overflow encountered in scalar add
+with warnings.catch_warnings():
+    warnings.simplefilter("error", RuntimeWarning)
+    try:
+        np.nanmean([np.nan, np.nan])
+    except RuntimeWarning as exc:
+        print(type(exc).__name__, str(exc))     # RuntimeWarning Mean of empty slice
+a = np.array([0.1, 1 / 3])
+print(a)            # [0.1        0.33333333]
+print(a.tolist())   # [0.1, 0.3333333333333333]
+with np.printoptions(precision=17, floatmode='fixed', legacy=False):
+    print(a)
+    # [0.10000000000000001 0.33333333333333331]
+print(np.float32(0.1), np.float32(0.1).item())   # 0.1 0.10000000149011612
+print(np.isclose(100.0, 100.00001), np.isclose(1e-9, 2e-9))   # True True
+print(np.isclose(0.0, 1e-9), np.isclose(0.0, 1e-7))           # True False
+print(np.isclose(1e8, 1e8 + 1.0), np.allclose([1.0, 2.0], [1.0000001, 2.0000001]))   # True True
+print(np.isclose(np.nan, np.nan), np.isclose(np.nan, np.nan, equal_nan=True))   # False True
+```
+
+`warn` goes through the Python warning registry, which reports a given call site once per process; `print` writes to standard error on every occurrence, which is what you want when the count matters. Narrower still, `np.array([127], dtype=np.int8) + 1` wraps to `-128` and records no warning at all, while the scalar `127 + 1` under the default `over='warn'` raises `RuntimeWarning: overflow encountered in scalar add`. Turning a warning into an exception inside `warnings.catch_warnings()` is how a silent `NaN` fails a test run instead of printing once and vanishing. Printed precision is separate state, eight significant digits by default, and scalar `float32` values print their shortest round-trip form regardless of `precision`, so `.item()` is how you inspect one. `np.printoptions` restores the previous settings on exit; `np.set_printoptions` does not and leaks into every later print in the process. `np.isclose(a, b)` tests `abs(a - b) <= atol + rtol * abs(b)` with `rtol=1e-05` and `atol=1e-08`, and `np.allclose` is `np.isclose(...).all()` over both arguments.
+
+The defaults mislead three ways. Near zero, `atol` decides everything, so `np.isclose(0.0, 1e-9)` is `True` for two values that say nothing. Near a large value, `rtol * abs(b)` swallows real differences: `np.isclose(1e8, 1e8 + 1)` is `True` although the gap is a whole unit. And `NaN` is never close to `NaN` unless `equal_nan=True`, the wrong answer for a gradient test and the right one for comparing two reference tables. Set both tolerances from the dtype and the expected magnitude, or report `np.abs(a - b).max()` to see the error instead of a verdict on it. The finite-difference check that turns `divide` into `raise` and compares two Jacobians is on [Backpropagation from Scratch](/ai/math-foundations/backprop-from-scratch).
+
+---
+
+## Cumulative operations
+
+Cumulative functions keep the axis they walk, so their output has the input's shape, and `diff` is the one that shrinks it: `np.cumsum` and `np.cumprod` give the running sum and product, `np.add.accumulate` is the same loop exposed as a ufunc method, `np.maximum.accumulate` is the prefix-max idiom, and `np.diff` is `x[1:] - x[:-1]`, one element shorter.
+
+```python title="cumulative.py"
+import numpy as np
+
+c = np.array([3, 1, 4, 1, 5, 9], dtype=np.int8)
+print(np.cumsum(c).tolist(), np.cumsum(c).dtype)      # [3, 4, 8, 9, 14, 23] int64
+print(np.cumprod(c).tolist())                          # [3, 3, 12, 12, 60, 540]
+print(np.maximum.accumulate(c).tolist())               # [3, 3, 4, 4, 5, 9]
+print(np.diff(c).tolist(), np.diff(c).dtype)           # [-2, 3, -3, 4, 4] int8
+x = np.array([1.5, 2.0, 5.0, 3.0, 4.0])
+print(np.diff(x, prepend=x[0], append=0.0).tolist())   # [0.0, 0.5, 3.0, -2.0, 1.0, -4.0]
+print(np.diff(x).size, x.size, np.diff(x, prepend=x[0]).size)   # 4 5 5
+print(np.allclose(x, x[0] + np.concatenate(([0.0], np.cumsum(np.diff(x))))))   # True
+```
+
+`cumsum` widens integers the way `sum` does, while `maximum.accumulate` and `diff` keep the input dtype, which is where an `int8` `diff` on image data wraps. `prepend=` and `append=` insert values before differencing, so a length-preserving forward difference is `np.diff(x, prepend=x[0])`, and `diff` with `cumsum` are inverses up to that first element. `np.maximum.accumulate` with `np.argmax` is the running-max-plus-index pattern behind monotonic masks; sorting and selection are on [Statistics and Selection](/ai/python/numpy/statistics-and-selection).
+
+---
+
+## Two tools that are not vectorization
+
+`np.vectorize` wraps a Python function so it accepts and returns arrays. It broadcasts, infers the output dtype by calling your function on the first element, and runs a Python loop. `np.nditer` is a configurable iteration protocol, also a Python loop.
+
+```python title="not_vectorized.py"
+import numpy as np
+
+byte_len = np.vectorize(lambda s: len(s.encode('utf-8')))
+print(byte_len(np.array(['ab', 'c', 'def'])).tolist(), type(byte_len).__name__)   # [2, 1, 3] vectorize
+print(np.vectorize(lambda a, b: a * a + b)([1, 2, 3], [10, 20, 30]).tolist())   # [11, 24, 39]
+gu = np.vectorize(lambda x: x * 2, signature='()->()')
+print(isinstance(gu, np.ufunc), gu(np.array([1, 2, 3])).tolist())   # False [2, 4, 6]
+print(np.frompyfunc(lambda x: x * 2, 1, 1)(np.array([1, 2, 3])).dtype)   # object
+
+m = np.arange(6).reshape(2, 3)
+it = np.nditer(m, flags=['multi_index'])
+print([(int(v), it.multi_index) for v in it])
+# [(0, (0, 0)), (1, (0, 1)), (2, (0, 2)), (3, (1, 0)), (4, (1, 1)), (5, (1, 2))]
+it2 = np.nditer(m, flags=['c_index'], order='F')
+print([(int(v), it2.index) for v in it2])   # [(0, 0), (3, 3), (1, 1), (4, 4), (2, 2), (5, 5)]
+```
+
+What `vectorize` buys is an array-shaped API: broadcasting, an `otypes=` argument that skips the trial call, and a `signature=` that produces a gufunc whose `object` output dtype comes from the `frompyfunc` loop underneath. What `nditer` buys is `order=` to pick the traversal and `flags=` to ask for indices, a buffered operand, or a cast, with every value you receive a 0-d array. Neither generates compiled elementwise code. Where the logic is expressible, `np.select`, boolean masks, or arithmetic on masks do it in real loops; where it is genuinely scalar, the honest options are `numba` or a batched reformulation. In application code `x.flat`, `enumerate`, and `np.ndindex` say the same thing more clearly.
+
+<Callout type="warn">
+  ### Both are a loop with array syntax
+
+`np.vectorize` and `np.nditer` do not turn your function into a ufunc. Use them for the API and the iterator protocol, and expect the cost of a Python loop per element either way.
+
+</Callout>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is a ufunc, and what does its `identity` control?">
+
+    A `numpy.ufunc` is one compiled elementwise loop plus a table of dtype signatures, with broadcasting and the `out=`, `where=`, and `dtype=` keywords in its call protocol. `identity` is the value a reduction returns for zero elements: `0` for `add`, `1` for `multiply`, `-inf` for `logaddexp`, `None` for `maximum`. With `None`, reducing an empty array raises `ValueError` and using `where=` requires an explicit `initial=`.
+
+  </Accordion>
+  <Accordion title={<>Why does <code>out=</code> matter, and when is aliasing allowed?</>}>
+
+    Each call allocates a full-size result, so a multi-step pipeline holds one array per operation unless you pass `out=`. Aliasing is defined when the output is one of the operands at the same shape and dtype, which is how `a += b` works. Overlapping a shifted view is documented as indeterminate, and buffering can make an example match the correct answer.
+
+  </Accordion>
+  <Accordion title={<>What does <code>where=</code> leave in the positions it skips?</>}>
+
+    Whatever the output buffer already held. With `out=np.empty(...)` that is uninitialized memory. Pre-set the buffer with `np.zeros`, `np.full`, or `np.copyto`, or use `np.where`, which allocates a new array each call and accepts no `out=`.
+
+  </Accordion>
+  <Accordion title="How do you control the dtype of a sum, and why does a float32 sum of ten million ones look exact?">
+
+    `dtype=` sets the accumulator width, so `x.sum(dtype=np.float64)` returns a `float64` while the input stays `float32`. The ten-million-ones case prints `1e+07` because NumPy sums pairwise, splitting the array and adding the halves, which keeps rounding error near the log of the element count. Ten million copies of `float32(1e-4)` still separate by width: `999.9999` against `999.9999747378752`.
+
+  </Accordion>
+  <Accordion title="On a (2, 3, 4) array, what do `axis=1`, `axis=-1`, and `axis=(0, 2)` return?">
+
+    The named axis disappears. `axis=1` gives `(2, 4)`, `axis=-1` is the same as `axis=2` and gives `(2, 3)`, and `axis=(0, 2)` gives `(3,)` in one pass. `keepdims=True` leaves the reduced axes at length 1, so `(2, 1, 4)` broadcasts back onto the original array without a manual reshape.
+
+  </Accordion>
+  <Accordion title="Why does `np.std` disagree with pandas on the same four numbers, and what does one NaN do?">
+
+    `ddof`. NumPy defaults to `ddof=0` and divides by `n`, giving `1.118033988749895` for `[1., 2., 3., 4.]`, while pandas and PyTorch default to `ddof=1` for `1.2909944487358056`. On the `NaN` side, one `NaN` makes `sum`, `mean`, `std`, `min`, and `max` return `NaN` and makes `argmin` and `argmax` point at the gap. The `nan*` family skips `NaN` entries: an all-`NaN` slice gives a silent `0.0` from `nansum`, a warned `NaN` from `nanmean`, and a `ValueError` from `nanargmax`. `np.isfinite` masking also drops infinities, which `nan*` keeps.
+
+  </Accordion>
+  <Accordion title={<>What is wrong with <code>np.isclose(a, b)</code> at the default tolerances?</>}>
+
+    It tests `abs(a - b) <= atol + rtol * abs(b)` with `rtol=1e-05` and `atol=1e-08`. Near zero `atol` decides everything, so `np.isclose(0.0, 1e-9)` is `True`. Near a large value `rtol` swallows real gaps, so `np.isclose(1e8, 1e8 + 1)` is `True`. `NaN` never compares close unless `equal_nan=True`. Pick tolerances from the dtype and magnitude, or report `np.abs(a - b).max()`.
+
+  </Accordion>
+</Accordions>

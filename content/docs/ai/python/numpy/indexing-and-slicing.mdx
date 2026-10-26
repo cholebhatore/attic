@@ -1,0 +1,398 @@
+---
+title: Indexing and Slicing
+description: 'View versus copy for every index form, boolean masks, scatter-add with duplicate indices, and bucketing with searchsorted and digitize.'
+---
+
+An indexing expression does two jobs: it picks elements, and it decides whether you get a window onto the original buffer or a fresh array you can edit in private. Most of the silent bugs in NumPy code are the second job being guessed wrong. A validation split taken with a slice aliases the training data, the same split taken with an index array does not, and the difference surfaces only after the numbers moved.
+
+---
+
+## The rule that decides everything
+
+Basic indexing (integers, slices, `...`, `np.newaxis`) returns a view, and <Tip term="fancy indexing">Indexing with an integer array or a boolean mask instead of a slice. The name predates NumPy's own vocabulary and means the same thing as advanced indexing.</Tip> returns a copy. One call settles any case: `np.shares_memory(a, result)`.
+
+| Index form        | Example            | Returns                             | Shares memory |
+| :---------------- | :----------------- | :---------------------------------- | :------------ |
+| Basic slice       | `a[1:3]`, `a[::2]` | View with new shape and strides     | Yes           |
+| Integer scalar    | `a[1]`             | View of one row                     | Yes           |
+| Element selection | `a[0, 2]`          | A NumPy scalar with no shape        | No buffer     |
+| Integer array     | `a[[0, 2]]`        | Copy, rows in the order listed      | No            |
+| Boolean mask      | `a[a > 6]`         | Copy, flattened row-major           | No            |
+| Slice plus array  | `a[:, [1, 3]]`     | Copy, view or not on the other axis | No            |
+
+The last row is the one people miss: one fancy or boolean index anywhere in the tuple makes the whole result a copy.
+
+```python title="view_or_copy.py"
+import numpy as np
+
+a = np.arange(12).reshape(3, 4).copy()
+sm = np.shares_memory
+print(sm(a, a[1:3]), sm(a, a[1]), sm(a, a[:, 1::2]), sm(a, a[[0, 2]]))   # True True True False
+print(sm(a, a[:, [1, 3]]), sm(a, a[a > 6]))    # False False
+print(a.base, a[1].base is a, a[[0, 2]].base)  # None True None
+print(a[1].nbytes, a[[0, 2]].nbytes, a.nbytes)  # 32 64 96
+```
+
+A view stores the array whose buffer it reads in `.base`; a copy owns its memory and reports `None`. `nbytes` counts each array's own logical footprint, so that 32-byte view of a 96-byte parent looks cheaper than it is, and the accounting note on [The ndarray](/ai/python/numpy/the-ndarray) says why. Chained indexing is where the rule bites, because the first bracket decides what the second one writes into.
+
+```python title="chained_writes.py"
+import numpy as np
+
+a = np.arange(12).reshape(3, 4).copy()
+a[0][1] = 99                  # a[0] is a view, so this reaches a
+print(a[0].tolist(), a[0].base is a)    # [0, 99, 2, 3] True
+a[[0, 2]][[1, 0]] = 77        # a[[0, 2]] is a copy; 77 lands on a temporary
+print(a.tolist())             # [[0, 99, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11]]
+a[[0, 2], [1, 0]] = 77        # both index arrays in one __setitem__ call
+print(a.tolist())             # [[0, 77, 2, 3], [4, 5, 6, 7], [77, 9, 10, 11]]
+X = np.arange(10.0)
+X[:5][0] -= 1.0               # a slice view, so the write reaches X
+holdout = X[[0, 2]]           # an index array copy, so this does not
+holdout -= 100.0
+print(X[:3].tolist())         # [-1.0, 1.0, 2.0]
+```
+
+NumPy raises no warning for the dropped write: nothing holds a reference to the temporary the first bracket produced, so the value is gone when the statement ends. Plain arithmetic on a view (`X[:5] - 1`) leaves the parent alone too, because the operation returns a new array; only in-place operators and subscript writes travel back, and `b.copy()` or `np.array(b)` is the escape hatch when you want the values without the alias.
+
+<Callout type="warn">
+  ### Write through one subscript
+
+`a[idx] = v` and `a[mask] *= 2` are `__setitem__` calls on `a`, so they modify the parent even though the matching read returns a copy. Splitting read and write across two bracket pairs breaks that, and the split is easy to miss: with `mask = np.array([True, False, True])` on a shape `(3, 4)` array, `a[mask][:, 1] = 99` writes into the copy and leaves column 1 as `[1, 5, 9]`, while `a[mask, 1] = 99` gives `[99, 5, 99]`. When the second index cannot map onto the axis the first one shrank you get an `IndexError` instead of silence, which is the luckier outcome.
+
+</Callout>
+
+---
+
+## Basic indexing
+
+```python title="basic_index.py"
+import numpy as np
+
+x = np.arange(24).reshape(2, 3, 4)
+bias = np.array([1.0, 2.0, 3.0, 4.0])
+print(x[1, 2, 3], x[-1][-1][-1], x[0, 1].tolist())   # 23 23 [4, 5, 6, 7]
+print(np.array_equal(x[..., 0], x[:, :, 0]), x[..., 0].tolist())   # True [[0, 4, 8], [12, 16, 20]]
+print(x[0, ..., ::2].tolist(), x[::-1, 0, 0].tolist())    # [[0, 2], [4, 6], [8, 10]] [12, 0]
+print(x[0, ::-1, 0].tolist(), x[0, 3:0:-1].tolist())      # [8, 4, 0] [[8, 9, 10, 11], [4, 5, 6, 7]]
+print(x[5:9].shape, x[..., None].shape, x[:, None].shape)  # (0, 3, 4) (2, 3, 4, 1) (2, 1, 3, 4)
+print(bias[None, :].shape, bias[:, None].shape, x[np.newaxis, ..., ::2].shape)
+# (1, 4) (4, 1) (1, 2, 3, 2)
+```
+
+| Form         | Effect                                                             |
+| :----------- | :----------------------------------------------------------------- |
+| `i`          | Drops that axis, or returns a scalar when no axes are left         |
+| `-i`         | Counts back from the end of that axis, as in a Python list         |
+| `start:stop` | Keeps the axis and clamps out-of-range bounds instead of raising   |
+| `::step`     | Every `step`-th element; a negative `step` walks the axis backward |
+| `...`        | As many `:` as needed to reach the remaining axes                  |
+| `None`       | Inserts a length-1 axis, identical to `np.newaxis`                 |
+
+Everything above returns a view, and slices clamp where integers raise: `x[5:9]` returns an empty axis while `x[9]` gives `IndexError: index 9 is out of bounds for axis 0 with size 2`, and `x[::0]` gives `ValueError: slice step cannot be zero`. The ellipsis is what lets one function body take `(T, C)` and `(B, T, C)` input without branching, and `np.newaxis` and `None` are the same object. Inserting a new axis where it has to line up is the habit worth building: `bias[None, :]` is a row across the feature axis, `bias[:, None]` a column down it, and the alignment rules are on [Tensor Broadcasting](/ai/math-foundations/tensor-broadcasting).
+
+`a[0, 1]` and `a[0][1]` read the same element. The tuple form is one `__getitem__` call returning a `np.int64` scalar with no shape and no buffer of its own; the chained form builds a whole intermediate array per step, which is a small allocation for a read and the reason a write can disappear. Use the tuple form, and treat a chained subscript on the left of `=` as a bug until proven otherwise.
+
+---
+
+## Integer-array indexing
+
+An index array is an array, and the result shape comes from broadcasting the index arrays against each other rather than from the array being indexed.
+
+```python title="integer_arrays.py"
+import numpy as np
+
+a = np.arange(12).reshape(3, 4)
+x = np.arange(24).reshape(2, 3, 4)
+rows, cols = np.array([[0], [2], [1]]), np.array([1, 3])
+print(a[[0, 2]].shape, a[[0, 2]].tolist())    # (2, 4) [[0, 1, 2, 3], [8, 9, 10, 11]]
+print(a[[0, 2], [1, 3]].tolist(), a[rows, cols].shape, a[rows, cols].tolist())
+# [1, 11] (3, 2) [[1, 3], [9, 11], [5, 7]]
+print(a[np.ix_([0, 2], [1, 3])].tolist(), a[[-1, -3]].tolist())
+# [[1, 3], [9, 11]] [[8, 9, 10, 11], [0, 1, 2, 3]]
+print(x[:, [0, 2]].shape, x[:, [0, 1], [0, 1]].shape, x[[0, 1], :, [0, 1]].shape)
+# (2, 2, 4) (2, 2) (2, 3)
+print(x[[0, 1], :, [0, 1]].tolist())          # [[0, 4, 8], [13, 17, 21]]
+print(np.take(a, [0, 5, 10]).tolist(), np.take(a, [0, 2], axis=1).tolist())
+# [0, 5, 10] [[0, 2], [4, 6], [8, 10]]
+print(np.take(a, [0, 20], mode='clip').tolist(), np.take(a, [0, 20], mode='wrap').tolist())
+# [0, 11] [0, 8]
+```
+
+`a[[0, 2], [1, 3]]` answers "cell (0,1) then cell (2,3)", which is why two length-2 arrays collapse to a length-2 result instead of a 2-by-2 grid. The `rows`/`cols` pair broadcasts to `(3, 2)` and does give a grid, and `np.ix_` reshapes plain sequences against each other so they broadcast that way: read `a[np.ix_(rows, cols)]` as "these rows crossed with these columns", the selection you want for a batch subset against a feature subset. That same grid is what makes `onehot[np.arange(n), labels] = 1` hit one cell per row, as covered on [The ndarray](/ai/python/numpy/the-ndarray).
+
+Slices and index arrays mix under two rules: a lone index array keeps its axis position, and index arrays separated by a slice move their shared broadcast axis to the front, which is why `x[[0, 1], :, [0, 1]]` is `(2, 3)` and not `(2, 2, 3)`. `np.take` is the functional form, and its default of `axis=None` flattens the input so `[0, 5, 10]` are positions into `a.ravel()`; `axis=1` reads one column out of every row and leaves the other axes their original size, and `mode='clip'` clamps an out-of-range index into the axis while `mode='wrap'` takes it modulo the size. Those two modes exist only on `np.take`. Subscript indexing has no such mercy: `a[[0, 5]]` raises `IndexError: index 5 is out of bounds for axis 0 with size 3`, and a float index array raises `IndexError: arrays used as indices must be of integer (or boolean) type`. Negative indices are legal and count from the end, which is why `a[[-1, -3]]` is a valid row selection. torch keeps the same view-versus-copy split, and the naming difference worth stating up front is that `torch.gather` wants an index tensor of the same rank as its source where NumPy wants `np.take_along_axis`, covered on [Indexing and Shapes](/ai/pytorch/indexing-and-shapes).
+
+---
+
+## Boolean masks
+
+A mask selects wherever it is `True`, and it has to be broadcastable to the axis it indexes: the mask's shape matches that axis in the trailing dimensions.
+
+```python title="masks.py"
+import numpy as np
+
+a = np.array([[-1.0, 2.0, -3.0], [4.0, -5.0, 6.0]])
+m = a > 0
+print(a[m].tolist(), a[m].shape)    # [2.0, 4.0, 6.0] (3,)
+print(np.count_nonzero(m), m.sum(), np.count_nonzero(m, axis=1).tolist())    # 3 3 [1, 2]
+print(np.where(m), np.argwhere(m).shape)    # (array([0, 1, 1]), array([1, 0, 2])) (3, 2)
+print(np.where(a > 0, a, 0.0).tolist())    # [[0.0, 2.0, 0.0], [4.0, 0.0, 6.0]]
+print(a[a[:, 0] > 0].tolist(), a[:, a[0] > 0].tolist())    # [[4.0, -5.0, 6.0]] [[2.0], [-5.0]]
+```
+
+A full-shape mask flattens the result, so `a[m]` is 1-D of length 3 rather than a 2-D array with holes. To keep the shape, use the three-argument `np.where(condition, x, y)`, which is a select and not an index. To filter whole rows or columns, build the mask along the axis being filtered: `a[:, 0] > 0` has length 2 and matches the row axis, `a[0] > 0` has length 3 and matches the column axis. A boolean index never broadcasts across a mismatch, so a mask of the wrong length raises `IndexError: boolean index did not match indexed array along axis 0; size of axis is 2 but size of corresponding boolean axis is 3`. `np.argwhere` is the easy shape to loop over or save, with one coordinate per row; `np.nonzero` and its alias `np.where` are the easy form to feed straight back into a subscript, and converting between them costs one `np.stack` or one `zip`.
+
+| Call                  | Returns                                                   |
+| :-------------------- | :-------------------------------------------------------- |
+| `np.where(cond)`      | Tuple of index arrays, one per axis, same as `np.nonzero` |
+| `np.nonzero(a)`       | Tuple `(idx0, idx1, ...)`, each 1-D, ready to re-index    |
+| `np.argwhere(a)`      | One `(N, ndim)` array, each row a coordinate              |
+| `np.flatnonzero(a)`   | 1-D array of positions into `a.ravel()`                   |
+| `np.where(c, x, y)`   | Array shaped like the broadcast of `c`, `x`, `y`          |
+| `np.count_nonzero(c)` | `np.int64` count of the truthy cells, supports `axis=`    |
+
+<Tip term="counting a mask">
+  `np.count_nonzero(m)` and `m.sum()` both return `np.int64` and both take `axis=`, and the name
+  says which one means "how many True". Built-in `sum(m)` is a Python loop over the first axis: on a
+  2-D mask it returns `[1, 1, 1]`, a per-column count rather than a total.
+</Tip>
+
+Combining conditions needs parentheses, because Python's `&`, `|`, and `~` bind tighter than the comparison operators.
+
+```python title="mask_precedence.py"
+import numpy as np
+
+v = np.array([-1.0, 2.0, 3.0, 8.0])
+try:
+    v > 0 & v < 5                 # missing parentheses
+except TypeError as exc:
+    print(str(exc).splitlines()[0])
+# ufunc 'bitwise_and' not supported for the input types, and the inputs could not be safely coerced to any supported types according to the casting rule ''safe''
+print(((v > 0) & (v < 5)).tolist(), (~(v > 0)).tolist())    # [False, True, True, False] [True, False, False, False]
+z = np.array([1.0, np.nan, 3.0, np.nan])
+z[np.isnan(z)] = 0.0
+print(z.tolist())                 # [1.0, 0.0, 3.0, 0.0]
+b = np.arange(6.0)
+b[b > 3] *= 10
+print(b.tolist(), np.where(np.abs(b) > 45, np.sign(b) * 45, b).tolist())
+# [0.0, 1.0, 2.0, 3.0, 40.0, 50.0] [0.0, 1.0, 2.0, 3.0, 40.0, 45.0]
+```
+
+On numbers both mistake shapes are loud: floats raise the `TypeError` above, and an integer array raises `ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()` because Python reads the line as the chained comparison `v > (0 & v) < 5`. Two boolean masks are quieter, since `m1 & m2 > 0` evaluates `(m1 & m2) > 0` and runs without complaint. The words `and`, `or`, and `not` never work on arrays. Writing through a mask is a `__setitem__` call, so the in-place edits above reach the parent: the NaN fill, the `b[b > 3] *= 10`, and the last line, which is gradient clipping in mask form. The same pattern replaces out-of-range values, since a mask is just a condition evaluated elementwise.
+
+---
+
+## Scatter and gather
+
+Gather reads values out by index, `a[ids]`. Scatter writes values in, `a[ids] = vals`. A gather can visit the same cell twice with no consequence; a scatter cannot, and that asymmetry is the trap.
+
+```python title="duplicate_scatter.py"
+import numpy as np
+
+idx = np.array([0, 0, 1])
+v = np.array([1.0, 1.0, 1.0])
+buffered = np.zeros(2)
+buffered[idx] += v
+unbuffered = np.zeros(2)
+np.add.at(unbuffered, idx, v)
+print(buffered.tolist(), unbuffered.tolist(), np.bincount(idx, weights=v).tolist())
+# [1.0, 1.0] [2.0, 1.0] [2.0, 1.0]
+```
+
+<Tip term="buffered assignment">
+  `a[idx] += v` reads a copy, adds into it, then writes that copy back once. Two rows aimed at the
+  same cell produce two copies of the same base value, and the second write wins instead of the two
+  adding up.
+</Tip>
+
+`np.add.at(out, idx, v)` is the general fix: it walks the indices without buffering, so duplicates accumulate. Every ufunc has the `.at` form, and it writes into the array you pass instead of returning a new one. When you only need per-bin sums of a 1-D value array, `np.bincount(idx, weights=v)` computes the same numbers into contiguous output. It is narrower: `idx` must be non-negative integers, `v` must be 1-D and the same length, and the operation is addition only. A negative label raises `ValueError: 'list' argument must have no negative elements`, so an `ignore_index=-1` convention has to be masked off first. On this machine the two are within measurement noise of each other on a 1,000,000-index scatter into 128 bins, so choose on capability rather than speed.
+
+```python title="scatter_in_training.py"
+import numpy as np
+
+E = np.arange(20, dtype=np.float32).reshape(5, 4)    # embedding table, vocab 5, d_model 4
+tok = np.array([3, 1, 3, 3, 0])                     # token ids
+doc = np.array([0, 0, 0, 0, 1])                     # document each id belongs to
+bag = np.zeros((2, 4), dtype=np.float32)
+lost = np.zeros((2, 4), dtype=np.float32)
+np.add.at(bag, doc, E[tok])
+lost[doc] += E[tok]
+print(bag.tolist())          # [[40.0, 44.0, 48.0, 52.0], [0.0, 1.0, 2.0, 3.0]]
+print(lost.tolist())         # [[12.0, 13.0, 14.0, 15.0], [0.0, 1.0, 2.0, 3.0]]
+pred = np.array([1, 3, 3, 0, 3, 1])                 # predicted classes
+print(np.bincount(pred, minlength=4).tolist())      # [1, 2, 0, 3]
+dW = np.zeros((3, 2))                               # parameter buffer
+row = np.array([0, 2, 2, 1])                        # row each example updated
+g = np.array([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [4.0, 4.0]])
+np.add.at(dW, row, g)
+print(dW.tolist())                                  # [[1.0, 1.0], [4.0, 4.0], [5.0, 5.0]]
+```
+
+Row 0 of `bag` is `3 * E[3] + E[1]`, the pooled document vector before you divide by length, and `lost` kept only the last write per position. `minlength=` matters for the class histogram: without it the output is only as long as the largest label seen, so a class missing from the batch shortens the array and a per-class accuracy vector is silently the wrong width. Counting labels is the subject of [Statistics and Selection](/ai/python/numpy/statistics-and-selection); here it is the scatter case. Row 2 of `dW` is `2 + 3 = 5` because two examples touched it, and since `dW.ravel()` is a view, `np.add.at` against flat cell indices updates the same buffer a flat optimizer reads. For axis-wise work, where each output row picks from its own input row, use `take_along_axis` and `put_along_axis`.
+
+```python title="along_axis.py"
+import numpy as np
+
+logits = np.array([[10, 20, 30], [40, 50, 60]])
+idx = np.array([[2], [0]])
+s = np.array([[0.1, 0.9, 0.2], [0.7, 0.1, 0.3]])
+print(np.take_along_axis(logits, idx, axis=1).tolist())   # [[30], [40]]
+print(np.take_along_axis(s, s.argmax(axis=1, keepdims=True), axis=1).tolist())   # [[0.9], [0.7]]
+q = logits.copy()
+np.put_along_axis(q, idx, np.array([[99], [7]]), axis=1)
+print(q.tolist())          # [[10, 20, 99], [7, 50, 60]]
+try:
+    np.put_along_axis(logits, idx, np.array([[99, 7]]), axis=1)
+except ValueError as exc:
+    print(exc)
+# shape mismatch: value array of shape (1,2) could not be broadcast to indexing result of shape (2,1)
+```
+
+The index array and the indexed result always have the same shape, so the values for `put_along_axis` must be shaped like the result and not like the source axis: `idx` of shape `(2, 1)` needs values of shape `(2, 1)`, and a `(1, 2)` row vector fails with the message above. `keepdims=True` on `argmax` exists for exactly that alignment, and the axis rules are on [Ufuncs and Reductions](/ai/python/numpy/ufuncs-and-reductions).
+
+---
+
+## Search and bucketize
+
+`np.searchsorted(sorted_arr, values)` returns, for each value, the position where it would be inserted. `np.digitize` takes the same information in the other order and returns bin numbers.
+
+```python title="searchsorted.py"
+import numpy as np
+
+edges = np.array([0.0, 1.0, 4.0, 9.0])
+x = np.array([-1.0, 0.0, 2.0, 9.0, 20.0])
+print(np.searchsorted(edges, x).tolist(), np.searchsorted(edges, x, side='right').tolist())
+# [0, 0, 2, 3, 4] [0, 1, 2, 4, 4]
+print(np.digitize(x, edges).tolist(), np.digitize(x, edges, right=True).tolist())
+# [0, 1, 2, 4, 4] [0, 0, 2, 3, 4]
+raw = np.array([3.0, 1.0, 2.0])
+probe = [0.5, 2.5, 3.5]
+print(np.argsort(raw).tolist(), np.searchsorted(raw, probe, sorter=np.argsort(raw)).tolist())
+# [1, 2, 0] [0, 2, 3]
+print(np.searchsorted(np.sort(raw), probe).tolist(), np.searchsorted(raw, probe).tolist())
+# [0, 2, 3] [0, 3, 3]  - the second one is meaningless
+```
+
+| Call                            | Bin convention                      | Value on an edge       |
+| :------------------------------ | :---------------------------------- | :--------------------- |
+| `searchsorted(b, v)`            | Insertion point, `side='left'`      | Upper bin              |
+| `searchsorted(b, v, 'right')`   | Insertion point past all equal ones | Lower bin              |
+| `np.digitize(v, b)`             | `b[i-1] <= x < b[i]`, increasing    | Same as `side='right'` |
+| `np.digitize(v, b, right=True)` | `b[i-1] < x <= b[i]`                | Same as `side='left'`  |
+
+The two are one call with the arguments swapped: `np.digitize(x, bins)` equals `np.searchsorted(bins, x, side='right')`, and the `right=True` forms equal `side='left'`. A bucket boundary is inclusive on one side only, so name the convention where the edges are stored or two readers will disagree about which bin holds the edge case. `sorter=` takes the permutation that would sort the array and applies it during the lookup, which avoids materializing a copy of a large sorted table; the positions it returns refer to the sorted order, so they are bin numbers and not indices into `raw`. `np.searchsorted` does not check that its input is sorted, which is how the `[0, 3, 3]` above passes for an answer, and `np.digitize` handles decreasing edges by itself (`np.digitize([1, 2, 3, 4], [4, 2, 1])` gives `[2, 1, 1, 0]`) where `np.searchsorted` needs `sorter`. `np.argsort` itself is on [Statistics and Selection](/ai/python/numpy/statistics-and-selection).
+
+A continuous feature becomes bucket indices with a set of edges, and quantile edges give roughly equal populations per bin.
+
+```python title="bucketize_feature.py"
+import numpy as np
+
+rng = np.random.default_rng(7)
+latency = rng.gamma(2.0, 100.0, 2000)
+edges = np.quantile(latency, np.linspace(0, 1, 6)[1:-1])
+print(np.round(edges, 1).tolist())      # [76.8, 130.7, 189.6, 285.1]
+bucket = np.digitize(latency, edges)
+print(bucket.min(), bucket.max())       # 0 4
+print(np.bincount(bucket).tolist())     # [400, 400, 400, 400, 400]
+```
+
+Four interior edges give five bins with a fifth of the mass in each. The bucket index is an ordinary integer label from there: one-hot it with the `onehot[np.arange(n), labels]` idiom, look it up in a learned embedding, or feed it to a per-bin schedule. Store the edges next to the model that uses them, since refitting the quantiles silently renumbers every bucket.
+
+---
+
+## Flat-index helpers
+
+A flat index is a position into `a.ravel()`, and these two functions convert between it and a coordinate tuple.
+
+```python title="flat_index.py"
+import numpy as np
+
+m = np.arange(12).reshape(3, 4)
+print(np.ravel_multi_index((1, 2), m.shape), np.unravel_index(6, m.shape))   # 6 (np.int64(1), np.int64(2))
+print(np.ravel_multi_index(([0, 2], [1, 3]), m.shape).tolist(), np.unravel_index([1, 11], m.shape))
+# [1, 11] (array([0, 2]), array([1, 3]))
+print(np.ravel_multi_index((1, 2), m.shape, order='F'))    # 7
+loss = np.array([[5.0, 1.0, 3.0], [2.0, 9.0, 4.0]])
+print(loss.argmin(), np.unravel_index(loss.argmin(), loss.shape))   # 1 (np.int64(0), np.int64(1))
+print(np.unravel_index(np.flatnonzero(loss > 3), loss.shape))       # (array([0, 1, 1]), array([0, 1, 2]))
+clip = np.array([-2.0, -0.5, 0.3, 1.7, 5.0])
+print(np.clip(clip, 0.0, 1.0).tolist(), clip.tolist())
+# [0.0, 0.0, 0.3, 1.0, 1.0] [-2.0, -0.5, 0.3, 1.7, 5.0]
+np.clip(clip, 0.0, 1.0, out=clip)
+print(clip.tolist(), np.clip(np.array([np.nan, 2.0]), 0.0, 1.0).tolist())
+# [0.0, 0.0, 0.3, 1.0, 1.0] [nan, 1.0]
+```
+
+Both converters accept arrays of coordinates or indices and return arrays, so a whole set of positions converts in one call. `order='F'` counts down columns instead of across rows and has to match the `order=` of the `ravel` being indexed into, or the coordinates land on the wrong cell. The pairing that shows up constantly is an `axis=None` reduction plus an `unravel_index` to recover the row and column, with `np.flatnonzero` doing the same for a mask. `np.clip(a, lo, hi)` is the elementwise limiter: `out=clip` writes into a buffer you already own, which is the allocation-free form for a hot loop, per-element bounds broadcast against the data (`np.clip(a, lo_array, 1.0)` is valid), and NaN passes through untouched, so a masked fill has to come first if the missing values matter.
+
+---
+
+## Variable-length sequences into one batch
+
+Sequences of different lengths cannot form a rectangular array, so the recipe pads to `T_max` and carries a mask alongside.
+
+```python title="pad_and_mask.py"
+import numpy as np
+
+lengths = np.array([3, 1, 4, 2])
+tokens = np.arange(1, 11)
+B, T_max = lengths.size, int(lengths.max())
+batch = np.full((B, T_max), 0, dtype=np.int64)
+start = 0
+for i, n in enumerate(lengths):
+    batch[i, :n] = tokens[start:start + n]
+    start += n
+print(batch.tolist())      # [[1, 2, 3, 0], [4, 0, 0, 0], [5, 6, 7, 8], [9, 10, 0, 0]]
+print(np.arange(T_max)[None, :].tolist(), lengths[:, None].tolist())   # [[0, 1, 2, 3]] [[3], [1], [4], [2]]
+mask = np.arange(T_max)[None, :] < lengths[:, None]
+print(mask.astype(int).tolist())    # [[1, 1, 1, 0], [1, 0, 0, 0], [1, 1, 1, 1], [1, 1, 0, 0]]
+print(np.where(mask, batch, -1).tolist())    # [[1, 2, 3, -1], [4, -1, -1, -1], [5, 6, 7, 8], [9, 10, -1, -1]]
+print((np.arange(T_max) < lengths).tolist())   # [True, False, True, False]  - the wrong mask
+sums = (batch * mask).sum(axis=1)
+print(sums.tolist(), (sums / lengths).tolist(), np.trim_zeros(batch[3]).tolist())
+# [6, 4, 26, 19] [2.0, 4.0, 6.5, 9.5] [9, 10]
+```
+
+The per-row assignment is `__setitem__` on `batch`, so those slices write through, and `np.full` with the pad id rather than `np.zeros` keeps a legitimate token id `0` from being confused with padding. The two axis insertions are what turn the comparison into a `(B, T_max)` grid: `np.arange(T_max)[None, :]` is one row of positions, `lengths[:, None]` is one column of lengths, so `<` broadcasts across both. Without the `None`s the operands have equal length and broadcast elementwise into the 1-D mask, which is correct for no row. `True` acts as `1` in the product, so padded cells contribute nothing to `sums`, and the divisor is `lengths` rather than `T_max`. `np.trim_zeros` strips zeros from both ends of a 1-D array and is only safe when the pad id cannot be a real token.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>Which indexing expressions return a view and which return a copy, and how do you check without guessing?</>}>
+
+Slices, integer scalars, `...`, and `np.newaxis` return views. Integer arrays and boolean masks return copies, and one index array anywhere in the tuple makes the whole result a copy. Check with `np.shares_memory(a, result)`, or read `result.base`, which is `None` for a copy and the parent array for a view.
+
+  </Accordion>
+  <Accordion title={<>Why does <code>out[idx] += v</code> lose updates when <code>idx</code> repeats, and what are two fixes?</>}>
+
+Buffered assignment reads a copy, adds into it, and writes that copy back once, so two indices aimed at one cell produce one write instead of a sum. `np.add.at(out, idx, v)` walks the indices unbuffered and handles any ufunc and any shape. `np.bincount(idx, weights=v)` gives the same totals for per-bin sums of a 1-D value array, needs non-negative integer indices, and returns a new array.
+
+  </Accordion>
+  <Accordion title={<>What does <code>np.ix_</code> do, and what does <code>a[[0, 2], [1, 3]]</code> return on a shape <code>(3, 4)</code> array?</>}>
+
+`np.ix_` reshapes 1-D index arrays against each other so they broadcast into a grid, turning row and column lists into a sub-matrix. `a[[0, 2], [1, 3]]` pairs the indices elementwise and returns `[1, 11]`, the cells `(0,1)` and `(2,3)`, with shape `(2,)`.
+
+  </Accordion>
+  <Accordion title={<>Difference between <code>np.where(cond)</code>, <code>np.nonzero(cond)</code>, and <code>np.argwhere(cond)</code>?</>}>
+
+The first two are the same call: a tuple of one index array per axis, ready to feed back into a subscript. `np.argwhere` returns a single `(N, ndim)` array with one coordinate per row, which is easier to loop over and to store.
+
+  </Accordion>
+  <Accordion title={<>How do <code>side='left'</code> and <code>side='right'</code> differ, and which matches <code>np.digitize</code>?</>}>
+
+They decide where a value equal to an edge goes. `side='left'` returns the first position among equal entries, putting the value in the upper bin; `side='right'` returns the position after them, putting it in the lower bin. `np.digitize(x, bins)` matches `side='right'`, and `np.digitize(x, bins, right=True)` matches `side='left'`.
+
+  </Accordion>
+  <Accordion title={<>Why does <code>np.searchsorted</code> take <code>sorter=</code>, and what happens if you skip it on unsorted data?</>}>
+
+`searchsorted` assumes the input is sorted and does not verify it, so unsorted input returns plausible numbers with no exception. `sorter=np.argsort(raw)` supplies the permutation to apply, avoids copying a large table, and makes the returned positions refer to the sorted order.
+
+  </Accordion>
+  <Accordion title={<>For a padded batch, why is the length mask <code>np.arange(T_max)[None, :] &lt; lengths[:, None]</code>?</>}>
+
+Each operand needs a length-1 axis so the comparison broadcasts into a `(B, T_max)` grid: one row of positions, one column of lengths. With equal lengths and no inserted axes they broadcast elementwise into a `(T_max,)` mask that is wrong for every row.
+
+  </Accordion>
+</Accordions>

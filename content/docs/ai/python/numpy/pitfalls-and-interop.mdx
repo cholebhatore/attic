@@ -1,0 +1,697 @@
+---
+title: Pitfalls and Interop
+description: 'Silent overflow, NaN equality, ambiguous truth values, accidental views, the NumPy 2 migration table, and the boundary with PyTorch, JAX, and pandas.'
+---
+
+Most NumPy bug reports come down to four things: an arithmetic result that is silently the wrong number, an equality test that answers the wrong question, an array that turns out to be a window onto someone else's buffer, and a library boundary where the object stops being an `ndarray`. NumPy 2 moved several of the silent cases into the loud column and left the rest exactly as they were.
+
+Every arithmetic, equality, truth-value, view, and migration block on this page ran in this environment against NumPy 2.3.2 on Python 3.13.7, and the trailing comments are that run's output. The PyTorch, JAX, pandas, and scikit-learn blocks are API-shape illustrations: those packages are not installed here, so they carry shape and dtype annotations and documented behavior instead of observed output.
+
+---
+
+## Silent arithmetic
+
+Integer arrays wrap modulo the dtype width, and the warning depends on whether you hit a scalar or an array.
+
+```python title="wraparound.py"
+import warnings
+
+import numpy as np
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    print(np.int8(127) + np.int8(1))          # -128
+    print(caught[0].category.__name__, caught[0].message.args[0])
+    # RuntimeWarning overflow encountered in scalar add
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    print((np.array([127], dtype=np.int8) + np.array([1], dtype=np.int8)).tolist())   # [-128]
+    print(len(caught))                        # 0
+```
+
+The scalar path warns because NumPy 2 routes scalar integer overflow through the same floating-point
+exception machinery as `over`. The array path is a plain ufunc loop and emits nothing, even under
+`np.errstate(over="raise")`:
+
+```python title="errstate_does_not_cover_integers.py"
+import numpy as np
+
+with np.errstate(over="raise"):
+    print((np.array([127], dtype=np.int8) + np.array([1], dtype=np.int8)).tolist())   # [-128]
+    print(np.dot(np.ones(200, dtype=np.int8), np.ones(200, dtype=np.int8)))           # -56
+```
+
+`np.dot` and `@` keep the input dtype for integers, so a 200-term dot product of `int8` vectors lands
+at `-56` with no diagnostic. Reductions are the opposite case: `sum`, `prod`, and `cumsum` widen an
+integer input to the default integer of its own signedness, `int64` or `uint64` on this build.
+
+| Path                                                   | Result on 2.3.2  | Signal                                                     |
+| :----------------------------------------------------- | :--------------- | :--------------------------------------------------------- |
+| `np.int8(127) + np.int8(1)`                            | `-128`           | `RuntimeWarning`                                           |
+| `np.array([127], np.int8) + np.array([1], np.int8)`    | `[-128]`         | none, any settings                                         |
+| `np.dot` of two 200-long `int8` vectors                | `-56`            | none                                                       |
+| `np.ones(300, dtype=np.int8).sum()`                    | `300` as `int64` | widened for you                                            |
+| `b[0] = 300` on an `int8` array                        | raises           | `OverflowError: Python integer 300 out of bounds for int8` |
+| `b[:] = np.array([300], dtype=np.int32)` on `int8`     | `[44, 44, 44]`   | none                                                       |
+| `np.array([256, 257], dtype=np.int32).astype(np.int8)` | `[0, 1]`         | none                                                       |
+| `b[0] = 1.9` on an `int8` array                        | `1`              | none, truncates toward zero                                |
+| `h[0] = 1e39` on a `float32` array                     | `inf`            | `RuntimeWarning: overflow encountered in cast`             |
+
+Scalar assignment raises; array assignment casts. That asymmetry is the one people trip over after a
+NumPy 1 port, because on 1.x both paths truncated.
+
+For floats the danger is precision rather than range. `float32` stores `1e-8` without difficulty, and
+what flushes to zero is below `1e-45`:
+
+```python title="float32_range.py"
+import numpy as np
+
+print(repr(np.float32(1e-8)))                       # np.float32(1e-08)
+print(np.float32(1e-8) == 0.0)                      # False
+print(repr(np.float32(1e-46)))                      # np.float32(0.0)
+print(np.nextafter(np.float32(0), np.float32(1)))   # 1e-45
+print(repr(np.float32(1.0) + np.float32(1e-8)))     # np.float32(1.0)
+print(repr(np.float32(2**24) + np.float32(1.0)))    # np.float32(1.6777216e+07)
+```
+
+The last two lines are the real loss: `float32` keeps 24 bits of mantissa, so a value near `1.0`
+cannot resolve an increment of `1e-8`, and a value at `2**24` cannot resolve an increment of `1`. The
+stored number is fine; the sum is where it disappears.
+
+```python title="accumulator.py"
+import numpy as np
+
+x = np.full(5_000_000, np.float32(1e-4), dtype=np.float32)
+print(repr(x.sum(dtype=np.float32)))                # np.float32(499.99997)
+print(repr(x.sum(dtype=np.float64)))                # np.float64(499.999994947575)
+print(repr(x.cumsum(dtype=np.float32)[-1]))         # np.float32(486.02954)
+print(repr(x.cumsum(dtype=np.float64)[-1]))         # np.float64(499.9999873689376)
+
+acc = np.float32(0.0)
+for _ in range(100_000):
+    acc += np.float32(1e-4)
+print(repr(acc))                                    # np.float32(10.00631)
+```
+
+`np.sum` uses pairwise summation, so it stays close even in `float32`. `np.cumsum` cannot: every
+partial sum is an output, so the running total is the accumulator, and by element 5,000,000 the
+`float32` version ends 14 short of the 500 it should reach. A hand-written accumulation loop is worse
+still. Pass `dtype=` to the reduction when the accumulator width matters, and widen the loop variable
+itself rather than the array.
+
+<Callout type="warn">
+  ### Integer overflow is not a floating-point exception
+
+`np.errstate` and `np.seterr` key on `divide`, `over`, `under`, and `invalid`, and the defaults on this
+build are `{'divide': 'warn', 'over': 'warn', 'under': 'ignore', 'invalid': 'warn'}`. None of them
+cover an integer ufunc wrap. The mechanism is on [Ufuncs and Reductions](/ai/python/numpy/ufuncs-and-reductions);
+the defense here is the dtype you chose at construction.
+
+</Callout>
+
+<Callout type="info">
+  ### Python scalars are weak
+
+`np.uint8(200) + 100` is `44`, not `int64`: the bare Python `int` adapts to the array's dtype and the
+sum wraps inside `uint8`. NEP 50 promotion and the array-versus-array rules are on
+[The ndarray](/ai/python/numpy/the-ndarray).
+
+</Callout>
+
+Name the dtype whenever the range matters, and name the accumulator dtype whenever the sum matters.
+Every other arithmetic surprise on this page is a case of neither being named.
+
+---
+
+## NaN and comparison
+
+`NaN` is not equal to itself, which is IEEE 754 behaving correctly and NumPy propagating it into every
+comparison-based API.
+
+```python title="nan_equality.py"
+import numpy as np
+
+a = np.array([1.0, np.nan, 2.0, np.nan])
+print(np.nan == np.nan)                   # False
+print((a == a).tolist())                  # [True, False, True, False]
+print(np.isnan(a).sum())                  # 2
+print(np.nan in [np.nan])                 # True
+```
+
+That last line is CPython's container test short-circuiting on identity, so `x in [np.nan]` and
+`x == np.nan` disagree about the same value. Membership in a Python `list` or `set` can succeed where
+an elementwise `==` fails.
+
+The comparison helpers do not agree with each other either.
+
+```python title="comparison_helpers.py"
+import numpy as np
+
+print(np.array_equal([np.nan], [np.nan]))                     # False
+print(np.array_equal([np.nan], [np.nan], equal_nan=True))     # True
+print(np.array_equal([1, 2], [[1, 2]]))                       # False - shape must match
+print(np.array_equiv([1, 2], [[1, 2], [1, 2]]))               # True  - broadcasting allowed
+print(np.allclose([np.nan], [np.nan]))                        # False
+print(np.allclose([np.inf], [np.inf]))                        # True
+print(np.unique([1.0, np.nan, 2.0, np.nan]).tolist())         # [1.0, 2.0, nan]
+print(np.unique([1.0, np.nan, 2.0, np.nan], equal_nan=False).tolist())   # [1.0, 2.0, nan, nan]
+try:
+    np.isin([np.nan], [np.nan], equal_nan=True)
+except TypeError as exc:
+    print(exc)
+# isin() got an unexpected keyword argument 'equal_nan'
+```
+
+| Function                     | `NaN` policy by default | Shape rule                | Other notes                               |
+| :--------------------------- | :---------------------- | :------------------------ | :---------------------------------------- |
+| `==`                         | never equal             | broadcast, elementwise    | masks silently drop `NaN` rows            |
+| `np.array_equal`             | not equal               | shapes must match exactly | `equal_nan=True` opt-in                   |
+| `np.array_equiv`             | not equal               | broadcasts allowed        | `True` for `[1,2]` versus `[[1,2],[1,2]]` |
+| `np.allclose`, `np.isclose`  | not equal               | broadcasts allowed        | `rtol=1e-05`, `atol=1e-08`                |
+| `np.unique`                  | equal, collapsed to one | one input                 | `equal_nan=False` keeps every `NaN`       |
+| `np.isin`                    | not a member            | two inputs                | no `equal_nan` argument in 2.3.2          |
+| `np.testing.assert_allclose` | equal                   | broadcasts allowed        | `rtol=1e-07`, `atol=0`                    |
+
+`np.isin` has no `equal_nan`, so `NaN` can never be found in a `NaN`-containing vocabulary. Filter the
+`NaN` mask out separately or the row disappears.
+
+Tolerances are the second half of this section. `np.allclose` tests `|a - b| <= atol + rtol * |b|`, and
+the defaults make the answer depend on magnitude:
+
+```python title="tolerances.py"
+import numpy as np
+
+print(np.allclose([0.0], [1e-9]))               # True   - atol 1e-08 swamps a target at zero
+print(np.allclose([0.0], [1e-7]))               # False
+print(np.allclose([1e-10], [2e-10]))            # True   - 100% relative error, passes anyway
+print(np.allclose([1e-10], [2e-10], atol=0))    # False
+print(np.allclose([1e8], [1e8 + 1.0]))          # True   - the tolerance is rtol * 1e8
+print(np.allclose([1e8], [1e8 + 1001.0]))       # False
+try:
+    np.testing.assert_allclose([1e-9], [0.0])
+except AssertionError as exc:
+    print(str(exc).splitlines()[1])
+# Not equal to tolerance rtol=1e-07, atol=0
+```
+
+Near zero `atol` decides the answer and relative error says nothing. Near `1e8` the absolute tolerance
+is irrelevant and `rtol` permits a difference of 1000. Both defaults are absolute-plus-relative, which
+is the right shape for most tests and the wrong one at either end of the range. `np.testing.assert_allclose`
+starts out stricter than `np.allclose` (`rtol=1e-07`, `atol=0`) and treats `NaN` as equal, so a value
+that passes a hand-written `allclose` can fail the assert.
+
+```python title="gradient_check.py"
+import numpy as np
+
+analytic = np.array([1e-9, 2.0])
+numeric = np.array([0.0, 2.0 + 1e-4])
+print(np.allclose(analytic, numeric))                        # False
+print(np.allclose(analytic, numeric, atol=1e-3))             # True
+print(np.isclose(analytic, numeric, atol=1e-3).tolist())     # [True, False]
+```
+
+A gradient of `1e-9` passing against `0.0` under a loose `atol` is how a broken backward pass survives
+review. The relative-error ratio used in
+[Backpropagation from Scratch](/ai/math-foundations/backprop-from-scratch) exists for that reason: it
+divides by `max(|analytic| + |numeric|, 1e-8)` instead of adding a fixed absolute allowance, so a
+near-zero gradient has to be near-zero on both sides.
+
+---
+
+## Truth values and ambiguity
+
+An array has no single truth value, and Python's `if`, `and`, `or`, and `assert` all ask for one.
+
+```python title="truth_value.py"
+import numpy as np
+
+arr = np.array([1, 2, 3])
+try:
+    if arr:
+        pass
+except ValueError as exc:
+    print(exc)
+# The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()
+
+print(bool(np.array(5)), bool(np.array(0)))      # True False
+print(bool(np.array([5])))                       # True - size 1 still converts
+try:
+    bool(np.array([]))
+except ValueError as exc:
+    print(exc)
+# The truth value of an empty array is ambiguous. Use `array.size > 0` to check that an array is not empty.
+```
+
+| Expression                | On 2.3.2                                |
+| :------------------------ | :-------------------------------------- |
+| `bool(np.array(5))`       | `True`                                  |
+| `bool(np.array([5]))`     | `True`, no warning                      |
+| `float(np.array([5.0]))`  | `5.0` plus `DeprecationWarning`         |
+| `bool(np.array([]))`      | `ValueError`, empty-array message above |
+| `bool(np.array([1, 2]))`  | `ValueError`, ambiguous message above   |
+| `np.array([]).all()`      | `True`                                  |
+| `np.array([]).any()`      | `False`                                 |
+| `bool(np.float64("nan"))` | `True`                                  |
+
+The `float()` and `int()` path on a one-element array is the piece that breaks under you. The warning
+text is `Conversion of an array with ndim > 0 to a scalar is deprecated, and will error in future.`, so
+`float(loss_array)` works today and will not forever. Use `loss.item()` or `loss[0]`.
+
+`and` and `or` call `bool()` on their operands, so they raise on arrays. The elementwise operators are
+`&`, `|`, `^`, and `~`, and they need parentheses because they bind tighter than a comparison:
+
+```python title="operators.py"
+import numpy as np
+
+a = np.array([1, 2, 3])
+b = np.array([3, 4, 5])
+print(((a > 1) & (b > 3)).tolist())     # [False, True, True]
+print(((a > 1) | (b > 4)).tolist())     # [False, True, True]
+print((~(a > 1)).tolist())              # [True, False, False]
+print(np.logical_and(a > 1, b > 3).tolist())   # [False, True, True]
+try:
+    a > 1 & b > 3
+except ValueError as exc:
+    print(exc.splitlines()[0])
+# The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()
+```
+
+`a > 1 & b > 3` parses as `a > (1 & b) > 3`, a chained comparison whose middle step asks Python for a
+truth value of the whole mask. The function forms `np.logical_and` and `np.logical_or` sidestep
+precedence entirely and short-circuit nothing, which is what you want when both sides are arrays.
+
+In tests, `assert mask.any()` fails with an empty message: the `AssertionError` carries no text, and
+pytest prints `assert False`. Write the message and the count.
+
+```python title="asserts.py"
+import numpy as np
+
+mask = np.array([False, False, False])
+try:
+    assert mask.all()
+except AssertionError as exc:
+    print(repr(str(exc)))               # ''
+assert mask.any(), "no element selected"
+print(np.count_nonzero(mask))           # 0
+```
+
+---
+
+## Views you did not ask for
+
+Basic slicing returns a window onto the parent buffer. Writing through the window writes the parent.
+
+```python title="views.py"
+import numpy as np
+
+a = np.arange(6)
+v = a[1:4]
+v[0] = 99
+print(a.tolist(), np.shares_memory(a, v))     # [0, 99, 2, 3, 4, 5] True
+
+w = a[1:4]
+w += 10
+print(a.tolist())                             # [0, 109, 12, 13, 4, 5]
+
+x = np.arange(6)
+y = x[1:4]
+y = y + 100
+print(x.tolist(), y.tolist(), np.shares_memory(x, y))   # [0, 1, 2, 3, 4, 5] [101, 102, 103] False
+```
+
+`w += 10` is `np.add(w, 10, out=w)`: the result lands in the buffer the view already points at, so the
+parent changes. `y = y + 100` builds a new array and rebinds the name, leaving the parent alone. Two
+lines that look like different spellings of one operation have opposite effects on the caller's data.
+
+`reshape` is a view whenever the strides can express the new shape, and a transposed array is a view
+too:
+
+```python title="reshape_transpose.py"
+import numpy as np
+
+buf = np.arange(6)
+m = buf.reshape(2, 3)
+print(m.flags["OWNDATA"])                  # False
+m[0, 0] = 42
+print(buf.tolist())                        # [42, 1, 2, 3, 4, 5]
+
+t = np.arange(6).reshape(2, 3)
+t.T[0, 1] = 99
+print(t.tolist())                          # [[0, 1, 2], [99, 4, 5]]
+
+f = np.arange(6)
+g = f[[0, 1]]
+g[0] = 99
+print(f.tolist(), np.shares_memory(f, g))  # [0, 1, 2, 3, 4, 5] False
+
+base = np.arange(6)
+print(np.shares_memory(base[1::2], base[0::2]))   # False - the ranges never overlap
+print(np.may_share_memory(base[1::2], base[0::2]))   # True  - same buffer
+```
+
+Fancy indexing with an integer array copies, so writes to `g` go nowhere. `np.shares_memory` answers
+the overlap question precisely and `np.may_share_memory` answers the cheaper one: whether two arrays
+read the same buffer at all. Two non-overlapping slices of one array give `False` and `True`.
+
+The escape hatch is `.copy()`, and the diagnostic for whether you need it is `np.shares_memory(a, out)`.
+Both are worked through on [Indexing and Slicing](/ai/python/numpy/indexing-and-slicing) and
+[Reshaping and Views](/ai/python/numpy/reshaping-and-views). Habits carried over from Python lists break
+on every one of these lines:
+
+| Expression                             | `list`                               | `ndarray`                                    |
+| :------------------------------------- | :----------------------------------- | :------------------------------------------- |
+| `b = a`                                | same object, one name more           | same buffer, new shape and strides           |
+| `b = a[:]`                             | new list, elements still shared      | view, buffer shared                          |
+| `b = a.copy()`                         | new list, inner objects still shared | new buffer, nothing shared                   |
+| `b[0] = x` after `b = a[1:]`           | parent list untouched                | parent array changed                         |
+| nested mutation                        | shallow copies alias one level deep  | dtypes are fixed-width, no inner objects     |
+| `b = b + [1]` vs `b = np.append(b, 1)` | new list, `append` mutates           | `np.append` copies the whole array each call |
+
+---
+
+## The NumPy 2 migration table
+
+| Change                                                                                                           | Symptom                                                              | Fix                                                                                                                     |
+| :--------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------- |
+| `np.float_`, `np.complex_`, `np.longfloat`                                                                       | `AttributeError` naming the replacement                              | `np.float64`, `np.complex128`, `np.longdouble`                                                                          |
+| `np.bool8`                                                                                                       | `AttributeError: module 'numpy' has no attribute 'bool8'`            | `np.bool_`                                                                                                              |
+| `np.object0`, `np.int0`, `np.uint0`, `np.void0`                                                                  | `AttributeError`, no hint                                            | `np.object_`, `np.intp`, `np.uintp`, `np.void`                                                                          |
+| `np.unicode_`, `np.string_`                                                                                      | `AttributeError` pointing at `np.str_` / `np.bytes_`                 | `np.str_`, `np.bytes_`                                                                                                  |
+| `np.NaN`, `np.Inf`, `np.infty`, `np.PINF`, `np.NINF`                                                             | `AttributeError` with replacement                                    | `np.nan`, `np.inf`, `-np.inf`                                                                                           |
+| `np.round_`, `np.product`, `np.cumproduct`, `np.sometrue`, `np.alltrue`, `np.msort`                              | `AttributeError`                                                     | `np.round`, `np.prod`, `np.cumprod`, `np.any`, `np.all`, `np.sort(a, axis=0)`                                           |
+| `np.mat`, `np.cast`, `np.math`, `np.compat`, `np.asscalar`, `np.alen`, `np.recfromcsv`, `np.set_string_function` | `AttributeError`                                                     | `np.asmatrix`, `np.asarray(a, dtype=...)`, `math`, `2to3`, `float(a)`, `a.size`, `np.genfromtxt`, `np.set_printoptions` |
+| `np.int`, `np.float`, `np.object`, `np.str`                                                                      | `AttributeError`; `np.object` and `np.str` also emit `FutureWarning` | builtins `int`, `float`, `str`                                                                                          |
+| `np.bool`                                                                                                        | exists again, as `np.bool_`                                          | either spelling works                                                                                                   |
+| `ndarray.ptp`, `.itemset`, `.newbyteorder`, `.tostring`                                                          | `AttributeError`, method removed from the class                      | `np.ptp(a)`, `a[i] = v`, `a.view(a.dtype.newbyteorder(o))`, `a.tobytes()`                                               |
+| `np.trapz`, `np.in1d`, `np.row_stack`                                                                            | still callable, `DeprecationWarning` on call                         | `np.trapezoid`, `np.isin`, `np.vstack`                                                                                  |
+| `np.array(x, copy=False)`                                                                                        | `ValueError` when a copy is unavoidable                              | `np.asarray(x)`, or `copy=None` for old behavior                                                                        |
+| `np.percentile(..., interpolation=...)`                                                                          | `DeprecationWarning`, result unchanged                               | `method=`                                                                                                               |
+| Integer scalar overflow                                                                                          | `RuntimeWarning: overflow encountered in scalar add`                 | widen the dtype                                                                                                         |
+| `b[0] = 300` on an `int8` array                                                                                  | `OverflowError`                                                      | clamp, or assign an array instead                                                                                       |
+| Ragged nested sequences                                                                                          | `ValueError: setting an array element with a sequence...`            | `dtype=object` on purpose, or pad first                                                                                 |
+| `np.int_` width on Windows                                                                                       | 8 bytes; `np.long` is 4                                              | pick `np.int64` or `np.intp` explicitly                                                                                 |
+| Python scalars in arithmetic                                                                                     | weak, no widening: `np.uint8(200) + 100` is `44`                     | name both dtypes                                                                                                        |
+| `__array__` implementations                                                                                      | NumPy now passes `dtype=` and `copy=`                                | accept `(self, dtype=None, copy=None)`                                                                                  |
+| `np.errstate` keys and defaults                                                                                  | unchanged: `divide`, `over`, `under`, `invalid`                      | nothing to change                                                                                                       |
+
+```python title="removed_and_renamed.py"
+import warnings
+
+import numpy as np
+
+for name in ["float_", "bool8", "object0", "unicode_", "mat", "msort", "product"]:
+    try:
+        getattr(np, name)
+        print(f"{name}: still present")
+    except AttributeError as exc:
+        print(f"np.{name}: {str(exc).splitlines()[0]}")
+
+print(np.dtype(np.int_).itemsize, np.dtype(np.long).itemsize, np.dtype(np.intp).itemsize)   # 8 4 8
+print(np.geterr())
+# {'divide': 'warn', 'over': 'warn', 'under': 'ignore', 'invalid': 'warn'}
+
+try:
+    np.array([[1, 2], [1, 2, 3]])
+except ValueError as exc:
+    print(str(exc).splitlines()[0])
+# setting an array element with a sequence. The requested array has an inhomogeneous shape after 1 dimensions. The detected shape was (2,) + inhomogeneous part.
+
+try:
+    np.array([1, 2, 3], dtype=np.float32, copy=False)
+except ValueError as exc:
+    print(str(exc).splitlines()[0])
+# Unable to avoid copy while creating an array as requested.
+
+for name, args in [("trapz", ([0.0, 1.0], [0.0, 1.0])), ("in1d", ([1], [1, 2]))]:
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        getattr(np, name)(*args)
+        print(f"{name}: {caught[0].message.args[0]}")
+```
+
+The two lines that need judgment calls are `np.int_` and `copy=False`. `np.int_` being 8 bytes on a
+64-bit Windows build is the fix, not the bug: code that assumed the old 4-byte `long` should say
+`np.long` or `np.intc`. And `np.array(x, copy=False)` was never a view request, it was a hope;
+`np.asarray(x)` states the hope out loud.
+
+---
+
+## NumPy and PyTorch
+
+torch is not installed in this environment, so nothing below is observed output. Each line is
+documented API behavior with shape and dtype annotations.
+
+```python title="torch_bridge.py"
+import numpy as np
+import torch
+
+a = np.zeros((2, 3), dtype=np.float32)      # (2, 3) float32, owns its buffer
+t = torch.from_numpy(a)                     # (2, 3) torch.float32, same storage as a
+
+a[0, 0] = 1.0                               # t[0, 0] is 1.0 now
+t.add_(5.0)                                 # a is 6.0 at [0, 0], 5.0 everywhere else
+
+back = t.numpy()                            # (2, 3) float32, still that buffer
+
+grad = torch.ones(3, requires_grad=True)
+# grad.numpy() raises; call grad.detach().numpy()
+
+wide = torch.zeros(1, 3).expand(4, 3)       # (4, 3) with a zero stride on axis 0
+# hand that to NumPy as wide.contiguous().numpy(), not as wide.numpy()
+
+np_readonly = np.broadcast_to(np.arange(3), (2, 3))   # (2, 3) int64, WRITEABLE False
+# torch.from_numpy(np_readonly) converts and warns that the array is not writable
+```
+
+The failure mode in production is the third and fourth lines. A preprocessing step that mutates the
+NumPy array behind a live tensor changes the tensor, and a tensor mutated in place changes the array
+the DataLoader is still holding. `torch.from_numpy` is the cheap call precisely because it is a
+reference, not a conversion. Copy at the boundary when the two owners are on different lifetimes:
+`torch.from_numpy(a.copy())`.
+
+`torch.as_tensor` is the one that does the right thing by default. It reuses the buffer when the dtype
+matches and copies when it does not, so `torch.as_tensor(a, dtype=torch.float32)` on a `float64` array
+is an explicit copy rather than a surprise.
+
+| Direction            | Call                              | Copies?     | Constraints                                                  |
+| :------------------- | :-------------------------------- | :---------- | :----------------------------------------------------------- |
+| ndarray to tensor    | `torch.from_numpy(a)`             | never       | `a` must be writable and in a dtype torch has                |
+| ndarray to tensor    | `torch.as_tensor(a, dtype=...)`   | if needed   | accepts lists, scalars, arrays                               |
+| tensor to ndarray    | `t.numpy()`                       | never       | CPU and detached; `.contiguous()` first for an expanded view |
+| tensor to ndarray    | `t.detach().cpu().numpy()`        | device copy | the standard form for a GPU tensor                           |
+| non-contiguous slice | `np.ascontiguousarray(a[:, ::2])` | yes         | cheap insurance before any torch op                          |
+
+The dtype table is short because the mapping is one-to-one except at the edges: `float64`, `float32`,
+`float16`, `int64`, `int32`, `int16`, `int8`, `uint8`, and `bool_` have torch counterparts, `bfloat16`
+has no NumPy dtype at all ([The ndarray](/ai/python/numpy/the-ndarray) covers `ml_dtypes`), and
+`datetime64` has no torch equivalent.
+
+On promotion the two libraries disagree, and [Tensor Fundamentals](/ai/pytorch/tensor-fundamentals)
+has the full statement: NumPy promotes `int64` plus `float32` to `float64`, torch keeps it `float32`.
+State the dtype on both sides of any port. The pipeline consequences, batching, collation, and worker
+processes, are on [Data Pipelines](/ai/pytorch/data-pipelines).
+
+---
+
+## NumPy and the rest of the stack
+
+The same constraint as above: jax, pandas, and scikit-learn are not installed here, so the blocks are
+signatures and shapes, not output.
+
+```python title="jax_bridge.py"
+import numpy as np
+import jax
+import jax.numpy as jnp
+
+x = jnp.asarray(np.arange(3, dtype=np.float32))   # (3,) float32 on the default device
+y = x + 1.0                                       # (3,) float32, a new array
+
+# x[0] = 9.0                 fails: a jax.Array is immutable
+z = x.at[0].set(9.0)         # (3,) float32, functional update
+
+host = np.asarray(z)         # blocking device-to-host copy back into an ndarray
+z.block_until_ready()        # makes the async dispatch complete; no NumPy analogue
+```
+
+JAX dispatches work asynchronously, so a Python timer around one operation measures enqueue cost rather
+than compute, and `block_until_ready` is how you close that gap. NumPy has no equivalent concept
+because every NumPy operation has already finished when it returns.
+
+```python title="pandas_bridge.py"
+import numpy as np
+import pandas as pd
+
+df = pd.DataFrame({"n": [1, 2], "s": ["a", "b"]})
+dense = df.to_numpy()                 # (2, 2) object: one text column forces it
+nums = df["n"].to_numpy()             # (2,) int64
+same = df["n"].values                 # (2,) int64, the older spelling of the same thing
+
+s = pd.Series([1, None, 3], dtype="Int64")   # nullable integer dtype
+s.to_numpy()                           # a pandas masked array, pd.NA still in place
+np.asarray(s)                          # dtype=object: NumPy has no masked integer kind
+```
+
+`to_numpy()` and `.values` are near synonyms for a homogeneous frame, and both hand back `object`
+dtype the moment a frame mixes types. An object column is a pointer array: no vectorization, no
+promotion rules, and `np.isnan` on it raises because it cannot ask a Python object whether it is a
+number. Reach for a numeric-only slice (`.select_dtypes("number").to_numpy()`) before feeding a frame
+to NumPy math.
+
+`pd.NA` is a third state, not a float. `pd.NA == pd.NA` returns `pd.NA` rather than `False`, asking for
+`bool(pd.NA)` raises, and `np.nan` comparisons return `False` silently. `pd.isna()` covers both;
+`np.isnan()` does not cover `pd.NA` and fails on the object array holding it. The two sentinel families
+also disagree across dtypes: `NaT` for datetimes, `None` for object columns.
+
+scikit-learn reads anything implementing `__array__`, then normalizes it. `check_array` coerces to a
+numeric dtype, copies unless the input already fits, converts sparse input to dense unless
+`accept_sparse` names the formats the estimator supports, and rejects non-finite values unless the
+finite check is turned off. The flag for that last one has changed name across versions, so read the
+signature of the release you pinned. The consequence for NumPy code is a silent `float64` upcast of a
+`float32` input, and a full copy of a view you expected to pass through free.
+
+The two protocols that make all of this work:
+
+```python title="protocols.py"
+import numpy as np
+
+class Legacy:
+    def __array__(self):
+        return np.arange(3)
+
+class Current:
+    def __array__(self, dtype=None, copy=None):
+        base = np.arange(3)
+        return base.astype(dtype) if dtype is not None else base
+
+print(np.asarray(Legacy()).tolist())                     # [0, 1, 2]
+print(np.asarray(Current(), dtype=np.float32).dtype)     # float32
+try:
+    np.asarray(Legacy(), dtype=np.float32)
+except TypeError as exc:
+    print(exc)
+# Legacy.__array__() takes 1 positional argument but 2 were given
+
+ns = np.arange(3).__array_namespace__()
+print(ns.__name__)                    # numpy
+print(np.__array_namespace_info__().default_device())   # cpu
+```
+
+`__array__` is the old handshake: any object that can describe itself as a buffer becomes an `ndarray`
+through `np.asarray`. NumPy 2 changed the call signature to pass `dtype` and `copy`, which is why
+third-party classes written against the no-argument form raise `TypeError` the moment a caller asks for
+a specific dtype.
+
+`<Tip term="array namespace">` is the newer one, from the
+[Python array API standard](https://data-apis.org/array-api/latest/): an object exposes
+`__array_namespace__()` and gets you a module of functions that work on that type, so library code can
+drive NumPy, JAX, CuPy, or torch arrays through one path without conversion. NumPy satisfies it and
+returns the `numpy` module itself. It answers a different question from `__array__`: the array API asks
+what operations exist for this array, while `__array__` asks how to turn this thing into a buffer.
+
+---
+
+## Backends and timings
+
+Before optimizing, find out which BLAS the wheel linked, because the same `np.dot` call can differ by
+an order of magnitude between builds.
+
+```python title="blas_backend.py"
+import numpy as np
+
+blas = np.__config__.CONFIG["Build Dependencies"]["blas"]
+print(blas["name"], blas["version"])          # scipy-openblas 0.3.30
+print(blas["openblas configuration"])
+# OpenBLAS 0.3.30  USE64BITINT DYNAMIC_ARCH NO_AFFINITY Haswell MAX_THREADS=24
+print(np.__config__.CONFIG["Machine Information"]["host"]["system"])   # windows
+```
+
+`np.show_config()` prints the same data; without `pyyaml` installed it warns
+`Install pyyaml for better output` and dumps raw JSON. What you are looking for is the backend name,
+the threading model, and whether `DYNAMIC_ARCH` picked the instruction set your CPU actually has.
+
+Timing needs repeats, not one call, and `time.perf_counter` is enough:
+
+```python title="timing_harness.py"
+import time
+
+import numpy as np
+
+def bench(fn, repeats=5):
+    times = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        fn()
+        times.append(time.perf_counter() - start)
+    return min(times)
+
+a = np.arange(10_000_000, dtype=np.float32)
+temp = a * a
+print(temp.shape, temp.dtype)                    # (10000000,) float32
+print(temp.nbytes, f"{temp.nbytes / 2**20:.1f} MiB")   # 40000000 38.1 MiB
+```
+
+`bench` returns the minimum of five runs, which is the statistic to report because a single run picks up
+whatever else the machine was doing. <Tip term="page cache">The kernel's copy of recently read file pages, which makes the second read of a file faster than the first and disappears when memory pressure rises.</Tip> is the reason a benchmark that reads a `np.memmap` looks faster on the second pass than in
+production; the file-format side of that is on [I/O and Memory](/ai/python/numpy/io-and-memory).
+
+Vectorized does not mean allocation-free. `np.sum(a * a)` is two passes over 10 million elements and one
+extra 38.1 MiB buffer; `np.dot(a, a)` is one fused pass through BLAS. On this box that is about 20 ms
+against about 3 ms (minimum of five repeats per round, three rounds): a factor of six or seven for the
+same number, and the direction is the only part that transfers to another machine.
+
+The opposite case, where vectorizing is the large win, is already measured on
+[Tensor Broadcasting](/ai/math-foundations/tensor-broadcasting): a per-element Python double loop over a
+million rows against one broadcast expression, 621.60 ms versus 3.42 ms on the machine that ran it. The
+rule between the two is the size of the temporary. A broadcast over a small operand and a large result
+is cheap; a broadcast that materializes an intermediate the size of the batch is a memory-bandwidth
+problem, and `out=`, `where=`, and `np.einsum` are the ways around it
+([Ufuncs and Reductions](/ai/python/numpy/ufuncs-and-reductions)). The 38.1 MiB figure is byte
+arithmetic, and the backend strings above come from `np.__config__` on this install.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>Why does <code>np.array([127], dtype=np.int8) + np.array([1], dtype=np.int8)</code> warn on nothing while <code>np.int8(127) + np.int8(1)</code> warns?</>}>
+
+    The scalar path routes through NumPy's floating-point exception machinery and emits `RuntimeWarning: overflow encountered in scalar add`. The array path is a ufunc loop that wraps modulo the dtype and reports nothing, and `np.errstate(over="raise")` does not change that, because integer wraparound is not one of the four conditions `errstate` keys on.
+
+  </Accordion>
+  <Accordion title={<>What is <code>np.ones(200, dtype=np.int8).dot(np.ones(200, dtype=np.int8))</code>?</>}>
+
+    `-56`, and the result dtype is `int8`. `dot` and `@` keep the input dtype for integers, so the accumulator wraps at 200. `np.sum` on the same array returns `int64` because integer reductions widen first. The fix is `.astype(np.int32)` before the product, since `np.dot` offers no `dtype=` argument.
+
+  </Accordion>
+  <Accordion title={<>Can <code>float32</code> store <code>1e-8</code>?</>}>
+
+    Yes. The float32 subnormal floor is `1e-45`, so `1e-8` stores exactly as advertised and `np.float32(1e-46)` is the value that becomes `0.0`. The loss shows up in arithmetic: `np.float32(1.0) + np.float32(1e-8)` is `1.0`, because 24 mantissa bits cannot represent a `1e-8` increment on top of `1.0`.
+
+  </Accordion>
+  <Accordion title={<>A gradient check passes with <code>np.allclose(analytic, numeric)</code> and the analytic gradient is all zeros. What went wrong?</>}>
+
+    `atol=1e-08` decides the answer near zero, so a `1e-9` gradient compares equal to `0.0`. Tighten with `atol=0` and a relative tolerance, or use the relative-error ratio in the backprop check, which divides by the magnitude instead of adding a fixed allowance.
+
+  </Accordion>
+  <Accordion title={<>Which NumPy equality function treats <code>NaN</code> as equal by default?</>}>
+
+    `np.unique` (`equal_nan=True`) and `np.testing.assert_allclose`. `np.array_equal`, `np.array_equiv`, `np.allclose`, `np.isclose`, and `==` all report unequal, and `np.isin` has no `equal_nan` argument in 2.3.2, so a `NaN` label can never be found in a vocabulary.
+
+  </Accordion>
+  <Accordion title={<>Why does <code>a[1:3] += 1</code> change <code>a</code> and <code>a[1:3] = a[1:3] + 1</code> also change <code>a</code>, while <code>v = a[1:3]; v = v + 1</code> does not?</>}>
+
+    The first is an in-place ufunc writing through the view's buffer. The second assigns into the slice, which is also a write to the parent. The third rebinds the local name to a new array and never touches the parent's buffer. Only writes travel back; rebinding a name does not.
+
+  </Accordion>
+  <Accordion title={<>You slice a column, convert it to torch, and the result looks wrong or expensive. What do you check first?</>}>
+
+    `np.shares_memory` against the parent and the `WRITEABLE` and `C_CONTIGUOUS` flags. A column slice is strided, `np.broadcast_to` results are read-only, and torch warns when it wraps a non-writable array. `np.ascontiguousarray` before the conversion is the cheap fix.
+
+  </Accordion>
+  <Accordion title={<>What breaks in a NumPy 1 to 2 port that no test catches?</>}>
+
+    `np.float_` and friends fail at import, so those are loud. The quiet ones are behavior changes: `np.array(x, copy=False)` now raises, out-of-range Python integers raise on scalar assignment instead of truncating, ragged sequences raise instead of producing an object array, and NEP 50 makes Python scalars weak, so `uint8_array + 100` stays `uint8` where it used to promote.
+
+  </Accordion>
+</Accordions>

@@ -1,0 +1,492 @@
+---
+title: Statistics and Selection
+description: Sorting and top-k selection, multi-key ordering, unique labels and counts, histograms, percentiles, correlation, normalization, and schedules.
+---
+
+Selection functions answer four questions about a batch: what order these rows go in, which `k` of them are the biggest, how many of each label there are, and where a value sits relative to the rest. Each returns indices or counts instead of values, and each turns on a convention you have to state: which axis is ordered, how ties break, which bin edge is closed.
+
+The reduction mechanics behind `axis=`, `keepdims=`, and `ddof=` live on [Ufuncs and Reductions](/ai/python/numpy/ufuncs-and-reductions). This page uses them and does not restate them.
+
+---
+
+## Sorting
+
+| Call                                | Returns                                    | Fully ordered     |
+| :---------------------------------- | :----------------------------------------- | :---------------- |
+| `np.sort(a, axis=-1, kind=None)`    | a sorted copy of the values                | yes               |
+| `np.argsort(a, axis=-1, kind=None)` | indices `idx` such that `a[idx]` is sorted | yes               |
+| `a.sort(axis=-1, kind=None)`        | `None`, with `a` reordered in place        | yes               |
+| `np.partition` / `np.argpartition`  | copy / indices with element `kth` placed   | only around `kth` |
+
+`argsort` is the call that keeps a batch together: you order the score column and apply the returned indices to the feature rows, so both move as one. `np.sort` gives ordered values and discards which row each came from.
+
+```python title="sort_versus_argsort.py"
+import numpy as np
+
+v = np.array([3.0, 1.0, 2.0])
+idx = np.argsort(v)
+print(np.sort(v).tolist(), v.tolist())     # [1.0, 2.0, 3.0] [3.0, 1.0, 2.0]
+print(idx.tolist(), v[idx].tolist())       # [1, 2, 0] [1.0, 2.0, 3.0]
+
+m = np.array([[3.0, 1.0, 2.0], [6.0, 5.0, 4.0]])
+print(np.sort(m, axis=1).tolist())         # [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+print(np.sort(m, axis=0).tolist())         # [[3.0, 1.0, 2.0], [6.0, 5.0, 4.0]]
+print(np.argsort(m, axis=0).tolist())      # [[0, 0, 0], [1, 1, 1]]
+flat = np.sort(m, axis=None)
+print(flat.ndim, flat.tolist())            # 1 [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+print(np.take_along_axis(m, np.argsort(m, axis=1), axis=1).tolist())
+# [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+```
+
+`axis=-1` orders each row on its own. `axis=0` orders each column, and the indices are positions within that column, so applying them takes `np.take_along_axis` instead of plain indexing. `axis=None` flattens first and returns a 1-D array.
+
+### Algorithm choice
+
+| `kind=`                 | Worst case       | Extra space      | Stable |
+| :---------------------- | :--------------- | :--------------- | :----- |
+| `'quicksort'` (default) | `O(n log n)`     | 0                | no     |
+| `'heapsort'`            | `O(n log n)`     | 0                | no     |
+| `'mergesort'`           | `O(n log n)`     | about `n/2`      | yes    |
+| `'stable'`              | depends on dtype | depends on dtype | yes    |
+
+Those are the properties `numpy.sort`'s notes print. The table in that docstring still lists `'quicksort'` at `O(n^2)`, and the notes below it say the implementation is introsort, whose worst case is `O(n log n)`. `'mergesort'` and `'stable'` both reach timsort or radix sort depending on the dtype. The four names above are the whole accepted set: `np.sort(a, kind='timsort')` raises `ValueError: sort kind must be one of 'quick', 'heap', or 'stable' (got 'timsort')`. A boolean `stable=`, marked `versionadded 2.0.0` in the same docstring, asks for stability without naming an algorithm, and passing it with `kind=` raises.
+
+A <Tip term="stable sort">A sort that leaves elements comparing as equal in the order they appeared in the input.</Tip> is what makes a second sort safe. Order by the secondary key first, then by the primary key with a stable algorithm, and the ties keep the first ordering:
+
+```python title="stability.py"
+import numpy as np
+
+score = np.array([0.95, 0.80, 0.80, 0.80, 0.95])
+item = np.array([101, 102, 103, 104, 105])
+
+quick = np.argsort(-score)
+stable = np.argsort(-score, kind='stable')
+print(quick.tolist(), item[quick].tolist())    # [0, 4, 2, 1, 3] [101, 105, 103, 102, 104]
+print(stable.tolist(), item[stable].tolist())  # [0, 4, 1, 2, 3] [101, 105, 102, 103, 104]
+print(np.argsort(-score, stable=True).tolist())        # [0, 4, 1, 2, 3]
+by_item = np.argsort(item, kind='stable')
+ranked = by_item[np.argsort(-score[by_item], kind='stable')]
+print(item[ranked].tolist(), score[ranked].tolist())
+# [101, 105, 102, 103, 104] [0.95, 0.95, 0.8, 0.8, 0.8]
+```
+
+The default `'quicksort'` scrambles the three equal scores; the stable sort keeps `102, 103, 104` in input order, so the second key survives. Reversing an index array with `[::-1]` reverses the tie order too, which is why a descending sort built by reversal hands back ties in the opposite sequence from the ascending one.
+
+### Descending order
+
+```python title="descending_and_inplace.py"
+import numpy as np
+
+v = np.array([0.3, 1.2, 0.7])
+print(np.sort(v)[::-1].tolist())        # [1.2, 0.7, 0.3]
+print(v[np.argsort(-v)].tolist())       # [1.2, 0.7, 0.3]
+
+u = np.array([1, 2, 255], dtype=np.uint8)
+print(np.sort(-u).tolist(), np.argsort(-u).tolist())    # [1, 254, 255] [2, 1, 0]
+print(np.sort(u)[::-1].tolist())        # [255, 2, 1]
+
+a = np.array([3.0, 1.0, 2.0])
+result = a.sort()
+print(a.tolist(), result)               # [1.0, 2.0, 3.0] None
+try:
+    np.sort(a, inplace=False)
+except TypeError as exc:
+    print(exc)
+# sort() got an unexpected keyword argument 'inplace'
+```
+
+Negating the key is the shorter route and it is wrong for unsigned integers: `-u` wraps modulo 256 with no warning, so `255` becomes `1` and ranks first. The same wrap hits the most negative value of any signed dtype, where `int8` `-128` negates back to `-128`. Reverse the sorted result when the dtype is an integer you inherited.
+
+<Callout type="warn">
+  ### The method returns None
+
+`x = x.sort()` reorders the array and then assigns `None` to the name, which surfaces later as `TypeError: 'NoneType' object is not subscriptable`. The method is the only in-place form here: this build has no `inplace=` keyword on `np.sort`, as the `TypeError` above shows. Use `np.sort(x)` whenever the original order still has readers.
+
+</Callout>
+
+---
+
+## Top-k without sorting
+
+A full sort orders every element, which is more than a <Tip term="top-k">The k highest-scoring items of a batch, used for top-k accuracy, retrieval depth, and beam width.</Tip> question asks. You want the `k` winners and nothing about the order of the rest, and `np.argpartition` is exactly that weaker promise.
+
+| Goal                       | Call                            | Documented cost         |
+| :------------------------- | :------------------------------ | :---------------------- |
+| Everything ranked          | `np.argsort(x)`                 | `O(n log n)` worst case |
+| The `k` biggest, unordered | `np.argpartition(x, -k)[-k:]`   | `O(n)` worst case       |
+| The `k` biggest, ranked    | that plus a sort over `k` items | `O(n + k log k)`        |
+
+The costs are the ones NumPy prints for each algorithm: `introselect`, which backs `partition`, is listed at `O(n)` worst case with no extra workspace, and every `sort` kind sits at `O(n log n)`. They are documentation, not measurements from this machine.
+
+```python title="partition_and_top_k.py"
+import numpy as np
+
+x = np.array([3, 1, 5, 2, 7])
+ap = np.argpartition(x, 3)
+print(ap.tolist(), ap[:3].tolist())     # [1, 3, 0, 2, 4] [1, 3, 0]
+print(x[ap[:3]].tolist())               # [1, 2, 3]
+print(np.partition(x, 3)[3], np.sort(x)[3])     # 5 5
+
+probs = np.array([
+    [0.05, 0.30, 0.35, 0.25, 0.05],
+    [0.40, 0.10, 0.05, 0.35, 0.10],
+    [0.02, 0.03, 0.05, 0.10, 0.80],
+    [0.12, 0.30, 0.28, 0.20, 0.10],
+])
+labels = np.array([1, 3, 4, 0])
+
+for k in (1, 2, 3):
+    cand = np.argpartition(probs, -k, axis=1)[:, -k:]
+    hits = (cand == labels[:, None]).any(axis=1)
+    ranked = (np.argsort(-probs, axis=1)[:, :k] == labels[:, None]).any(axis=1)
+    print(k, cand.tolist(), hits.mean(), np.array_equal(hits, ranked))
+# 1 [[2], [0], [4], [1]] 0.25 True
+# 2 [[1, 2], [3, 0], [3, 4], [2, 1]] 0.75 True
+# 3 [[3, 1, 2], [4, 3, 0], [2, 3, 4], [3, 2, 1]] 0.75 True
+
+cand = np.argpartition(probs, -2, axis=1)[:, -2:]
+vals = np.take_along_axis(probs, cand, axis=1)
+print(vals.tolist())                    # [[0.3, 0.35], [0.35, 0.4], [0.1, 0.8], [0.28, 0.3]]
+print(np.take_along_axis(cand, np.argsort(-vals, axis=1), axis=1).tolist())
+# [[2, 1], [0, 3], [4, 3], [1, 2]]
+```
+
+The promise is local: element `kth` lands where it would in the fully sorted array, everything to its left is less than or equal, everything to its right is greater than or equal. `[1, 3, 0]` is the three smallest and their order is whatever the selection pass left behind, which is the whole point of partitioning and the reason the next step is yours. Top-`k` accuracy only asks whether the true label is in the candidate set, so the weak promise is enough for the metric and the re-ranking is a separate, smaller job. Top-3 buys nothing over top-2 here, which is what a saturated metric looks like. Partitioning along anything but the last axis makes temporary copies, a note in `numpy.partition`, so a row-wise top-`k` is cheapest when the class axis is last.
+
+---
+
+## Multi-key ordering
+
+`np.lexsort` takes a sequence of keys and sorts by them innermost-first: the **last** key in the tuple is the primary one. It is always stable, which replaces the two-pass recipe with one call.
+
+```python title="lexsort.py"
+import numpy as np
+
+label = np.array([1, 0, 1, 0, 1])
+score = np.array([0.9, 0.4, 0.1, 0.7, 0.5])
+
+order = np.lexsort((-score, label))
+print(order.tolist())                   # [3, 1, 0, 4, 2]
+print(label[order].tolist())            # [0, 0, 1, 1, 1]
+print(score[order].tolist())            # [0.7, 0.4, 0.9, 0.5, 0.1]
+
+ties = np.array([0.95, 0.80, 0.80, 0.80, 0.95])
+item = np.array([101, 102, 103, 104, 105])
+two = np.lexsort((item, -ties))
+print(two.tolist(), item[two].tolist())   # [0, 4, 1, 2, 3] [101, 105, 102, 103, 104]
+print(np.array_equal(two, np.argsort(-ties, kind='stable')))    # True
+```
+
+Class `0` comes out first and the scores descend inside each class because that key was negated. The result is indices, so every array that travels with the ordering gets indexed with them. Structured arrays use the opposite convention: `np.sort(a, order='field')` takes the **first** field as primary.
+
+---
+
+## Unique labels and counts
+
+`np.unique(ar, return_index=False, return_inverse=False, return_counts=False, axis=None, *, equal_nan=True, sorted=True)` returns the distinct values plus four optional companions.
+
+| Flag             | Adds        | What it is for                                      |
+| :--------------- | :---------- | :-------------------------------------------------- |
+| `return_index`   | first index | where each value first appears in the input         |
+| `return_inverse` | codes       | position of each input element within `values`      |
+| `return_counts`  | counts      | occurrences of each value, aligned with `values`    |
+| `axis`           | —           | treat 1-D subarrays along that axis as the elements |
+
+```python title="unique_returns_and_switches.py"
+import numpy as np
+
+y = np.array([7, 3, 7, 1, 3, 7])
+values, first, codes, counts = np.unique(
+    y, return_index=True, return_inverse=True, return_counts=True
+)
+print(values.tolist(), first.tolist())        # [1, 3, 7] [3, 1, 0]
+print(codes.tolist(), counts.tolist())        # [2, 1, 2, 0, 1, 2] [1, 2, 3]
+print(np.array_equal(values[codes], y))       # True
+
+tokens = np.array(['cat', 'dog', 'cat', 'bird', 'dog', 'cat'])
+vocab, vcodes = np.unique(tokens, return_inverse=True)
+print(vocab.tolist(), vcodes.tolist())        # ['bird', 'cat', 'dog'] [1, 2, 1, 0, 2, 1]
+print(np.array_equal(vocab[vcodes], tokens), np.bincount(vcodes, minlength=vocab.size).tolist())
+# True [1, 3, 2]
+
+nan_arr = np.array([np.nan, np.nan, 1.0])
+print(np.unique(nan_arr).tolist())                        # [1.0, nan]
+print(np.unique(nan_arr, return_counts=True)[1].tolist())  # [1, 2]
+print(np.unique(nan_arr, equal_nan=False).tolist())       # [1.0, nan, nan]
+
+cols = np.array([[3, 3], [1, 1], [4, 4]])
+print(np.unique(cols, axis=1).tolist())                   # [[3], [1], [4]]
+print(np.unique(y, sorted=False).tolist())                # [7, 3, 1]
+print(np.unique(y, sorted=False, return_inverse=True)[0].tolist())    # [1, 3, 7]
+```
+
+`return_inverse` is the labels-to-codes remap: dense positions into `values` that index a table of per-class statistics, with `values[codes]` rebuilding the original. It is the pair a tokenizer or a `LabelEncoder` hands back, and `np.bincount` on the codes gives class counts in one more call.
+
+The switches decide what counts as equal and whether the output gets ordered. `equal_nan=` (added in 1.24) collapses several `NaN`s into one value, which is what counting labels wants and counting missing data does not. `axis=1` deduplicates columns, `axis=0` rows, and `return_counts` aligns with either. `sorted=` arrived in 2.3 and skips the final sort; `numpy.unique` warns that elements "may be sorted in practice even if sorted=False", and the last two lines above show that caveat firing: the bare call is unordered, adding `return_inverse=True` makes the result come back sorted. Do not build logic on the unsorted order.
+
+---
+
+## Counting and histograms
+
+Which call to use depends on whether the labels are small non-negative integers.
+
+| Call                                               | Output length                | Accepts                    |
+| :------------------------------------------------- | :--------------------------- | :------------------------- |
+| `np.bincount(x, weights=None, *, minlength=0)`     | `max(x) + 1`, or `minlength` | non-negative integers, 1-D |
+| `np.histogram(x, bins, range=None, density=False)` | one count per bin            | any real values            |
+
+```python title="bincount.py"
+import numpy as np
+
+y = np.array([0, 1, 1, 3])
+print(np.bincount(y).tolist(), np.bincount(y, minlength=5).tolist())
+# [1, 2, 0, 1] [1, 2, 0, 1, 0]
+
+w = np.array([0.5, 0.25, 1.0, 2.0])
+counts = np.bincount(y, minlength=4)
+print(np.bincount(y, weights=w).tolist())               # [0.5, 1.25, 0.0, 2.0]
+print((np.bincount(y, weights=w) / np.maximum(counts, 1)).tolist())
+# [0.5, 0.625, 0.0, 2.0]
+try:
+    np.bincount(np.array([0, -1]))
+except ValueError as exc:
+    print(exc)
+# 'list' argument must have no negative elements
+```
+
+With `weights=`, `bincount` stops counting rows and starts summing a value per class, which is how a per-class mean becomes one division. `minlength=` pads the output to the class count the model has, so a class absent from the batch still occupies a slot. Float labels raise a `TypeError` about safe casting rather than rounding silently, and negative labels raise the `ValueError` above; remap them with `np.unique(..., return_inverse=True)` first.
+
+`np.histogram` counts into intervals:
+
+```python title="histogram.py"
+import numpy as np
+
+x = np.array([0.5, 1.5, 1.6, 2.4, 3.5, 3.5])
+counts, edges = np.histogram(x, bins=4)
+print(counts.tolist())                  # [1, 2, 1, 2]
+print(edges.tolist())                   # [0.5, 1.25, 2.0, 2.75, 3.5]
+print(counts.size, edges.size)          # 4 5
+
+fixed, fedges = np.histogram(x, bins=[0, 1, 2, 3, 4])
+print(fixed.tolist(), fedges.tolist())  # [1, 2, 1, 2] [0, 1, 2, 3, 4]
+print(np.histogram(np.array([0.0, 1.0, 2.0]), bins=[0, 1, 2])[0].tolist())    # [1, 2]
+
+dens, dedges = np.histogram(x, bins=4, density=True)
+print(dens.tolist())
+# [0.2222222222222222, 0.4444444444444444, 0.2222222222222222, 0.4444444444444444]
+print((dens * np.diff(dedges)).sum())   # 1.0
+```
+
+`n` bins come back with `n + 1` edges because the edges are boundaries and the last bin needs a right side. Bins are half-open `[a, b)` except the last, which is closed, so `2.0` lands in `[1, 2]` and the maximum is never dropped. An integer `bins` spreads edges over the observed min and max; `range=(0, 6)` spreads them over an interval you supply, which is how two batches share one histogram.
+
+<Tip term="density">
+  Histogram counts divided by the total count and the bin width, so the bars integrate to 1 instead
+  of summing to n.
+</Tip>
+With `density=True` the check is `(counts * np.diff(edges)).sum() == 1.0`, printed above: wide bars
+get shortened, so unequal widths stay comparable. Per-bin statistics need the edges back, and
+`np.digitize` maps values to bin numbers; it is on [Indexing and
+Slicing](/ai/python/numpy/indexing-and-slicing) with `searchsorted`.
+
+---
+
+## Distribution shape
+
+| Call                       | Answers                                         | Notes                                 |
+| :------------------------- | :---------------------------------------------- | :------------------------------------ |
+| `np.percentile(x, q)`      | value below which `q` percent of the data falls | `q` in `0` to `100`                   |
+| `np.quantile(x, q)`        | the same with `q` a fraction                    | `q` in `0` to `1`, accepts a list     |
+| `np.median(x)`             | the 50 percent point                            | equals `percentile(x, 50)` by default |
+| `np.average(x, weights=w)` | weighted mean                                   | no `ddof`, no shape inference         |
+| `np.cov(m)`                | covariance matrix                               | rows are variables by default         |
+| `np.corrcoef(m)`           | correlation matrix                              | same row convention                   |
+
+```python title="percentiles_and_weights.py"
+import numpy as np
+import warnings
+
+x = np.array([1.0, 2.0, 3.0, 4.0])
+print(np.percentile(x, 50), np.quantile(x, 0.5), np.median(x))   # 2.5 2.5 2.5
+print(np.percentile(x, [25, 50, 75]).tolist())                   # [1.75, 2.5, 3.25]
+methods = ['lower', 'higher', 'midpoint', 'nearest']
+print([np.percentile(x, 50, method=m).item() for m in methods])  # [2.0, 3.0, 2.5, 3.0]
+print(np.percentile(np.array([1, 2, 3, 4, 5]), 50, method='linear'))      # 3.0
+
+v = np.array([1.0, 2.0, 3.0])
+print(np.average(v, weights=[0.1, 0.2, 0.7]))     # 2.5999999999999996
+print(np.average(v, weights=[1, 1, 2], returned=True))    # (np.float64(2.25), np.float64(4.0))
+rows = np.array([[1.0, 2.0], [3.0, 4.0]])
+print(np.average(rows, axis=0, weights=[1.0, 3.0]).tolist())     # [2.5, 3.5]
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    np.percentile(x, 50, interpolation='lower')
+print(caught[0].category.__name__, str(caught[0].message).splitlines()[0])
+# DeprecationWarning the `interpolation=` argument to percentile was renamed to `method=`, which has additional options.
+```
+
+`percentile` and `quantile` are one function with different units on the request. When the point falls between two samples, `method=` picks the rule: the four discontinuous options above are NumPy's own additions to the nine Hyndman & Fan estimators its docs list, and `'linear'` is the default. `interpolation=` is the old name, deprecated since 1.22 and still accepted on this build with the warning above.
+
+Weights do not need to sum to one; `np.average` normalizes them, and `returned=True` gives back the sum it divided by. A weight vector whose length does not match the axis being reduced is a `TypeError` asking for `axis=`.
+
+```python title="covariance_and_correlation.py"
+import numpy as np
+
+m = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+print(np.cov(m).tolist())                    # [[1.0, 1.0], [1.0, 1.0]]
+print(np.cov(m.T, rowvar=False).tolist())    # [[1.0, 1.0], [1.0, 1.0]]
+print(np.corrcoef(m).tolist())               # [[1.0, 1.0], [1.0, 1.0]]
+print(np.corrcoef([[1, 2], [2, 4]])[0, 1])   # 0.9999999999999999
+
+with np.errstate(invalid='ignore'):
+    flat = np.corrcoef(np.array([[1.0, 2.0, 3.0], [5.0, 5.0, 5.0]]))
+print(flat.tolist())                         # [[1.0, nan], [nan, nan]]
+```
+
+Both read **rows as variables and columns as observations**, the opposite of the `(samples, features)` layout scikit-learn and PyTorch use, so pass `rowvar=False` for a feature table or transpose once and say which. Perfectly collinear integers give `0.9999999999999999`, which is why correlation gets compared to a threshold and not with `== 1`. A zero-variance row divides by its own standard deviation and produces `NaN` off the diagonal; `np.errstate` is the reductions page's topic.
+
+---
+
+## Normalization recipes
+
+Four shapes of one request: put numbers on a common scale without letting the statistics cross the axis that separates samples.
+
+| Recipe               | Formula                                        | Along                                  |
+| :------------------- | :--------------------------------------------- | :------------------------------------- |
+| z-score              | `(x - mean) / std`                             | per row here, per feature in a dataset |
+| min-max              | `(x - min) / (max - min)`                      | per row or per feature                 |
+| L2 row normalization | `x / np.linalg.norm(x, axis=1, keepdims=True)` | each row                               |
+| Label smoothing      | `(1 - eps) * onehot + eps / n_classes`         | the class axis                         |
+
+```python title="scale_rows.py"
+import numpy as np
+
+X = np.array([[1.0, 2.0, 3.0], [10.0, 20.0, 30.0], [5.0, 5.0, 5.0]])
+mu = X.mean(axis=1, keepdims=True)
+sd = X.std(axis=1, keepdims=True)
+Z = (X - mu) / np.where(sd == 0, 1.0, sd)
+print(Z.tolist())
+# [[-1.224744871391589, 0.0, 1.224744871391589], [-1.224744871391589, 0.0, 1.224744871391589], [0.0, 0.0, 0.0]]
+print(Z.mean(axis=1).tolist(), Z.std(axis=1).tolist())
+# [0.0, 0.0, 0.0] [0.9999999999999999, 0.9999999999999999, 0.0]
+
+lo = X.min(axis=1, keepdims=True)
+hi = X.max(axis=1, keepdims=True)
+S = (X - lo) / np.where(hi == lo, 1.0, hi - lo)
+print(S.tolist())
+# [[0.0, 0.5, 1.0], [0.0, 0.5, 1.0], [0.0, 0.0, 0.0]]
+```
+
+`keepdims=True` is what lets the statistics broadcast back against `X`; without it the reduction drops the axis and rows pair with the wrong columns. Guarding `sd` keeps a constant feature at zeros instead of `NaN`, and the third row shows that outcome. Standardizing with statistics computed on the test set is a leak; the same subtraction with training statistics is a deployment step.
+
+Min-max divides by the extremes it just subtracted, so one outlier flattens everything else toward zero. It suits pixel data and hurts heavy-tailed features.
+
+```python title="l2_and_label_smoothing.py"
+import numpy as np
+
+E = np.array([[3.0, 4.0], [0.0, 0.0], [1.0, 1.0]])
+n = np.linalg.norm(E, axis=1, keepdims=True)
+U = E / np.where(n == 0, 1.0, n)
+print(n.ravel().tolist())        # [5.0, 0.0, 1.4142135623730951]
+print(U.tolist())
+# [[0.6, 0.8], [0.0, 0.0], [0.7071067811865475, 0.7071067811865475]]
+print(U[0] @ U[2])               # 0.9899494936611665
+
+y = np.array([0, 4, 2])
+onehot = np.zeros((y.size, 5))
+onehot[np.arange(y.size), y] = 1.0
+eps = 0.1
+smoothed = (1 - eps) * onehot + eps / onehot.shape[1]
+print(smoothed.tolist())
+# [[0.92, 0.02, 0.02, 0.02, 0.02], [0.02, 0.02, 0.02, 0.02, 0.92], [0.02, 0.02, 0.92, 0.02, 0.02]]
+print(smoothed.sum(axis=1).tolist())        # [1.0, 1.0, 1.0]
+```
+
+After the division every non-zero row has length one, so a dot product between two of them is cosine similarity: `U[0] @ U[2]` depends on the angle between the embeddings and not their magnitudes. That is the normalization behind embedding retrieval and cosine classifiers, with the norm identities on [Similarity and Norms](/ai/math-foundations/similarity-and-norms).
+
+<Tip term="label smoothing">
+  Blending a fraction of the uniform distribution into a one-hot target, so the model is never asked
+  to put probability 1 on one class.
+</Tip>
+Rows still sum to one, the target class keeps `1 - eps`, and `eps` spreads over all `n_classes`
+slots including the true one. The scatter that builds `onehot` is from [The
+ndarray](/ai/python/numpy/the-ndarray); softmax and cross-entropy mechanics are on [Softmax and
+Logits](/ai/math-foundations/softmax-and-logits).
+
+---
+
+## Piecewise and interpolated schedules
+
+`np.interp` evaluates a piecewise-linear function given by breakpoints, which is a warmup ramp in one call. `np.select` and `np.piecewise` build the stepped and curved decays that follow it.
+
+```python title="warmup_and_decay.py"
+import numpy as np
+
+step = np.arange(10)
+ramp = np.interp(step, [0, 4], [0.0, 1.0])
+print(ramp.tolist())
+# [0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+print((0.1 * ramp).tolist())
+# [0.0, 0.025, 0.05, 0.07500000000000001, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+print(np.interp([-1, 2, 6], [0, 4], [0.0, 1.0]).tolist())        # [0.0, 0.5, 1.0]
+print(np.interp([-1, 2, 6], [0, 4], [0.0, 1.0], left=0.02, right=0.5).tolist())
+# [0.02, 0.5, 0.5]
+
+progress = np.linspace(0, 1, 9)
+stairs = np.select(
+    [progress < 0.3, progress < 0.6, progress < 0.9],
+    [1.0, 0.5, 0.1],
+    default=0.01,
+)
+print(np.round(progress, 3).tolist(), stairs.tolist())
+# [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0] [1.0, 1.0, 1.0, 0.5, 0.5, 0.1, 0.1, 0.1, 0.01]
+
+cosine = np.piecewise(
+    progress,
+    [progress < 0.1],
+    [0.1, lambda x: 0.1 * 0.5 * (1 + np.cos(np.pi * (x - 0.1) / 0.9))],
+)
+print(np.round(cosine, 4).tolist())
+# [0.1, 0.0998, 0.0933, 0.0787, 0.0587, 0.0371, 0.0179, 0.0047, 0.0]
+```
+
+Breakpoints must increase, and outside them `np.interp` clamps to the first and last value unless you set `left=` and `right=`. A floor learning rate during warmup is the usual reason to set `left=`, since a ramp starting at exactly `0.0` makes the first updates do nothing. The `0.07500000000000001` is ordinary float multiplication: compare schedule values with a tolerance.
+
+`np.select` walks the conditions in order and takes the first match, so the `progress < 0.6` arm never fires below `0.3` and the result reads as buckets; everything unmatched takes `default=`, and with `default=0` a silent zero segment appears. `np.piecewise` takes one scalar or callable per condition plus an optional trailing fallback, which is how a flat warmup feeds a cosine decay in one vectorized expression. Schedules wired into an optimizer are on [The Training Loop](/ai/pytorch/training-loop) and [Learning Rate Schedules](/ai/neural-networks/lr-schedules).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>What is the difference between <code>np.sort</code> and <code>np.argsort</code>?</>}>
+
+`np.sort` returns the values in order and loses which row each came from. `np.argsort` returns indices such that `a[idx]` is sorted, so applying `idx` reorders every parallel array the same way. `a.sort()` is the in-place method and returns `None`.
+
+  </Accordion>
+  <Accordion title="Which NumPy sort kinds are stable, and when does stability change the answer?">
+
+`'mergesort'` and `'stable'` are stable; the default `'quicksort'` and `'heapsort'` are not. Stability matters whenever equal keys are ordered by something else: a second sort pass, a row identity you want to preserve, or reproducibility, since an unstable tie order can differ between builds while the values stay identical.
+
+  </Accordion>
+  <Accordion title={<>When do you use <code>np.argpartition</code> instead of <code>np.argsort</code>, and what step does it still require?</>}>
+
+When you need the `k` best and nothing about the ranking of the rest. `np.argpartition(x, -k)[-k:]` is documented at `O(n)` worst case against `O(n log n)` for a full sort. The `k` winners come back unordered, so a ranked top-`k` list needs a second sort over those `k` items.
+
+  </Accordion>
+  <Accordion title={<>In <code>np.lexsort((a, b, c))</code>, which key is primary?</>}>
+
+`c`, the last one. The tuple runs least significant first, so `np.lexsort` reads like columns of a table ordered by `c`, then `b`, then `a`. It is always stable, and passing it a single key matches `kind='stable'` in `argsort`.
+
+  </Accordion>
+  <Accordion title={<>What does <code>np.bincount(y, minlength=K)</code> give that <code>np.unique(y, return_counts=True)</code> does not, and vice versa?</>}>
+
+`bincount` returns a dense array indexed by class id with a slot for every id up to `minlength`, so absent classes read as zero and metrics stay aligned with the model's width. It takes only non-negative integers and its length grows with the largest label. `unique` returns just the labels that occurred, so it handles sparse or arbitrary ids, and you map them to a fixed width yourself.
+
+  </Accordion>
+  <Accordion title={<>Why does <code>np.histogram</code> return <code>n + 1</code> edges for <code>n</code> bins, and what does <code>density=True</code> change?</>}>
+
+The edges are boundaries, and the last bin needs both a left and a right side. Bins are half-open except the last, which is closed. `density=True` divides each count by the total count and that bin's width, so the bars integrate to 1 and unequal widths stay comparable; check it with `(counts * np.diff(edges)).sum()`.
+
+  </Accordion>
+</Accordions>

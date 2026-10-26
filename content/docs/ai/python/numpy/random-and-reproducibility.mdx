@@ -1,0 +1,419 @@
+---
+title: Random and Reproducibility
+description: 'Generator versus the legacy global stream, bit generators, the ML distribution shortlist, SeedSequence spawning, and aligned shuffles.'
+---
+
+Two random-number APIs ship inside `numpy.random` and they do not share state. The old one is a set of module-level functions reading one process-global stream. The new one is an object you construct, hold, and pass into the functions that need randomness. Everything below uses the new API unless a line says otherwise, because the global stream is why a "reproducible" script stops being reproducible the moment it grows a second consumer.
+
+---
+
+## Two APIs, and which one to use
+
+```python title="two_apis.py"
+import numpy as np
+
+np.random.seed(0)
+print(np.random.randn(3).round(4).tolist())          # [1.7641, 0.4002, 0.9787]
+
+rng = np.random.default_rng(0)
+print(type(rng).__name__, type(rng.bit_generator).__name__)   # Generator PCG64
+print(rng.normal(size=3).round(4).tolist())          # [0.1257, -0.1321, 0.6404]
+
+np.random.seed(0)
+print(np.random.randn(3).round(4).tolist())          # [1.7641, 0.4002, 0.9787]
+print(np.random.default_rng(0).normal(size=3).round(4).tolist())   # [0.1257, -0.1321, 0.6404]
+```
+
+Each API replays its own sequence, which is the property you are buying. The two do not agree with each other: seed 0 gives `1.7641` first through the legacy path and `0.1257` through `Generator`, so a `np.random.seed` call never changes what a `Generator` produces.
+
+|                      | Legacy                                   | New                                                  |
+| :------------------- | :--------------------------------------- | :--------------------------------------------------- |
+| Handle               | module functions `np.random.normal`      | a `Generator` from `np.random.default_rng`           |
+| State                | one global `RandomState` for the process | one per object, yours to pass around                 |
+| Seeding              | `np.random.seed(int)` moves the global   | seed given at construction                           |
+| Seed range           | `int` in `[0, 2**32)`, larger raises     | any non-negative `int`, list, or `SeedSequence`      |
+| Bit generator        | MT19937, fixed                           | `PCG64` by default, swappable                        |
+| Cross-version stream | guaranteed frozen                        | no compatibility guarantee                           |
+| Uniform floats       | `random_sample()`, `rand(d0, d1)`        | `random(size)`, also `random((d0, d1))`              |
+| Integers             | `randint(low, high)`                     | `integers(low, high)`, adds `endpoint=` and `dtype=` |
+
+`np.random.seed(2**32)` raises `ValueError: Seed must be between 0 and 2**32 - 1`, while `np.random.default_rng(2**64 + 12345)` works, because the new seed goes through `SeedSequence` instead of becoming the state directly.
+
+Any code in your process that calls a `np.random.*` function reads and writes the same stream, so a draw you never made moves your numbers:
+
+```python title="global_stream.py"
+import numpy as np
+
+def dropout_mask(n):
+    return (np.random.random(n) < 0.5).tolist()      # reads the global stream
+
+np.random.seed(0)
+first = dropout_mask(4)
+np.random.random()                                   # another library drew one number
+second = dropout_mask(4)
+print(first, second, first == second)                # [False, False, False, False] [False, True, False, False] False
+
+a = np.random.default_rng(3).random(4).round(4).tolist()
+b = np.random.default_rng(3).random(4).round(4).tolist()
+print(a, a == b)                                     # [0.0856, 0.2368, 0.8013, 0.5822] True
+
+def add_noise(x, scale=0.1, rng=None):
+    rng = np.random.default_rng(rng)                 # a Generator passes through, None becomes a fresh one
+    return x + scale * rng.normal(size=x.shape)
+
+x = np.zeros(4)
+rng = np.random.default_rng(0)
+print(add_noise(x, rng=rng).round(4).tolist())       # [0.0126, -0.0132, 0.064, 0.0105]
+print(add_noise(x, rng=rng).round(4).tolist())       # [-0.0536, 0.0362, 0.1304, 0.0947]
+print(add_noise(x, rng=np.random.default_rng(0)).round(4).tolist())   # [0.0126, -0.0132, 0.064, 0.0105]
+print(np.random.default_rng(None).bit_generator.seed_seq.entropy !=
+      np.random.default_rng(None).bit_generator.seed_seq.entropy)     # True - no seed, no replay
+```
+
+That is the difference in tests. A test that seeds globally passes until another test, a fixture, or an import draws first, and then the failure moves when test order changes; two `default_rng(3)` objects are independent, so consuming one leaves the other alone. The library pattern is the `add_noise` signature above: take the generator as an argument and let `default_rng` normalize it, since it returns a `Generator` unchanged and builds one for `None`. Mixing the APIs in one file does not isolate you from the global stream, it only hides which numbers came from where, so keep your randomness in a `Generator` the legacy callers never see. `RandomState` still exists if you need a second legacy stream, and `np.random.default_rng(np.random.RandomState(0))` wraps one into a `Generator` so existing state carries forward.
+
+---
+
+## Bit generators
+
+A <Tip term="bit generator">The integer engine under a `Generator`. It emits raw 32- and 64-bit words; the `Generator` on top turns them into normals, integers, permutations, and the rest.</Tip> supplies the words and `Generator` turns them into distributions. `default_rng` picks `PCG64`, and the choice is worth revisiting only when you run many streams at once.
+
+| Bit generator | Period (documented) | `advance()` | `jumped()` | Documented notes                                           |
+| :------------ | :------------------ | :---------- | :--------- | :--------------------------------------------------------- |
+| `PCG64`       | `2**128`            | yes         | yes        | the default; `2**127` streams; state is two 128-bit values |
+| `PCG64DXSM`   | `2**128`            | yes         | yes        | "better statistical properties in parallel contexts"       |
+| `MT19937`     | Mersenne Twister    | no          | yes        | the Python stdlib engine, 624 32-bit words of state        |
+| `Philox`      | `2**256 - 1`        | yes         | yes        | counter-based; different keys give independent sequences   |
+| `SFC64`       | about `2**255`      | no          | no         | "usually the fastest generator of the four"                |
+
+Periods, state sizes, and the quoted notes come from NumPy's [bit generators page](https://numpy.org/doc/stable/reference/random/bit_generators/index.html) and the docstrings in this build. The `advance()` and `jumped()` columns are the methods that exist on the objects, printed below. `jumped()` returns a **new** bit generator at the state you would reach after `2**128` draws, so two streams cannot overlap; `advance(n)` moves the same object forward `n` steps.
+
+```python title="bit_generators.py"
+import numpy as np
+
+print(type(np.random.default_rng(0).bit_generator).__name__)    # PCG64
+
+for name in ("PCG64", "PCG64DXSM", "MT19937", "Philox", "SFC64"):
+    bg = getattr(np.random, name)(0)
+    rng = np.random.Generator(bg)
+    print(f"{name:<10} {rng.normal(size=3).round(4).tolist()}"
+          f" advance={hasattr(bg, 'advance')} jumped={hasattr(bg, 'jumped')} spawn={hasattr(bg, 'spawn')}")
+# PCG64      [0.1257, -0.1321, 0.6404] advance=True jumped=True spawn=True
+# PCG64DXSM  [1.1375, 0.5382, 0.3819] advance=True jumped=True spawn=True
+# MT19937    [-0.6252, -0.5969, 0.1391] advance=False jumped=True spawn=True
+# Philox     [-0.206, -0.1288, -0.2898] advance=True jumped=True spawn=True
+# SFC64      [-0.5424, -0.7333, -0.2993] advance=False jumped=False spawn=True
+
+bg = np.random.Philox(0)
+print(np.random.Generator(bg).random(3).round(4).tolist())           # [0.0141, 0.2578, 0.4716]
+print(np.random.Generator(bg.jumped()).random(3).round(4).tolist())  # [0.1683, 0.8813, 0.1923]
+```
+
+Every bit generator has `spawn(n)`, which gets you `n` independent engines from one seed without any jump arithmetic. Sharing one generator across threads is the case where the `lock` attribute on a bit generator exists, and `Generator` does not take it for you: give each thread its own spawned stream.
+
+<Callout type="info">
+  ### When PCG64 stops being the right default
+
+[Upgrading PCG64 with PCG64DXSM](https://numpy.org/doc/stable/reference/random/upgrading-pcg64.html) documents a statistical weakness in `PCG64` under many randomly-initialized parallel streams. By the numbers on that page, thousands of spawned streams is negligibly small, and only millions of streams each drawing heavily is where the recommendation becomes `PCG64DXSM`, `SFC64`, or `Philox`. The same page says `PCG64DXSM` "will eventually become the new default". A single `Generator` in a single process is unaffected.
+
+</Callout>
+
+---
+
+## The distributions that matter in ML
+
+| Need                                  | Call                               | Parameterization                                       |
+| :------------------------------------ | :--------------------------------- | :----------------------------------------------------- |
+| Gaussian noise, known mean and spread | `rng.normal(loc, scale, size)`     | mean and standard deviation, not variance              |
+| Standard normal                       | `rng.standard_normal(size)`        | no loc or scale; one `size` argument                   |
+| Uniform floats                        | `rng.uniform(low, high, size)`     | half-open, `high` excluded                             |
+| Uniform doubles in `[0, 1)`           | `rng.random(size)`                 | no `low` or `high`; legacy spelling is `random_sample` |
+| Integer indices or ids                | `rng.integers(low, high, size)`    | `high` excluded unless `endpoint=True`                 |
+| Sample rows or columns                | `rng.choice(a, size, replace, p)`  | `a` is an array or an `arange` length                  |
+| Shuffled copy, or a shuffled `arange` | `rng.permutation(x)`               | `x` is an array or an int                              |
+| Shuffle in place                      | `rng.shuffle(x, axis=0)`           | returns `None`                                         |
+| Counts in categories, fixed trials    | `rng.multinomial(n, pvals, size)`  | `pvals` must sum to 1                                  |
+| Random probability vectors            | `rng.dirichlet(alpha, size)`       | one concentration parameter per category               |
+| Bounded ratio in `[0, 1)`             | `rng.beta(a, b, size)`             | two shape parameters                                   |
+| Waiting time, positive tail           | `rng.exponential(scale, size)`     | `scale` is the mean, that is, `1 / rate`               |
+| Count of rare events                  | `rng.poisson(lam, size)`           | `lam` is the mean count                                |
+| Multiplicative noise, prices, sizes   | `rng.lognormal(mean, sigma, size)` | parameters of the underlying normal                    |
+| Successes in `n` trials               | `rng.binomial(n, p, size)`         | trials and success probability                         |
+
+Two spelling traps when you port legacy code. Legacy shape arguments are separate dimensions, `np.random.randn(2, 3)` and `np.random.rand(2, 3)`, while a `Generator` wants one `size` that is an int or a tuple, so `rng.standard_normal(2, 3)` fails with `TypeError: Cannot interpret '3' as a data type`: `2` was read as the size and `3` as a dtype. And `rng.normal(loc, scale, size)` keeps legacy's order, so `rng.normal(0.0, 1.0, (2, 3))` is a standard normal of that shape.
+
+```python title="distributions.py"
+import numpy as np
+
+print(np.random.default_rng(0).normal(2.0, 0.5, (2, 3)).round(4).tolist())
+# [[2.0629, 1.9339, 2.3202], [2.0525, 1.7322, 2.1808]]
+print(np.random.default_rng(0).standard_normal((2, 3)).round(4).tolist())
+# [[0.1257, -0.1321, 0.6404], [0.1049, -0.5357, 0.3616]]
+print(np.random.default_rng(0).uniform(-1.0, 1.0, 4).round(4).tolist())   # [0.2739, -0.4604, -0.9181, -0.9669]
+print(np.random.default_rng(0).random((2, 3)).round(4).tolist())          # [[0.637, 0.2698, 0.041], [0.0165, 0.8133, 0.9128]]
+print(np.random.default_rng(1).integers(0, 3, 6).tolist())                # [1, 1, 2, 2, 0, 0]
+print(np.random.default_rng(1).integers(0, 3, 6, endpoint=True).tolist())   # [1, 2, 3, 3, 0, 0]
+print(np.random.default_rng(0).choice(np.arange(10), 3, replace=False).tolist())   # [5, 9, 6]
+print(np.random.default_rng(0).poisson(3.0, 6).tolist())                  # [2, 0, 7, 1, 4, 1]
+print(np.random.default_rng(0).binomial(10, 0.3, 3).tolist())             # [3, 2, 1]
+print(np.random.default_rng(0).exponential(2.0, 3).round(4).tolist())     # [1.3599, 2.0392, 0.0396]
+print(np.random.default_rng(0).lognormal(0.0, 0.5, 3).round(4).tolist())   # [1.0649, 0.9361, 1.3774]
+print(np.random.default_rng(0).beta(2, 5, (2, 2)).round(4).tolist())
+# [[0.2286, 0.1165], [0.2095, 0.0415]]
+print(np.random.default_rng(0).dirichlet([1.0, 1.0, 1.0], 2).round(4).tolist())
+# [[0.3955, 0.593, 0.0115], [0.001, 0.2522, 0.7468]]
+print(np.random.default_rng(0).multinomial(10, [0.5, 0.5], 2).tolist())    # [[6, 4], [4, 6]]
+```
+
+`integers` is high-exclusive by default and so is legacy `randint`: `default_rng(1).integers(0, 3, 6)` and `np.random.randint(0, 3, 6)` under `np.random.seed(1)` both stay in `0`, `1`, `2`. They differ in values, not in the endpoint, and only `integers` takes `endpoint=True` or `dtype=`. The one-argument form is the range, so `rng.integers(3)` draws `0`, `1`, or `2`. Weight initialization wants `normal` and `uniform` at a scale derived from the fan-in, which is on [Layers and Initialization](/ai/neural-networks/layers-and-initialization).
+
+---
+
+## Seeding correctly
+
+A fixed integer seed is correct for a script that runs in one process. It is wrong the moment the same line runs in several processes, which is what a `DataLoader` with workers, a DDP launch, or a job array does.
+
+```python title="seed_sequence.py"
+import numpy as np
+
+streams = [np.random.default_rng(0).random(3).round(4).tolist() for _ in range(3)]
+print(len({tuple(s) for s in streams}), streams[0])     # 1 [0.637, 0.2698, 0.041]
+
+base = np.random.SeedSequence(0x87351080E25CB0FAD77A44A3BE03B491)
+print(hex(base.entropy))                               # 0x87351080e25cb0fad77a44a3be03b491
+children = base.spawn(3)
+print(len(children), type(children[0]).__name__, [c.spawn_key for c in children])
+# 3 SeedSequence [(0,), (1,), (2,)]
+
+for child in children:
+    print(np.random.Generator(np.random.PCG64(child)).random(3).round(4).tolist())
+# [0.5362, 0.3685, 0.7635]
+# [0.395, 0.2222, 0.3072]
+# [0.8526, 0.4616, 0.6104]
+
+rng = np.random.default_rng(0)
+kids = rng.spawn(2)
+print([k.random(2).round(4).tolist() for k in kids])    # [[0.9429, 0.3163], [0.6772, 0.243]]
+print(rng.random(2).round(4).tolist())                  # [0.637, 0.2698] - parent stream unmoved
+print([k.random(2).round(4).tolist() for k in kids] != [k.random(2).round(4).tolist()
+      for k in rng.spawn(2)])                           # True - spawning twice gives the next pair
+```
+
+Three processes seeded with `0` share one stream, so every worker applies the same augmentation to a different slice of the batch. `SeedSequence` fixes that. <Tip term="entropy">The seed material a `SeedSequence` is built from: an arbitrary-precision integer or a list of them, hashed out into one high-quality state per stream.</Tip> Hold one parent entropy, call `spawn(n)` for `n` children, and hand each child to a process, thread, or rank. The children are distinct and derived from the same parent, so one logged number still describes the whole run. `np.random.SeedSequence()` with no argument pulls 128 bits of OS entropy and exposes it as `.entropy`, which is the pattern the docs recommend: default to fresh entropy, print it, accept it as a flag on a rerun. They also advise against seeds below 32 bits for results you will publish, while a fixed small seed for a unit test is fine.
+
+`Generator.spawn(n)` does the same thing one level up and leaves the parent's own draws alone. The last line above is the trap: each `spawn` call extends the parent's `spawn_key`, so calling it twice on a live object returns the next children rather than the same ones. Rebuild the parent from its logged entropy and spawn once when you need the exact worker set back.
+
+<Callout type="warn">
+  ### A pinned seed reproduces on a pinned version
+
+NumPy's `Generator` docstring says it directly: "does not provide a version compatibility guarantee. In particular, as better algorithms evolve the bit stream may change." Each bit generator guarantees only that a fixed seed yields the same integer stream, and the distribution methods on top are free to change algorithm. `RandomState` is documented as "effectively frozen". Log `np.__version__` next to the seed, and treat an unpinned environment as one where the numbers can move even though the seed did not.
+
+</Callout>
+
+---
+
+## Sampling a dataset
+
+Minibatch epochs are permutations, class balancing is a probability vector, augmentation is a parameter draw per sample, and a bootstrap is a choice with replacement.
+
+```python title="epoch_sampling.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+n, batch_size = 1000, 128
+
+order = rng.permutation(n)
+print(order.shape, order[:8].tolist())                  # (1000,) [459, 206, 222, 162, 711, 814, 350, 890]
+print(np.bincount(order, minlength=n).min(), np.bincount(order, minlength=n).max())   # 1 1
+
+batches = [order[i : i + batch_size] for i in range(0, n, batch_size)]
+print(len(batches), [b.size for b in batches[:3]], batches[-1].size)                  # 8 [128, 128, 128] 104
+print(np.array_equal(order, rng.permutation(n)))        # False - next epoch is a new order
+```
+
+One `permutation` per epoch, sliced into batches, gives every sample exactly once per pass in a new order. `np.bincount(order, minlength=n)` coming back all ones is the cheap assertion that you built a partition rather than a resample; `bincount` is on [Statistics and Selection](/ai/python/numpy/statistics-and-selection).
+
+```python title="class_balanced.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+labels = np.concatenate([np.zeros(800, int), np.ones(150, int), np.full(50, 2)])
+print(np.bincount(labels, minlength=3).tolist())        # [800, 150, 50]
+print(np.bincount(rng.choice(labels, 1000), minlength=3).tolist())   # [789, 152, 59]
+
+pools = [np.flatnonzero(labels == c) for c in range(3)]
+idx = np.concatenate([rng.choice(p, 40, replace=False) for p in pools])
+print(np.bincount(labels[idx], minlength=3).tolist(), np.bincount(idx, minlength=labels.size).max())
+# [40, 40, 40] 1
+
+counts = np.bincount(labels, minlength=3)
+probs = (1.0 / counts[labels]) / (1.0 / counts[labels]).sum()
+print(np.bincount(labels[rng.choice(labels.size, 300, p=probs)], minlength=3).tolist())   # [94, 102, 104]
+```
+
+Sampling rows keeps the mix you have, so imbalance needs `p=` or a per-class pool. The weighted path samples with replacement by default, which is why 300 draws land at 94, 102, 104 rather than 100 each. `replace=False` with a probability vector is legal but slower, because weighted sampling without replacement is a different algorithm. For an exact per-class count, draw from each class's own index pool and rely on the pools being disjoint, which the `max()` of 1 confirms.
+
+```python title="augment_and_bootstrap.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+n = 6
+print(rng.uniform(0.8, 1.25, n).round(4).tolist())      # [1.0866, 0.9214, 0.8184, 0.8074, 1.166, 1.2107]
+print((rng.random(n) < 0.5).tolist())                   # [False, False, False, False, False, True]
+print(rng.normal(1.0, 0.05, n).round(4).tolist())       # [0.8837, 0.9891, 0.9377, 0.9634, 0.9728, 0.9842]
+print(rng.uniform(-15, 15, n).round(2).tolist())        # [-6.01, -2.32, -14.15, -11.27, 5.12, 4.42]
+
+boot = np.random.default_rng(0).choice(np.arange(200), size=200, replace=True)
+counts = np.bincount(boot, minlength=200)
+print(boot.size, np.unique(boot).size, int((counts == 0).sum()), int(counts.max()))   # 200 131 69 5
+```
+
+Augmentation is four vectorized calls for six images rather than a loop with a `random` module call per image. Draw all the parameters for the batch first, then apply them, and one seed replays the whole augmentation.
+
+A <Tip term="bootstrap sample">A draw of `n` items from a pool of `n` with replacement. Each item is left out with probability about `1 - 1/e`, so roughly 37 percent of the pool never appears.</Tip> kept 131 of 200 rows and repeated one of them five times. The 69 rows never picked are the <Tip term="out-of-bag sample">The part of the pool a bootstrap draw never selected, usable as a free validation split for a model fit on the bootstrap.</Tip>, which is the point of `replace=True`: training set and check set come out of one draw.
+
+---
+
+## Shuffle and order
+
+`rng.shuffle` writes through and returns `None`. `rng.permutation` returns a new array. Both consume the stream, so a shuffle you did not expect still moves your numbers.
+
+```python title="shuffle.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+X = np.arange(10).reshape(5, 2)
+
+copy = X.copy()
+print(rng.shuffle(copy), copy.tolist())                 # None [[4, 5], [8, 9], [6, 7], [0, 1], [2, 3]]
+print(X.tolist())                                       # [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9]]
+perm = rng.permutation(X)
+print(perm.tolist(), np.shares_memory(X, perm))         # [[8, 9], [2, 3], [4, 5], [0, 1], [6, 7]] False
+print(rng.permutation(5).tolist())                      # [0, 2, 3, 4, 1]
+
+lst = [1, 2, 3]
+rng.shuffle(lst)
+print(lst)                                              # [3, 2, 1] - lists work, nothing is returned
+try:
+    rng.shuffle((1, 2, 3))
+except TypeError as exc:
+    print("TypeError:", exc)                            # 'tuple' object does not support item assignment
+try:
+    rng.shuffle(np.array(5))
+except TypeError as exc:
+    print("TypeError:", exc)                            # len() of unsized object
+
+Z = np.arange(12).reshape(3, 4)
+rng2 = np.random.default_rng(3)
+rows, cols = Z.copy(), Z.copy()
+rng2.shuffle(rows)
+rng2.shuffle(cols, axis=1)
+print(rows.tolist())                                    # [[8, 9, 10, 11], [4, 5, 6, 7], [0, 1, 2, 3]]
+print(cols.tolist())                                    # [[2, 0, 3, 1], [6, 4, 7, 5], [10, 8, 11, 9]]
+print(np.argsort(cols[0]).tolist() == np.argsort(cols[2]).tolist())   # True - one column order for all rows
+```
+
+`shuffle` needs a length it can assign into, which rules out tuples and 0-d arrays, and a read-only array raises `ValueError: array is read-only`. The `axis=` argument decides what counts as one item: along `axis=0` rows move, along `axis=1` whole columns move together so every row keeps its own multiset of values and a feature stays one feature across samples.
+
+Features and labels live in different arrays, so the order has to be computed once and applied to each. Shuffling them independently scrambles the pairing while leaving each array individually uniform, so every marginal still looks right and the model simply learns worse.
+
+```python title="aligned_shuffle.py"
+import numpy as np
+
+rng = np.random.default_rng(0)
+X = np.arange(80).reshape(10, 8)
+y = X[:, 0] // 8                                        # label derived from the row, so misalignment shows
+
+bad_X, bad_y = X.copy(), y.copy()
+rng.shuffle(bad_X)
+rng.shuffle(bad_y)
+print(int((bad_X[:, 0] // 8 == bad_y).sum()))           # 1 of 10 pairs survives, by luck
+
+order = rng.permutation(len(X))
+Xs, ys = X[order], y[order]
+print(int((Xs[:, 0] // 8 == ys).sum()), np.shares_memory(X, Xs))   # 10 False
+X[:, :], y[:] = X[order], y[order]                      # same permutation written back in place
+```
+
+The recipe is one permutation, indexed twice. `X[order]` is fancy indexing and therefore a copy, with the axis-0 row semantics on [Indexing and Slicing](/ai/python/numpy/indexing-and-slicing). For arrays too large to copy, shuffle the index array only and let the loader gather rows per batch.
+
+---
+
+## Reproducibility across the stack
+
+NumPy is one of several streams in a training run. The torch rows are named for orientation and are not run here; that half lives on [Data Pipelines](/ai/pytorch/data-pipelines) and [Training Loop](/ai/pytorch/training-loop).
+
+| Layer              | Knob                                          | What it pins                                                                                   |
+| :----------------- | :-------------------------------------------- | :--------------------------------------------------------------------------------------------- |
+| NumPy, your code   | `np.random.default_rng(seed)`                 | every draw from that `Generator`                                                               |
+| NumPy, legacy code | `np.random.seed(seed)`                        | the process-global stream only                                                                 |
+| NumPy, workers     | `SeedSequence(seed).spawn(n)`                 | `n` independent child streams from one logged number                                           |
+| PyTorch            | `torch.manual_seed(seed)`                     | torch CPU and CUDA RNG, and per its docs the `random` and NumPy streams in the calling process |
+| PyTorch kernels    | `torch.use_deterministic_algorithms(True)`    | makes nondeterministic kernels raise; needs `CUBLAS_WORKSPACE_CONFIG=:4096:8`                  |
+| CUDA reductions    | atomics in scatter-add and some backwards     | nothing by default; accumulation order varies between runs                                     |
+| DataLoader         | `worker_init_fn` plus `generator=`            | per-worker seeds derived from `base_seed + worker_id`                                          |
+| Python             | `PYTHONHASHSEED`                              | `hash()` of `str` and `bytes`, so set order and anything built from a set                      |
+| Your data          | `sorted()` on a `glob`, `set`, or `dict` scan | the file order `__getitem__` indexes into                                                      |
+
+The last two rows are the ones people forget. A class list built straight from a set gives a different label-to-index mapping in every process, which changes your weights, your metric, and your checkpoint name without touching a random seed.
+
+```python title="hash_seed.py"
+import os
+import subprocess
+import sys
+
+snippet = "print(list({'alpha','beta','gamma','delta','epsilon','zeta','eta','theta','iota','kappa','lambda','mu','nu','xi','pi','rho','sigma','tau','upsilon','phi'}))"
+
+run = lambda **extra: subprocess.run(
+    [sys.executable, "-c", snippet], capture_output=True, text=True,
+    env={**os.environ, **extra}, check=True,
+).stdout.strip()
+
+print(run() != run())                                        # True - set order moves between processes
+print(run(PYTHONHASHSEED="0") == run(PYTHONHASHSEED="0"))     # True - pinned
+```
+
+`PYTHONHASHSEED` must be in the environment before the interpreter starts, so it belongs in the launcher or the job spec. `sorted(...)` where you build the list does the same job for the label table and is easier to spot in review. For a run you expect to reproduce:
+
+- seed before constructing anything that draws, including the model, the sampler, and the loader
+- one parent entropy per process, `spawn` for every child of it
+- log the seed, the NumPy version, and the torch version into the same artifact as the metrics
+- `sorted()` every path or key scan that determines index order
+- accept bitwise nondeterminism in CUDA reductions unless you turn on deterministic algorithms and pay for it
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>What is the difference between <code>np.random.seed(0)</code> and <code>np.random.default_rng(0)</code>?</>}>
+
+    The first configures one process-global legacy stream that every `np.random.*` call shares. The second returns a `Generator` whose state is yours alone, seeded at construction and moved only by calls you make on it.
+
+  </Accordion>
+  <Accordion title={<>Do the legacy and the new API give the same numbers for the same seed?</>}>
+
+    No, they run different bit generators, MT19937 versus `PCG64`. Seed 0 gives `1.7641` first through `np.random.randn` and `0.1257` first through `rng.normal`. Each API reproduces itself and neither changes the other.
+
+  </Accordion>
+  <Accordion title={<>Which bit generator do you use, and when does the choice matter?</>}>
+
+    `PCG64`, the default, for one or a handful of streams. The documented upgrade path is `PCG64DXSM`, `SFC64`, or `Philox` once you spawn millions of parallel streams that each draw heavily, because `PCG64` has a statistical weakness in that regime.
+
+  </Accordion>
+  <Accordion title={<>Why is <code>rng.shuffle(X); rng.shuffle(y)</code> wrong, and what do you write instead?</>}>
+
+    Two shuffles are two independent permutations, so features and labels stop referring to the same sample while each array still looks shuffled. Build one `order = rng.permutation(n)` and index both arrays with it.
+
+  </Accordion>
+  <Accordion title={<>What breaks if every worker process calls <code>np.random.default_rng(0)</code>?</>}>
+
+    They all get the same stream, so worker 0 and worker 3 apply identical random crops to different samples and the augmentation diversity you paid for never happens. Spawn children from one parent `SeedSequence`, or let the loader seed each worker.
+
+  </Accordion>
+  <Accordion title={<>Can a pinned seed reproduce values after a NumPy upgrade?</>}>
+
+    Not with `Generator`. Its docstring gives no version compatibility guarantee and says the bit stream may change as algorithms improve; the bit generators pin only the integer stream. `RandomState` is the one path with a cross-version promise, documented as effectively frozen.
+
+  </Accordion>
+</Accordions>
