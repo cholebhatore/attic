@@ -1,13 +1,31 @@
 ---
 name: html-tracker
-description: Build beautiful, self-contained interactive HTML trackers, checklists, curricula, reading lists, roadmaps, and audit pages. Features a minimalist Linear/Vercel-inspired developer aesthetic, Geist and Geist Mono typography, pure-black dark theme (#000000), localStorage state persistence, live progress calculation, real-time search, filter pills, collapsible accordions, clipboard summary export, and toast notifications. Use whenever the user asks to create an interactive HTML checklist, progress tracker, table of contents tracker, curriculum tracker, study plan HTML, audit checklist, or standalone HTML dashboard with checkboxes.
+description: Build interactive trackers, checklists, curricula, reading lists, roadmaps, and audit pages with nested topic groups. Features a minimalist Linear/Vercel-inspired aesthetic, localStorage progress persistence, live search, filter pills, collapsible accordions, clipboard summary export, and toast notifications. In a Next.js or fumadocs app the tracker is a route segment, not a standalone file; outside one it is a single self-contained HTML page. Use whenever the user asks for an interactive checklist, progress tracker, table of contents tracker, curriculum tracker, study plan, roadmap, audit checklist, or dashboard with checkboxes.
 ---
 
 # Interactive HTML Tracker
 
-Create standalone, zero-dependency HTML files designed for tracking progress across structured topics, checklists, study curricula, roadmaps, or technical documentation.
+Create zero-dependency tracker pages designed for tracking progress across structured topics, checklists, study curricula, roadmaps, or technical documentation.
 
-The generated HTML file is fully self-contained: HTML, CSS, SVG icons, and vanilla JavaScript all live in a single file that can be opened locally in any browser (`file:///...`) or hosted on any static web server with zero build step.
+---
+
+## Where the tracker lives
+
+Two targets, and the app decides which one applies.
+
+- **Inside a Next.js or fumadocs app** — this repo's tracker is the route segment
+  `src/app/ai/curriculum/`, built from the app's own React, Tailwind, and lucide-react.
+  Do not emit a standalone `.html` and do not add a generator script. The four exported
+  HTML copies and `scripts/build-toc.js` were deleted on purpose; `next.config.mjs`
+  redirects `/tracker`, `/curriculum`, `/ai-tracker`, and `/ai-engineering-tracker` to
+  the route so old links hold.
+- **No app to live in** — one self-contained file with HTML, CSS, SVG icons, and vanilla
+  JavaScript inline, openable at `file:///...` or hosted statically with no build step.
+  Use `references/template.html` as the structural foundation.
+
+The design system below applies to both. Where it names a raw CSS value, take the
+Tailwind equivalent the app already uses: zinc surfaces, `emerald-500` for covered,
+`amber-500` for priority, `font-mono tabular-nums` for counts.
 
 ---
 
@@ -105,13 +123,14 @@ Every generated tracker must include these structured sections:
 │ Group Section 1:                                            │
 │   ▼ Phase 1: Topic Group Title         [Written] [0/8] [▼]  │
 │       Phase description text...                             │
-│       [8 items]                    [Toggle Phase Covered]   │
 │       ┌──────────────────────────────────────────────────┐  │
 │       │ [ ] Item 1 Title  [⭐ PRIORITY] [✓ Covered] [Link]│  │
 │       │     Description of subtopic / item...            │  │
 │       ├──────────────────────────────────────────────────┤  │
-│       │ [✓] Item 2 Title                 [✓ Covered] [Link]│  │
-│       │     Description of subtopic / item...            │  │
+│       │ [ ] Parent Title  [0/9]             [Read] [▼]   │  │
+│       │     Description; clicking this row expands        │  │
+│       │   ├ [ ] Child title                  [Read]      │  │
+│       │   └ [✓] Child title       [✓ Covered] [Read]     │  │
 │       └──────────────────────────────────────────────────┘  │
 │   ▼ Phase 2: ...                                            │
 ├─────────────────────────────────────────────────────────────┤
@@ -175,7 +194,10 @@ Every generated tracker must include these structured sections:
   - Hidden `<input type="checkbox">` for native state.
   - Custom `15px x 15px` box with `1.5px` border.
   - On checked: background fills with `var(--accent-green)` and displays a white SVG checkmark.
-  - Entire row is clickable to toggle checkbox (with `event.stopPropagation()` on link buttons).
+  - Row body toggles coverage on a leaf row, and expands or collapses the group on a
+    parent row. The checkbox is the only coverage control on a parent.
+  - `stopPropagation()` on the chevron and the link so neither click leaks into the row
+    handler. The checkbox stops propagation too, or a click counts twice.
 - **Row Content**:
   - Item Title: `12px font-weight: 500`.
   - Badges:
@@ -195,6 +217,58 @@ Every generated tracker must include these structured sections:
 
 ---
 
+## Nested topics
+
+A roadmap reads better when a page and its children group together the way a docs
+sidebar groups them. Nest without restructuring the data.
+
+**Derive the tree from each topic's url at render time.** Keep `topics[]` flat. A
+`children` field duplicates what the url already says, and any restructure that renames
+ids orphans every saved progress entry, because the localStorage key holds raw ids.
+
+A topic `C` is a child of `P` when all of these hold:
+
+- `dirname(C.url) === P.url`
+- `P` is itself a tracked row, and is not the phase root — otherwise every phase grows
+  an Overview parent that only repeats the phase header
+- `P` has at least two such children; one child is noise, not a group
+- `P.url` starts with the phase root plus a slash, so a row at the section root cannot
+  swallow an entire phase
+
+Index parents with `Map<string, Topic[]>`, not `Map<string, Topic>`, and skip grouping
+for any url that maps to more than one row. This corpus has two topics sharing
+`/ai/mlops/system-design-framework`, and a single-valued map would silently drop one. A
+child whose parent is missing stays at top level. Every topic must appear exactly once
+in the output, so assert `flatten(buildTree(phase)).length === phase.topics.length` for
+each phase.
+
+### Interaction contract
+
+| Control                    | Does                                                                                              |
+| :------------------------- | :------------------------------------------------------------------------------------------------ |
+| Parent row body            | Expands or collapses the group                                                                    |
+| Parent checkbox            | Toggles the parent and every descendant to the same state, both directions                        |
+| Child row body or checkbox | Toggles that child only                                                                           |
+| Chevron                    | Same as the parent row body; sits at the row's right edge beside the link so all checkboxes align |
+| Link                       | Navigates, with `stopPropagation()`                                                               |
+
+### Counters and filters
+
+- The parent badge is `covered/total` descendants, computed from the **unfiltered** tree,
+  so a search never changes what `0/9` means.
+- Phase and overall totals keep reading the flat array. A cascade writes real ids, so no
+  aggregation site needs to know nesting exists.
+- Search text must include ancestor titles and url segments. Child titles drop their
+  module prefix once the group supplies it, so searching `numpy` would otherwise stop
+  matching `The ndarray`.
+- A filter keeps an ancestor when any descendant matches, without pill-testing the
+  ancestor itself. A parent that passes the filter but has no visible children renders
+  as an ordinary row with no chevron, so the Covered filter never yields an empty group.
+- Force a group open while a filter is active, but never write that into the persisted
+  manual state — clearing the search should restore whatever the user had collapsed.
+
+---
+
 ## JavaScript Architecture (Zero Dependencies)
 
 Embed an IIFE in the `<script>` tag at the bottom of the HTML:
@@ -207,6 +281,7 @@ Embed an IIFE in the `<script>` tag at the bottom of the HTML:
   // 1. Theme initialization & toggle (reads localStorage or prefers-color-scheme)
   // 2. State loading & saving (Set of checked item IDs in localStorage JSON)
   // 3. UI update pipeline:
+  //    - Builds the nested row list from topic urls (see "Nested topics")
   //    - Updates checkboxes to match Set
   //    - Updates item row classes (.is-covered)
   //    - Recalculates master progress bar width & percentage badge
@@ -230,13 +305,23 @@ Embed an IIFE in the `<script>` tag at the bottom of the HTML:
 A complete, working reference implementation is provided in:
 `references/template.html`
 
-When building a new tracker, use `references/template.html` as the structural foundation, replacing the curriculum/data array and metadata with the user's specific topics.
+When building a new standalone tracker, use `references/template.html` as the structural
+foundation, replacing the curriculum/data array and metadata with the user's specific
+topics.
+
+For the app variant there is no template to copy: read `src/app/ai/curriculum/`, which is
+the live implementation of everything above, including the nesting derived in
+`topic-tree.ts`.
 
 ---
 
 ## Generation Best Practices
 
-1. **Standalone output**: Always ensure the resulting HTML file works offline with no node server, python server, or framework needed.
-2. **Build script option**: If generating a large tracker (over 50 items), prefer writing a node generator script (e.g. `scripts/build-tracker.js`) that defines structured JSON and outputs the standalone HTML. This makes future data updates effortless.
+1. **Standalone output**: For the single-file variant, the page must work offline with no
+   node server, python server, or framework.
+2. **Build script option**: Only for the single-file variant, and only past ~50 items —
+   a node generator (e.g. `scripts/build-tracker.js`) that holds structured JSON and
+   emits the HTML keeps data updates effortless. Never add one to an app that already
+   renders the tracker from a route segment.
 3. **Preserve exact font weights**: Never use `font-weight: 700` or `font-weight: bold`. Always stick to `400`, `500`, and `600`.
 4. **Pure black dark mode**: Always keep dark theme `--bg: #000000;`. Avoid blue/slate tints.

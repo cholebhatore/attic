@@ -26,7 +26,7 @@ export function TopicRow({
 }: TopicRowProps) {
   return (
     <div
-      onClick={() => onToggle(topic.id)}
+      onClick={() => (expandable ? onToggleOpen?.(topic.id) : onToggle(topic.id))}
       className={`group flex items-start gap-3 rounded-lg border p-3 transition cursor-pointer select-none ${
         isCovered
           ? 'border-emerald-500/20 bg-emerald-500/5 dark:border-emerald-500/15 dark:bg-emerald-500/[0.03]'
