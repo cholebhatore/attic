@@ -5,9 +5,50 @@ description: 'Why random beats grid, log-uniform spaces, successive halving and 
 
 Learning rate matters more than every other hyperparameter combined. Get it wrong by a factor of three and nothing else you tune will save the run. Get it right and most of the remaining choices move the metric by less than a percent. That ordering decides how to spend a search budget, and most of this page is about spending it well.
 
+Symbols here (`P` axes, `k` values per axis, `n` configurations, `r` budget, `eta` the halving factor, `R` the maximum budget) are decoded in [Notation and Symbols](/ai/math-foundations/notation-and-symbols).
+
+---
+
+## Start here
+
+Every knob a gradient cannot learn has to be paid for with a training run. A **trial** is one such run: one setting of every knob, trained once, scored once. Your hardware hands you a fixed number of trials per night, so the question is not "which learning rate is right?" It is "how do I spend 100 trials so that the best one is as good as possible?" Allocation, not cleverness.
+
+Picture a dark room full of dials and one meter, with a rule that you may only look at the meter after finishing a turn. Two facts about those dials decide everything:
+
+- **Few of them matter.** Nine knobs, one budget, and the top row of the table below can move the metric more than the other eight put together.
+- **Almost every position is hopeless.** `1e-5` and `1e-1` are both legal learning rates; one trains and the other does something close to nothing. What you are buying is coverage of the small useful region.
+
+The **search space** is the list of knobs together with the range you allow each one to take. Choosing it is half the job: a search can never find a value you did not permit. The other half is the **budget**, and both are counted in the same coin, the **config-epoch** — one <Tip term="config-epoch">One configuration trained for one epoch. Five configurations trained for 81 epochs each cost 405 config-epochs.</Tip> trained for one epoch.
+
+Here is the whole cost argument of this page at its smallest. Three knobs, five values each:
+
+```text
+grid     5 x 5 x 5 = 125 trials    each knob tested at 5 values. that's it.
+random   125 trials                each knob tested at 125 values
+```
+
+Same money, 25 times as many looks at every knob. No clever idea is involved — a grid spends its budget on combinations of values you already knew were boring, and random spends it on the axis you care about.
+
+The second lever is stopping bad runs early. Suppose one full run costs 81 epochs, so 405 config-epochs buys five full runs — or this:
+
+```text
+81 configs at  1 epoch  -> keep 27       cost   81
+27 configs at  3 epochs -> keep  9       cost   81
+ 9 configs at  9 epochs -> keep  3       cost   81
+ 3 configs at 27 epochs -> keep  1       cost   81
+ 1 config  at 81 epochs                 cost   81
+                                     total  405  = five full runs
+```
+
+Eighty-one candidates screened down to one finished run, for the price of five. <Tip term="Successive halving">Run everything a little, throw away the worst fraction, double the budget of the survivors, repeat.</Tip> is the name of that ladder, and it is the arithmetic behind every pruning method later on this page.
+
+Everything below unpacks one piece of those two blocks: what belongs in the search space, why random beats a grid at equal cost, why the sampling has to happen in log space, how halving spends a budget, which tool implements what, and a protocol that puts the numbers in the right order.
+
 ---
 
 ## What is worth searching
+
+The table is the search space written down. Read **scale** as "how the candidate values should be spaced", which decides how many trials you need to cover the range: a `log` row spans orders of magnitude and wants its points a factor of ten apart, `linear` rows want equal steps, `power of two` rows have only a handful of legal values, and a <Tip term="categorical">A knob whose values are names, not numbers — cosine, linear, WSD. There is no distance between them, so no interpolation and no ordering.</Tip> row is just a short list. Sensitivity is the reason the rows are in this order.
 
 | Hyperparameter      | Scale        | Usual range         | Sensitivity |
 | :------------------ | :----------- | :------------------ | :---------- |
@@ -21,31 +62,37 @@ Learning rate matters more than every other hyperparameter combined. Get it wron
 | Schedule shape      | categorical  | cosine, linear, WSD | low         |
 | `eps`               | log          | `1e-8` to `1e-4`    | low         |
 
-Search the top of that list first and fix the bottom. A budget of 20 trials spent on learning rate and weight decay beats 200 spent on all nine.
+Search the top of that list first and fix the bottom. A budget of 20 trials spent on learning rate and weight decay beats 200 spent on all nine. The arithmetic says why: 20 trials on two axes is 20 shots at the right decade of the learning rate, while a grid over all nine at two values each costs `2^9 = 512` trials and still only ever tests two learning rates. Three values each is `3^9 = 19,683` trials, which is not a search, it is a small company's quarterly compute budget. Fixing the bottom rows is what makes the top rows affordable.
 
-Two of these are not independent, which trips up every automatic search. Learning rate and batch size are coupled by the linear scaling rule: doubling the batch size halves the gradient noise and roughly doubles the learning rate you can use, or `sqrt(2)` times it for Adam-family optimizers. Searching them on independent axes wastes most of the budget on combinations that are wrong by construction. Either fix the batch size and search the rate, or search the ratio `lr / batch_size`.
+The last two rows of the table also earn their place by being cheap to settle rather than hard to tune: `eps` and `beta2` have published defaults that survive almost any run, and the schedule shape belongs to [Learning Rate Schedules](/ai/neural-networks/lr-schedules) rather than to a search. Leave them at their defaults, spend the trials on the first four rows, and revisit only if the metric is still disappointing.
 
-Weight decay and learning rate are coupled in the same way under AdamW, since the decay is applied as `lr * wd * p`. Halving the learning rate halves the effective decay. Search `wd` after the rate is settled, or search the product.
+Two of these are not independent, which trips up every automatic search. Learning rate and batch size are coupled by the linear scaling rule: doubling the batch size halves the gradient noise and roughly doubles the learning rate you can use, or `sqrt(2)` times it for Adam-family optimizers ([_Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour_, Goyal et al., arXiv:1706.02677](https://arxiv.org/abs/1706.02677)). Take the numbers one step at a time: batch `256` to `1024` is four times the samples, so the gradient's <Tip term="variance">The average squared distance from the mean — the square of the standard deviation. Averaging four times as many samples divides the variance by 4.</Tip> is divided by 4 and its standard deviation by `sqrt(4) = 2`, and the matching rate is `4x` for SGD or `2x` for Adam. A batch of 1024 at `lr = 3e-4` is therefore the same experiment as a batch of 256 at roughly `1.2e-3` under SGD and `6e-4` under Adam, and a search that treats the two knobs as independent spends most of its trials re-testing that identity. Either fix the batch size and search the rate, or search the ratio `lr / batch_size`. The noise scale that decides where the rule stops paying is derived in [_An Empirical Model of Large-Batch Training_, McCandlish, Kaplan, Amodei, arXiv:1812.06162](https://arxiv.org/abs/1812.06162).
+
+Weight decay and learning rate are coupled in the same way under [AdamW](/ai/neural-networks/optimizers), since the decay is applied as `lr * wd * p` ([_Decoupled Weight Decay Regularization_, Loshchilov and Hutter, arXiv:1711.05101](https://arxiv.org/abs/1711.05101)). Halving the learning rate halves the effective decay. Put numbers on it, because this is the trap: `lr = 3e-4` with `wd = 0.1` multiplies every weight by `1 - 3e-5` on each step, so over 10,000 steps a weight is pulled down to `(1 - 3e-5)^10000 = 0.74` of its length. Halve the rate and the identical `wd` leaves it at `0.86`. Tuning weight decay before the rate is settled means you measured a penalty that was never the one you think you set. Search `wd` after the rate is settled, or search the product.
 
 ---
 
 ## Grid against random
 
-Random search beats grid search at equal budget, and the reason is arithmetic rather than subtle.
+Random search beats grid search at equal budget, and the reason is arithmetic rather than subtle. This is the claim of [_Random Search for Hyper-Parameter Optimization_, Bergstra and Bengio, JMLR 13:281–305, 2012](https://jmlr.org/papers/v13/bergstra12a.html), and it needs nothing from the paper to check.
 
 A grid over `P` hyperparameters with `k` values each costs `k^P` trials and evaluates each axis at only `k` distinct values. Random search over the same `P` axes with the same budget evaluates each axis at `k^P` distinct values. If the loss depends strongly on one axis and weakly on the rest, the grid tests that axis `k` times while random tests it `k^P` times.
 
-| Axes `P` | Values per axis `k` | Grid trials | Distinct values per axis |
-| :------- | :------------------ | :---------- | :----------------------- |
-| 2        | 5                   | 25          | 5                        |
-| 3        | 4                   | 64          | 4                        |
-| 4        | 3                   | 81          | 3                        |
-| 5        | 3                   | 243         | 3                        |
-| 6        | 2                   | 64          | 2                        |
+Three knobs, five values each: the grid costs `5 x 5 x 5 = 125` trials and has seen five learning rates when it finishes. Random spends the same 125 trials and has seen 125.
 
-Six axes on a two-point grid is 64 trials that only ever try two values of the learning rate. Nobody would design that experiment on purpose, and a grid search does it by default.
+| Axes `P` | Values per axis `k` | Grid trials | Distinct values per axis | Same budget, distinct values per axis | Coverage gain |
+| :------- | :------------------ | :---------- | :----------------------- | :------------------------------------ | :------------ |
+| 2        | 5                   | 25          | 5                        | 25                                    | 5x            |
+| 3        | 4                   | 64          | 4                        | 64                                    | 16x           |
+| 4        | 3                   | 81          | 3                        | 81                                    | 27x           |
+| 5        | 3                   | 243         | 3                        | 243                                   | 81x           |
+| 6        | 2                   | 64          | 2                        | 64                                    | 32x           |
 
-Measured directly. The objective is a synthetic loss with a minimum at `lr = 3.7e-3`, deliberately placed off-grid, and a second axis that does not affect the score:
+The last column is just `k^(P-1)`: five axes at three values each is `3^4 = 81` times more coverage of each axis for the same money. That is the whole reason random wins in three dimensions and up, and it is why the gain at `P = 1` is `k^0 = 1`, which is to say none.
+
+Six axes on a two-point grid is 64 trials that only ever try two values of the learning rate. Nobody would design that experiment on purpose, and a grid search does it by default. At the other end of the scale, a three-axis grid with ten values per axis is 1,000 runs that test ten learning rates, while 1,000 random runs test a thousand.
+
+Measured directly. The objective is a synthetic loss with a minimum at `lr = 3.7e-3`, deliberately placed off-grid, and a second axis that does not affect the score. The shape is `1.20 + 8 * e^2`, where `e` is how far the trial's learning rate sits from the optimum measured in <Tip term="dex">One dex is a factor of ten: the difference between two exponents. Two dex is a hundred times, `0.3` dex is about a factor of 2, `0.05` dex is about 12%.</Tip>, so every loss number below can be turned back into a distance from the true optimum by hand.
 
 ```python title="grid_vs_random.py"
 import math
@@ -95,6 +142,18 @@ P(random beats grid) = 99.8%
 
 Both methods spent 25 trials. The grid's best learning rate is `1e-2`, which is `0.43` in log10 away from the true optimum, and its loss sits `1.49` above the floor of `1.20`. The random search lands within `0.024` of the floor on a median run and beats the grid 99.8% of the time.
 
+Those numbers are checkable without running anything. The five grid points are `1e-5, 1e-4, 1e-3, 1e-2, 1e-1` — `1e-5` to `1e-1` is four decades and four gaps, so the points sit exactly one dex apart, ten times each other. The grid's miss of `0.43` dex against a spacing of `1.0` is nearly the worst case, and `8 * 0.43^2 = 1.49` is the excess loss it printed. Invert the same formula on the random run: `8 * e^2 = 0.024` gives `e = sqrt(0.024 / 8) = 0.055` dex, a factor of `10^0.055 = 1.13` on the learning rate. One search was 2.7 times off (`10^0.43`), the other 1.13 times off, and both paid 25 runs.
+
+Convert that into the coverage rule, which is the sentence to remember. A point can only be useful if it lands within a factor of two of the optimum, and a factor of two is `0.301` dex, so a band `0.602` dex wide counts as a hit:
+
+| Search                       | Trial spacing on the lr axis | Chance a given optimum is within a factor of 2 of a trial |
+| :--------------------------- | :--------------------------- | :-------------------------------------------------------- |
+| 5-point log grid             | 1.0 dex                      | `0.602 / 1.0` is about 60%                                |
+| 25 random log-uniform draws  | none — 25 scattered points   | `1 - (1 - 0.602 / 4)^25` is about 98%                     |
+| 125 random log-uniform draws | none                         | `1 - (1 - 0.602 / 4)^125` is better than 1,000 to 1       |
+
+The grid column is just the hit band divided by the gap between neighbouring points. The random column is the chance that none of `n` independent draws missed the band, subtracted from 1. Same arithmetic the simulation runs, and it says the grid is not slightly worse — it is structurally unable to aim.
+
 The same experiment with a budget matched at around 25 trials across increasing numbers of axes:
 
 | Axes `P` | `k` | Grid trials | Distinct lr | Grid best | Random median | P(random wins) |
@@ -106,6 +165,69 @@ The same experiment with a budget matched at around 25 trials across increasing 
 | 5        | 2   | 32          | 2           | `17.6004` | `1.2154`      | 100.0%         |
 
 At `P = 1` the two are equivalent, which is the correct sanity check: with one axis a grid is a set of distinct values and random just draws from the same distribution. The advantage appears at `P = 2` and grows from there.
+
+Every entry in that `Grid best` column is the hand arithmetic above, restricted to whichever `k` log-spaced points the row allows, so the column is forced rather than unlucky:
+
+| `k` | The learning rates the grid may try                                   | Best score it can reach | Excess over the `1.20` floor |
+| :-- | :-------------------------------------------------------------------- | :---------------------- | :--------------------------- |
+| 25  | 25 points a sixth of a dex apart; closest to `3.7e-3` is `3.1623e-03` | `1.2372`                | 0.0372                       |
+| 5   | `1e-5, 1e-4, 1e-3, 1e-2, 1e-1`; closest is `1e-2`                     | `2.6916`                | 1.49                         |
+| 3   | `1e-5, 1e-3, 1e-1`; closest is `1e-3`                                 | `3.7828`                | 2.58                         |
+| 2   | `1e-5, 1e-1`; closest is `1e-1`                                       | `17.6004`               | 16.40                        |
+
+Coarser grid, worse score, no randomness in it anywhere. The `Random median` column, by contrast, barely moves from `1.22` no matter how many axes join, because every trial is a fresh learning rate.
+
+### The axis a grid cannot see
+
+There is a nastier version of the same disease, worth drawing out because the offending axis is invisible on the page it is printed on. Take the two knobs the previous section said are coupled, learning rate and weight decay, and lay a `3x3` grid over them. Under AdamW what the run responds to is the decay applied per step, `lr * wd`. Fill each cell with that product:
+
+| lr \ wd | `1e-5` | `1e-4` | `1e-3` |
+| :------ | :----- | :----- | :----- |
+| `1e-4`  | 1e-9   | 1e-8   | 1e-7   |
+| `1e-3`  | 1e-8   | 1e-7   | 1e-6   |
+| `1e-2`  | 1e-7   | 1e-6   | 1e-5   |
+
+Nothing on that grid says the score responds to the _sum of the two exponents_, which is what a product is, yet that is the axis being measured. Count what nine trials actually buy on it: `1e-9` once, `1e-8` twice, `1e-7` three times, `1e-6` twice, `1e-5` once. Five distinct effective decays from nine runs, and the most-tested value, `1e-7`, is special for no reason except that three different pairs multiply into it. The hyperparameter that matters is hidden inside the structure of the grid, and the two corners `1e-9` and `1e-5` are each tested exactly once.
+
+```python title="hidden_axis.py"
+import numpy as np
+
+lr_axis = np.array([1e-4, 1e-3, 1e-2])
+wd_axis = np.array([1e-5, 1e-4, 1e-3])
+
+print("grid cells, lr * wd:")
+for lr in lr_axis:
+    print(f"  lr={lr:.0e}: " + "  ".join(f"{lr * wd:.0e}" for wd in wd_axis))
+
+exps = [int(round(np.log10(lr) + np.log10(wd))) for lr in lr_axis for wd in wd_axis]
+vals, counts = np.unique(exps, return_counts=True)
+print(f"\n{len(exps)} trials -> {vals.size} distinct effective decays:")
+print("  " + "  ".join(f"1e{v} x{c}" for v, c in zip(vals, counts)))
+
+rng = np.random.default_rng(0)
+r_lr = 10 ** rng.uniform(-4, -2, 9)
+r_wd = 10 ** rng.uniform(-5, -3, 9)
+prod = r_lr * r_wd
+print(f"\nrandom, 9 trials -> {np.unique(prod).size} distinct effective decays:")
+print("  " + "  ".join(f"{v:.4e}" for v in np.sort(prod)))
+print(f"range: {prod.min():.4e} to {prod.max():.4e}")
+```
+
+```text
+grid cells, lr * wd:
+  lr=1e-04: 1e-09  1e-08  1e-07
+  lr=1e-03: 1e-08  1e-07  1e-06
+  lr=1e-02: 1e-07  1e-06  1e-05
+
+9 trials -> 5 distinct effective decays:
+  1e-9 x1  1e-8 x2  1e-7 x3  1e-6 x2  1e-5 x1
+
+random, 9 trials -> 9 distinct effective decays:
+  1.2230e-09  3.6693e-08  4.9398e-08  5.5958e-08  1.4797e-07  1.4835e-07  1.3934e-06  1.5323e-06  1.9267e-06
+range: 1.2230e-09 to 1.9267e-06
+```
+
+Nine random trials on the same two ranges give nine distinct products, spread from `1.2230e-09` to `1.9267e-06`, because random draws never have to share a row. Note what random does _not_ fix: it does not know that the product is the axis either, which is why the real answer to a coupling is to write the space in terms of the product or the ratio. What it buys is that no value is ever repeated, so each extra trial is an extra sample of every axis — 27 random draws over the full `1e-5` to `1e-1` learning-rate range give 27 distinct learning rates, where the grid above gives 3 however many axes you cross it with.
 
 <Callout type="info">
   ### When a grid is the right answer
@@ -120,15 +242,87 @@ Grid search wins when you have one or two hyperparameters, when you need a repro
 
 Learning rates, weight decays, and `eps` span orders of magnitude, and the useful values are distributed multiplicatively. `1e-4` and `1.1e-4` are the same configuration for any purpose; `1e-4` and `1e-3` are not. Sampling uniformly in linear space puts almost all of the budget at the top of the range.
 
+That claim is a distance, and it is worth measuring. On a log scale the gap from `1e-4` to `1.1e-4` is `log10(1.1e-4) - log10(1e-4) = 0.0414`, while `1e-4` to `1e-3` is a full `1.0` — twenty-four times further. On a linear scale both gaps look like "a bit", and the sampler cannot tell a duplicate from a different universe.
+
 Sample uniformly in log space and exponentiate:
 
 ```python
 lr = 10 ** rng.uniform(math.log10(1e-5), math.log10(1e-1))
 ```
 
+Read the line as: pick a random exponent between -5 and -1, then raise 10 to it. Same range, different spread. The name for that spread is <Tip term="log-uniform">Uniform in the exponent rather than in the value: every decade inside the range gets the same share of the draws. Also called sampling uniformly in log space, and written `log=True` or `loguniform` by the libraries below.</Tip>, and it is the whole reason the sampling in this page's experiments looks the way it does.
+
 Optuna and Ray Tune both have this as a primitive, `suggest_float(..., log=True)` and `tune.loguniform(...)` respectively, and it is the single most common thing people get wrong when they set up a search.
 
+### Which values each sampler actually picks
+
+One seed, twenty draws of the learning rate from the same `1e-5` to `1e-1` range, sorted, plus the batch-size case:
+
+```python title="linear_vs_log.py"
+import numpy as np
+
+rng = np.random.default_rng(7)
+log_lr = np.sort(10 ** rng.uniform(-5, -1, 20))
+lin_lr = np.sort(rng.uniform(1e-5, 1e-1, 20))
+
+print("learning rate over 1e-5 to 1e-1, 20 draws, sorted")
+print("  log-uniform:", " ".join(f"{v:.1e}" for v in log_lr))
+print("  linear     :", " ".join(f"{v:.1e}" for v in lin_lr))
+
+edges = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+print("\ndraws per decade (1e-5..1e-4, ..1e-3, ..1e-2, ..1e-1)")
+for name, d in (("log-uniform", log_lr), ("linear", lin_lr)):
+    counts = [int(((d >= edges[i]) & (d < edges[i + 1])).sum()) for i in range(4)]
+    print(f"  {name:12s} {counts}")
+
+print("\nmedians")
+print("  log-uniform 10**-3 =", 10 ** -3.0)
+print("  linear (1e-5 + 1e-1)/2 =", (1e-5 + 1e-1) / 2)
+
+print("\nbatch size over 16 to 4096, 12 draws, sorted")
+b_log = np.sort(2 ** rng.integers(4, 13, 12))
+b_lin = np.sort(np.round(rng.uniform(16, 4096, 12)).astype(int))
+print("  exponent-uniform:", " ".join(str(v) for v in b_log))
+print("  linear          :", " ".join(str(v) for v in b_lin))
+powers = np.array([v for v in b_lin if v & (v - 1) == 0])
+print(f"  powers of two among the linear draws: {powers.size}")
+```
+
+```text
+learning rate over 1e-5 to 1e-1, 20 draws, sorted
+  log-uniform: 1.0e-05 8.0e-05 1.0e-04 1.3e-04 1.6e-04 1.6e-04 6.0e-04 7.4e-04 1.0e-03 1.6e-03 3.1e-03 3.2e-03 1.3e-02 1.5e-02 1.5e-02 1.9e-02 3.1e-02 3.9e-02 9.0e-02 9.6e-02
+  linear     : 3.8e-04 1.2e-03 3.6e-03 4.4e-03 1.5e-02 1.6e-02 1.9e-02 2.0e-02 2.2e-02 2.5e-02 3.7e-02 4.7e-02 5.0e-02 5.1e-02 5.1e-02 6.1e-02 6.3e-02 6.9e-02 8.3e-02 9.2e-02
+
+draws per decade (1e-5..1e-4, ..1e-3, ..1e-2, ..1e-1)
+  log-uniform  [2, 6, 4, 8]
+  linear       [0, 1, 3, 16]
+
+medians
+  log-uniform 10**-3 = 0.001
+  linear (1e-5 + 1e-1)/2 = 0.050005
+
+batch size over 16 to 4096, 12 draws, sorted
+  exponent-uniform: 16 32 64 256 256 512 1024 1024 2048 2048 4096 4096
+  linear          : 258 389 629 1334 1490 1564 1598 2088 2224 2457 3347 3571
+  powers of two among the linear draws: 0
+```
+
+The log-uniform line reaches every decade, from `1.0e-05` to `9.6e-02`, and it put two draws (`3.1e-03` and `3.2e-03`) right on top of the `3.7e-3` optimum from the grid section. The linear line has eighteen of its twenty draws at or above `1.5e-02`, and its smallest is `3.8e-04`: that run never visited `1e-5`, never visited the decade below `1e-3` properly, and would have reported "the learning rate does not matter" from a search that only ever looked at the top of the range.
+
+The exact shares rather than one sample of them, so the claim does not depend on the seed:
+
+| Range a draw lands in | log-uniform | linear   | The 20 draws above, log / linear |
+| :-------------------- | :---------- | :------- | :------------------------------- |
+| `1e-5` to `1e-4`      | 25.0%       | 0.0900%  | 2 / 0                            |
+| `1e-4` to `1e-3`      | 25.0%       | 0.9001%  | 6 / 1                            |
+| `1e-3` to `1e-2`      | 25.0%       | 9.0009%  | 4 / 3                            |
+| `1e-2` to `1e-1`      | 25.0%       | 90.0090% | 8 / 16                           |
+
+Read it out loud: each decade is one tenth of the log range, so a log-uniform sampler spends a quarter of the budget in each. A linear sampler weights by width, and the top decade is 900 times wider than the bottom one, so 90.01% of its budget goes there and 0.0900% reaches below `1e-4`. The medians say the same thing in one number: `0.050005` against `1e-3`, a factor of 50.
+
 Batch size is a special case: sample uniformly over the exponents, since only powers of two are meaningful. Same for layer counts and other small integers, where a log spacing keeps you from spending 90% of the budget on depths between 12 and 24.
+
+The batch half of the output shows both failure modes at once. Only nine values in `16` to `4096` are meaningful — `16, 32, 64, 128, 256, 512, 1024, 2048, 4096` — and drawing the exponent uniformly picks from exactly those nine, spread over the range. Twelve linear draws gave `258, 389, 629, 1334, 1490, 1564, 1598, 2088, 2224, 2457, 3347, 3571`: no power of two among the twelve, and 8 of 12 above 1024. In expectation a linear draw lands above 1024 with probability `3072 / 4080 = 75.3%`, where exponent-uniform gives `2 / 8 = 25%`, and the top of that range is where a batch stops fitting in memory.
 
 ---
 
@@ -137,6 +331,97 @@ Batch size is a special case: sample uniformly over the exponents, since only po
 Random search runs every trial to completion, and most trials are obviously bad within the first few epochs. Successive halving spends a small budget on everything and a large budget only on the survivors.
 
 Start with `n` configurations at budget `r`. Run all of them, keep the best `1 / eta` fraction, multiply the budget by `eta`, repeat until one is left or the budget reaches `R`.
+
+The vocabulary first. A <Tip term="rung">One level of the budget ladder: the rung at `r = 3` is the round where every surviving configuration has had three epochs. Borrowed from a ladder — you only climb after the ones below are settled.</Tip> is one level of that ladder, and <Tip term="pruning">Stopping a trial before it reaches the full budget because its intermediate score says it will not win. Successive halving is one pruning rule among several.</Tip> is the act of deleting a configuration at a rung. The unit of cost is the config-epoch, one configuration trained for one epoch, so a rung costs "how many are still alive" times "how many epochs they get at this level".
+
+### The whole ladder, eight configurations
+
+Run one end to end before the formulas, so every number in the general case has a small sibling you can redo in your head. Eight configurations, `eta = 2` (halve at each rung), `R = 4` epochs, which makes three rungs at `r = 1`, `r = 2`, `r = 4`. Every loss in the table is made up so the ordering stays easy to check — these are illustrative numbers, not measurements of anything — and the last column is what that configuration would score if it were trained all the way to 4 epochs.
+
+| Config | lr (illustrative) | loss at `r = 1` | loss at `r = 2` | loss at `r = 4`, final |
+| :----- | :---------------- | :-------------- | :-------------- | :--------------------- |
+| A      | `1e-4`            | 2.80            | 2.60            | 2.45                   |
+| B      | `3e-4`            | 2.10            | 1.85            | 1.70                   |
+| C      | `1e-3`            | 1.90            | 1.60            | 1.42                   |
+| D      | `3e-3`            | 1.75            | 1.40            | **1.21**               |
+| E      | `1e-2`            | 2.05            | 1.95            | 1.90                   |
+| F      | `3e-2`            | 2.60            | 2.55            | 2.50                   |
+| G      | `1e-1`            | 3.40            | 3.35            | 3.30                   |
+| H      | `5e-3`            | 1.82            | 1.50            | 1.30                   |
+
+Now the three rungs, taking the top half each time:
+
+- Rung 1, `r = 1`: all eight run, cost `8 * 1 = 8`. Ranked best to worst: D 1.75, H 1.82, C 1.90, E 2.05, then B 2.10, F 2.60, A 2.80, G 3.40. Keep `D H C E`; four configurations die having cost one epoch each.
+- Rung 2, `r = 2`: four run, cost `4 * 2 = 8`, cumulative 16. The order is D 1.40, H 1.50, C 1.60, E 1.95. Keep `D H`.
+- Rung 3, `r = 4`: two run, cost `2 * 4 = 8`, cumulative 24. D 1.21 beats H 1.30, so **D wins**.
+
+```python title="sh_toy.py"
+import itertools
+import numpy as np
+
+# illustrative losses, made up so the arithmetic is checkable
+losses = {
+    "A": (2.80, 2.60, 2.45),
+    "B": (2.10, 1.85, 1.70),
+    "C": (1.90, 1.60, 1.42),
+    "D": (1.75, 1.40, 1.21),
+    "E": (2.05, 1.95, 1.90),
+    "F": (2.60, 2.55, 2.50),
+    "G": (3.40, 3.35, 3.30),
+    "H": (1.82, 1.50, 1.30),
+}
+rungs = [1, 2, 4]
+eta = 2
+
+alive, spent = sorted(losses), 0
+for i, r in enumerate(rungs):
+    order = sorted(alive, key=lambda k: losses[k][i])
+    keep = order[: max(1, len(order) // eta)]
+    spent += len(alive) * r
+    print(f"rung {i + 1}: r={r}, {len(alive)} configs run, cost {len(alive)}*{r}={len(alive) * r}, cumulative {spent}")
+    print("   ranked  :", "  ".join(f"{k} {losses[k][i]:.2f}" for k in order))
+    print("   survives:", " ".join(keep))
+    print("   killed  :", " ".join(k for k in order if k not in keep) or "-")
+    alive = keep
+print(f"winner: {alive[0]} at {losses[alive[0]][-1]:.2f}; total spent {spent} config-epochs")
+print(f"equal-budget random at r=4: {spent} // 4 = {spent // 4} configs")
+
+final = {k: v[-1] for k, v in losses.items()}
+best_of_8 = min(final, key=lambda k: final[k])
+subsets = list(itertools.combinations(sorted(losses), spent // 4))
+bests = [min(final[k] for k in s) for s in subsets]
+hits = sum(best_of_8 in s for s in subsets)
+print(f"\n{len(subsets)} possible subsets of {spent // 4} from 8")
+print(f"  P(random sees the true best {best_of_8}) = {hits}/{len(subsets)} = {100 * hits / len(subsets):.1f}%")
+print(f"  mean best final loss = {np.mean(bests):.4f}, median = {np.median(bests):.4f}, worst = {max(bests):.4f}")
+```
+
+```text
+rung 1: r=1, 8 configs run, cost 8*1=8, cumulative 8
+   ranked  : D 1.75  H 1.82  C 1.90  E 2.05  B 2.10  F 2.60  A 2.80  G 3.40
+   survives: D H C E
+   killed  : B F A G
+rung 2: r=2, 4 configs run, cost 4*2=8, cumulative 16
+   ranked  : D 1.40  H 1.50  C 1.60  E 1.95
+   survives: D H
+   killed  : C E
+rung 3: r=4, 2 configs run, cost 2*4=8, cumulative 24
+   ranked  : D 1.21  H 1.30
+   survives: D
+   killed  : H
+winner: D at 1.21; total spent 24 config-epochs
+equal-budget random at r=4: 24 // 4 = 6 configs
+
+28 possible subsets of 6 from 8
+  P(random sees the true best D) = 21/28 = 75.0%
+  mean best final loss = 1.2368, median = 1.2100, worst = 1.4200
+```
+
+Where the saving comes from: every rung cost exactly 8 config-epochs, and the total is 24. The same 24 config-epochs handed to plain random search at the full 4-epoch budget buys `24 // 4 = 6` configurations, each trained blind. Halving screened 8 candidates and then trained the survivor properly; random screened 6 and never got a second look at any of them.
+
+It is worse than just two extra candidates. `D` is genuinely the best of all eight (final `1.21`, the lowest number in the last column), so halving reports the true winner by construction. Random draws 6 of the 8 and reports the best of what it happened to draw: enumerating all `C(8, 6) = 28` possible subsets, `D` is in `21 / 28 = 75.0%` of them, the average best score across the subsets is `1.2368`, and the unluckiest draw can only report `1.42`, which is configuration C. Halving is a funnel; random is a lottery drawing on the same prize pool.
+
+And the price is the first kill list. `B` started fifth-best at `2.10` and finished fourth-best overall at `1.70`, and it was thrown away at rung 1, along with A, F and G. That is the honest cost of believing a one-epoch measurement, and it is why the closing paragraph of this section is about when the assumption breaks.
 
 With `eta = 3` and `R = 81`:
 
@@ -192,6 +477,8 @@ grand total = 1902,  (s_max+1)*B = 2025
 ```
 
 Read `9@1` as nine configurations at budget one. The total cost is always `n` multiplied by the number of rungs, because each rung spends the same amount: `n` configs at `r` costs the same as `n / eta` configs at `r * eta`. That identity is what makes the Hyperband budget arithmetic work out, and the last six lines of the output are the Hyperband brackets that use it.
+
+Check the identity on the `n= 81` line, which is the eight-config toy grown up: `81 * 1`, `27 * 3`, `9 * 9`, `3 * 27` and `1 * 81` are all 81, so five rungs cost `5 * 81 = 405`, and that is the printed `cost=405`. In the toy the same claim was `8 * 1 = 4 * 2 = 2 * 4 = 8`, three rungs and `3 * 8 = 24`. Read the ladder out loud as: 81 configurations for one epoch, 27 for three, 9 for nine, 3 for twenty-seven, one for eighty-one. Halving the field and tripling the budget are the same expenditure, which is why the ladder is flat and why the cost collapses to `n` times the rung count.
 
 Does the early stopping cost more than it saves? Simulated on the same synthetic objective, with per-observation noise of standard deviation `0.5 / sqrt(r)` so early measurements are unreliable but not random:
 
@@ -252,6 +539,10 @@ equal budget of 405 config-epochs, R = 81, eta = 3, 300 repeats
 
 Successive halving evaluates 81 configurations for the same 405 config-epochs that random search spends on five. It wins 92.7% of the time and its 90th percentile is three times tighter, because a bad configuration is discarded at rung one instead of consuming a full run.
 
+Same shape as the toy, one size up: 81 candidates against 5 where the toy had 8 against 6, and 405 config-epochs against the toy's 24. The difference is that this run has noise, so read what the rung-1 measurement is actually worth. The model adds standard deviation `0.5 / sqrt(r)`, which gives `0.5` at `r = 1`, `0.2887` at `r = 3`, `0.1667` at `r = 9`, `0.0962` at `r = 27` and `0.0556` at `r = 81`. A rung-1 score is a badly blurred copy of the truth, and every rung after it sharpens the copy only for the configurations that were good enough to still be alive.
+
+The random-search mean of `3.0406` against a median of `2.3074` is the tail doing the damage: five blind runs, and one of them is very often a disaster. Halving's `1.6118` at the 90th percentile against random's `4.9771` is the same three-times-tighter claim as the toy's guarantee that the worst random draw could only report `1.42` while halving always reported `1.21`.
+
 The assumption underneath all of this is that early loss correlates with final loss. That holds for learning rate and most regularization, and it fails for schedules that anneal late, for models whose training is unstable early, and for anything with a long warmup. If your configurations reorder themselves between epoch 5 and epoch 81, pruning will discard the winner.
 
 ---
@@ -260,7 +551,7 @@ The assumption underneath all of this is that early loss correlates with final l
 
 Successive halving has a free parameter you cannot choose well. A large `n` gives you lots of configurations but only a few rungs, so nothing gets trained long enough to be trustworthy. A small `n` gives you full-length runs on barely any candidates.
 
-Hyperband runs several successive-halving brackets with different `n` and spends the same total budget on each. Given a maximum budget `R` and a reduction factor `eta`:
+Hyperband runs several successive-halving <Tip term="bracket">One complete successive-halving ladder, from its starting number of configurations up to whatever budget is left. Each bracket is one choice of how aggressively to prune; Hyperband runs all the choices side by side.</Tip>s with different `n` and spends the same total budget on each. Given a maximum budget `R` and a reduction factor `eta`:
 
 ```text
 s_max = floor(log_eta(R))
@@ -268,6 +559,13 @@ B     = (s_max + 1) * R
 n_s   = ceil( (B / R) * eta^s / (s + 1) )
 r_s   = R * eta^(-s)
 ```
+
+Read those four lines out loud, one at a time:
+
+- `s_max = floor(log_eta(R))` — how many times you can divide `R` by `eta` before you reach 1. With `R = 81` and `eta = 3`: 81, 27, 9, 3, 1 is four divisions, so `s_max = 4`.
+- `B = (s_max + 1) * R` — what one complete ladder costs, `5 * 81 = 405` config-epochs, which is the `cost=405` printed for `n=81` above.
+- `n_s = ceil((B / R) * eta^s / (s + 1))` — how many configurations bracket `s` begins with. As `s` falls, `eta^s` shrinks quickly and `s + 1` shrinks slowly, so the two nearly cancel. That near-cancellation is the entire trick: it is why every bracket costs about the same.
+- `r_s = R * eta^(-s)` — the budget at the first rung of bracket `s`. Bracket 4 starts at `81 * 3**-4 = 1` epoch, bracket 0 at `81 * 3**0 = 81`.
 
 The last six lines of `halving.py` above compute this. For `R = 81` and `eta = 3`, `s_max = floor(log_3 81) = 4` and `B = 5 * 81 = 405`:
 
@@ -279,7 +577,11 @@ The last six lines of `halving.py` above compute this. For `R = 81` and `eta = 3
 | 1           | 8           | 27                  | 2     | 378    | `0.933`      |
 | 0           | 5           | 81                  | 1     | 405    | `1.000`      |
 
+The table is one column per question a first-timer asks: how many different configurations did I get to try, and how much training did each one actually receive. Bracket 4 is 81 shots at one epoch apiece; bracket 0 is five shots at the full run. Read the `Budget` column down and it barely moves, from 405 to 363 to 351 to 378 back to 405, and that flatness is `n_s` doing its job.
+
 Bracket 4 is aggressive pruning: 81 configurations starting at one epoch. Bracket 0 is no pruning at all: five full 81-epoch runs. The brackets in between hedge. Every bracket costs roughly `B`, so the whole search costs about `5 * B = 2025` config-epochs, and the computed total is 1902 because the integer floors in `n_s` lose a few configurations in the middle brackets.
+
+The two end rows are the two failure modes named at the top of this section — "barely any candidates" and "nothing trained long enough" — and the middle rows are the compromises between them. Hyperband does not pick one; it pays for all of them and lets the results decide.
 
 You do not have to know in advance whether pruning helps for your problem, which is the point. Hyperband tries every level of aggressiveness at once and the best bracket wins.
 
@@ -287,9 +589,18 @@ You do not have to know in advance whether pruning helps for your problem, which
 
 ## ASHA
 
-Hyperband runs its brackets one after another, and each bracket is a synchronous halving: nothing advances until every configuration at a rung has finished. On a cluster with 64 workers and a bracket of five configurations at the last rung, 59 workers sit idle.
+Hyperband runs its brackets one after another, and each bracket is a synchronous halving: nothing advances until every configuration at a rung has finished. On a cluster with 64 workers and a bracket of five configurations at the last rung, 59 workers sit idle. Check that count, because it is the whole complaint: `64 - 5 = 59` accelerators watching five runs finish, and the last rung of every bracket is the emptiest one.
 
 ASHA, the Asynchronous Successive Halving algorithm, promotes a configuration as soon as it lands in the top `1 / eta` of everything reported so far at that rung, without waiting for the rung to fill. Promotion decisions are made against partial information and are occasionally wrong, which costs a little accuracy, and the parallel efficiency gain is much larger. ASHA scales to thousands of concurrent trials where synchronous Hyperband stalls.
+
+|                        | Synchronous Hyperband                                | ASHA                                                  |
+| :--------------------- | :--------------------------------------------------- | :---------------------------------------------------- |
+| When a config moves up | after every config at that rung has reported         | as soon as it is in the top `1 / eta` reported so far |
+| What the ranking sees  | a complete rung, so the comparison is fair           | a partial rung, so a few promotions are wrong         |
+| Idle workers           | many, whenever a rung holds fewer configs than slots | few, because new configs start as old ones die        |
+| Scales to              | a handful of concurrent trials                       | thousands                                             |
+
+The trade is the second row against the third: ASHA buys its parallelism with a little judgment made on incomplete evidence, and keeps a cluster busy instead of waiting for stragglers.
 
 This is what `HyperbandPruner` in Optuna and `ASHAScheduler` in Ray Tune implement. Use them whenever you have more than a handful of workers.
 
@@ -299,13 +610,70 @@ This is what `HyperbandPruner` in Optuna and `ASHAScheduler` in Ray Tune impleme
 
 Pruning decides how long to run each trial. Model-based search decides which trial to run next, using the results of all previous trials rather than drawing independently.
 
-**Gaussian processes** (SMAC, BoTorch, spearmint) fit a GP over the configuration space, which gives a predicted mean and a predicted uncertainty at every untried point. An acquisition function, usually expected improvement, combines the two into a score and the next configuration is its argmax. GPs handle continuous spaces well and degrade past roughly 20 dimensions, since the covariance matrix has to be inverted and the length scales become hard to estimate.
+Both methods below build a cheap stand-in for the real objective and interrogate that instead, because the real objective costs a training run per question and the stand-in costs a fraction of a second. The stand-in has a name: a <Tip term="surrogate model">A statistical fit to the trials you have already run, used in place of the expensive real objective. It can be evaluated at thousands of untried configurations in the time one run takes, which is what makes "which trial next?" a question you can answer.</Tip>. Random search has no surrogate and no memory: it draws each trial as though the study were empty, which is exactly what the sections above relied on.
+
+**Gaussian processes** (SMAC, BoTorch, spearmint) fit a GP over the configuration space, which gives a predicted mean and a predicted uncertainty at every untried point. An <Tip term="acquisition function">One score per untried configuration, folding the surrogate's predicted mean and predicted uncertainty into a single number so candidates can be ranked against each other.</Tip>, usually <Tip term="expected improvement">How much better than your current best you expect a point to turn out, counting both its predicted mean and the chance that its uncertainty hides a dip below the best. It falls to zero for a point that is predictably worse with certainty.</Tip>, combines the two into a score and the next configuration is its argmax, which is just the shorthand for "the input that gives the biggest output". GPs handle continuous spaces well and degrade past roughly 20 dimensions, since the covariance matrix has to be inverted and the length scales become hard to estimate.
 
 **TPE**, Tree-structured Parzen Estimator, is Optuna's default. It splits observed trials at a quantile `gamma` into a good set and a bad set, fits a density to each, and picks the configuration maximizing `l(x) / g(x)`, the ratio of the good density to the bad density. TPE does not model the loss value directly, only the density of configurations on either side of the threshold, which makes it cheaper and more tolerant of conditional and categorical spaces.
 
+Set side by side, the difference is one of direction:
+
+| Dimension            | Gaussian process                                                         | TPE                                                                     |
+| :------------------- | :----------------------------------------------------------------------- | :---------------------------------------------------------------------- |
+| What it fits         | a distribution over the loss value itself                                | two distributions over configurations, one for good trials, one for bad |
+| Predicts the loss    | yes                                                                      | never                                                                   |
+| Next trial chosen by | the best acquisition score, usually expected improvement                 | the largest density ratio `l(x) / g(x)`                                 |
+| Spaces it handles    | continuous and smooth                                                    | conditional and categorical spaces as well                              |
+| Where it degrades    | past roughly 20 dimensions, since the covariance matrix must be inverted | at small budgets, where both densities are noise                        |
+| Names on this page   | SMAC, BoTorch, spearmint                                                 | Optuna's default sampler                                                |
+
+_Expected improvement_ is the least intuitive phrase on the page, and three numbers retire it. Take the best score found so far to be the synthetic objective's random median from the grid section, `1.2241`, and rank three candidates a surrogate might be holding:
+
+| Candidate | Predicted mean | Predicted std | `z = (best - mean) / std` | Expected improvement |
+| :-------- | :------------- | :------------ | :------------------------ | :------------------- |
+| tight     | 1.2300         | 0.0200        | -0.2950                   | 0.005374             |
+| middle    | 1.2600         | 0.0800        | -0.4488                   | 0.017126             |
+| wide      | 1.3000         | 0.2000        | -0.3795                   | 0.047516             |
+
+```python title="expected_improvement.py"
+import math
+
+Phi = lambda z: 0.5 * (1 + math.erf(z / math.sqrt(2)))
+phi = lambda z: math.exp(-0.5 * z * z) / math.sqrt(2 * math.pi)
+
+def expected_improvement(mean, std, best):
+    z = (best - mean) / std
+    return (best - mean) * Phi(z) + std * phi(z), z
+
+best = 1.2241
+for name, mean, std in (("tight", 1.2300, 0.0200), ("middle", 1.2600, 0.0800), ("wide", 1.3000, 0.2000)):
+    ei, z = expected_improvement(mean, std, best)
+    print(f"{name:7s} mean={mean:.4f} std={std:.4f} z={z:+.4f} "
+          f"Phi(z)={Phi(z):.5f} phi(z)={phi(z):.5f} "
+          f"pieces={(best - mean) * Phi(z):+.6f} {std * phi(z):.6f} EI={ei:.6f}")
+```
+
+```text
+tight   mean=1.2300 std=0.0200 z=-0.2950 Phi(z)=0.38400 phi(z)=0.38196 pieces=-0.002266 0.007639 EI=0.005374
+middle  mean=1.2600 std=0.0800 z=-0.4488 Phi(z)=0.32681 phi(z)=0.36073 pieces=-0.011732 0.028858 EI=0.017126
+wide    mean=1.3000 std=0.2000 z=-0.3795 Phi(z)=0.35216 phi(z)=0.37122 pieces=-0.026729 0.074245 EI=0.047516
+```
+
+Read the formula as two pieces. `(best - mean) * Phi(z)` is the improvement you would expect if the prediction is right, weighted by the probability of that; `std * phi(z)` is the bonus for not knowing. For `wide` the pieces are `-0.026729` and `0.074245`, and the second one wins, so `0.047516`. The candidate with the _worst_ predicted mean of the three is the one picked, because its uncertainty makes a dip below `1.2241` plausible and expected improvement pays for that possibility. Exploit versus explore, and it is one multiplication, not a mood.
+
+TPE's ratio is even smaller arithmetic. With `gamma = 0.25` and 8 observed trials, the split is the best 2 trials against the remaining 6, and every candidate value `x` gets two density readings: `l(x)`, how tightly the good trials sit around `x`, and `g(x)`, how tightly the bad ones do.
+
+| Candidate | `l(x)`, good density | `g(x)`, bad density | `l(x) / g(x)` |
+| :-------- | :------------------- | :------------------ | :------------ |
+| A         | 0.60                 | 0.05                | 12.0          |
+| B         | 0.20                 | 0.02                | 10.0          |
+| C         | 0.05                 | 0.40                | 0.125         |
+
+A is the pick, and it beats C by `12.0 / 0.125 = 96` times. Read the rule out loud as: try the value that good runs used far more often than bad runs did. No loss value appears anywhere in that sentence, which is the "does not model the loss value directly" claim above made concrete, and it is why TPE costs less per decision.
+
 Both need a warmup. TPE with `gamma = 0.25` on fewer than about ten observations is fitting densities to noise and does worse than random. Optuna's `TPESampler` therefore runs `n_startup_trials = 10` random trials before it starts modeling. If your budget is under 20 trials, use random search.
 
-The crossover point is around 20 to 30 trials. Below that, use random sampling with a pruner. Above it, TPE pulls ahead because it stops revisiting regions that already scored badly, and the gap widens as the space gets higher dimensional.
+The crossover point is around 20 to 30 trials. Below that, use random sampling with a pruner. Above it, TPE pulls ahead because it stops revisiting regions that already scored badly, and the gap widens as the space gets higher dimensional. That is an <Tip term="asymptotically optimal">A rule is asymptotically optimal if, in the limit of unlimited budget, it does as well as any rule could. The claim is about the limit, not about your 50-trial budget — which is why the useful number on this page is the 20-to-30-trial crossover, measured rather than proved.</Tip> claim, and the distance between "in the limit" and "at 30 trials" is exactly what the warmup paragraph is managing.
 
 ---
 
@@ -345,6 +713,8 @@ study.optimize(objective, n_trials=200, n_jobs=4)
 print(study.best_params, study.best_value)
 ```
 
+One pass over the shape of that function, since everything outside the model is the search talking to itself. `objective` receives one trial, asks for a value of each knob, trains, reports intermediate scores, and returns one final metric; `study.optimize(objective, n_trials=200)` then calls it 200 times with 200 different sets of knob values. The line `trial.suggest_float("lr", 1e-5, 1e-1, log=True)` reads as: draw `lr` between `1e-5` and `1e-1`, uniformly in `log10` — the <Tip term="log-uniform">Every decade in the range is equally likely. The sampler draws the exponent uniformly and exponentiates; `log=True` is that one line of arithmetic as a library call.</Tip> of the section above, spelled as an argument.
+
 `trial.report(value, step)` is what makes pruning possible. Without it the pruner has nothing to look at and every trial runs to completion. Call it once per epoch, or once per few hundred steps for long runs.
 
 The samplers and pruners:
@@ -360,6 +730,19 @@ optuna.pruners.PercentilePruner(25.0)
 optuna.pruners.HyperbandPruner(min_resource=1, reduction_factor=3)
 optuna.pruners.NopPruner()
 ```
+
+A sampler and a pruner are two unrelated jobs, which is why `create_study` takes both. The sampler answers "what combination should the next trial use?"; the pruner answers "should this trial still be running?" Changing one does not change the other, and the study above pairs a TPE sampler with a Hyperband pruner precisely because those are the two independent decisions.
+
+| Name               | Job     | What it does                                                                  | Reach for it when                              |
+| :----------------- | :------ | :---------------------------------------------------------------------------- | :--------------------------------------------- |
+| `RandomSampler`    | sampler | draws every trial independently from the declared spaces                      | budget under 20 trials, or as the baseline     |
+| `TPESampler`       | sampler | splits trials at `gamma` into good and bad, maximizes their density ratio     | 20 or more trials, mixed or conditional spaces |
+| `CmaEsSampler`     | sampler | evolves a multivariate normal over the candidates, continuous spaces          | smooth continuous spaces, moderate budgets     |
+| `NSGAIISampler`    | sampler | multi-objective                                                               | you are trading two metrics against each other |
+| `MedianPruner`     | pruner  | stops a trial tracking below the running median of its peers at the same step | the default, no budget arithmetic              |
+| `PercentilePruner` | pruner  | the same rule at a percentile you choose instead of the median                | you want a dial on how hard to prune           |
+| `HyperbandPruner`  | pruner  | successive halving across Hyperband brackets                                  | more than a handful of workers                 |
+| `NopPruner`        | pruner  | never stops anything                                                          | every trial must reach the full budget         |
 
 `MedianPruner` kills any trial below the running median of its peers at the same step, which is successive halving with `eta = 2` and no fixed bracket. It is the right default when you do not want to think about budgets.
 
@@ -405,9 +788,24 @@ analysis = tune.run(
 print(analysis.best_config, analysis.best_result)
 ```
 
+Read the `config` dictionary first, because it is the whole <Tip term="search space">The list of knobs plus the range each one may take. In Ray Tune it is written as a dictionary of space objects; in Optuna it is written as the `suggest_*` calls inside `objective`.</Tip> for this run, one line per knob: `tune.loguniform` is the log-uniform spread from the section above, `tune.uniform` is a linear spread, `tune.randint(2, 7)` is an integer count of layers drawn from 2 through 6, and a bare `81` is not a search at all — it is a constant handed to every trial. `trainable` is the function Ray runs once per trial, the counterpart of Optuna's `objective`, and `num_samples=200` is the budget.
+
 `tune.report` is the equivalent of `trial.report` and it is what ASHA uses to decide promotion. `grace_period=1` is the budget at the first rung, `reduction_factor=3` is `eta`, `max_t=81` is `R`. Those three numbers are the same Hyperband bracket arithmetic.
 
+Set them against the page's own worked example and they are the same ladder written two ways: `grace_period=1`, `reduction_factor=3`, `max_t=81` is the bracket `s = 4` row of the Hyperband table, `81@1 -> 27@3 -> 9@9 -> 3@27 -> 1@81`, and each of its five rungs costs `81 * 1`, `27 * 3`, `9 * 9`, `3 * 27`, `1 * 81` — always 81 config-epochs, so five rungs cost `5 * 81 = 405`.
+
 Swapping `BasicVariantGenerator` for `BayesOptSearch` or `OptunaSearch` turns random sampling into model-based sampling without changing anything else. Ray Tune can drive Optuna as its search algorithm while keeping its own scheduler and resource management, which is the combination most large runs use.
+
+The two libraries are the same four decisions wearing different names, so learning one transfers:
+
+| Decision                | Optuna                               | Ray Tune                           |
+| :---------------------- | :----------------------------------- | :--------------------------------- |
+| declare a space         | `trial.suggest_float(..., log=True)` | `tune.loguniform(...)`             |
+| report a score          | `trial.report(value, step)`          | `tune.report(loss=..., epoch=...)` |
+| allow early stopping    | `trial.should_prune()` plus a pruner | a scheduler, no call needed        |
+| halving across brackets | `HyperbandPruner`                    | `ASHAScheduler`                    |
+| model-based suggestions | `TPESampler`, `CmaEsSampler`         | `BayesOptSearch`, `OptunaSearch`   |
+| run trials in parallel  | `n_jobs`                             | cluster resources                  |
 
 ---
 
@@ -416,6 +814,8 @@ Swapping `BasicVariantGenerator` for `BayesOptSearch` or `OptunaSearch` turns ra
 PBT is a different shape of algorithm and it is the only common method that tunes hyperparameters _during_ a run rather than choosing them once.
 
 Maintain a population of workers, each training its own copy of the model. Periodically, the worst performers copy the weights of the best performers and perturb their hyperparameters. The perturbations are multiplicative, usually drawing from `[0.8, 1.2]` or resampling from the prior.
+
+Multiplicative rather than additive, for the same reason the log-uniform section above exists: a fixed nudge means different things at different sizes. A `+5e-4` step on a learning rate of `3e-3` is a 1.17x change, mild; the same absolute step on `1e-4` is a 6x change and wrecks the run. The factors are easy to check: from `3e-3`, the two corners of `[0.8, 1.2]` are `2.40e-3` and `3.60e-3`. And because a perturbation is a ratio, a `0.8` draw undone by a `1.25` draw returns the worker to exactly `3e-3`, so the population can wander around its prior without drifting off the scale it started on.
 
 ```text
 every T steps:
@@ -457,7 +857,19 @@ flowchart TD
 
 Step 5 is the one people skip, and skipping it is how a search produces a result that does not reproduce. Report mean and standard deviation over seeds, never a single best number.
 
+Each of those five steps is one mechanism from this page, at a size you can afford:
+
+| Step | What it buys                                                       | Trials      | The section that justifies it                           |
+| :--- | :----------------------------------------------------------------- | :---------- | :------------------------------------------------------ |
+| 1    | one thing changed at a time, so a result means something           | 0           | everything, but especially the couplings                |
+| 2    | the right decade of the learning rate                              | 20          | Grid against random, Log-uniform spaces                 |
+| 3    | the second-most sensitive knob, at a settled rate                  | 30          | the two couplings at the end of What is worth searching |
+| 4    | all four or five axes at once, without paying full price per trial | 100 to 200  | Pruning, Hyperband, ASHA, Model-based search            |
+| 5    | proof the winner is a winner                                       | 6 full runs | the seed spread, and nothing else                       |
+
 Budget matters more than algorithm. Going from 20 trials to 200 trials helps more than going from random search to TPE, and going from full-length trials to pruned trials helps more than both. Spend on the number of configurations you can evaluate, not on the sophistication of the sampler.
+
+The whole page compresses into those two sentences, and the arithmetic behind them is three lines: `k^P` says a grid cannot afford many axes, `n` times the number of rungs says pruning multiplies how many configurations a budget can screen, and the seed spread says the last decimal places of a winner are noise.
 
 ---
 
@@ -474,14 +886,29 @@ Budget matters more than algorithm. Going from 20 trials to 200 trials helps mor
     One or two axes, or when you want to see the shape of the response surface rather than just its minimum. A 2D heatmap is worth more than a best score when you are trying to understand the problem.
 
   </Accordion>
+  <Accordion title="Give an example of a hyperparameter hidden inside a grid's structure.">
+
+    Cross a `3x3` learning-rate grid with a `3x3` weight-decay grid when what matters is the product `lr * wd`. The nine cells give only five distinct products, and the middle one, `1e-7`, is tested three times because three different pairs multiply into it. Nine random draws on the same ranges give nine distinct products.
+
+  </Accordion>
   <Accordion title="Why sample the learning rate log-uniformly?">
 
     Useful values are spread multiplicatively across orders of magnitude. `1e-4` and `1.1e-4` are the same configuration; `1e-4` and `1e-3` are not. A uniform linear sample puts nearly all of its budget at the top of the range.
 
   </Accordion>
+  <Accordion title="What does a linear draw over 1e-5 to 1e-1 spend its budget on?">
+
+    90.01% of the draws land in the top decade and 0.0900% below `1e-4`, so most of the range is never visited. Its median is `0.050005` against the log-uniform median of `1e-3`, a factor of 50.
+
+  </Accordion>
   <Accordion title="How does successive halving work?">
 
     Run `n` configurations at budget `r`, keep the top `1 / eta`, multiply `r` by `eta`, repeat. Total cost is `n` times the number of rungs, because each rung costs the same as the one before it.
+
+  </Accordion>
+  <Accordion title="Run successive halving on 8 configs with eta of 2 and R of 4. Who dies at which rung?">
+
+    Rung `r = 1`: all 8 run, cost 8, the worst 4 are cut. Rung `r = 2`: 4 run, cost 8, the worst 2 are cut. Rung `r = 4`: 2 run, cost 8, one survives. Total 24 config-epochs, which buys random search only `24 / 4 = 6` full runs, and the survivor is the true best of the eight by construction.
 
   </Accordion>
   <Accordion title="What does Hyperband add?">
@@ -504,6 +931,11 @@ Budget matters more than algorithm. Going from 20 trials to 200 trials helps mor
     `n_startup_trials = 10`. Fitting a density to fewer than about ten observations models noise and does worse than random sampling.
 
   </Accordion>
+  <Accordion title="A GP says candidate one has mean 1.2300 and std 0.0200, candidate two has mean 1.3000 and std 0.2000, and your best score is 1.2241. Which does expected improvement choose?">
+
+    Candidate two, by `0.047516` against `0.005374`. The tight candidate is almost certainly a little worse than the incumbent, so there is nothing to win; the uncertain one might dip below it, and the `std * phi(z)` term pays for that possibility. This is explore versus exploit written as one arithmetic expression.
+
+  </Accordion>
   <Accordion title={<>What does <code>trial.report</code> do?</>}>
 
     It sends an intermediate score to the pruner. Without it there is nothing to prune on and every trial runs to completion.
@@ -512,6 +944,11 @@ Budget matters more than algorithm. Going from 20 trials to 200 trials helps mor
   <Accordion title="What is population based training?">
 
     A population of workers trains in parallel; periodically the worst copy the weights of the best and perturb their hyperparameters. It produces a hyperparameter schedule discovered online rather than a fixed value, which is why it is used in reinforcement learning and long pretraining.
+
+  </Accordion>
+  <Accordion title="Why are PBT's perturbations multiplicative?">
+
+    Because a fixed additive nudge means different things at different sizes: `+5e-4` is a 1.17x change to a learning rate of `3e-3` and a 6x change to `1e-4`. A factor drawn from `[0.8, 1.2]` is the same size move wherever it lands, and a `0.8` draw followed by `1.25` returns the worker to its starting value.
 
   </Accordion>
   <Accordion title="Why re-run the top configurations with several seeds?">

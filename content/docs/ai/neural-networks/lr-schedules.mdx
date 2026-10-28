@@ -3,9 +3,130 @@ title: Learning Rate Schedules
 description: 'Warmup, step decay, cosine annealing, the Noam schedule, warmup-stable-decay, and SGDR restarts, with formulas and measured curves.'
 ---
 
-The learning rate is the one hyperparameter that has to change during a run. A constant value is either too large at the start, before the optimizer has any idea which direction is downhill, or too large at the end, when it overshoots a minimum it has already found. Schedules exist to be small at both ends and large in the middle.
+The learning rate is the one <Tip term="hyperparameter">A setting you pick before training rather than one the training loop learns from data. The learning rate, its warmup length, and its decay factor are hyperparameters; the weights are parameters.</Tip> that has to change during a run. A constant value is either too large at the start, before the optimizer has any idea which direction is downhill, or too large at the end, when it overshoots a minimum it has already found. Schedules exist to be small at both ends and large in the middle.
 
 Six families cover everything in use. This page gives the formula, the measured curve, and the situation each one belongs to.
+
+---
+
+## Start here
+
+Picture walking down a hillside in thick fog. You cannot see the valley, so you feel the slope under your feet and take a step. The learning rate is the length of that step. Too short and you spend the whole day on the mountain. Too long and one stride carries you clean across the valley and lands you higher up the far side than you started.
+
+Everything on this page follows from one awkward fact: the right step length is not a constant. On the open hillside above the valley you want long strides. Down in the valley, where the ground is nearly flat and one careless step puts you back on the slope you just came down, you want short ones. A <Tip term="schedule">A rule that says what the learning rate is at every step of the run, usually written as a formula in the step counter t. "Decay schedule" and "LR schedule" mean the same thing.</Tip> is that rule written down.
+
+### Every schedule is one line
+
+Whatever the page looks like later, every family here fills in the same expression:
+
+$$
+\text{lr}(t) = \text{base} \times m(t)
+$$
+
+Read it as: "the rate at step $t$ equals the peak rate times a multiplier between zero and one." `base` never changes during the run; the entire personality of a schedule lives in $m(t)$, the shape. Warmup, cosine, WSD, Noam, SGDR — five different ways of drawing $m(t)$. This is not a simplification for the sake of teaching: it is exactly what PyTorch's `LambdaLR` asks you to return, which is why one function of `step` implements all of them (see Implementing it, below).
+
+The knobs that appear in every formula below:
+
+| Knob              | Written as | Plain meaning                                                   |
+| :---------------- | :--------- | :-------------------------------------------------------------- |
+| Peak rate         | `base`     | the largest rate the run ever uses                              |
+| Shape             | `m(t)`     | the fraction of `base` used at step `t`, always between 0 and 1 |
+| Warmup length     | `W`        | how many steps it takes to climb up to the peak                 |
+| Total steps       | `T`        | when the run ends                                               |
+| Decay factor      | `gamma`    | how much of the rate survives each interval                     |
+| Floor             | `eta_min`  | the smallest rate the schedule is allowed to reach, usually 0   |
+| Stable hold point | `hold`     | the step where a WSD run stops being flat and starts annealing  |
+
+### A ten-step schedule you can check by hand
+
+Take `base = 1e-3`, warmup `W = 2` steps, total `T = 10` steps, cosine decay after the warmup. Every number below is that formula evaluated step by step:
+
+```text
+t=0  lr=5.000000e-04  frac=0.5000  warmup
+t=1  lr=1.000000e-03  frac=1.0000  warmup
+t=2  lr=1.000000e-03  frac=1.0000  cosine
+t=3  lr=9.619398e-04  frac=0.9619  cosine
+t=4  lr=8.535534e-04  frac=0.8536  cosine
+t=5  lr=6.913417e-04  frac=0.6913  cosine
+t=6  lr=5.000000e-04  frac=0.5000  cosine
+t=7  lr=3.086583e-04  frac=0.3087  cosine
+t=8  lr=1.464466e-04  frac=0.1464  cosine
+t=9  lr=3.806023e-05  frac=0.0381  cosine
+```
+
+The `frac` column is $m(t)$, the multiplier. Four things to notice:
+
+- **Step 0 is not zero.** `lr(0)` is `5e-4`, half the peak, because the warmup formula uses `(t + 1) / W` and not `t / W`. With a plain `t / W` the first step of the run would do nothing at all.
+- **The peak lands exactly at `t = W`.** Step 1 finishes the ramp and step 2 is the first full-rate step.
+- **The midpoint is exactly half the peak.** At `t = 6` the anneal is half finished, `cos(pi * 0.5) = 0`, so $m = 0.5 \times (1 + 0) = 0.5$ and the rate is `5.000000e-04`. That is the one property worth memorizing about cosine.
+- **From `t = 6` to `t = 9` the rate falls off a cliff.** It drops from half the peak to under 4% of it. Whatever a run is going to gain from annealing, it gains in that last stretch.
+
+### The two failures, and why one shape fixes both
+
+A schedule has to solve two unrelated problems, one at each end:
+
+- **Early: a full-size step on bad information diverges.** The parameters are random and the <Tip term="second-moment estimate">In Adam and AdamW, a running average `v` of the squares of recent gradients. It is what divides the gradient to make each parameter's step its own size.</Tip> that Adam uses to size steps starts at zero, so the first few updates have enormous and meaningless magnitude. Warmup keeps those steps tiny until `v` has real statistics behind it.
+- **Late: a full-size step will not let you stop.** Near a minimum the gradient is small and noisy, so a big rate makes the parameters orbit the minimum forever instead of settling in. <Tip term="Annealing">Borrowed from metallurgy: cooling a melt slowly so it settles into a good crystal structure. In training it means shrinking the learning rate toward the end of a run so the parameters come to rest instead of jittering.</Tip> shrinks the steps and recovers accuracy you would otherwise leave on the table.
+
+Those are the only two jobs. Every family below is an answer to "how do I get small-big-small, and what else do I want along the way?"
+
+### What the rest of the page settles
+
+- **All seven shapes at the same steps** — the curves measured, side by side, so you can see them instead of imagining them.
+- **Why the rate has to move** — the two failures above in detail.
+- **Warmup** — the first 1% to 10% of the run, and how long that is per model family.
+- **The decay families** — six decay laws and where each one ends up.
+- **Cosine annealing**, **Noam and inverse sqrt**, **Warmup-stable-decay**, **SGDR restarts** — the four shapes people actually deploy.
+- **Implementing it** — `LambdaLR`, the built-in schedulers, and the step-versus-epoch trap.
+- **Choosing** — which one for which run.
+
+---
+
+## All seven shapes at the same steps
+
+Seven columns, one per curve: the six decay laws from The decay families, each with warmup folded in where it belongs, plus SGDR's repeated cosine. All of them evaluated with the same peak rate `base = 1e-3`, the same warmup `W = 1000`, and the same total `T = 10000` steps. Warmup+cosine, linear, inverse sqrt and WSD use the shared ramp; step decay (`gamma = 0.5`, halving every 2500 steps), exponential (`gamma = 0.9999`) and SGDR (`T_0 = 2500`, `T_mult = 2`) are drawn in their classic no-warmup form, which is why they start at the peak. Numbers are computed, not sketched.
+
+| Step `t` | Warmup + cosine | Step decay  | Exponential | Linear to zero | Inverse sqrt | WSD         | SGDR restarts |
+| :------- | :-------------- | :---------- | :---------- | :------------- | :----------- | :---------- | :------------ |
+| 0        | `1.000e-06`     | `1.000e-03` | `1.000e-03` | `1.000e-06`    | `1.000e-06`  | `1.000e-06` | `1.000e-03`   |
+| 100      | `1.010e-04`     | `1.000e-03` | `9.900e-04` | `1.010e-04`    | `1.010e-04`  | `1.010e-04` | `9.961e-04`   |
+| 1000     | `1.000e-03`     | `1.000e-03` | `9.048e-04` | `1.000e-03`    | `1.000e-03`  | `1.000e-03` | `6.545e-04`   |
+| 5000     | `5.868e-04`     | `2.500e-04` | `6.065e-04` | `5.556e-04`    | `4.472e-04`  | `1.000e-03` | `5.000e-04`   |
+| 10000    | `0.000e+00`     | `6.250e-05` | `3.679e-04` | `0.000e+00`    | `3.162e-04`  | `0.000e+00` | `8.536e-04`   |
+
+Read the rows in order, because each one makes a different point:
+
+- **`t = 0` and `t = 100`:** four of the seven columns are identical (`1.000e-06`, then `1.010e-04`). During warmup there is nothing to choose; every family that warms up uses the same straight ramp. The decay law only starts to matter after step `W`.
+- **`t = 1000`:** the warmup families are exactly at the peak `1.000e-03`. The exponential column is already slipping (`9.048e-04`) and SGDR reads `6.545e-04`, 40% of the way down its first 2500-step cycle — it has been decaying since step 0.
+- **`t = 5000`:** this is the row that separates the families. Same step, seven different rates spanning `2.500e-04` to `1.000e-03`, a factor of four.
+- **`t = 10000`:** cosine, linear and WSD reach exactly `0` by construction. Exponential is still at `3.679e-04`, 36.8% of peak, and inverse sqrt at `3.162e-04`, 31.6% — neither ever arrives. That gap is the entire meaning of <Tip term="decay">Any rule that shrinks the learning rate as the run goes on. Watch for the collision on this page: `weight_decay` in AdamW is a penalty on the weights, not a schedule, and has nothing to do with these curves.</Tip>: a per-step multiplier that shrinks the rate forever and lands on zero never. Step decay sits at `6.250e-05` and will stay there until the run ends. SGDR is back up at `8.536e-04` because it restarted twice. (`t = 10000` is the endpoint the curve aims at; the last executed step is `t = 9999`.)
+
+Two summary numbers make the same point more sharply. Both are computed by evaluating each curve at all 10000 steps:
+
+| Family       | Average rate, as a fraction of peak | Share of the run above half the peak |
+| :----------- | :---------------------------------- | :----------------------------------- |
+| WSD          | `0.8001`                            | `0.8000`                             |
+| Exponential  | `0.6321`                            | `0.6932`                             |
+| SGDR         | `0.6126`                            | `0.6250`                             |
+| Cosine       | `0.5001`                            | `0.5000`                             |
+| Linear       | `0.5001`                            | `0.5000`                             |
+| Inverse sqrt | `0.4825`                            | `0.3500`                             |
+| Step decay   | `0.4688`                            | `0.2500`                             |
+
+Cosine and linear have the same average and the same time above half speed, `0.5001` and `0.5000`. So the difference between them is not how much fast running you get, it is where the slow part is concentrated: cosine holds high and then drops hard, linear spreads the same reduction evenly. WSD buys `0.8001` by refusing to anneal until the last 30% of the run, and step decay gives away `0.7500` of the run below half speed because it halves early and often.
+
+And the one-line map from family to the failure it exists to prevent:
+
+| Family              | The failure it is built to prevent                                         |
+| :------------------ | :------------------------------------------------------------------------- |
+| Linear warmup       | Early divergence: full-size steps on gradient statistics that mean nothing |
+| Step decay          | Nothing forcing the rate down while the loss plateaus for epochs at a time |
+| Exponential         | The jolt of a milestone drop; each step shrinks by the same small factor   |
+| Linear to zero      | Curved machinery when a fixed budget only needs a rule that ends at zero   |
+| Cosine annealing    | The late-training plateau: too much jitter near the minimum                |
+| Inverse sqrt / Noam | Having to know `T`, and picking a rate that ignores the model's width      |
+| WSD                 | Committing to `T` before you know it                                       |
+| SGDR restarts       | Settling into one narrow minimum for the whole run                         |
 
 ---
 
@@ -13,19 +134,27 @@ Six families cover everything in use. This page gives the formula, the measured 
 
 Two separate problems, solved by two separate halves of the schedule.
 
-**Early in training** the parameters are random and the gradient points in a direction that is only loosely related to where the minimum is. Adam compounds this, because its second-moment estimate `v` starts at zero and takes hundreds of steps to become a reliable average. Taking full-size steps on that information throws the parameters somewhere worse. Warmup exists to keep the early steps small until the optimizer has statistics worth trusting.
+**Early in training** the parameters are random and the gradient points in a direction that is only loosely related to where the minimum is. Adam compounds this, because its second-moment estimate `v` starts at zero and takes hundreds of steps to become a reliable average. Taking full-size steps on that information throws the parameters somewhere worse. <Tip term="Warmup">Starting a run at a small fraction of the peak rate and ramping linearly up to the peak over the first `W` steps, so the earliest updates are deliberately under-sized.</Tip> exists to keep the early steps small until the optimizer has statistics worth trusting.
+
+How bad is "full-size" early? Adam's update is `lr * m / (sqrt(v) + eps)`, and before `v` has accumulated, that ratio is roughly `±1` per coordinate, so each weight moves about one `lr` in a direction it has no business picking. Across a single `512`-wide layer that is a displacement of about `1e-3 * sqrt(512) = 2.2627e-02` — a random shove of roughly `0.023` in a parameter space whose useful scale is a few thousandths. Run the same step under the warmup of the table above, where `lr(0) = 1e-6`, and the shove is `1e-6 * sqrt(512) = 2.2627e-05`, a thousand times smaller. Warmup does not make the first steps useless; it makes them harmless.
 
 **Late in training** the parameters are near a minimum and the gradient is small but noisy. A large learning rate makes the parameters orbit the minimum rather than settle into it. Decay shrinks the steps so the final position is close to the best one the run visited. This is worth a surprising amount: on most tasks, annealing to zero recovers one to three tenths of a percent of accuracy over stopping at the peak rate.
+
+That is the whole reason schedules exist. The rest of this page is shape.
 
 ---
 
 ## Warmup
+
+The failure warmup prevents is early divergence: full-size steps taken before the optimizer's gradient statistics mean anything.
 
 Linear warmup ramps the rate from zero to the base value over the first `W` steps:
 
 ```text
 lr(t) = base * (t + 1) / W        for t < W
 ```
+
+Read it as: "at step `t` you get the fraction `(t + 1) / W` of the peak rate." `W` is the knob that decides how long the optimizer is allowed to crawl. With `W = 1000` and `base = 1e-3`, step 0 gets `1.000e-06`, step 500 gets `5.010e-04`, and step 999 gets `1.000e-03` — the peak.
 
 Using `t + 1` rather than `t` means step 0 gets a nonzero rate. With plain `t / W` the first step does nothing at all, which wastes it.
 
@@ -59,6 +188,8 @@ All six, measured at base `1e-3`, total `1000` steps, warmup `100`:
 | 750      | `1.786e-04`     | `1.250e-04` | `4.722e-04` | `2.778e-04`    | `3.651e-04`  | `8.333e-04` |
 | 999      | `3.046e-09`     | `1.250e-04` | `3.681e-04` | `1.111e-06`    | `3.164e-04`  | `3.333e-06` |
 
+This table is six of the seven families from the 10000-step table above, squeezed to `T = 1000` (SGDR has no fixed `T` to squeeze). Schedules are shape-invariant: `t = 500` here is the halfway point of the run, and `t = 5000` above is also the halfway point, and both give the warmup+cosine rate `5.868e-04` and the WSD rate `1.000e-03`. Read either table as "fraction of the way through the run", not as a step number.
+
 The formulas:
 
 ```text
@@ -70,19 +201,41 @@ inverse sqrt    lr = base * sqrt(W / max(t, W))
 WSD             lr = base while t < hold, then linear to zero over the last (T - hold) steps
 ```
 
-Read the last row of the table. Cosine reaches `3e-9`, effectively zero. Linear reaches `1.1e-6`, also effectively zero. Exponential at `gamma = 0.999` reaches `3.7e-4`, still a third of the base rate, because exponential decay never arrives at zero. Step decay plateaus at `1.25e-4` and would stay there forever. Inverse sqrt reaches `3.2e-4` and keeps falling slowly.
+Each said out loud, in the order above:
+
+- **Step decay:** "the rate is the base times `gamma` raised to the number of whole intervals you have crossed." `floor` means rounding down to a whole interval, so the rate is flat inside an interval and jumps only at its boundaries. That table's column uses `step_size = 250` and `gamma = 0.5`, so it jumps at 250, 500 and 750: `1.000e-03`, `5.000e-04`, `2.500e-04`, `1.250e-04`, and then holds.
+- **Exponential:** "the rate is the base times `gamma` to the power of the step count" — every single step multiplies by `gamma`, so the shrink is continuous instead of stair-stepped.
+- **Linear:** "the rate is the base times the fraction of the anneal you have left." Subtract the progress, done.
+- **Cosine:** "the rate is the base times one half plus one half of the cosine of pi times your progress." The `cos` term runs from `+1` at the start of the anneal to `-1` at the end, so the multiplier runs from 1 to 0 — smoothly, and slow at first.
+- **Inverse sqrt:** "the rate is the base times the square root of the warmup length divided by the current step." Doubling the step count divides the rate by `sqrt(2)`.
+- **WSD:** "full rate until `hold`, then a straight line to zero." Warmup is prepended.
+
+Read the last row of the table. Cosine reaches `3e-9`, effectively zero. Linear reaches `1.1e-6`, also effectively zero. Exponential at `gamma = 0.999` reaches `3.7e-4`, still a third of the base rate, because exponential decay never arrives at zero. Step decay gets to `1.25e-4` and would stay there forever — it hits a <Tip term="plateau">To flatten out at a constant value instead of continuing to fall. The other plateau on this page is the P in `ReduceLROnPlateau`, which waits for the validation loss to stop improving before it shrinks the rate.</Tip>. Inverse sqrt reaches `3.2e-4` and keeps falling slowly.
 
 That is the practical difference. If your schedule needs to end near zero, cosine and linear do it by construction. Exponential and step decay need `gamma` tuned against the total step count, and getting it wrong means you finish training at a rate that is still too high.
+
+The `gamma` sensitivity is worth one number each. In the table above, exponential with `gamma = 0.999` lands at `3.681e-04` on a 1000-step run. In the 10000-step table, exponential with `gamma = 0.9999` — a decay per step ten times gentler — lands at `3.679e-04`, essentially the same place. `0.9999` is the right choice for `T = 10000` and the wrong one for `T = 1000`, where it would leave you at `9.048e-04`, still 90% of peak. Step decay has the same coupling in blunter form: with `step_size = 2500` and `gamma = 0.5` on a 10000-step run you take four halvings and finish at `6.250e-05`; stop the run at 3000 steps and you have had one halving and you finish at `5.000e-04`.
+
+<Callout type="info">
+  ### Zero-reaching is a property, not an achievement
+
+Cosine, linear and WSD reach zero because their formulas contain `T` and are constructed to vanish at it. Exponential and step decay contain a per-step multiplier and asymptotically approach zero, which is not the same thing. So the honest question when you pick a family is not "does it decay fast enough" but "does it know where the end of the run is". If it does not, tune `gamma` to `T` or you will finish at whatever the curve happens to be at, and the annealing benefit of the last tenth of a percent never materializes.
+
+</Callout>
 
 ---
 
 ## Cosine annealing
+
+The failure this shape prevents is the flat late-training stretch where the loss stops improving: the run still moving at close to the peak rate when it is already sitting on a minimum, so the loss curve plateaus without the parameters ever coming to rest. Cosine's answer is to spend the last quarter of the run falling off a cliff.
 
 The most widely used schedule, and the reason is the shape:
 
 ```text
 lr(t) = eta_min + 0.5 * (base - eta_min) * (1 + cos(pi * t / T))
 ```
+
+Read out loud: "start at the floor `eta_min`, then add half the distance between the floor and the peak, times one plus a cosine of pi times your progress through the run." At progress 0 the cosine is `1`, so the added term is the full `base - eta_min` and you are at the peak. At progress 1 the cosine is `-1` and you are at the floor. At progress 0.5 the cosine is `0` and you are exactly halfway.
 
 Fractions of the base rate at each point, with `eta_min = 0` and `T = 1000`:
 
@@ -96,17 +249,23 @@ Fractions of the base rate at each point, with `eta_min = 0` and `T = 1000`:
 
 It holds near the base rate for the first quarter, passes through half at the midpoint, and drops steeply through the last quarter. Compare that with linear decay, which is at `0.75` at `t = 250` and `0.25` at `t = 750`. Cosine spends more of the run at a high rate and does its annealing faster at the end, which is the shape that works best empirically.
 
-The steep final drop is doing real work. A fast anneal at the end lets the parameters settle into a sharp minimum they were orbiting, which is the mechanism SGDR exploits by restarting.
+The precise version of that comparison: cosine is above linear for the first half of the anneal and below it for the second half, and the two have identical averages (`0.5001` of peak over the 10000-step run measured above). The difference is entirely about _where_ the slow part sits. Linear gives you a gentle, constant reduction that starts the moment warmup ends; cosine defers the reduction and then delivers it hard.
+
+The steep final drop is doing real work. A fast anneal at the end lets the parameters settle into a sharp minimum they were orbiting, which is the mechanism SGDR exploits with a <Tip term="restart">Resetting the learning rate back to the peak partway through a run instead of letting it keep decaying. The moment the rate snaps back up is the end of one cycle and the start of the next.</Tip>.
 
 ---
 
 ## Noam and inverse sqrt
+
+The failure this shape prevents is having to know `T`: warmup and decay come out of one expression, so the curve is defined for an unbounded run. It also bakes in a rate that shrinks automatically as the model gets wider.
 
 The original Transformer used a schedule that combines linear warmup with inverse-square-root decay in a single expression:
 
 ```text
 lr(step) = base_factor * d_model^(-0.5) * min( step^(-0.5),  step * warmup^(-1.5) )
 ```
+
+Read it as: "take the smaller of two curves." One of them, `step * warmup^(-1.5)`, grows with the step count and is what you use early; the other, `step^(-0.5)`, falls with it and is what you use later. `min` picks the growing one while you are below the warmup length and the falling one afterwards, so the peak is not a special case in the code — it is where the two curves cross. The `d_model^(-0.5)` in front has nothing to do with time: it says a wider model needs a smaller rate.
 
 The `min` picks warmup while `step < warmup` and decay afterwards, so there is no branch. With `d_model = 512` and `warmup = 4000`:
 
@@ -124,11 +283,17 @@ The `min` picks warmup while `step < warmup` and decay afterwards, so there is n
 
 The peak is `d_model^(-0.5) * warmup^(-0.5) = 6.987712e-04`, reached exactly at `step = warmup`. Doubling the warmup steps lowers the peak by `sqrt(2)` and moves it later. Doubling `d_model` lowers it by `sqrt(2)` as well, which is the part of the formula that scales the rate down for wider models.
 
+Both halves of that claim are checkable: `512^(-0.5) = 0.0441942` and `4000^(-0.5) = 0.0158114`, whose product is `6.987712e-04`, exactly the table's peak. Swapping `warmup` to 8000 gives `512^(-0.5) * 8000^(-0.5) = 4.941059e-04`, and the ratio of the two peaks is `1.414214`, which is `sqrt(2)`.
+
 The `1/sqrt(step)` tail never approaches zero. At 200000 steps the rate is still `9.9e-5`, a seventh of the peak. That is fine for the original Transformer, which was trained to a fixed step count with a large model, and it is the reason modern LLM pretraining moved to cosine or WSD, which do reach zero.
+
+Note that Noam's shape and the "inverse sqrt" column of the decay tables are the same curve: a linear ramp to a peak at step `W`, then `base * sqrt(W / t)`. That column is at `3.162e-04` at step 10000 with `W = 1000`, i.e. `sqrt(1000 / 10000) = 0.3162` of peak. Noam is that shape with the peak chosen by the model width instead of by you.
 
 ---
 
 ## Warmup-stable-decay
+
+The failure WSD prevents is committing to a step budget you do not have. Cosine needs `T` before the first step; WSD does not need it until the last.
 
 WSD holds the base rate for most of training and anneals only at the end:
 
@@ -138,9 +303,13 @@ lr(t) = base                                        W <= t < hold
 lr(t) = base * (T - t) / (T - hold)                 t >= hold
 ```
 
+Read the three lines as three phases, in the order the name gives: warm up, stay flat, then "the rate is the base times the fraction of the decay window you have left." `T - t` counts the steps remaining and `T - hold` is the whole decay window, so the multiplier is 1 at the start of the window and 0 at the end of the run.
+
 The table above uses `W = 100`, `hold = 700`, `T = 1000`, so 70% of the run is at a constant rate and the last 30% decays linearly. Recent large-scale runs use 10% warmup, 80% stable, 10% decay.
 
 The advantage is that you do not have to know `T` in advance. With cosine, deciding to train for twice as many steps changes the rate at every step you have already taken, so you cannot extend a run without restarting it. With WSD you keep going at the base rate and anneal whenever you decide to stop. That makes it the natural choice for runs where the budget is not fixed upfront, and it is why MiniCPM and a growing number of pretraining runs use it.
+
+The measured cost of that freedom is in the averages above: WSD runs at `0.8001` of peak for the whole run, against `0.5001` for cosine, because it refuses to slow down until the last 30%. It also anneals over 3000 steps instead of 9000, so the drop is steeper — from `1.000e-03` to `0.000e+00` in the 10000-step table.
 
 A useful side effect: you can branch off the stable phase and anneal several different endpoints from the same checkpoint, which gives you multiple models for the cost of one long run plus several short anneals.
 
@@ -148,13 +317,17 @@ A useful side effect: you can branch off the stable phase and anneal several dif
 
 ## SGDR restarts
 
-Cosine annealing with warm restarts runs the cosine curve repeatedly, each cycle longer than the last:
+The failure SGDR targets is a different one: not a bad rate at a bad time, but a good rate that spends the entire run refining the single minimum it first landed in.
+
+Cosine annealing with warm restarts runs the cosine curve repeatedly, each <Tip term="cycle">One complete pass of a decay curve from the peak down to the floor. In SGDR the schedule is a string of cycles rather than one long fall.</Tip> longer than the last:
 
 ```text
 lr(t) = eta_min + 0.5 * (base - eta_min) * (1 + cos(pi * t_cur / T_i))
 ```
 
-where `T_i` is the length of the current cycle and `t_cur` is the position within it. With `T_0 = 10` and `T_mult = 2`, cycles run 10, 20, 40, 80 epochs and restart at epochs 10, 30, 70, 150:
+where `T_i` is the length of the current cycle and `t_cur` is the position within it. Read it as: the ordinary cosine formula with `t` replaced by `t_cur`, so the curve is always measured from the start of the cycle you happen to be in. That one substitution is the entire change. When `t_cur` reaches `T_i` the cosine comes back to `+1`, the rate snaps to the peak, and the count restarts.
+
+With `T_0 = 10` and `T_mult = 2`, cycles run 10, 20, 40, 80 epochs and restart at epochs 10, 30, 70, 150:
 
 | Epoch | Learning rate | Current `T_i` |
 | :---- | :------------ | :------------ |
@@ -170,9 +343,11 @@ where `T_i` is the length of the current cycle and `t_cur` is the position withi
 | 70    | `1.000e-03`   | 80            |
 | 109   | `5.196e-04`   | 80            |
 
+The restart epochs are just the cumulative cycle lengths: `10`, `10 + 20 = 30`, `30 + 40 = 70`, `70 + 80 = 150`. And the pattern repeats inside each cycle: epoch 5 is the midpoint of a 10-epoch cycle and reads `5.000e-04`; epoch 50 is the midpoint of a 40-epoch cycle and reads the same `5.000e-04`. Half the peak at half a cycle, every cycle.
+
 Each restart snaps the rate back to base. The idea is that the jump kicks the parameters out of whichever minimum they settled into, and the longer cycle that follows lets them find a wider one. Wide minima generalize better, and the doubling cycle length spends progressively more time in each.
 
-SGDR pairs with snapshot ensembling: save the weights at the end of each cycle, when the rate is lowest and the model is best, then average the predictions of all the snapshots. That gets you an ensemble for the cost of one training run.
+SGDR pairs with <Tip term="snapshot ensembling">Keeping a checkpoint at the bottom of each cycle instead of only at the end of training, then averaging the checkpoints' predictions at inference. Several models for the price of one run.</Tip>: save the weights at the end of each cycle, when the rate is lowest and the model is best, then average the predictions of all the snapshots. That gets you an ensemble for the cost of one training run.
 
 In practice plain cosine without restarts usually matches SGDR on final accuracy and is simpler to reason about, which is why restarts are not common in large-scale training.
 
@@ -203,6 +378,8 @@ def make_schedule(optimizer, total_steps, warmup_steps, hold_frac=None):
 
 The function returns a multiplier, not a learning rate. `LambdaLR` multiplies it by the `lr` each parameter group was constructed with, so `return 1.0` means the base rate and `return 0.5` means half of it.
 
+That multiplier is exactly the $m(t)$ of the Start here section, and the three branches of `lr_lambda` are the three lines of the WSD formula: warm up, hold at `1.0`, then anneal linearly. Drop the `hold_frac` branch and you have warmup plus cosine. So `make_schedule` with `hold_frac` set is WSD, and with it left as `None` is warmup+cosine — the two most used families on this page in about ten lines.
+
 Wiring it into the harness from [Training Loop](/ai/pytorch/training-loop):
 
 ```python title="with_scheduler.py"
@@ -218,6 +395,8 @@ for epoch in range(epochs):
         optimizer.step()
         scheduler.step()          # per step, not per epoch
 ```
+
+The unit the schedule counts in — <Tip term="steps versus epochs">A step (or iteration) is one batch: one forward pass, one backward pass, one update. An epoch is one full pass over the training set, which is `len(loader)` steps.</Tip> — is the single most common way to break a schedule: `total_steps` has to be in the same unit as whatever calls `scheduler.step()`.
 
 <Callout type="warn">
   ### `scheduler.step()` per step or per epoch
@@ -243,6 +422,19 @@ torch.optim.lr_scheduler.SequentialLR(opt, [warmup, cosine], milestones=[500])
 ```
 
 `SequentialLR` composes warmup and decay without writing a lambda. `ReduceLROnPlateau` is the only one driven by a metric rather than a counter, and it is the right choice when you do not know how long training will take. It calls `scheduler.step(val_loss)` after each validation pass.
+
+Mapping the families on this page to those calls, since the names do not line up with the formulas:
+
+| Family in this page                | Built-in call                                               |
+| :--------------------------------- | :---------------------------------------------------------- |
+| Step decay                         | `StepLR`, or `MultiStepLR` for a fixed list of milestones   |
+| Exponential                        | `ExponentialLR`                                             |
+| Cosine annealing                   | `CosineAnnealingLR` with `T_max` equal to the anneal length |
+| SGDR restarts                      | `CosineAnnealingWarmRestarts` with `T_0` and `T_mult`       |
+| Warmup plus any decay              | `SequentialLR`, or `LambdaLR` with the `lr_lambda` above    |
+| Inverse sqrt / Noam                | `LambdaLR` only                                             |
+| WSD                                | `LambdaLR` only (`hold_frac` in `make_schedule`)            |
+| "Shrink it when validation stalls" | `ReduceLROnPlateau`                                         |
 
 ---
 
@@ -275,6 +467,8 @@ flowchart TD
 | Want an ensemble for free            | SGDR with snapshot ensembling                     |
 
 The peak rate matters more than the shape. Cosine against linear against WSD is worth a fraction of a percent; getting the base rate wrong by a factor of three is worth ten percent. Tune the base rate first, then pick a shape.
+
+Which is the same conclusion the measured tables point at. At the halfway mark of a 10000-step run the seven families span `2.500e-04` to `1.000e-03`, a factor of four, and their run-long averages sit between `0.4688` and `0.8001` of the peak. A base rate that is wrong by three is wrong by three at every step of every one of those curves.
 
 ---
 
