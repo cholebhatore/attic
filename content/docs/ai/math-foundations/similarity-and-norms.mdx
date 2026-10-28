@@ -1,6 +1,6 @@
 ---
 title: Similarity and Norms
-description: Dot products, vector projections, cosine similarity, unit-normalized embeddings, and how L1 and L2 norms shape regularization.
+description: Dot products, vector projections, cosine similarity, term frequency vectors, unit-normalized embeddings, and how L1 and L2 norms shape regularization.
 ---
 
 Retrieval, attention, and regularization all reduce to two questions: how much do these vectors point the same way, and how large is this vector. The dot product answers the first. Norms answer the second.
@@ -17,7 +17,18 @@ $$
 \mathbf{a} \cdot \mathbf{b} = \sum_{i=1}^{n} a_i b_i = a_1 b_1 + a_2 b_2 + \dots + a_n b_n
 $$
 
-Three entries in, three products, one number out. Nothing about the operation mixes positions: entry 1 pairs with entry 1, entry 2 with entry 2.
+Three entries in, three products, one number out. Nothing about the operation mixes positions: entry 1 pairs with entry 1, entry 2 with entry 2. Here it is by hand for `a = [1, 2, 3]` and `b = [4, -5, 6]`:
+
+| Position | `a` says | `b` says | Multiply |
+| :------- | :------- | :------- | :------- |
+| 1        | 1        | 4        | 4        |
+| 2        | 2        | -5       | -10      |
+| 3        | 3        | 6        | 18       |
+|          |          | Total    | **12**   |
+
+Two passes over the same positions: multiply each pair, then add the products. That is the whole operation. The $\sum$ in the formula is just shorthand for "do this for every position and add".
+
+The word that makes it useful is _agreement_. At each position, a large value paired with a large value gives a big positive product; a positive paired with a negative gives a negative product that pulls the total back down. So the single number coming out of a dot product is a score of how much the two vectors agree across their positions, and a score that can go negative when they disagree.
 
 ```python title="dot_product.py"
 import numpy as np
@@ -29,6 +40,8 @@ print(np.dot(a, b))     # 4 - 10 + 18 = 12
 print(a @ b)            # 12, same operation
 print(np.sum(a * b))    # 12, element-wise multiply then reduce
 ```
+
+The third line is the operation spelled out in NumPy: `a * b` produces the products column of the table, `.sum()` produces the total.
 
 The same quantity has a geometric form:
 
@@ -45,6 +58,46 @@ The arithmetic version and the geometric version are the same number computed tw
 | Positive | Under 90°   | Pointing broadly the same way   |
 | Zero     | Exactly 90° | Orthogonal, no shared direction |
 | Negative | Over 90°    | Pointing broadly opposite ways  |
+
+### A vector you can build yourself
+
+The fastest way to make "entries of a vector" concrete is a <Tip term="term frequency vector">A document turned into a list of counts: one entry per word in the vocabulary, holding how many times that word appears in the document.</Tip>. A document becomes a vector where each number records how many times a particular word appears in it.
+
+Suppose there are two documents:
+
+- Document A: `apple apple banana`
+- Document B: `apple banana banana`
+
+First build a **vocabulary**: the list of all unique words across both documents, which here is `[apple, banana]`. That vocabulary defines the positions. Now each document is one number per vocabulary word, in that fixed order:
+
+| Vector     | apple | banana |
+| :--------- | :---- | :----- |
+| Document A | 2     | 1      |
+| Document B | 1     | 2      |
+
+So `A = [2, 1]` and `B = [1, 2]`. The dot product is `2*1 + 1*2 = 4`, which is a score of how much the two documents use the same words with the same emphasis. Divide by the two lengths and cosine similarity gives `4 / (2.236 * 2.236) = 0.8`: very similar, because both lean on the same two words in roughly comparable amounts.
+
+```python title="term_frequency.py"
+vocab = ["apple", "banana"]
+
+def tf(doc):
+    return np.array([doc.count(word) for word in vocab], dtype=float)
+
+A = tf(["apple", "apple", "banana"])     # [2. 1.]
+B = tf(["apple", "banana", "banana"])    # [1. 2.]
+
+print(A @ B)                             # 4.0
+print((A / np.linalg.norm(A)).round(4))  # [0.8944 0.4472]
+sim = (A / np.linalg.norm(A)) @ (B / np.linalg.norm(B))
+print(sim.round(4))                      # 0.8
+```
+
+The third line is cosine similarity computed the way a vector database does it: normalize once at index time, then a plain dot product per query. That shortcut is the next section.
+
+Two properties of this construction carry straight through to real embeddings:
+
+- **The vocabulary is the dimension.** Two documents only have a dot product if they were built against the same vocabulary in the same order. `[2, 1]` against `[banana, apple]` is a different number, and silently wrong.
+- **Most entries are zero.** A real corpus has tens of thousands of distinct words, and a single sentence uses a few dozen. A 100,000-word vocabulary gives a 100,000-dimensional vector that is almost entirely zeros. That is the shape every text model lives in, and it is why sparse storage and matrix multiplication, not loops, are the only workable way to compute with these things.
 
 ---
 
@@ -223,9 +276,27 @@ The other half of the picture is the loss. Every set of weights that produce the
 
 The L1 ball has sharp corners sitting on the coordinate axes, so the contour usually makes contact at a corner, and a corner has some coordinates equal to exactly zero. The L2 ball is smooth, so the optimum lands somewhere along a curve and shrinks every weight a little without zeroing any.
 
+<Callout type="info">
+  ### The takeaway in two lines
+
+L1 regularization has diamond-shaped constraint regions in two dimensions, with corners on the axes, and the optimum often lands on one of those corners where one or more weights equal zero. L2 regularization has smooth, circular constraint regions, so the optimum is less likely to land exactly on an axis and the weights stay nonzero.
+
+L1 can eliminate weights because its penalty has a sharp corner at zero. L2 generally only shrinks weights because its penalty is smooth and its gradient becomes zero at zero.
+
+</Callout>
+
+### Why norms become regularizers
+
+Up to here the norms have only measured the size of a vector. They enter training when you start charging the model for using a big one:
+
+- **L1 regularization (Lasso)** adds a penalty based on the absolute values of the model weights. It can push some weights exactly to zero, effectively removing the features those weights depended on.
+- **L2 regularization (Ridge)** adds a penalty based on squared weights. It generally makes the weights smaller without forcing as many of them to become exactly zero.
+
 ### Lasso and Ridge
 
-That geometry becomes two regularization schemes. Adding a norm penalty to an unconstrained loss function $\mathcal{L}_0$:
+Lasso and Ridge are regularization techniques that prevent overfitting by penalizing large model weights. The main difference is that Lasso can make weights exactly zero while Ridge generally shrinks weights toward zero.
+
+That geometry becomes those two regularization schemes. Adding a norm penalty to an unconstrained loss function $\mathcal{L}_0$:
 
 $$
 \mathcal{L}_{\text{Lasso}} = \mathcal{L}_0 + \lambda \|\mathbf{w}\|_1 = \mathcal{L}_0 + \lambda \sum_i |w_i|

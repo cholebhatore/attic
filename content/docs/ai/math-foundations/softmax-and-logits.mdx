@@ -1,6 +1,6 @@
 ---
 title: Softmax and Logits
-description: How raw model scores become probabilities, temperature scaling, the log-sum-exp trick, and why softmax saturation drives attention scaling.
+description: How raw model scores become probabilities, softmax versus sigmoid, temperature scaling, the log-sum-exp trick, and why softmax saturation drives attention scaling.
 ---
 
 A language model's final layer outputs one raw number per vocabulary token. Those numbers are **logits**: unbounded, unnormalized, and not probabilities. Softmax converts them into a distribution the model can sample from and the loss function can score.
@@ -13,7 +13,15 @@ Symbols used here (`sum over j of`, `exp`, `log`, `argmax`, `axis=-1`, `p_i`) ar
 
 ## Logits
 
-The LM head is a linear projection from the hidden state to the vocabulary:
+Logits are the raw, unnormalized numerical scores produced by the final linear layer of a machine learning model, before any activation function such as softmax or sigmoid is applied. They represent the model's confidence for each class, unconstrained in scale.
+
+Where they come from is a single matrix multiply. A logit vector is the output of an affine transform:
+
+$$
+\mathbf{z} = \mathbf{W}\mathbf{x} + \mathbf{b}
+$$
+
+In a language model that transform is the LM head, a linear projection from the hidden state to the vocabulary:
 
 ```
 logits = h @ W_vocab.T        # h is (d_model,), W_vocab is (V, d_model)
@@ -46,6 +54,11 @@ $$
 
 Read that out loud as: "the $i$-th softmax output is $e$ to the power of logit $i$, divided by the sum of $e$ to the power of every logit $j$." The subscripts are element positions: $i$ is the one you are computing, $j$ runs over all classes. $\exp(x)$ is $e^x$, where $e \approx 2.71828$.
 
+The word _valid_ in "valid probability distribution" is a checklist of two requirements, and it is what the formula exists to satisfy:
+
+1. Every individual output is strictly between 0 and 1.
+2. The outputs across all classes sum to exactly 1.0, which is 100%.
+
 Three things happen: exponentiation makes everything positive, summing gives a <Tip term="normalizer">The number you divide by to force a vector to sum to 1.</Tip>, and dividing makes the vector sum to 1.
 
 ```python title="softmax.py"
@@ -58,6 +71,12 @@ p = softmax(z)
 print(p)             # [0.6590 0.2424 0.0986]
 print(p.sum())       # 1.0
 ```
+
+The same conversion at the scale of a whole network, where the logits are the last layer's node values and the probabilities are what the model is claiming:
+
+![Three hidden nodes feeding three logits, a softmax operation, and three probabilities that sum to 1](/ai/maths/softmax-covering-logits.png)
+
+Here the logits `2.33`, `-1.46` and `0.56` become `0.84`, `0.02` and `0.14`. The negative logit is not a problem — `exp(-1.46)` is a small positive number, and the ordering of the three scores survives the conversion untouched.
 
 ### Why exponentiate
 
@@ -100,6 +119,33 @@ The mathematics says those two lines must agree. The naive code overflows inside
 
 ---
 
+## Softmax or sigmoid
+
+Both functions turn scores into numbers between 0 and 1, and picking the wrong one is a silent bug: the shapes match, the code runs, and the model learns the wrong thing. The difference is whether the classes compete.
+
+Suppose an image classifier outputs the raw logits `[2.0, 1.0, 0.1]` for three mutually exclusive categories — Cat, Dog, Bird. Exactly one is right, and the model should say "65.9% cat, 24.2% dog, 9.9% bird", which is what softmax returns. Now suppose the task is tagging, where a single photo can be both `sunset` and `beach` and `boat`. Those labels do not compete, so softmax is the wrong tool: forcing them to sum to 1 makes predicting one label cost probability it needs for another.
+
+|                | Sigmoid                                        | Softmax                                           |
+| :------------- | :--------------------------------------------- | :------------------------------------------------ |
+| Applied to     | Each output on its own                         | The whole vector at once                          |
+| Outputs sum to | Anything between 0 and the number of outputs   | Exactly 1                                         |
+| Reads as       | Independent probability per class              | Share of one fixed budget                         |
+| Class relation | Not mutually exclusive — multi-label           | Mutually exclusive — one of `K`                   |
+| Typical loss   | Binary cross-entropy, one term per output      | Categorical cross-entropy, one term for the group |
+| Used for       | Tags, gates, "is this spam", attention weights | Next-token prediction, classification heads       |
+
+"Mutually exclusive" means two classes cannot both be correct, so raising one must lower the other. Softmax enforces that trade-off through the shared denominator; sigmoid has no shared denominator and therefore no trade-off.
+
+The two are the same function in disguise when there are exactly two classes. For logits $z_1$ and $z_2$:
+
+$$
+\text{softmax}(\mathbf{z})_1 = \frac{e^{z_1}}{e^{z_1} + e^{z_2}} = \frac{1}{1 + e^{-(z_1 - z_2)}} = \sigma(z_1 - z_2)
+$$
+
+A 2-class softmax is a sigmoid on the _difference_ of the two logits. This is why a binary head with one sigmoid output and a 2-class head with softmax carry the same information: the second logit in the pair is redundant once you know the gap.
+
+---
+
 ## Temperature scaling
 
 Dividing the logits by a temperature $T > 0$ before softmax controls the dispersion of the distribution:
@@ -108,12 +154,12 @@ $$
 \text{softmax}\left(\frac{\mathbf{z}}{T}\right)_i = \frac{e^{z_i / T}}{\sum_{j=1}^K e^{z_j / T}}
 $$
 
-| `T`      | Effect                                                    |
-| :------- | :-------------------------------------------------------- |
-| `T -> 0` | Distribution approaches one-hot at the argmax; greedy     |
-| `T = 1`  | The model's calibrated default                            |
-| `T > 1`  | Flatter distribution, more entropy, more diverse sampling |
-| `T < 1`  | Sharper distribution, more confident, more repetitive     |
+| $T$       | Effect on the logits $z_i / T$                                       | Shape of the distribution                                                                | Training and sampling effect                                                                    |
+| :-------- | :------------------------------------------------------------------- | :--------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------- |
+| $T = 1.0$ | Unaltered: normal logit values                                       | Standard softmax probabilities                                                           | The model's calibrated default; standard gradient flow and loss                                 |
+| $T > 1.0$ | Compressed: large logits shrink, gaps between scores narrow          | Softer and flatter: probability spreads more evenly across classes                       | Exposes the runner-up classes, softens hard targets, smooths gradients, more diverse sampling   |
+| $T < 1.0$ | Amplified: the highest logit grows dramatically relative to the rest | Sharper and more peaked: the dominant class nears $1.0$ while the others drop near $0.0$ | Confident and repetitive; penalizes mistakes aggressively, pushes weights toward hard decisions |
+| $T \to 0$ | Gaps blow up: the leader dominates by a factor of $1 / T$            | A one-hot vector at the $\text{argmax}$                                                  | Greedy decoding; effectively non-differentiable, no gradient for non-max classes                |
 
 Temperature is the "not scale invariant" row with a knob on it. Dividing by a small `T` is the same as multiplying the logits: `z / 0.1` scales them by 10, and scaling up is the sharpening case from the previous section. `argmax` is the index of the largest entry, and "approaches one-hot" means the distribution converges to a vector of zeros with a single 1 in that position. "Greedy" is the name for just taking that argmax every step.
 
@@ -382,7 +428,7 @@ print(np.allclose(probs.sum(axis=-1), 1.0))   # True
   </Accordion>
   <Accordion title="What does temperature do, and what happens as it approaches zero?">
 
-    It divides the logits before softmax, controlling sharpness. As `T -> 0` the output approaches a one-hot at the argmax, which is greedy decoding.
+    It divides the logits before softmax, controlling sharpness. As `T -> 0` the output approaches a one-hot at the argmax, which is greedy decoding. The single largest number takes 100% of the probability ($1.0$), and every other number drops to 0% ($0.0$).
 
   </Accordion>
   <Accordion title={<>Why does attention scale by <code>1/sqrt(d_k)</code>?</>}>
