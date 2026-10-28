@@ -32,8 +32,10 @@ Five things determine more about the output than any rule below:
   before you curl anything.
 - **Whether a math plugin is configured.** Grep for `rehype-katex` and `remark-math`. This app has
   `remark-math` and `rehype-katex` configured (with KaTeX CSS), so `$formula$` and `$$equation$$` are
-  fully supported. If working in an app without one, `$...$` renders as literal dollar signs and braces
-  like `2^{h+1}` throw Acorn JSX parse errors, in which case write math in inline backticks instead.
+  fully supported. Only those two delimiters work: LaTeX's `\[...\]` and `\(...\)` are not parsed by
+  `remark-math` and render as literal backslashes. If working in an app without a math plugin, `$...$`
+  renders as literal dollar signs and braces like `2^{h+1}` throw Acorn JSX parse errors, in which
+  case write math in inline backticks instead.
 - **Two or three existing pages in the same section.** They define depth, tone, and structure better
   than this file does. If the user explicitly asks to write in a specific tone, then you can skip this part.
 
@@ -61,6 +63,23 @@ Existing pages encode conventions no rule file mentions: whether they end with a
 exercises, a summary, or a further-reading section; how long a code sample runs; whether headings
 are sentence case; whether an overview page tracks progress per section. Read a few and follow
 them. If the corpus contradicts itself, follow the most recent pages and say which you chose.
+
+## Editing text the reader wrote
+
+Study docs often arrive with the reader's own explanation pasted in wherever they got stuck, plus
+markers like `(this still sounds difficult)` or `todo: add X somewhere`. Those are instructions, not
+prose.
+
+- **Topics are load-bearing; wording is not.** Never drop a topic or subtopic. Rewording, merging
+  duplicate passages, and reordering are all fair. Simplify by adding intuition, never by skimming
+  content away.
+- **Their phrasing is the style guide.** An analogy the reader reached for themselves is evidence
+  about what lands. Keep that register, and their words where the words work.
+- **Move it, do not append it.** Pasted text belongs where it fits the argument, which is rarely
+  where it was typed. Resolve the confusion marker, then delete the marker.
+- **Every geometric claim needs two numbers.** If a page asserts a shape, an angle, or which way a
+  weight moves, put a hand-checkable instance beside it. A claim the reader can verify in their head
+  stops being a claim.
 
 ## Writing standard
 
@@ -125,6 +144,10 @@ additions:
   afterwards" list, and canonical resources. The last three only apply to learning material; a
   reference or guide section stops after the cards.
 - Content pages: intro paragraph, `---` between every `## H2`, closing section last.
+- A section index for learning material also carries a full topic map: every heading from every child
+  page, in reading order, one clause of detail each, as a closed `<Accordion>` per page. It serves
+  three readers at once — the one previewing, the one revising, and the one using it as a cheat
+  sheet — and it is the only place the section's real breadth is visible on one screen.
 - Where a page ends with a recall list (interview questions, review prompts, self-checks), make it an
   `<Accordions>` block with one `<Accordion>` per item and a short answer in the body. A prompt the
   reader cannot check is a list of anxieties, not a study tool; collapsing it keeps the page scannable
@@ -149,7 +172,9 @@ Body paragraph starts at column 0 and is never re-wrapped.
 ```
 
 The same applies to any JSX block whose children are markdown. If a heading or list vanished after
-formatting, the blank lines were missing.
+formatting, the blank lines were missing. A markdown list at column 0 is worse than vanished: the
+indented closing tag reads as a lazy continuation of the last item, and MDX throws expecting
+`</Accordion>`. Indent list bullets four spaces inside a JSX child.
 
 The other JSX-child trap: text inside a component's children is still parsed as MDX, so a literal
 `{` or `}` opens an expression and throws, and a `<` followed by a letter opens a tag. That catches
@@ -165,6 +190,9 @@ Put such fragments in backticks, or spell them out in words.
 3. Build. Kill the dev server before you do — `next build` shares `.next` with it and the two
    corrupt each other's output. Restart the dev server afterwards.
 4. `curl` each new route and expect `200`. Derive the URL from the app directory, not the content
-   path.
+   path. A `000` is usually the dev server still compiling — retry one route before believing it.
+5. If you added or reordered a page, update every registration site. Grep the slug of a neighbouring
+   page and fix each hit: folder `meta.json`, the section index, the parent index, and any generated
+   curriculum or toc data file. One miss leaves a page reachable by URL and invisible in the sidebar.
 
 Do not commit unless asked.
