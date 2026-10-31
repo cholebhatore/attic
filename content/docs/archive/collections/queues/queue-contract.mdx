@@ -1,0 +1,125 @@
+---
+title: Queue Contract
+description: The Queue interface contract, parallel throwing vs sentinel method families, and boundary behaviors
+---
+
+`Queue<E>` is a foundational interface in the Java Collections Framework designed for holding elements prior to processing. It structures operations around head and tail access and enforces an explicit **Dual-Method Architecture** to cleanly separate exceptional failures from expected boundary conditions.
+
+---
+
+## The Dual-Method Architecture
+
+In bounded or empty queues, boundary conditions—such as attempting to insert into a full queue or dequeue from an empty queue—are routine runtime events. Rather than forcing developers to either catch costly exceptions or tolerate uninformative defaults, Java's `Queue<E>` specifies parallel method families for every operation:
+
+| Core Operation        | Strict Method _(Throws)_ | Strict Failure Behavior         | Safe Method _(Sentinel)_ | Safe Failure Behavior | Return Type | Boundary Trigger                     |
+| :-------------------- | :----------------------- | :------------------------------ | :----------------------- | :-------------------- | :---------: | :----------------------------------- |
+| **Insert / Enqueue**  | `add(e)`                 | Throws `IllegalStateException`  | `offer(e)`               | Returns `false`       |  `boolean`  | Capacity limit exceeded (queue full) |
+| **Remove / Dequeue**  | `remove()`               | Throws `NoSuchElementException` | `poll()`                 | Returns `null`        |     `E`     | Queue is empty                       |
+| **Examine / Inspect** | `element()`              | Throws `NoSuchElementException` | `peek()`                 | Returns `null`        |     `E`     | Queue is empty                       |
+
+---
+
+## Queue Toolkit Reference
+
+The primary API surface of `java.util.Queue<E>`:
+
+| Method      | Parameters | Return Type | Failure / Boundary Behavior                | Recommended Use Case                                          |
+| :---------- | :--------- | :---------: | :----------------------------------------- | :------------------------------------------------------------ |
+| `offer(e)`  | `(E e)`    |  `boolean`  | Returns `false` if capacity is full        | **Standard insertion** in bounded / flow-controlled queues    |
+| `add(e)`    | `(E e)`    |  `boolean`  | Throws `IllegalStateException` if full     | Invariant enforcement (when a full queue is a bug)            |
+| `poll()`    | _none_     |     `E`     | Returns `null` if queue is empty           | **Standard removal** in consumer loops and polling            |
+| `remove()`  | _none_     |     `E`     | Throws `NoSuchElementException` if empty   | When the queue is guaranteed non-empty by preceding logic     |
+| `peek()`    | _none_     |     `E`     | Returns `null` if queue is empty           | **Safe head inspection** without removing element             |
+| `element()` | _none_     |     `E`     | Throws `NoSuchElementException` if empty   | Strict head inspection where an empty queue indicates failure |
+| `isEmpty()` | _none_     |  `boolean`  | Inherited from `Collection`; `size() == 0` | Guard check before executing non-sentinel operations          |
+| `size()`    | _none_     |    `int`    | Number of currently contained elements     | Monitoring queue depth and capacity                           |
+
+<Callout type="info">
+  **Rule of Thumb**: Prefer the **Sentinel Family** (`offer`, `poll`, `peek`) for virtually all
+  standard algorithmic and concurrent workflows. Reserve the **Exception Family** (`add`, `remove`,
+  `element`) strictly for asserting state invariants where capacity or emptiness violations denote
+  application bugs.
+</Callout>
+
+---
+
+## Deque Dual-Method Symmetry
+
+`Deque<E>` (Double-Ended Queue) extends `Queue<E>` to allow insertions, removals, and inspections at **both** ends (Head and Tail). It doubles the dual-method contract with explicit `First` and `Last` variants:
+
+| Operation   | Head (Throws)   | Head (Sentinel) | Tail (Throws)  | Tail (Sentinel) |
+| :---------- | :-------------- | :-------------- | :------------- | :-------------- |
+| **Insert**  | `addFirst(e)`   | `offerFirst(e)` | `addLast(e)`   | `offerLast(e)`  |
+| **Remove**  | `removeFirst()` | `pollFirst()`   | `removeLast()` | `pollLast()`    |
+| **Examine** | `getFirst()`    | `peekFirst()`   | `getLast()`    | `peekLast()`    |
+
+### Queue & Stack Aliases on Deque
+
+To allow a single data structure to serve as a Queue, a Stack, or a Deque, `Deque` aliases its methods to standard contracts:
+
+| Target Role      | Target Method    | Deque Equivalent      | Behavior                        |
+| :--------------- | :--------------- | :-------------------- | :------------------------------ |
+| **Queue (FIFO)** | `queue.offer(e)` | `deque.offerLast(e)`  | Appends to tail                 |
+| **Queue (FIFO)** | `queue.poll()`   | `deque.pollFirst()`   | Retrieves and removes from head |
+| **Queue (FIFO)** | `queue.peek()`   | `deque.peekFirst()`   | Inspects head without removal   |
+| **Stack (LIFO)** | `stack.push(e)`  | `deque.addFirst(e)`   | Pushes onto head/top of stack   |
+| **Stack (LIFO)** | `stack.pop()`    | `deque.removeFirst()` | Pops off head/top of stack      |
+| **Stack (LIFO)** | `stack.peek()`   | `deque.peekFirst()`   | Inspects top of stack           |
+
+---
+
+## Critical Traps & Invariants
+
+<Callout type="error">
+  **The `null` Sentinel Ambiguity Trap**: Never insert `null` into a `Queue`! If a queue permitted
+  `null`, calling `poll()` or `peek()` and receiving `null` would be fatally ambiguous: does it mean
+  the queue is empty, or that the head element is literally `null`? Most modern implementations
+  (like `ArrayDeque` and `PriorityQueue`) strictly enforce this by throwing `NullPointerException`
+  on `offer(null)` or `add(null)`.
+</Callout>
+
+<Callout type="warn">
+  **Iteration Order Trap**: Calling `for (E item : queue)` or using an `Iterator` **does not dequeue elements** and does **not** guarantee processing in true priority order (particularly in `PriorityQueue`, where the iterator reflects the underlying un-sorted binary heap array). Always drain a queue via `while (!queue.isEmpty()) { E val = queue.poll(); }` when strict ordering is required.
+</Callout>
+
+---
+
+## Implementation Code Examples
+
+```java title="QueueContractPatterns.java"
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.Queue;
+
+public class QueueContractPatterns {
+    public static void main(String[] args) {
+        // 1. Standard FIFO Queue usage with Sentinel Family
+        Queue<String> queue = new ArrayDeque<>();
+        queue.offer("task-1");
+        queue.offer("task-2");
+        queue.offer("task-3");
+
+        // Safe consumer drain loop:
+        while (!queue.isEmpty()) {
+            String task = queue.poll(); // Returns null if empty; no exception thrown
+            System.out.println("Processing: " + task);
+        }
+
+        // Sentinel behavior on empty queue:
+        String emptyPoll = queue.poll(); // Returns null safely
+        String emptyPeek = queue.peek(); // Returns null safely
+        System.out.println("Empty poll: " + emptyPoll); // null
+
+        // 2. Double-Ended Queue (Deque) as a LIFO Stack
+        Deque<Integer> stack = new ArrayDeque<>();
+        stack.push(100); // addFirst()
+        stack.push(200);
+        stack.push(300);
+
+        System.out.println("Stack top: " + stack.peek()); // 300 (peekFirst)
+        while (!stack.isEmpty()) {
+            System.out.println("Popped: " + stack.pop()); // 300, 200, 100
+        }
+    }
+}
+```

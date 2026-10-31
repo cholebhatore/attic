@@ -1,0 +1,121 @@
+---
+title: HashMap
+description: Hash table bucket chaining, load factor resizing, Java 8 treeification at 8+ collisions, and core operations
+---
+
+`HashMap<K, V>` is the default key-value store in Java. It provides average constant-time `O(1)` lookups with no iteration-order guarantees.
+
+---
+
+## Internal Bucket Architecture
+
+```mermaid
+flowchart TD
+    K["Key.hashCode()"] --> H["Spread Hash"]
+    H --> B{"Bucket Index"}
+    B --> |"< 8 Nodes"| L["Singly-Linked Chain (Node)"]
+    B --> |">= 8 Nodes & Table >= 64"| T["Red-Black Tree (TreeNode)"]
+```
+
+- **Initial Capacity**: 16 buckets.
+- **Load Factor**: 0.75 (doubles table capacity when 75% full).
+- **Treeification Threshold**: When a single bucket index accumulates `>= 8` colliding entries and the total table capacity is `>= 64`, that linked chain transforms into a balanced **Red-Black Tree** (`TreeNode`). This bounds worst-case collision lookup at `O(log n)` instead of `O(n)`, mitigating Hash-DoS vulnerabilities.
+
+```java title="HashMapUsage.java"
+Map<Integer, String> map = new HashMap<>();
+
+String prev = map.put(1, "Alice"); // returns null
+String updated = map.put(1, "Bob"); // returns "Alice" (previous value)
+
+String val = map.get(1);            // "Bob" (null if absent)
+boolean hasK = map.containsKey(1);   // true (O(1))
+boolean hasV = map.containsValue("Bob"); // true (O(n) scan)
+
+String removed = map.remove(1);     // returns "Bob"
+```
+
+---
+
+## Complexity & Null Handling
+
+| Operation                          | Time Complexity | Notes                                           |
+| :--------------------------------- | :-------------: | :---------------------------------------------- |
+| **`get()` / `put()` / `remove()`** | `O(1)` average  | Amortized constant time (`O(log n)` worst case) |
+| **`containsKey()`**                | `O(1)` average  | Direct hash bucket lookup                       |
+| **`containsValue()`**              |     `O(n)`      | Must linearly scan all buckets and values       |
+
+- **Null Keys**: Allows **exactly one `null` key** (stored in bucket 0).
+- **Null Values**: Allows **multiple `null` values**.
+- **Thread Safety**: Not thread-safe. Use `ConcurrentHashMap` for concurrent multi-threaded access.
+
+---
+
+## Iteration & Traversal Patterns
+
+Because `Map` does not implement `Iterable`, traversal is performed via its collection views (`entrySet()`, `keySet()`, `values()`) or the `forEach` method:
+
+<Tabs items={['entrySet() (Key + Value)', 'keySet() (Keys)', 'values() (Values)', 'forEach() Lambda']}>
+  <Tab value="entrySet() (Key + Value)">
+    ```java title="EntrySetIteration.java"
+    // Recommended default: single-pass extraction of both key and value
+    for (Map.Entry<Integer, String> entry : map.entrySet()) {
+        Integer id = entry.getKey();
+        String name = entry.getValue();
+        System.out.println(id + " -> " + name);
+    }
+    ```
+  </Tab>
+  <Tab value="keySet() (Keys)">
+    ```java title="KeySetIteration.java"
+    // Use when you only need keys
+    for (Integer id : map.keySet()) {
+        System.out.println("Key: " + id);
+    }
+    ```
+  </Tab>
+  <Tab value="values() (Values)">
+    ```java title="ValuesIteration.java"
+    // Use when you only need values or aggregates
+    for (String name : map.values()) {
+        System.out.println("Value: " + name);
+    }
+    ```
+  </Tab>
+  <Tab value="forEach() Lambda">
+    ```java title="ForEachLambda.java"
+    // Modern Java 8+ concise syntax
+    map.forEach((id, name) -> {
+        System.out.println(id + " : " + name);
+    });
+    ```
+  </Tab>
+</Tabs>
+
+<Callout type="info">
+  **Advanced Iteration & Streams**: For filtering with the Streams API, sorting map entries by key
+  or value, safe concurrent removal, and the `keySet() + get()` anti-pattern, see the dedicated [Map
+  Iteration Patterns Guide](/archive/collections/maps/iteration).
+</Callout>
+
+---
+
+## High-Frequency DSA Idioms
+
+### 1. Frequency Counting with `merge()`
+
+```java title="FrequencyCounting.java"
+Map<String, Integer> freq = new HashMap<>();
+for (String word : words) {
+    freq.merge(word, 1, Integer::sum);
+}
+```
+
+### 2. Grouping / Multi-Map with `computeIfAbsent()`
+
+```java title="GroupingPattern.java"
+Map<Character, List<String>> groups = new HashMap<>();
+for (String word : words) {
+    char firstChar = word.charAt(0);
+    groups.computeIfAbsent(firstChar, k -> new ArrayList<>()).add(word);
+}
+```

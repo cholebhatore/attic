@@ -1,0 +1,182 @@
+---
+title: PriorityQueue
+description: Binary min/max-heap mechanics, siftUp/siftDown algorithms, custom Comparators, and top-K patterns
+---
+
+`PriorityQueue<E>` is an unbounded priority heap backed by a dynamic binary array. Unlike standard FIFO queues, elements in a `PriorityQueue` are ordered either by their **natural ordering** (implementing `Comparable`) or by an explicit `Comparator` provided at construction time. The head of the queue is always the least element according to the chosen ordering.
+
+---
+
+## Binary Min-Heap Internals
+
+`PriorityQueue` represents a complete binary tree inside a flat zero-indexed `Object[] queue` array.
+
+```
+Tree Representation:                     Array Representation:
+        [0] 10 (Root)                   ┌──────┬──────┬──────┬──────┬──────┬──────┐
+       /              \                 │ [0]  │ [1]  │ [2]  │ [3]  │ [4]  │ [5]  │
+    [1] 15          [2] 20              ├──────┼──────┼──────┼──────┼──────┼──────┤
+    /    \          /                   │  10  │  15  │  20  │  30  │  25  │  40  │
+ [3] 30  [4] 25   [5] 40                └──────┴──────┴──────┴──────┴──────┴──────┘
+```
+
+### Array Index Mathematics
+
+For any element positioned at index `i`:
+
+```
+├── Parent Index:       (i - 1) >>> 1
+├── Left Child Index:   (2 * i) + 1
+└── Right Child Index:  (2 * i) + 2
+```
+
+### Sift-Up & Sift-Down Mechanics
+
+1. **`offer(e)` (Sift-Up — `O(log n)`)**: The new element is initially placed at the next available leaf index (`size`). It then percolates upward, repeatedly swapping with its parent until the min-heap invariant (`parent <= child`) is restored.
+2. **`poll()` (Sift-Down — `O(log n)`)**: The root element at index `0` is extracted. The last leaf element is moved into index `0` and percolates downward, repeatedly swapping with its smaller child until the heap invariant is satisfied.
+3. **Linear Heap Construction (`O(n)`)**: When initializing via `new PriorityQueue<>(Collection c)`, Java applies Floyd's bottom-up heapification algorithm, which runs in **`O(n)`** time rather than `O(n log n)` repeated insertions.
+
+---
+
+## Natural Ordering vs Custom Comparators
+
+### 1. Min-Heap vs Max-Heap
+
+By default, Java creates a **min-heap**. To build a max-heap, reverse the comparator:
+
+```java title="HeapOrdering.java"
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.PriorityQueue;
+
+// Min-Heap (default: natural ascending order)
+PriorityQueue<Integer> minHeap = new PriorityQueue<>();
+
+// Max-Heap: Using Collections.reverseOrder()
+PriorityQueue<Integer> maxHeap = new PriorityQueue<>(Collections.reverseOrder());
+
+// Max-Heap: Using Integer.compare (AVOID 'b - a' subtraction due to int overflow!)
+PriorityQueue<Integer> safeMaxHeap = new PriorityQueue<>((a, b) -> Integer.compare(b, a));
+```
+
+### 2. Multi-Level Priority Ordering
+
+```java title="MultiKeyComparator.java"
+record Task(String name, int priority, long timestamp) {}
+
+// Higher priority first; if equal priority, oldest timestamp first (FIFO tie-break)
+Comparator<Task> taskComparator = Comparator
+    .comparingInt(Task::priority).reversed()
+    .thenComparingLong(Task::timestamp);
+
+PriorityQueue<Task> taskQueue = new PriorityQueue<>(taskComparator);
+```
+
+---
+
+## Critical Traps & Gotchas
+
+<Callout type="error">
+  **The Unsorted Iteration Trap**: `PriorityQueue` only guarantees ordering for the root element at `peek()` and `poll()`. Its internal array does **not** store elements in sorted order. If you iterate with an enhanced `for` loop, elements print in arbitrary heap-array order:
+  ```java
+  PriorityQueue<Integer> pq = new PriorityQueue<>(List.of(50, 10, 30, 20, 40));
+  
+  // ❌ WRONG: Does NOT print in sorted order!
+  for (int num : pq) {
+      System.out.print(num + " "); // Output: 10 20 30 50 40 (Heap structure, not sorted!)
+  }
+
+// ✅ CORRECT: Drain queue to process in strict priority order:
+while (!pq.isEmpty()) {
+System.out.print(pq.poll() + " "); // Output: 10 20 30 40 50
+}
+
+````
+</Callout>
+
+<Callout type="warn">
+**The Mutability Hazard**: If you mutate an object that is currently inside a `PriorityQueue` in a way that changes its comparator value, **the heap does not reorder itself**. The queue's internal invariants are broken, causing unpredictable subsequent `poll()` and `peek()` outputs. To modify an element safely: remove it, mutate it, and re-insert it.
+</Callout>
+
+<Callout type="error">
+**Null Prohibition**: `PriorityQueue` strictly forbids `null`. Inserting `null` throws `NullPointerException` because elements must be compared against each other.
+</Callout>
+
+---
+
+## Real-World Problem Patterns
+
+### 1. Top-K Elements / Frequent Numbers (`O(n log k)`)
+
+Rather than sorting the entire array in `O(n log n)`, keep a min-heap capped at size `k`. When size exceeds `k`, the smallest element is evicted, leaving the `k` largest:
+
+```java title="TopKElements.java"
+import java.util.PriorityQueue;
+
+public class TopKElements {
+  public static int findKthLargest(int[] nums, int k) {
+      // Min-heap keeps the k largest elements seen so far
+      PriorityQueue<Integer> minHeap = new PriorityQueue<>(k);
+
+      for (int num : nums) {
+          minHeap.offer(num);
+          if (minHeap.size() > k) {
+              minHeap.poll(); // Evict the smallest among the k + 1 candidates
+          }
+      }
+      return minHeap.peek(); // Root is the kth largest
+  }
+}
+````
+
+### 2. Merge K Sorted Streams / Lists (`O(N log k)`)
+
+```java title="MergeKSorted.java"
+record Element(int value, int listIndex, int nextIndex) {}
+
+public static List<Integer> mergeKSorted(List<List<Integer>> lists) {
+    PriorityQueue<Element> pq = new PriorityQueue<>(
+        Comparator.comparingInt(Element::value)
+    );
+
+    // 1. Prime the heap with the first element of each non-empty list
+    for (int i = 0; i < lists.size(); i++) {
+        if (!lists.get(i).isEmpty()) {
+            pq.offer(new Element(lists.get(i).get(0), i, 1));
+        }
+    }
+
+    List<Integer> result = new ArrayList<>();
+    while (!pq.isEmpty()) {
+        Element curr = pq.poll();
+        result.add(curr.value());
+
+        List<Integer> src = lists.get(curr.listIndex());
+        if (curr.nextIndex() < src.size()) {
+            pq.offer(new Element(src.get(curr.nextIndex()), curr.listIndex(), curr.nextIndex() + 1));
+        }
+    }
+    return result;
+}
+```
+
+---
+
+## PriorityQueue Toolkit Reference
+
+The primary operational API of `java.util.PriorityQueue<E>`:
+
+| Method               | Parameters   |       Return Type       | Time Complexity | Notes / Invariants                                               |
+| :------------------- | :----------- | :---------------------: | :-------------: | :--------------------------------------------------------------- |
+| `offer(e)`           | `(E e)`      |        `boolean`        |   `O(log n)`    | Sifts up to restore min-heap invariant; returns `true`           |
+| `add(e)`             | `(E e)`      |        `boolean`        |   `O(log n)`    | Identical to `offer(e)`                                          |
+| `poll()`             | _none_       |           `E`           |   `O(log n)`    | Removes and returns root (minimum); `null` if empty              |
+| `remove()`           | _none_       |           `E`           |   `O(log n)`    | Removes root; throws `NoSuchElementException` if empty           |
+| `peek()`             | _none_       |           `E`           |     `O(1)`      | Returns root element without removal; `null` if empty            |
+| `element()`          | _none_       |           `E`           |     `O(1)`      | Returns root element; throws `NoSuchElementException` if empty   |
+| `remove(Object o)`   | `(Object o)` |        `boolean`        |     `O(n)`      | Linear scan to find element, then `O(log n)` sift to repair heap |
+| `contains(Object o)` | `(Object o)` |        `boolean`        |     `O(n)`      | Linear array scan (`indexOf`)                                    |
+| `comparator()`       | _none_       | `Comparator<? super E>` |     `O(1)`      | Returns comparator used, or `null` if natural ordering           |
+| `clear()`            | _none_       |         `void`          |     `O(n)`      | Resets size to 0 and nulls array slots                           |
+| `size()`             | _none_       |          `int`          |     `O(1)`      | Returns count of active elements                                 |
+| `isEmpty()`          | _none_       |        `boolean`        |     `O(1)`      | Returns `size == 0`                                              |

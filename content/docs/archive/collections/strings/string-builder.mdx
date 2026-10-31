@@ -1,0 +1,119 @@
+---
+title: StringBuilder & StringBuffer
+description: Mutable character buffers, capacity expansion, loop concatenation pitfalls, and thread-safety differences
+---
+
+Because Java `String` instances are immutable, performing repeated string modifications or concatenations using the `+` operator generates redundant intermediate `String` objects on the heap. `StringBuilder` and `StringBuffer` provide resizable, mutable character buffers to assemble text with optimal performance.
+
+---
+
+## The Loop Concatenation Anti-Pattern
+
+A common performance bug in Java is concatenating strings inside a loop using `+`:
+
+```java title="StringConcatTrap.java"
+// ANTI-PATTERN: O(n^2) Time and Space Overhead
+String result = "";
+for (int i = 0; i < 10000; i++) {
+    result += i; // Allocates a brand-new String object and copies all characters on every iteration!
+}
+```
+
+<Callout type="error">
+  **Why `+` in loops destroys performance**: Each `+=` copies the entire accumulated character
+  buffer into a new heap object. For n iterations, this allocates (1 + 2 + ... + n) = `O(n^2)` total
+  characters, triggering heavy Garbage Collection pauses.
+</Callout>
+
+### The Idiomatic `StringBuilder` Solution
+
+Using `StringBuilder` reduces the time complexity from `O(n^2)` to **`O(n)`**:
+
+```java title="StringBuilderSolution.java"
+// OPTIMAL: O(n) Linear Time
+StringBuilder sb = new StringBuilder(10000);
+for (int i = 0; i < 10000; i++) {
+    sb.append(i);
+}
+String result = sb.toString();
+```
+
+---
+
+## `StringBuilder` Core API
+
+`StringBuilder` methods mutate the internal buffer in-place and return `this`, allowing fluent method chaining:
+
+| Method                          | Parameters                |   Return Type   | Description / Behavior                                              |
+| :------------------------------ | :------------------------ | :-------------: | :------------------------------------------------------------------ |
+| `append(T val)`                 | `primitive / Object`      | `StringBuilder` | Appends text representation to the end of the buffer                |
+| `insert(int offset, T val)`     | `int, primitive / Object` | `StringBuilder` | Inserts text at index `offset`, shifting following characters right |
+| `delete(int start, int end)`    | `int, int`                | `StringBuilder` | Deletes characters in half-open range `[start, end)`                |
+| `deleteCharAt(int index)`       | `int`                     | `StringBuilder` | Removes character at specified 0-based index                        |
+| `reverse()`                     | `—`                       | `StringBuilder` | Reverses buffer characters in-place                                 |
+| `setCharAt(int index, char ch)` | `int, char`               |     `void`      | Overwrites character at `index` in `O(1)` time                      |
+| `length()`                      | `—`                       |      `int`      | Current number of characters stored in buffer                       |
+| `capacity()`                    | `—`                       |      `int`      | Total character slots currently allocated                           |
+| `ensureCapacity(int min)`       | `int`                     |     `void`      | Expands buffer capacity if below `min`                              |
+| `setLength(int newLength)`      | `int`                     |     `void`      | Truncates or extends buffer (pads with NUL chars)                   |
+| `toString()`                    | `—`                       |    `String`     | Creates an immutable `String` from the buffer                       |
+
+```java title="StringBuilderDemo.java"
+StringBuilder sb = new StringBuilder("Hello");
+
+sb.append(" World");                  // "Hello World"
+sb.insert(5, ",");                    // "Hello, World"
+sb.delete(5, 6);                      // "Hello World"
+sb.setCharAt(0, 'h');                 // "hello World"
+sb.reverse();                         // "dlroW olleh"
+
+String output = sb.toString();
+```
+
+---
+
+## Capacity Allocation & Geometric Resizing
+
+Under the hood, `StringBuilder` is backed by a mutable `byte[]` buffer.
+
+1. **Default Capacity**: If instantiated without arguments (`new StringBuilder()`), the default initial capacity is **16 characters**.
+2. **Explicit Capacity**: If the final length is roughly known, pass the expected capacity to avoid resizing:
+   ```java
+   StringBuilder sb = new StringBuilder(64); // pre-allocates 64 slots
+   ```
+3. **Growth Mechanics**: When characters exceed current capacity, `StringBuilder` grows geometrically:
+   ```
+   newCapacity = (oldCapacity * 2) + 2
+   ```
+   Geometric growth guarantees an **amortized `O(1)`** cost per `append()` operation.
+
+---
+
+## `StringBuilder` vs `StringBuffer`
+
+| Dimension              | `StringBuilder`                                                              | `StringBuffer`                                                 |
+| :--------------------- | :--------------------------------------------------------------------------- | :------------------------------------------------------------- |
+| **Thread Safety**      | **Not thread-safe** (unsynchronized)                                         | **Thread-safe** (`synchronized` methods)                       |
+| **Throughput / Speed** | **Fastest** (Zero lock acquisition overhead)                                 | Slower due to synchronization monitor locks                    |
+| **JDK Introduction**   | Java 5+                                                                      | Java 1.0+ (Legacy)                                             |
+| **Recommendation**     | **Default choice** for single-threaded code, algorithms, and local variables | Legacy applications with shared multi-threaded logging buffers |
+
+<Callout type="info">
+  **Why StringBuffer is Rarely Needed Today**: In modern Java architectures, string construction is
+  almost exclusively local to a single thread or method stack. Using `StringBuffer` imposes
+  unnecessary synchronization overhead.
+</Callout>
+
+---
+
+## Simple String Concatenation Outside Loops
+
+For single-line concatenation statements like:
+
+```java
+String fullName = firstName + " " + lastName;
+```
+
+You do **not** need to manually construct a `StringBuilder`.
+
+Since Java 9, the compiler replaces simple string concatenation with `invokedynamic` calls backed by `java.lang.invoke.StringConcatFactory`. The JVM dynamically crafts the most optimal strategy at runtime without creating redundant intermediate objects.

@@ -27,6 +27,14 @@ import {
   Sparkles,
   Calculator,
   Bot,
+  Boxes,
+  CodeXml,
+  FileCode,
+  LayoutGrid,
+  Link,
+  ListOrdered,
+  RefreshCw,
+  ShieldAlert,
 } from 'lucide-react';
 
 function getNodeText(node: React.ReactNode): string {
@@ -115,6 +123,14 @@ export function getMDXComponents(components?: MDXComponents) {
     Sparkles,
     Calculator,
     Bot,
+    Boxes,
+    Code2: CodeXml,
+    FileCode,
+    LayoutGrid,
+    Link,
+    ListOrdered,
+    RefreshCw,
+    ShieldAlert,
     ...components,
   } satisfies MDXComponents;
 }

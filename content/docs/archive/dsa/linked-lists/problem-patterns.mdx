@@ -1,0 +1,263 @@
+---
+title: Canonical Problem Patterns
+description: Merging sorted lists, LRU cache doubly-linked node unlinking, and deep copying lists with random pointers
+---
+
+This reference covers the most frequent linked list problems encountered in technical interviews, including multi-list merging, complex pointer interleaving, and designing cache backing stores.
+
+---
+
+## 1. Merge Two Sorted Lists
+
+Combine two sorted linked lists into a single sorted list by dynamically splicing pointers:
+
+```java title="MergeTwoLists.java"
+public ListNode mergeTwoLists(ListNode list1, ListNode list2) {
+    ListNode dummy = new ListNode(0);
+    ListNode tail = dummy;
+
+    while (list1 != null && list2 != null) {
+        if (list1.val <= list2.val) {
+            tail.next = list1;
+            list1 = list1.next;
+        } else {
+            tail.next = list2;
+            list2 = list2.next;
+        }
+        tail = tail.next;
+    }
+
+    // Attach remaining non-null sublist directly in O(1)
+    tail.next = (list1 != null) ? list1 : list2;
+
+    return dummy.next;
+}
+```
+
+<Callout type="info">
+  **Time & Space**: `O(m + n)` time where `m` and `n` are the lengths of the two lists. Space is
+  `O(1)` because original node objects are reused without new allocations.
+</Callout>
+
+---
+
+## 2. Merge K Sorted Lists (Hard)
+
+Combine `k` sorted lists into one sorted list:
+
+<Tabs items={['PriorityQueue / Min-Heap (O(N log K))', 'Divide & Conquer (O(1) Heap Space)']}>
+  <Tab value="PriorityQueue / Min-Heap (O(N log K))">
+    Maintain a min-heap containing the current head of each list:
+
+    ```java title="MergeKSortedListsHeap.java"
+    public ListNode mergeKLists(ListNode[] lists) {
+        if (lists == null || lists.length == 0) return null;
+
+        // Min-heap ordered by node value
+        PriorityQueue<ListNode> pq = new PriorityQueue<>(
+            Comparator.comparingInt(node -> node.val)
+        );
+
+        // Add the head of each non-empty list
+        for (ListNode list : lists) {
+            if (list != null) pq.offer(list);
+        }
+
+        ListNode dummy = new ListNode(0);
+        ListNode tail = dummy;
+
+        while (!pq.isEmpty()) {
+            ListNode smallest = pq.poll();
+            tail.next = smallest;
+            tail = tail.next;
+
+            // If the extracted node has a successor, push it to heap
+            if (smallest.next != null) {
+                pq.offer(smallest.next);
+            }
+        }
+
+        return dummy.next;
+    }
+    ```
+    **Complexity**: `O(N log k)` time (where `N` is total nodes across all lists) and `O(k)` heap memory.
+
+  </Tab>
+
+  <Tab value="Divide & Conquer (O(1) Heap Space)">
+    Pairwise merge lists bottom-up similar to Merge Sort:
+
+    ```java title="MergeKSortedDivideAndConquer.java"
+    public ListNode mergeKLists(ListNode[] lists) {
+        if (lists == null || lists.length == 0) return null;
+        int interval = 1;
+
+        while (interval < lists.length) {
+            for (int i = 0; i + interval < lists.length; i += interval * 2) {
+                lists[i] = mergeTwoLists(lists[i], lists[i + interval]);
+            }
+            interval *= 2;
+        }
+
+        return lists[0];
+    }
+    ```
+    **Complexity**: `O(N log k)` time and `O(1)` auxiliary heap memory.
+
+  </Tab>
+</Tabs>
+
+---
+
+## 3. Copy List with Random Pointer
+
+Each node contains an additional `random` pointer that could point to any node in the list or `null`. A deep copy can be created in **`O(n)` time and `O(1)` extra space** using 3-phase node interleaving:
+
+```mermaid
+flowchart TD
+    S1["Phase 1: Clone each node directly next to original (A -> A' -> B -> B')"] --> S2["Phase 2: Assign cloned randoms (curr.next.random = curr.random.next)"]
+    S2 --> S3["Phase 3: Decouple interleaved chains into original and clone"]
+```
+
+```java title="CopyRandomList.java"
+class Node {
+    int val;
+    Node next;
+    Node random;
+    public Node(int val) { this.val = val; }
+}
+
+public class Solution {
+    public Node copyRandomList(Node head) {
+        if (head == null) return null;
+
+        // Phase 1: Create cloned nodes interleaved right after original nodes
+        Node curr = head;
+        while (curr != null) {
+            Node clone = new Node(curr.val);
+            clone.next = curr.next;
+            curr.next = clone;
+            curr = clone.next;
+        }
+
+        // Phase 2: Copy random pointers
+        curr = head;
+        while (curr != null) {
+            if (curr.random != null) {
+                curr.next.random = curr.random.next;
+            }
+            curr = curr.next.next;
+        }
+
+        // Phase 3: Unweave and separate the two lists
+        Node dummy = new Node(0);
+        Node copyCurr = dummy;
+        curr = head;
+
+        while (curr != null) {
+            Node clone = curr.next;
+            curr.next = clone.next; // Restore original list
+            copyCurr.next = clone;  // Build cloned list
+
+            copyCurr = copyCurr.next;
+            curr = curr.next;
+        }
+
+        return dummy.next;
+    }
+}
+```
+
+---
+
+## 4. Doubly-Linked Node Unlinking (LRU Cache Engine)
+
+A custom doubly-linked list with sentinel `head` and `tail` nodes allows **`O(1)` constant time** unlinking and insertion, forming the backbone of LRU eviction caches:
+
+```java title="DLinkedListLRU.java"
+public class DoubleList {
+    private static class Node {
+        int key, val;
+        Node prev, next;
+        Node(int k, int v) { key = k; val = v; }
+    }
+
+    private final Node head = new Node(0, 0); // Sentinel head
+    private final Node tail = new Node(0, 0); // Sentinel tail
+
+    public DoubleList() {
+        head.next = tail;
+        tail.prev = head;
+    }
+
+    // Add node right after sentinel head (most recently used): O(1)
+    public void addFirst(Node node) {
+        node.next = head.next;
+        node.prev = head;
+        head.next.prev = node;
+        head.next = node;
+    }
+
+    // Remove an existing node: O(1)
+    public void remove(Node node) {
+        node.prev.next = node.next;
+        node.next.prev = node.prev;
+    }
+
+    // Remove the least recently used node (before sentinel tail): O(1)
+    public Node removeLast() {
+        if (tail.prev == head) return null;
+        Node lru = tail.prev;
+        remove(lru);
+        return lru;
+    }
+}
+```
+
+---
+
+## 5. Partition List Around Value x
+
+Partition a linked list such that all nodes with value strictly less than `x` appear before nodes with value `>= x`, preserving their original relative order:
+
+```java title="PartitionList.java"
+public ListNode partition(ListNode head, int x) {
+    ListNode smallerHead = new ListNode(0);
+    ListNode greaterHead = new ListNode(0);
+
+    ListNode small = smallerHead;
+    ListNode great = greaterHead;
+
+    while (head != null) {
+        if (head.val < x) {
+            small.next = head;
+            small = small.next;
+        } else {
+            great.next = head;
+            great = great.next;
+        }
+        head = head.next;
+    }
+
+    great.next = null; // Sever trailing pointer
+    small.next = greaterHead.next; // Splice both sublists
+
+    return smallerHead.next;
+}
+```
+
+---
+
+## Problem Archetype Cheat Sheet
+
+| Problem Pattern             | Core Strategy                                          | Time Complexity | Auxiliary Space  |
+| :-------------------------- | :----------------------------------------------------- | :-------------: | :--------------: |
+| **Middle Node**             | Fast & Slow pointers (`fast.next.next`)                |     `O(n)`      |      `O(1)`      |
+| **Cycle Detection**         | Floyd's algorithm (`slow == fast`)                     |     `O(n)`      |      `O(1)`      |
+| **Cycle Entry Point**       | Advance `ptr1` from head and `ptr2` from meeting point |     `O(n)`      |      `O(1)`      |
+| **Remove N-th from End**    | Advance `fast` `N + 1` steps, then both simultaneously |     `O(n)`      |      `O(1)`      |
+| **Reverse Sublist**         | Splicing with 3 pointers (`prev`, `curr`, `next`)      |     `O(n)`      |      `O(1)`      |
+| **Palindrome Verification** | Middle -> Reverse 2nd half -> Compare                  |     `O(n)`      |      `O(1)`      |
+| **Merge K Lists**           | PriorityQueue (Min-heap) or Divide & Conquer           |  `O(N log k)`   | `O(k)` or `O(1)` |
+| **Copy Random Pointers**    | Interleave clones -> copy random -> unweave            |     `O(n)`      |      `O(1)`      |
+| **LRU Cache Eviction**      | Doubly-linked list with sentinel head and tail         |     `O(1)`      |      `O(1)`      |

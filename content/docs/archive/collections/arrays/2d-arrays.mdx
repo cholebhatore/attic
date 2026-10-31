@@ -1,0 +1,346 @@
+---
+title: 2D Arrays & Matrices
+description: Array-of-arrays heap layout, rectangular grids, jagged arrays, 2D printing methods, matrix traversals, rotations, and deep cloning
+---
+
+A two-dimensional (2D) array represents data organized in rows and columns. In Java, matrices are not stored as a single, contiguous block of memory; rather, they are structured as an **array of references to independent 1D array objects**.
+
+---
+
+## Mental Model: Array of Arrays
+
+In languages like C or C++, a 2D array can be allocated as a single, contiguous block of `rows * cols * sizeof(type)` bytes in row-major order.
+
+In Java, **there is no single contiguous 2D block**. A 2D array `int[][]` is an **outer array whose elements are object references pointing to independent 1D `int[]` heap objects**.
+
+```mermaid
+flowchart TD
+    subgraph STACK["Stack Memory"]
+        MATRIX["int[][] matrix"]
+    end
+    subgraph HEAP["Heap Memory"]
+        OUTER["Outer Array: int[3][]<br/>(Holds 3 Reference Pointers)"]
+        R0["Row 0: int[4]<br/>[ 10, 20, 30, 40 ]"]
+        R1["Row 1: int[4]<br/>[ 50, 60, 70, 80 ]"]
+        R2["Row 2: int[4]<br/>[ 90, 11, 22, 33 ]"]
+    end
+    MATRIX --> OUTER
+    OUTER -->|"matrix[0]"| R0
+    OUTER -->|"matrix[1]"| R1
+    OUTER -->|"matrix[2]"| R2
+```
+
+---
+
+## Rectangular Matrices
+
+A rectangular matrix has the same number of columns in every row:
+
+```java title="MatrixBasics.java"
+// 1. Declare and allocate 3 rows x 4 columns (all initialized to 0)
+int rows = 3;
+int cols = 4;
+int[][] matrix = new int[rows][cols];
+
+// 2. Direct 2D literal initialization
+int[][] grid = {
+    {1, 2, 3},
+    {4, 5, 6},
+    {7, 8, 9}
+};
+
+// 3. Extracting dimensions safely
+int numRows = grid.length;                     // 3
+int numCols = (numRows > 0) ? grid[0].length : 0; // 3
+```
+
+---
+
+## Jagged (Ragged) Arrays
+
+Because each row in Java is an independent array object, each row can possess a **different length**. These are called **jagged arrays** (or ragged arrays).
+
+```java title="JaggedArray.java"
+// Leave the second dimension empty to allocate rows independently
+int[][] jagged = new int[3][];
+
+jagged[0] = new int[2]; // Row 0 has 2 columns
+jagged[1] = new int[4]; // Row 1 has 4 columns
+jagged[2] = new int[1]; // Row 2 has 1 column
+
+// Populate jagged array
+jagged[0][0] = 5;
+jagged[0][1] = 9;
+jagged[1][3] = 42;
+```
+
+### Real-World Application: Pascal's Triangle
+
+Jagged arrays avoid wasting heap memory when storing triangular or hierarchical data:
+
+```java title="PascalsTriangle.java"
+public static int[][] generatePascalsTriangle(int numRows) {
+    int[][] triangle = new int[numRows][];
+
+    for (int i = 0; i < numRows; i++) {
+        triangle[i] = new int[i + 1]; // Row i has (i + 1) elements
+        triangle[i][0] = 1;          // First element is 1
+        triangle[i][i] = 1;          // Last element is 1
+
+        for (int j = 1; j < i; j++) {
+            triangle[i][j] = triangle[i - 1][j - 1] + triangle[i - 1][j];
+        }
+    }
+    return triangle;
+}
+```
+
+---
+
+## Printing 2D Arrays & Matrices
+
+Attempting to print a 2D array with `Arrays.toString(matrix)` outputs memory references for each row: `[[I@15db9742, [I@6d06d69c]`. Use one of the three idiomatic techniques below instead:
+
+<Tabs items={["Arrays.deepToString()", "Nested Loops (Grid)", "Stream per Row"]}>
+  <Tab value="Arrays.deepToString()">
+    The standard JDK recursive method for multidimensional arrays of arbitrary depth:
+
+    ```java title="PrintDeepToString.java"
+    import java.util.Arrays;
+
+    int[][] matrix = {
+        {1, 2, 3},
+        {4, 5, 6},
+        {7, 8, 9}
+    };
+
+    System.out.println(Arrays.deepToString(matrix));
+    // Output: [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+    ```
+
+  </Tab>
+
+  <Tab value="Nested Loops (Grid)">
+    Formats output as a clean mathematical matrix table with right-aligned columns:
+
+    ```java title="PrintMatrixGrid.java"
+    int[][] matrix = {
+        {1, 22, 333},
+        {4444, 5, 66},
+        {7, 888, 9}
+    };
+
+    for (int r = 0; r < matrix.length; r++) {
+        System.out.print("| ");
+        for (int c = 0; c < matrix[r].length; c++) {
+            System.out.printf("%5d ", matrix[r][c]); // 5-width right-aligned
+        }
+        System.out.println("|");
+    }
+    /* Output:
+    |     1    22   333 |
+    |  4444     5    66 |
+    |     7   888     9 |
+    */
+    ```
+
+  </Tab>
+
+  <Tab value="Stream per Row">
+    Prints each row on a new line using `Arrays.toString`:
+
+    ```java title="PrintStreamRows.java"
+    import java.util.Arrays;
+
+    int[][] matrix = {{1, 2}, {3, 4}, {5, 6}};
+
+    Arrays.stream(matrix)
+          .map(Arrays::toString)
+          .forEach(System.out::println);
+    /* Output:
+    [1, 2]
+    [3, 4]
+    [5, 6]
+    */
+    ```
+
+  </Tab>
+</Tabs>
+
+---
+
+## Matrix Traversal & Algorithmic Patterns
+
+### 1. Row-Major vs Column-Major Traversal
+
+```java title="MatrixTraversals.java"
+int[][] matrix = {
+    {1, 2, 3},
+    {4, 5, 6},
+    {7, 8, 9}
+};
+int R = matrix.length;
+int C = matrix[0].length;
+
+// A. Row-Major Traversal (Cache Friendly - O(R * C))
+for (int r = 0; r < R; r++) {
+    for (int c = 0; c < C; c++) {
+        int val = matrix[r][c]; // Sequential access along the row
+    }
+}
+
+// B. Column-Major Traversal (Cache Unfriendly - O(R * C))
+for (int c = 0; c < C; c++) {
+    for (int r = 0; r < R; r++) {
+        int val = matrix[r][c]; // Repeatedly jumps between different row objects
+    }
+}
+```
+
+<Callout type="warn">
+  **Cache Miss Penalty**: Row-major traversal is significantly faster on modern hardware. Because
+  row elements sit contiguously in memory, accessing `matrix[r][c]` followed by `matrix[r][c+1]`
+  utilizes the L1 cache line already fetched. In contrast, column-major access repeatedly
+  dereferences different row pointers, inducing frequent L1/L2 cache misses.
+</Callout>
+
+### 2. Diagonals of a Square Matrix (`N x N`)
+
+```java title="MatrixDiagonals.java"
+int n = matrix.length;
+
+// Main Diagonal: row == col (Top-Left to Bottom-Right)
+for (int i = 0; i < n; i++) {
+    int mainDiagVal = matrix[i][i];
+}
+
+// Anti-Diagonal: row + col == n - 1 (Top-Right to Bottom-Left)
+for (int i = 0; i < n; i++) {
+    int antiDiagVal = matrix[i][n - 1 - i];
+}
+```
+
+<Callout type="info">
+  **Advanced Grid & Matrix Algorithms**: For graph-based grid explorations (BFS/DFS direction
+  vectors) and perimeter peeling, see [DSA Patterns: Array & Matrix
+  Patterns](/archive/dsa/exam-prep/dsa-patterns#array--matrix-problem-patterns).
+</Callout>
+
+---
+
+## Matrix Transformations
+
+### In-Place Transposition & 90° Clockwise Rotation
+
+```java title="MatrixTransforms.java"
+// Transpose square N x N matrix in-place: swap matrix[r][c] with matrix[c][r]
+public static void transpose(int[][] matrix) {
+    int n = matrix.length;
+    for (int r = 0; r < n; r++) {
+        for (int c = r + 1; c < n; c++) {
+            int temp = matrix[r][c];
+            matrix[r][c] = matrix[c][r];
+            matrix[c][r] = temp;
+        }
+    }
+}
+
+// Rotate 90 degrees Clockwise = Transpose + Reverse each row
+public static void rotate90Clockwise(int[][] matrix) {
+    transpose(matrix);
+    int n = matrix.length;
+    for (int r = 0; r < n; r++) {
+        int left = 0, right = n - 1;
+        while (left < right) {
+            int temp = matrix[r][left];
+            matrix[r][left] = matrix[r][right];
+            matrix[r][right] = temp;
+            left++;
+            right--;
+        }
+    }
+}
+```
+
+---
+
+## Cloning & The Shallow Copy Trap
+
+Calling `.clone()` on a 2D array performs a **shallow copy** of the outer reference array only!
+
+```java title="ShallowCopyTrap.java"
+int[][] matrix = {{1, 2}, {3, 4}};
+int[][] copy = matrix.clone(); // TRAP!
+
+// Mutating copy mutates original!
+copy[0][0] = 999;
+System.out.println(matrix[0][0]); // 999! (MUTATED!)
+```
+
+<Callout type="error">
+  **Why this fails**: `matrix.clone()` creates a new outer array, but its entries are reference
+  pointers that still point to the exact same inner `int[]` row objects in the heap.
+</Callout>
+
+### Proper 2D Matrix Deep Copy
+
+To produce a true, independent deep copy of a 2D matrix, clone each row individually:
+
+```java title="DeepCopyMatrix.java"
+public static int[][] deepCopy2D(int[][] original) {
+    int[][] copy = new int[original.length][];
+    for (int i = 0; i < original.length; i++) {
+        copy[i] = original[i].clone(); // or Arrays.copyOf(original[i], original[i].length)
+    }
+    return copy;
+}
+```
+
+---
+
+## Custom Comparator Sorting on 2D Arrays
+
+Frequently required in interval scheduling and coordinate geometry problems:
+
+```java title="SortMatrix.java"
+int[][] intervals = {{1, 4}, {0, 2}, {3, 5}};
+
+// Sort intervals by start time ascending:
+Arrays.sort(intervals, (a, b) -> Integer.compare(a[0], b[0]));
+// Result: [[0, 2], [1, 4], [3, 5]]
+
+// Sort intervals by end time descending, tie-breaking by start time ascending:
+Arrays.sort(intervals, (a, b) -> {
+    int cmp = Integer.compare(b[1], a[1]);
+    return (cmp != 0) ? cmp : Integer.compare(a[0], b[0]);
+});
+```
+
+---
+
+## Complexity Profile
+
+| Operation                               | Time Complexity | Space Complexity | Notes / Invariants                                 |
+| :-------------------------------------- | :-------------: | :--------------: | :------------------------------------------------- |
+| **Direct Cell Access** (`matrix[r][c]`) |     `O(1)`      |      `O(1)`      | Two pointer dereferences: `outer[r]` then `row[c]` |
+| **Row-Major Traversal**                 |   `O(R * C)`    |      `O(1)`      | High CPU cache locality                            |
+| **Column-Major Traversal**              |   `O(R * C)`    |      `O(1)`      | Stride cache miss penalty                          |
+| **In-Place Transposition** (`N x N`)    |    `O(N^2)`     |      `O(1)`      | Swaps `matrix[r][c]` with `matrix[c][r]`           |
+| **90° Rotation** (`N x N`)              |    `O(N^2)`     |      `O(1)`      | Transpose + horizontal row reversal                |
+| **Deep Copy**                           |   `O(R * C)`    |    `O(R * C)`    | Allocates new outer array and R inner row arrays   |
+| **`Arrays.deepEquals()`**               |   `O(R * C)`    |      `O(1)`      | Recursively checks element equality                |
+
+---
+
+## 2D Matrix Toolkit Reference
+
+Static methods and operations commonly used when working with 2D matrices:
+
+| Method                            | Parameters                   | Return Type | Description / Notes                                                                 |
+| :-------------------------------- | :--------------------------- | :---------: | :---------------------------------------------------------------------------------- |
+| `Arrays.deepToString(a)`          | `(Object[] a)`               |  `String`   | Recursively formats multidimensional arrays as `[[...], [...]]`                     |
+| `Arrays.deepEquals(a1, a2)`       | `(Object[] a1, Object[] a2)` |  `boolean`  | Recursively verifies equality across all rows and cells                             |
+| `Arrays.deepHashCode(a)`          | `(Object[] a)`               |    `int`    | Computes content-based hash code for multidimensional arrays                        |
+| `Arrays.fill(row, val)`           | `(int[] a, int val)`         |   `void`    | Fills an individual row; loop over `for (int[] row : matrix)` to fill entire matrix |
+| `Arrays.sort(matrix, comparator)` | `(T[] a, Comparator c)`      |   `void`    | Sorts rows by column value (e.g. interval start/end times)                          |
+| `row.clone()`                     | `()`                         |   `int[]`   | Deep-copies a single row; call per row to produce an independent 2D deep copy       |

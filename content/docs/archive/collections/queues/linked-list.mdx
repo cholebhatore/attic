@@ -1,0 +1,163 @@
+---
+title: LinkedList Queue
+description: Doubly-linked FIFO queue and Deque implementation, heap node allocation overhead, and cache locality trade-offs
+---
+
+`LinkedList<E>` implements both the `Queue<E>` and `Deque<E>` interfaces in addition to `List<E>`. It maintains a doubly-linked chain of discrete heap-allocated `Node` objects with explicit `first` and `last` references, enabling `O(1)` insertions and removals at both ends.
+
+---
+
+## Doubly-Linked Node Architecture
+
+Each node in the list holds an element value alongside forward and backward pointers:
+
+```
+[first] ──➔ [prev | Node 1 | next] ⇄ [prev | Node 2 | next] ⇄ [prev | Node 3 | next] ──➔ null
+                                                                          ▲
+                                                                  [last] ─┘
+```
+
+```java title="NodeStructure.java"
+// Internal JVM representation inside java.util.LinkedList:
+private static class Node<E> {
+    E item;
+    Node<E> next;
+    Node<E> prev;
+
+    Node(Node<E> prev, E element, Node<E> next) {
+        this.item = element;
+        this.next = next;
+        this.prev = prev;
+    }
+}
+```
+
+---
+
+## Queue & Deque API Usage
+
+Because `LinkedList` implements both `Queue` and `Deque`, you can instantiate it to fulfill either contract:
+
+```java title="LinkedListQueueDemo.java"
+import java.util.Deque;
+import java.util.LinkedList;
+import java.util.Queue;
+
+public class LinkedListQueueDemo {
+    public static void main(String[] args) {
+        // 1. As a standard FIFO Queue
+        Queue<String> fifoQueue = new LinkedList<>();
+        fifoQueue.offer("Job-A");
+        fifoQueue.offer("Job-B");
+        fifoQueue.offer("Job-C");
+
+        while (!fifoQueue.isEmpty()) {
+            System.out.println("Processing: " + fifoQueue.poll()); // Job-A, Job-B, Job-C
+        }
+
+        // 2. As a Double-Ended Queue (Deque)
+        Deque<Integer> deque = new LinkedList<>();
+        deque.offerFirst(10); // Insert at Head
+        deque.offerLast(20);  // Insert at Tail
+        deque.offerFirst(5);  // Insert at Head: [5, 10, 20]
+
+        System.out.println(deque.peekFirst()); // 5
+        System.out.println(deque.peekLast());  // 20
+
+        deque.pollFirst(); // removes 5
+        deque.pollLast();  // removes 20
+        System.out.println(deque.size());      // 1 (only 10 remains)
+    }
+}
+```
+
+---
+
+## LinkedList vs ArrayDeque: The Performance Trade-off
+
+While `LinkedList` offers the same theoretical `O(1)` time complexity for head and tail operations as `ArrayDeque`, in practice **`ArrayDeque` is almost always significantly faster**:
+
+| Metric                     | `LinkedList`                                                    | `ArrayDeque`                                  |    Winner    |
+| :------------------------- | :-------------------------------------------------------------- | :-------------------------------------------- | :----------: |
+| **Element Storage**        | Discrete heap `Node` per element                                | Contiguous circular array                     | `ArrayDeque` |
+| **Per-Element Memory**     | **24–32 bytes** extra pointer overhead                          | **4–8 bytes** (only raw reference slot)       | `ArrayDeque` |
+| **CPU Cache Locality**     | **Poor** (pointer chasing across heap)                          | **Excellent** (contiguous memory prefetching) | `ArrayDeque` |
+| **GC Pressure**            | **High** (allocates/discards a `Node` on every enqueue/dequeue) | **Near zero** (reuses existing backing array) | `ArrayDeque` |
+| **Permits `null`**         | **Yes** (ambiguous with `poll() == null`)                       | **No** (throws `NullPointerException`)        | `ArrayDeque` |
+| **Mid-List O(1) Splicing** | **Yes** (if holding a `ListIterator` / node reference)          | **No** (requires element shifting)            | `LinkedList` |
+
+```
+Memory Footprint Comparison (1 Million Elements, 64-bit JVM with Compressed OOPs):
+├── ArrayDeque:   ~4 MB  (single contiguous Object[] array)
+└── LinkedList:  ~32 MB  (1,000,000 discrete Node instances + 3 refs each)
+```
+
+---
+
+## Critical Traps & Edge Cases
+
+<Callout type="error">
+  **The `null` Permissibility Trap**: `LinkedList` permits inserting `null`. This creates an insidious bug when polling:
+  ```java
+  Queue<String> q = new LinkedList<>();
+  q.offer(null);
+
+String item = q.poll(); // Returns null!
+// Does item == null mean the queue was empty, or did it contain null?
+// You must call q.isEmpty() separately to know!
+
+````
+`ArrayDeque` solves this by explicitly rejecting `null` entries on insertion.
+</Callout>
+
+<Callout type="warn">
+**The Random Access Trap**: Never call `get(i)` on a `LinkedList` when treating it as a list in a loop:
+```java
+// ❌ DISASTROUS: O(n^2) quadratic iteration!
+for (int i = 0; i < list.size(); i++) {
+    process(list.get(i)); // Traverses pointers from closest end for every index
+}
+
+// ✅ CORRECT: O(n) linear consumption
+for (String item : list) {
+    process(item);
+}
+````
+
+</Callout>
+
+---
+
+## When to Use LinkedList as a Queue
+
+1. **You strictly require `null` elements** in your queue (rare, generally considered an anti-pattern).
+2. **You need `O(1)` arbitrary node deletion or splicing** while retaining the element reference (e.g., custom LRU Cache implementations where items are detached and moved to the head).
+3. **Worst-case latency guarantees**: `LinkedList` never triggers an array resize/copy pause (unlike `ArrayDeque` when doubling capacity). However, GC pauses from node churn often outweigh this benefit.
+
+---
+
+## LinkedList Queue & Deque Toolkit
+
+The complete method toolkit for `LinkedList` when operating as a Queue and Deque:
+
+| Method                     | Parameters   | Return Type | Time Complexity | Throws on Boundary / Notes                              |
+| :------------------------- | :----------- | :---------: | :-------------: | :------------------------------------------------------ |
+| `offer(e)`                 | `(E e)`      |  `boolean`  |     `O(1)`      | Appends to tail; returns `true`                         |
+| `add(e)`                   | `(E e)`      |  `boolean`  |     `O(1)`      | Appends to tail; returns `true`                         |
+| `poll()`                   | _none_       |     `E`     |     `O(1)`      | Removes head; returns `null` if empty                   |
+| `remove()`                 | _none_       |     `E`     |     `O(1)`      | Removes head; throws `NoSuchElementException` if empty  |
+| `peek()`                   | _none_       |     `E`     |     `O(1)`      | Inspects head; returns `null` if empty                  |
+| `element()`                | _none_       |     `E`     |     `O(1)`      | Inspects head; throws `NoSuchElementException` if empty |
+| `offerFirst(e)`            | `(E e)`      |  `boolean`  |     `O(1)`      | Prepends to head                                        |
+| `offerLast(e)`             | `(E e)`      |  `boolean`  |     `O(1)`      | Appends to tail                                         |
+| `pollFirst()`              | _none_       |     `E`     |     `O(1)`      | Removes head; returns `null` if empty                   |
+| `pollLast()`               | _none_       |     `E`     |     `O(1)`      | Removes tail; returns `null` if empty                   |
+| `peekFirst()`              | _none_       |     `E`     |     `O(1)`      | Inspects head; returns `null` if empty                  |
+| `peekLast()`               | _none_       |     `E`     |     `O(1)`      | Inspects tail; returns `null` if empty                  |
+| `push(e)`                  | `(E e)`      |   `void`    |     `O(1)`      | Stack push onto head (`addFirst`)                       |
+| `pop()`                    | _none_       |     `E`     |     `O(1)`      | Stack pop from head (`removeFirst`); throws if empty    |
+| `removeFirstOccurrence(o)` | `(Object o)` |  `boolean`  |     `O(n)`      | Removes first match traversing head-to-tail             |
+| `removeLastOccurrence(o)`  | `(Object o)` |  `boolean`  |     `O(n)`      | Removes first match traversing tail-to-head             |
+| `clear()`                  | _none_       |   `void`    |     `O(n)`      | Unlinks all nodes for garbage collection                |
+| `size()`                   | _none_       |    `int`    |     `O(1)`      | Returns current element count                           |
+| `isEmpty()`                | _none_       |  `boolean`  |     `O(1)`      | Checks if list has zero elements                        |

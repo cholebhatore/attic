@@ -1,0 +1,122 @@
+---
+title: ArrayList
+description: In-depth analysis of ArrayList dynamic resizing, amortized O(1) performance, methods, and the capacity trap
+---
+
+`ArrayList<E>` is backed by a dynamically resizing array. It is the premier choice for read-heavy workloads where indexed random access dominates.
+
+---
+
+## Dynamic Resizing Mechanics
+
+When an `ArrayList` reaches full capacity, the JVM allocates a replacement array roughly **50% larger** (`oldCapacity + (oldCapacity >> 1)`) and copies the elements into the new memory buffer.
+
+```java title="ArrayListUsage.java"
+// Pre-allocate capacity when expected element count is known
+List<Integer> list = new ArrayList<>(100);
+
+// Basic operations
+list.add(10);                   // O(1) amortized -> returns boolean
+list.add(1, 20);                // O(n) shifted right -> returns void
+int val = list.get(0);          // O(1) random access -> returns E
+int old = list.set(0, 99);      // O(1) in-place update -> returns old E
+boolean has = list.contains(99);// O(n) scan -> returns boolean
+int size = list.size();         // returns int
+
+// Index-based vs Object-based removal
+int removed = list.remove(0);                      // Removes index 0 (returns E)
+boolean wasRemoved = list.remove(Integer.valueOf(20)); // Removes value 20 (returns boolean)
+
+// Bulk operations
+list.addAll(List.of(1, 2, 3));
+list.removeIf(x -> x < 0);
+list.sort(Comparator.naturalOrder());
+```
+
+<Callout type="warn">
+  **The Capacity Trap**: `new ArrayList<>(100)` reserves memory space for 100 elements, but `list.size()` is still `0`. Attempting to read or replace `list.get(5)` throws `IndexOutOfBoundsException`.
+</Callout>
+
+---
+
+## Complexity Profile
+
+| Operation                                  | Time Complexity | Notes                       |
+| :----------------------------------------- | :-------------: | :-------------------------- |
+| **`get(index)` / `set(index)`**            |     `O(1)`      | Direct array index lookup   |
+| **`add(e)` (Append)**                      |     `O(1)`      | Amortized constant time     |
+| **`add(index, e)`**                        |     `O(n)`      | Shifts elements right       |
+| **`remove(index)` / `remove(Object)`**     |     `O(n)`      | Shifts elements left        |
+| **`contains(Object)` / `indexOf(Object)`** |     `O(n)`      | Linear scan via `.equals()` |
+
+---
+
+## Core Methods Reference
+
+| Method                      | Parameters |  Returns  | Note / Behavior                                  |
+| :-------------------------- | :--------- | :-------: | :----------------------------------------------- |
+| `add(E e)`                  | `E`        | `boolean` | Appends element to end                           |
+| `add(int index, E e)`       | `int, E`   |  `void`   | Inserts at index; shifts trailing elements       |
+| `get(int index)`            | `int`      |    `E`    | Fast indexed read                                |
+| `set(int index, E e)`       | `int, E`   |    `E`    | Returns previous value at index                  |
+| `remove(int index)`         | `int`      |    `E`    | Removes at index; shifts left                    |
+| `remove(Object o)`          | `Object`   | `boolean` | Removes first matching instance                  |
+| `subList(int from, int to)` | `int, int` | `List<E>` | **Live view**; modifications propagate to parent |
+| `toArray(T[] a)`            | `T[]`      |   `T[]`   | Fills or instantiates typed array                |
+| `ensureCapacity(int min)`   | `int`      |  `void`   | Guarantees minimum buffer capacity               |
+
+---
+
+## List Iteration & `ListIterator`
+
+`List<E>` supports four primary traversal mechanisms. `ListIterator<E>` is unique because it is the **only iterator that can move backward, replace elements in place, and insert new elements during traversal**:
+
+<Tabs items={['Enhanced For-Loop', 'ListIterator (Bidirectional)', 'Indexed Loop', 'Safe removeIf()']}>
+  <Tab value="Enhanced For-Loop">
+    ```java title="EnhancedForLoop.java"
+    List<String> names = new ArrayList<>(List.of("Alice", "Bob", "Charlie"));
+
+    // Standard read-only traversal
+    for (String name : names) {
+        System.out.println(name);
+    }
+    ```
+
+  </Tab>
+  <Tab value="ListIterator (Bidirectional)">
+    ```java title="ListIteratorDemo.java"
+    ListIterator<String> it = names.listIterator();
+
+    // 1. Forward Traversal & In-Place Replacement
+    while (it.hasNext()) {
+        String s = it.next();
+        if (s.equals("Bob")) {
+            it.set("Robert"); // Replaces current element in-place
+        }
+    }
+
+    // 2. Backward Traversal (walks in reverse order)
+    while (it.hasPrevious()) {
+        int prevIdx = it.previousIndex();
+        String prevVal = it.previous();
+        System.out.println(prevIdx + ": " + prevVal);
+    }
+    ```
+
+  </Tab>
+  <Tab value="Indexed Loop">
+    ```java title="IndexedLoop.java"
+    // O(1) random access makes this optimal specifically for ArrayList
+    for (int i = 0; i < names.size(); i++) {
+        System.out.println(i + " -> " + names.get(i));
+    }
+    ```
+  </Tab>
+  <Tab value="Safe removeIf()">
+    ```java title="SafeRemoveIf.java"
+    // Modifying a list during an enhanced for-loop throws ConcurrentModificationException!
+    // Always use removeIf (Java 8+) for conditional deletions:
+    names.removeIf(n -> n.startsWith("A"));
+    ```
+  </Tab>
+</Tabs>

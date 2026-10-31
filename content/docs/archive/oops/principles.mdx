@@ -1,0 +1,204 @@
+---
+title: Core Principles & Patterns
+description: Comprehensive exploration of Encapsulation, Abstraction, Inheritance, and Polymorphism in Java
+---
+
+Object-Oriented Programming (OOP) structures software architecture around self-contained entities (objects) that bundle state with behavior. This guide details the four foundational pillars—Encapsulation, Abstraction, Inheritance, and Polymorphism—alongside JVM runtime dispatch mechanics and clean architecture guidelines.
+
+---
+
+## The Four Foundational Pillars
+
+These four core principles work cohesively to maximize reusability, safeguard data integrity, and decouple implementation details from public contracts.
+
+```mermaid
+flowchart TD
+    OOP["Object-Oriented Principles"] --> ENC["Encapsulation (Data Hiding)"]
+    OOP --> ABS["Abstraction (Contract Separation)"]
+    OOP --> INH["Inheritance (Code Reuse)"]
+    OOP --> POLY["Polymorphism (Dynamic Dispatch)"]
+
+    ENC --> E1["Private Fields + Accessors"]
+    ABS --> A1["Interfaces & Abstract Classes"]
+    INH --> I1["Single Class + Multi-Interface"]
+    POLY --> P1["Overloading (Compile-Time)"]
+    POLY --> P2["Overriding (Runtime / vtable)"]
+```
+
+---
+
+## Encapsulation vs Abstraction
+
+While often conflated, Encapsulation focuses on **data protection** (how an object hides its internal representation), whereas Abstraction focuses on **interface simplification** (what capabilities an object reveals to the outside world):
+
+| Dimension          | Encapsulation                                                        | Abstraction                                                        |
+| :----------------- | :------------------------------------------------------------------- | :----------------------------------------------------------------- |
+| **Primary Goal**   | Protect internal state from arbitrary mutation                       | Reduce cognitive complexity by hiding implementation details       |
+| **Java Mechanism** | Access modifiers (`private`, `protected`), getters, defensive copies | `interface`, `abstract class`                                      |
+| **Focus**          | How an object fulfills its responsibilities internally               | What contract an object presents to consumers                      |
+| **Key Advantage**  | Maintain invariants and enforce validation constraints               | Freedom to refactor underlying algorithms without breaking clients |
+
+<Callout type="info">
+  **Modern Immutability with Records**: In Java 16+, prefer `record` declarations for transparent
+  data carriers. Records automatically enforce private final fields, accessor methods, and robust
+  `equals`/`hashCode` contracts.
+</Callout>
+
+---
+
+## Polymorphism: Compile-Time vs Runtime
+
+Polymorphism allows objects of disparate types to be addressed through a common interface, with concrete behaviors resolved either statically by the compiler or dynamically by the JVM runtime.
+
+<Tabs items={['Method Overloading (Static)', 'Method Overriding (Dynamic)', 'JVM vtable Mechanics']}>
+  <Tab value="Method Overloading (Static)">
+    Static polymorphism resolves which method signature to invoke at compile time based on parameter types and arity:
+
+    ```java title="LoggerOverloading.java"
+    public class Logger {
+        public void log(String message) {
+            System.out.println("[INFO] " + message);
+        }
+
+        public void log(String message, Throwable cause) {
+            System.err.println("[ERROR] " + message + ": " + cause.getMessage());
+        }
+
+        public void log(String format, Object... args) {
+            System.out.printf(format + "%n", args);
+        }
+    }
+    ```
+
+  </Tab>
+
+  <Tab value="Method Overriding (Dynamic)">
+    Dynamic polymorphism resolves which method implementation to execute at runtime depending on the actual instance type on the heap:
+
+    ```java title="PaymentGateway.java"
+    public interface PaymentGateway {
+        void processPayment(double amount);
+    }
+
+    public class StripeGateway implements PaymentGateway {
+        @Override
+        public void processPayment(double amount) {
+            System.out.println("Processing $" + amount + " via Stripe Token API");
+        }
+    }
+
+    public class PayPalGateway implements PaymentGateway {
+        @Override
+        public void processPayment(double amount) {
+            System.out.println("Redirecting to PayPal Checkout for $" + amount);
+        }
+    }
+    ```
+
+  </Tab>
+
+  <Tab value="JVM vtable Mechanics">
+    The HotSpot JVM implements runtime dispatch using a Virtual Method Table (`vtable`):
+
+    ```
+    StripeGateway Object (Heap)
+    ┌──────────────────────┐
+    │  _mark (Header)      │
+    │  _klass (Klass*)     ───►  Klass Metadata (Metaspace)
+    │  fields...           │     ┌────────────────────────┐
+    └──────────────────────┘     │  vtable:               │
+                                 │  [0] toString()        │
+                                 │  [1] processPayment()  ───► StripeGateway::processPayment
+                                 └────────────────────────┘
+    ```
+
+    The bytecode `invokevirtual` indexes into the instance's `Klass` vtable array at a fixed offset, executing dynamic dispatch in `O(1)` constant time without reflection.
+
+  </Tab>
+</Tabs>
+
+---
+
+## Inheritance Pitfalls & Composition
+
+Inheritance creates a strong coupling relationship between parent and child classes. Modern software engineering prioritizes object composition over class inheritance.
+
+<Callout type="warn">
+  **The Fragile Base Class Problem**: Changes to a parent class's internal implementation can
+  inadvertently break child class invariants. When behavior reuse is needed, prefer injecting
+  dependencies via constructor composition rather than `extends`.
+</Callout>
+
+<Callout type="error">
+  **Diamond Problem & Interface Clashes**: While Java forbids multiple class inheritance to avoid
+  ambiguous member resolution, implementing two interfaces that provide conflicting `default` method
+  signatures requires explicit override disambiguation (`InterfaceA.super.doSomething()`).
+</Callout>
+
+---
+
+## Designing Extensible Class Hierarchies
+
+Follow this checklist when modeling domain hierarchies to satisfy the Liskov Substitution Principle (LSP):
+
+<Steps>
+  <Step>
+    ### Define Behavior with Narrow Interfaces
+
+    Adhere to the Interface Segregation Principle (ISP). Keep interfaces focused on a single responsibility rather than creating monolithic contracts.
+
+  </Step>
+
+  <Step>
+    ### Use Abstract Classes for Shared Invariants Only
+
+    Reserve abstract classes for template method patterns where common pre-flight validations, resource hooks, or logging must be enforced before child execution.
+
+  </Step>
+
+  <Step>
+    ### Mark Classes Final by Default
+
+    Design explicitly for inheritance or forbid it. Classes that are not designed with template hooks should be marked `final` or sealed (`sealed ... permits`).
+
+  </Step>
+</Steps>
+
+---
+
+## Frequently Asked Questions
+
+<Accordions>
+  <Accordion title="Why does Java disallow multiple class inheritance?">
+    To avoid the Diamond Problem and state ambiguity. If Class `A` defines a field `int count`, and Classes `B` and `C` both inherit from `A`, a Class `D` inheriting from both `B` and `C` would carry two ambiguous copies of `count` in its object memory layout. Interfaces carry behavior without instance state, preventing this memory collision.
+  </Accordion>
+
+<Accordion title="Can private or static methods be overridden?">
+  No. Static methods belong to the class namespace and are resolved at compile-time via
+  `invokestatic` (method hiding, not overriding). Private methods are not visible to sub-classes and
+  are invoked via `invokespecial`, bypassing dynamic dispatch.
+</Accordion>
+
+  <Accordion title="What is the Liskov Substitution Principle (LSP)?">
+    LSP states that subtypes must be substitutable for their base types without altering program correctness. A subclass must not strengthen preconditions (e.g. throwing new checked exceptions) or weaken postconditions (e.g. failing to maintain guarantees made by the superclass).
+  </Accordion>
+</Accordions>
+
+---
+
+## Related Documentation
+
+<Cards>
+  <Card
+    icon={<LayoutGrid className="size-4" />}
+    title="Java Collections Framework"
+    description="Explore polymorphic data structure hierarchies and complexity benchmarks"
+    href="/archive/collections"
+  />
+  <Card
+    icon={<FileCode className="size-4" />}
+    title="Collections Master Cheatsheet"
+    description="One-stop reference matrix for collection method signatures and time complexities"
+    href="/archive/collections/cheatsheet"
+  />
+</Cards>

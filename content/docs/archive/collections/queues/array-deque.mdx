@@ -1,0 +1,195 @@
+---
+title: ArrayDeque
+description: Circular array buffer mechanics, Stack and Queue personas, null prohibition, and sliding window patterns
+---
+
+`ArrayDeque<E>` (Array Double-Ended Queue) is a resizable, high-performance dynamic array implementing `Deque<E>`. It has no capacity restrictions and operates with amortized `O(1)` time complexity for insertions and removals at both ends. It serves as Java's official, modern replacement for both `java.util.Stack` and `LinkedList`.
+
+---
+
+## Circular Ring Buffer Mechanics
+
+Internally, `ArrayDeque` manages elements within a contiguous `Object[] elements` array using two integer pointers: `head` and `tail`.
+
+```
+Circular Array Buffer (Capacity = 8):
+Index:    [0]   [1]   [2]     [3]      [4]      [5]       [6]        [7]
+Element: [ C ] [ D ] [ E ]  [empty]  [empty]  [empty]   [ A ]      [ B ]
+                              ▲                           ▲
+                              │                           │
+                          tail = 3                    head = 6
+```
+
+### The Power-of-Two Bitmask Optimization
+
+The backing array capacity is always forced to a **power of two** (default initial capacity is 16). This allows index incrementation and decrementation to wrap around circularly using an ultra-fast bitwise `AND` instead of costly division/modulo:
+
+```java
+// Increment head/tail circularly:
+tail = (tail + 1) & (elements.length - 1);
+
+// Decrement head circularly:
+head = (head - 1) & (elements.length - 1);
+```
+
+When `head == tail`, the circular buffer is completely full. `ArrayDeque` doubles its capacity via `doubleCapacity()`, copying existing elements into a continuous zero-indexed sequence.
+
+---
+
+## The Three Personas of ArrayDeque
+
+`ArrayDeque` is multi-modal and seamlessly transitions across three primary structural roles:
+
+### 1. High-Performance FIFO Queue
+
+Use `offer(e)`, `poll()`, and `peek()` for First-In, First-Out queueing:
+
+```java title="QueuePersona.java"
+Queue<String> queue = new ArrayDeque<>();
+queue.offer("request-1");
+queue.offer("request-2");
+
+String next = queue.poll(); // "request-1"
+```
+
+### 2. Modern LIFO Stack (Replaces `java.util.Stack`)
+
+Use `push(e)`, `pop()`, and `peek()` for Last-In, First-Out stack processing:
+
+```java title="StackPersona.java"
+Deque<Integer> stack = new ArrayDeque<>();
+stack.push(10); // calls addFirst()
+stack.push(20);
+
+int top = stack.pop(); // 20 (calls removeFirst())
+```
+
+<Callout type="warn">
+  **Why `java.util.Stack` is Deprecated**: `Stack` inherits from `Vector`. Every method call
+  (`push`, `pop`, `peek`) acquires an intrinsic object lock, causing unnecessary synchronization
+  overhead in single-threaded environments. Furthermore, because it extends `Vector`, it exposes
+  index-based methods like `stack.insertElementAt(e, 0)` that violate LIFO semantics. **Always use
+  `ArrayDeque` as a Stack.**
+</Callout>
+
+### 3. Double-Ended Deque
+
+Freely insert and extract from either side:
+
+```java title="DequePersona.java"
+Deque<String> deque = new ArrayDeque<>();
+deque.addFirst("Front");
+deque.addLast("Back");
+
+String front = deque.removeFirst(); // "Front"
+String back = deque.removeLast();   // "Back"
+```
+
+---
+
+## Core Problem Patterns
+
+### 1. Monotonic Queue (Sliding Window Maximum)
+
+A classic `O(n)` interview pattern that maintains elements in monotonically decreasing order within a moving window:
+
+```java title="SlidingWindowMax.java"
+import java.util.ArrayDeque;
+import java.util.Deque;
+
+public class SlidingWindowMax {
+    public static int[] maxSlidingWindow(int[] nums, int k) {
+        if (nums == null || k <= 0) return new int[0];
+        int n = nums.length;
+        int[] result = new int[n - k + 1];
+        int ri = 0;
+
+        // Stores INDICES of elements; head always holds max for current window
+        Deque<Integer> deque = new ArrayDeque<>();
+
+        for (int i = 0; i < n; i++) {
+            // 1. Remove indices that are out of the current window bounds
+            while (!deque.isEmpty() && deque.peekFirst() < i - k + 1) {
+                deque.pollFirst();
+            }
+
+            // 2. Remove smaller elements from tail to preserve descending monotonicity
+            while (!deque.isEmpty() && nums[deque.peekLast()] < nums[i]) {
+                deque.pollLast();
+            }
+
+            // 3. Append current index
+            deque.offerLast(i);
+
+            // 4. Record current window max once first k elements are processed
+            if (i >= k - 1) {
+                result[ri++] = nums[deque.peekFirst()];
+            }
+        }
+        return result;
+    }
+}
+```
+
+### 2. Level-Order Tree Traversal (BFS)
+
+```java title="BinaryTreeBFS.java"
+public static void levelOrderTraversal(TreeNode root) {
+    if (root == null) return;
+    Queue<TreeNode> queue = new ArrayDeque<>();
+    queue.offer(root);
+
+    while (!queue.isEmpty()) {
+        int levelSize = queue.size();
+        for (int i = 0; i < levelSize; i++) {
+            TreeNode curr = queue.poll();
+            System.out.print(curr.val + " ");
+
+            if (curr.left != null) queue.offer(curr.left);
+            if (curr.right != null) queue.offer(curr.right);
+        }
+        System.out.println(); // Next level
+    }
+}
+```
+
+---
+
+## Critical Invariants & Gotchas
+
+<Callout type="error">
+  **Strict Null Prohibition**: `ArrayDeque` prohibits `null` elements. Passing `null` to `addFirst`,
+  `addLast`, `offer`, or `push` immediately throws `NullPointerException`. This guarantee ensures
+  that `poll()` returning `null` unambiguously indicates an empty container.
+</Callout>
+
+<Callout type="info">
+  **Capacity Pre-allocation**: If you anticipate holding thousands of elements, initialize the buffer with an estimated size: `new ArrayDeque<>(expectedSize)`. This eliminates multiple array doubling reallocations and copies during burst insertions.
+</Callout>
+
+---
+
+## ArrayDeque Toolkit Reference
+
+The primary operational API for `ArrayDeque<E>`:
+
+| Method                 | Parameters |  Return Type  | Time Complexity | Description / Role                                                 |
+| :--------------------- | :--------- | :-----------: | :-------------: | :----------------------------------------------------------------- |
+| `offerFirst(e)`        | `(E e)`    |   `boolean`   |     `O(1)`      | Inserts element at head; returns `true`                            |
+| `offerLast(e)`         | `(E e)`    |   `boolean`   |     `O(1)`      | Inserts element at tail; returns `true` (standard queue enqueue)   |
+| `addFirst(e)`          | `(E e)`    |    `void`     |     `O(1)`      | Inserts element at head                                            |
+| `addLast(e)`           | `(E e)`    |    `void`     |     `O(1)`      | Inserts element at tail                                            |
+| `pollFirst()`          | _none_     |      `E`      |     `O(1)`      | Removes and returns head; `null` if empty (standard queue dequeue) |
+| `pollLast()`           | _none_     |      `E`      |     `O(1)`      | Removes and returns tail; `null` if empty                          |
+| `removeFirst()`        | _none_     |      `E`      |     `O(1)`      | Removes and returns head; throws `NoSuchElementException` if empty |
+| `removeLast()`         | _none_     |      `E`      |     `O(1)`      | Removes and returns tail; throws `NoSuchElementException` if empty |
+| `peekFirst()`          | _none_     |      `E`      |     `O(1)`      | Inspects head; `null` if empty (standard queue peek)               |
+| `peekLast()`           | _none_     |      `E`      |     `O(1)`      | Inspects tail; `null` if empty                                     |
+| `getFirst()`           | _none_     |      `E`      |     `O(1)`      | Inspects head; throws `NoSuchElementException` if empty            |
+| `getLast()`            | _none_     |      `E`      |     `O(1)`      | Inspects tail; throws `NoSuchElementException` if empty            |
+| `push(e)`              | `(E e)`    |    `void`     |     `O(1)`      | Stack push; prepends to head (`addFirst(e)`)                       |
+| `pop()`                | _none_     |      `E`      |     `O(1)`      | Stack pop; removes from head (`removeFirst()`)                     |
+| `descendingIterator()` | _none_     | `Iterator<E>` |     `O(1)`      | Returns iterator traversing from tail to head                      |
+| `clear()`              | _none_     |    `void`     |     `O(n)`      | Resets pointers and nulls backing array slots                      |
+| `size()`               | _none_     |     `int`     |     `O(1)`      | Number of elements currently in the deque                          |
+| `isEmpty()`            | _none_     |   `boolean`   |     `O(1)`      | `head == tail` emptiness check                                     |

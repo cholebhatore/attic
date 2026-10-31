@@ -1,0 +1,319 @@
+---
+title: DSA Patterns & Best Practices
+description: 12 essential problem-solving archetypes, canonical code snippets, safe iteration removal, and production guidelines
+---
+
+Most technical interview problems reduce to identifying the problem's underlying shape and selecting the optimal Java collection to model it.
+
+---
+
+## 12 Core Problem Archetypes
+
+| Pattern                     | Problem Archetype                                   | Recommended Java Collection                                                |
+| :-------------------------- | :-------------------------------------------------- | :------------------------------------------------------------------------- |
+| **1. Frequency Counting**   | Anagrams, character counts, majority element        | `HashMap<T, Integer>` with `merge(k, 1, Integer::sum)` or `int[26]`        |
+| **2. Seen-Before / Dedup**  | Two Sum, cycle detection, uniqueness verification   | `HashSet<T>` for `O(1)` membership; `HashMap<T, Integer>` to track indices |
+| **3. Grouping / Bucketing** | Group anagrams, categorize items by key             | `HashMap<K, List<V>>` with `computeIfAbsent(k, k -> new ArrayList<>())`    |
+| **4. Sliding Window**       | Substring with unique chars, window max             | Two pointers (`left`, `right`) + `int[128]` or `HashMap` for window state  |
+| **5. Monotonic Stack**      | Next Greater Element, Daily Temperatures            | `Deque<Integer> = new ArrayDeque<>()` holding array indices                |
+| **6. BFS / Level-Order**    | Shortest path in unweighted graph, tree levels      | `Queue<Node> = new ArrayDeque<>()` (never use `LinkedList`)                |
+| **7. DFS / Backtracking**   | Permutations, combinations, pathfinding             | Implicit call-stack recursion, or explicit `Deque<Node>` stack             |
+| **8. Top-K / Extremes**     | K closest points, K frequent numbers, median        | `PriorityQueue<T>` capped at size K (Min-heap for largest K)               |
+| **9. LRU Cache**            | Cache design with eviction policies                 | `LinkedHashMap<K, V>` with `accessOrder = true` & `removeEldestEntry`      |
+| **10. Nearest / Range**     | Closest scheduled event, range queries              | `TreeSet<T>` / `TreeMap<K, V>` using `ceiling`, `floor`, `subMap`          |
+| **11. Two Pointers**        | Pair sum in sorted array, Container With Most Water | Flat array `int[]` or `ArrayList` with `left` and `right` indices          |
+| **12. Disjoint Union**      | Connected components, cycle detection               | Flat array `int[] parent` (Union-Find / Disjoint Set Union)                |
+
+---
+
+## Canonical Implementation Snippets
+
+### 1. Two Sum (O(n) Single Pass)
+
+```java title="TwoSum.java"
+public int[] twoSum(int[] nums, int target) {
+    Map<Integer, Integer> indexMap = new HashMap<>();
+
+    for (int i = 0; i < nums.length; i++) {
+        int complement = target - nums[i];
+        if (indexMap.containsKey(complement)) {
+            return new int[]{indexMap.get(complement), i};
+        }
+        indexMap.put(nums[i], i);
+    }
+    return new int[0];
+}
+```
+
+### 2. Monotonic Stack (Next Greater Element)
+
+```java title="NextGreaterElement.java"
+public int[] nextGreaterElement(int[] nums) {
+    int[] result = new int[nums.length];
+    Arrays.fill(result, -1);
+    Deque<Integer> stack = new ArrayDeque<>(); // Stores array indices
+
+    for (int i = 0; i < nums.length; i++) {
+        while (!stack.isEmpty() && nums[stack.peek()] < nums[i]) {
+            int prevIndex = stack.pop();
+            result[prevIndex] = nums[i];
+        }
+        stack.push(i);
+    }
+    return result;
+}
+```
+
+### 3. Top-K Frequent Elements
+
+```java title="TopKFrequent.java"
+public int[] topKFrequent(int[] nums, int k) {
+    Map<Integer, Integer> freq = new HashMap<>();
+    for (int n : nums) freq.merge(n, 1, Integer::sum);
+
+    // Min-heap ordered by frequency
+    PriorityQueue<Integer> pq = new PriorityQueue<>(
+        Comparator.comparingInt(freq::get)
+    );
+
+    for (int num : freq.keySet()) {
+        pq.offer(num);
+        if (pq.size() > k) pq.poll();
+    }
+
+    int[] res = new int[k];
+    for (int i = 0; i < k; i++) res[i] = pq.poll();
+    return res;
+}
+```
+
+### 4. BFS / Level-Order Traversal (Unweighted Shortest Path)
+
+```java title="BreadthFirstSearch.java"
+public void bfs(Node start) {
+    Queue<Node> queue = new ArrayDeque<>(); // Never use LinkedList
+    Set<Node> visited = new HashSet<>();
+
+    queue.offer(start);
+    visited.add(start);
+
+    while (!queue.isEmpty()) {
+        Node curr = queue.poll();
+
+        for (Node neighbor : curr.neighbors) {
+            if (visited.add(neighbor)) { // add returns false if already visited
+                queue.offer(neighbor);
+            }
+        }
+    }
+}
+```
+
+---
+
+## Array & Matrix Problem Patterns
+
+### 1. In-Place Reversal & k-Step Rotation (Two Pointers)
+
+Reversing an array without auxiliary memory runs in `O(n)` time and `O(1)` space. A classic LeetCode problem (e.g., Rotate Array) uses this three-step reversal technique:
+
+```java title="ArrayRotation.java"
+public void rotate(int[] nums, int k) {
+    int n = nums.length;
+    k %= n; // Handle k >= n
+
+    // 1. Reverse entire array
+    reverse(nums, 0, n - 1);
+    // 2. Reverse first k elements
+    reverse(nums, 0, k - 1);
+    // 3. Reverse remaining n - k elements
+    reverse(nums, k, n - 1);
+}
+
+private void reverse(int[] arr, int left, int right) {
+    while (left < right) {
+        int temp = arr[left];
+        arr[left++] = arr[right];
+        arr[right--] = temp;
+    }
+}
+```
+
+### 2. Prefix Sums & O(1) Range Queries
+
+Precomputing prefix sums allows calculating the sum of any subarray `[left, right]` in `O(1)` time after `O(n)` preprocessing:
+
+```java title="PrefixSum.java"
+public class NumArray {
+    private final int[] prefix;
+
+    public NumArray(int[] nums) {
+        // Size n + 1 simplifies boundary conditions (prefix[0] = 0)
+        prefix = new int[nums.length + 1];
+        for (int i = 0; i < nums.length; i++) {
+            prefix[i + 1] = prefix[i] + nums[i];
+        }
+    }
+
+    public int sumRange(int left, int right) {
+        return prefix[right + 1] - prefix[left];
+    }
+}
+```
+
+### 3. Grid Direction Vectors & Boundary Guards (BFS / DFS)
+
+When traversing 2D matrices in graph problems (e.g., Number of Islands, Flood Fill), avoid cascading `if-else` blocks by using direction delta arrays with a boundary guard check:
+
+```java title="GridDirections.java"
+// 4-Directional: Up, Down, Left, Right
+private static final int[][] DIRS_4 = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+
+// 8-Directional (includes diagonals)
+private static final int[][] DIRS_8 = {
+    {-1, 0}, {1, 0}, {0, -1}, {0, 1},
+    {-1, -1}, {-1, 1}, {1, -1}, {1, 1}
+};
+
+public void exploreNeighbors(int[][] grid, int r, int c) {
+    int rows = grid.length;
+    int cols = grid[0].length;
+
+    for (int[] dir : DIRS_4) {
+        int nr = r + dir[0];
+        int nc = c + dir[1];
+
+        // Safe boundary guard check
+        if (nr >= 0 && nr < rows && nc >= 0 && nc < cols) {
+            // Process valid neighbor cell grid[nr][nc]
+        }
+    }
+}
+```
+
+### 4. Spiral Matrix Traversal (Boundary Simulation)
+
+Simulate perimeter peeling using four dynamic boundary pointers (`top`, `bottom`, `left`, `right`):
+
+```java title="SpiralMatrix.java"
+public List<Integer> spiralOrder(int[][] matrix) {
+    List<Integer> result = new ArrayList<>();
+    if (matrix.length == 0) return result;
+
+    int top = 0, bottom = matrix.length - 1;
+    int left = 0, right = matrix[0].length - 1;
+
+    while (top <= bottom && left <= right) {
+        // 1. Traverse top row (left to right)
+        for (int c = left; c <= right; c++) result.add(matrix[top][c]);
+        top++;
+
+        // 2. Traverse right column (top to bottom)
+        for (int r = top; r <= bottom; r++) result.add(matrix[r][right]);
+        right--;
+
+        // 3. Traverse bottom row (right to left)
+        if (top <= bottom) {
+            for (int c = right; c >= left; c--) result.add(matrix[bottom][c]);
+            bottom--;
+        }
+
+        // 4. Traverse left column (bottom to top)
+        if (left <= right) {
+            for (int r = bottom; r >= top; r--) result.add(matrix[r][left]);
+            left++;
+        }
+    }
+    return result;
+}
+```
+
+---
+
+## Safe Iteration, Removal & Streams
+
+Mutating a collection inside an enhanced `for` loop throws `ConcurrentModificationException`. Always use `removeIf()` or an explicit iterator:
+
+<Tabs items={['removeIf() (Recommended)', 'Explicit Iterator.remove()', 'Streams Pipeline', 'Bug (Throws CME)']}>
+  <Tab value="removeIf() (Recommended)">
+    ```java title="SafeRemoveIf.java"
+    List<Integer> list = new ArrayList<>(List.of(1, 2, 3, 4, 5, 6));
+
+    // Clean, high-performance in-place removal (Java 8+)
+    list.removeIf(n -> n % 2 == 0);
+    ```
+
+  </Tab>
+  <Tab value="Explicit Iterator.remove()">
+    ```java title="IteratorRemove.java"
+    Iterator<Integer> it = list.iterator();
+    while (it.hasNext()) {
+        if (it.next() % 2 == 0) {
+            it.remove(); // Safely updates internal modCount
+        }
+    }
+    ```
+  </Tab>
+  <Tab value="Streams Pipeline">
+    ```java title="StreamsPipeline.java"
+    // Filter, transform, and collect without modifying the original source
+    List<String> adultNames = people.stream()
+        .filter(p -> p.getAge() >= 18)
+        .map(Person::getName)
+        .collect(Collectors.toList());
+    ```
+  </Tab>
+  <Tab value="Bug (Throws CME)">
+    ```java title="ConcurrentModificationBug.java"
+    // ❌ FAILS: Throws ConcurrentModificationException!
+    for (Integer n : list) {
+        if (n % 2 == 0) {
+            list.remove(n);
+        }
+    }
+    ```
+  </Tab>
+</Tabs>
+
+---
+
+## 11 Production Engineering Best Practices
+
+<Steps>
+  <Step>
+    ### Declare by Interface, Instantiate by Class
+    Write `List<String> list = new ArrayList<>()` to decouple consumers from internal implementations.
+  </Step>
+  <Step>
+    ### Prefer `ArrayDeque` for Stacks and Queues
+    `ArrayDeque` beats `Stack` (eliminates synchronization lock overhead) and outperforms `LinkedList` (eliminates discrete node pointer allocations).
+  </Step>
+  <Step>
+    ### Check Emptiness with `isEmpty()`, Not `size() == 0`
+    `isEmpty()` is guaranteed `O(1)` constant time across all collection structures.
+  </Step>
+  <Step>
+    ### Pre-Size Collections Upfront
+    Initialize collections with expected capacity (`new ArrayList<>(count)`) to eliminate dynamic array reallocations and hash re-indexing.
+  </Step>
+  <Step>
+    ### Always Override `equals()` and `hashCode()` Together
+    Custom keys in `HashSet` or `HashMap` require consistent hash codes when objects evaluate as equal.
+  </Step>
+  <Step>
+    ### Iterate Maps Using `entrySet()` Over `keySet() + get()`
+    Avoid paying for redundant hash computations and bucket lookups on each row.
+  </Step>
+  <Step>
+    ### Protect Exposed State with Immutable Views
+    Use `Collections.unmodifiableList(list)` or `List.copyOf(list)` to prevent unauthorized external mutations.
+  </Step>
+  <Step>
+    ### Use `java.util.concurrent` for Concurrency
+    Prefer `ConcurrentHashMap` and `CopyOnWriteArrayList` over legacy `Vector` or `Hashtable`.
+  </Step>
+  <Step>
+    ### Guard Against Autoboxing in Hot Loops
+    Avoid continuous heap allocations from generic wrappers in high-throughput numeric algorithms.
+  </Step>
+</Steps>
