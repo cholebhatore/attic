@@ -1,0 +1,198 @@
+---
+title: Vision and Sequence Basics
+description: Why dense layers struggle with images and sequences, how images and text become tensors, the main computer vision and NLP tasks and datasets, inductive bias, the CNN, RNN, and transformer families, and the pretrain-then-adapt workflow.
+---
+
+Phase 3 built networks from dense layers, where every input connects to every neuron. That works for a short feature vector like `[bedrooms, sqft, balconies]`. It works badly for the two kinds of data most of AI is about: **images** and **sequences** (text, audio, time series). This phase covers the architectures designed for them. This page sets up the vocabulary and the reasons first.
+
+It covers, in order:
+
+1. **Why dense layers are not enough**: the parameter cost on images, and the length problem on sequences
+2. **Images as tensors**: pixels, channels, shapes, and scaling
+3. **Computer vision tasks and datasets**: what the field asks models to do
+4. **Sequences as tensors**: text, audio, and time series as numbers
+5. **Inductive bias**: building assumptions about the data into the architecture
+6. **The three families**: CNNs for space, RNNs for time, transformers for both
+7. **Pretrain, then adapt**: why almost nobody trains from scratch
+8. **Where each idea is covered**
+
+---
+
+## Why dense layers are not enough
+
+**On images.** A small `224 x 224` color photo is 150,528 numbers. A dense layer mapping that to just 64 outputs needs about 9.6 million weights, and each weight is tied to one pixel position. A cat detector learned in the top-left corner knows nothing about cats in the bottom-right; it must be learned again for every position.
+
+**On sequences.** A dense layer has a fixed number of inputs. Sentences do not have a fixed length: "Hi" and a 300-word paragraph both need processing. And meaning depends on order: "dog bites man" is not "man bites dog".
+
+Each problem has an architectural answer:
+
+| Data      | What is special about it                                           | Architecture that exploits it                              |
+| :-------- | :----------------------------------------------------------------- | :--------------------------------------------------------- |
+| Images    | Nearby pixels are related; a pattern means the same thing anywhere | **Convolution**: one small filter reused at every position |
+| Sequences | Order matters; length varies                                       | **Recurrence**: one cell reused at every time step         |
+
+---
+
+## Images as tensors
+
+A digital image is a grid of **pixels**. Each pixel stores brightness as a number, commonly an integer from 0 (black) to 255 (white).
+
+- A **grayscale** image has one number per pixel: one grid, or one **channel**.
+- A **color** image has three numbers per pixel, for red, green, and blue: three channels.
+
+Image files and most image libraries store pixels as `(H, W, C)`: height, width, channels. PyTorch expects channels first, `(C, H, W)`, and a batch in front, `(B, C, H, W)`. Pixel values are also usually rescaled from 0..255 to 0..1, then **normalized** by subtracting a per-channel mean and dividing by a per-channel standard deviation.
+
+```python title="image_tensor.py"
+import numpy as np
+
+img = np.array([[[255,   0,   0], [  0, 255,   0]],
+                [[  0,   0, 255], [255, 255, 255]]], dtype=np.uint8)   # (H=2, W=2, C=3): red, green, blue, white
+
+x = img.astype(np.float32) / 255.0          # 0..255 -> 0..1
+x = x.transpose(2, 0, 1)                    # (H, W, C) -> (C, H, W)
+print(x.shape)                              # (3, 2, 2)
+print(x[0].tolist())                        # red channel: [[1.0, 0.0], [0.0, 1.0]]
+```
+
+The red channel is `1.0` exactly where the image is red or white, the two pixels that contain full red. For models pretrained on ImageNet, the standard normalization uses mean `[0.485, 0.456, 0.406]` and standard deviation `[0.229, 0.224, 0.225]` per channel (the values `torchvision` documents for its pretrained weights).
+
+<Callout type="warn">
+  ### Common mistake
+
+Feeding a pretrained model images normalized differently from how it was trained (0..255 instead of 0..1, or no mean and standard deviation step). Nothing errors; accuracy just collapses. Always use the preprocessing that came with the weights.
+
+</Callout>
+
+---
+
+## Computer vision tasks and datasets
+
+**Computer vision (CV)** is the field of AI that works with images and video.
+
+| Task                      | Output                             | Example                              |
+| :------------------------ | :--------------------------------- | :----------------------------------- |
+| **Image classification**  | One label for the whole image      | "cat"                                |
+| **Object detection**      | A box and a label for every object | three boxes: two people, one bicycle |
+| **Semantic segmentation** | A label for every pixel            | road pixels, car pixels, sky pixels  |
+| **Image captioning**      | A sentence                         | "a dog catching a frisbee"           |
+| **Video classification**  | One label for a clip               | "playing basketball"                 |
+
+| Dataset         | Contents                                                           | Used for                                                 |
+| :-------------- | :----------------------------------------------------------------- | :------------------------------------------------------- |
+| **MNIST**       | 70,000 grayscale 28 by 28 handwritten digits, 10 classes           | The "hello world" of vision; quick experiments           |
+| **CIFAR-10**    | 60,000 color 32 by 32 photos, 10 classes (airplane, cat, truck...) | Small but real image classification                      |
+| **ImageNet-1k** | About 1.28 million training photos, 1,000 classes                  | The standard benchmark, and the standard pretraining set |
+
+---
+
+## Sequences as tensors
+
+A sequence is a list of items in order. Each item becomes a vector, so a batch of sequences has shape `(B, T, F)`: batch, time steps, features per step.
+
+| Sequence    | One item is                  | Becomes                                           |
+| :---------- | :--------------------------- | :------------------------------------------------ |
+| Text        | A token (word or word piece) | An integer ID, then an embedding vector           |
+| Audio       | A slice of sound             | A frame of frequency measurements                 |
+| Time series | A measurement at one time    | A vector of readings (temperature, pressure, ...) |
+
+**Natural Language Processing (NLP)** is the field of AI that enables computers to understand, interpret, and generate human language. Its classic tasks (classification, translation, summarization, language modeling) are covered in [Classical NLP and Seq2Seq](/ai/classical-deep-learning/classical-nlp), along with how text was turned into numbers before and after embeddings.
+
+---
+
+## Inductive bias
+
+An **inductive bias** is an assumption about the data that is built into a model's design rather than learned. Good assumptions let a model learn from far less data.
+
+| Architecture | Built-in assumption                                                                                                     | Consequence                                           |
+| :----------- | :---------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------- |
+| Dense layer  | None: every input may relate to every other                                                                             | Flexible, but needs a lot of data and parameters      |
+| Convolution  | **Locality** (nearby pixels matter together) and **translation equivariance** (a pattern means the same thing anywhere) | Far fewer parameters, learns from less data on images |
+| Recurrence   | **Order matters**, and the same rule applies at every step                                                              | Handles any length                                    |
+| Attention    | Almost none: every position may look at every other                                                                     | Most flexible; needs the most data (Phase 5)          |
+
+**Translation equivariance** means that if the object moves, the feature map moves the same way. **Translation invariance**, which pooling adds, means the final answer does not change when the object moves.
+
+---
+
+## The three families
+
+<Mermaid
+  chart={`
+flowchart LR
+    D["Dense / MLP: fixed-size vectors"] --> C["CNN: shares weights across space"]
+    D --> R["RNN, LSTM, GRU: shares weights across time"]
+    C --> T["Transformer: attention over all positions"]
+    R --> T
+`}
+/>
+
+- **CNNs** (convolutional neural networks) dominated vision from 2012 to roughly 2020, and are still widely used.
+- **RNNs**, and their gated forms **LSTM** and **GRU**, dominated sequences until 2017.
+- **Transformers** replaced RNNs for language and now compete with CNNs in vision. They are Phase 5. This phase ends at the exact limitation of RNN encoder-decoders that attention was invented to fix.
+
+---
+
+## Pretrain, then adapt
+
+Training a vision model from scratch on ImageNet takes days of GPU time. Almost every project instead starts from a **pretrained** model, whose early layers already detect edges, textures, and shapes, and adapts it:
+
+| Term                  | Plain meaning                                                                                           |
+| :-------------------- | :------------------------------------------------------------------------------------------------------ |
+| **pretraining**       | The first, large training run on a general dataset like ImageNet.                                       |
+| **backbone**          | The reusable body of the network that turns an input into features.                                     |
+| **head**              | The small task-specific output layer, replaced for each new task.                                       |
+| **transfer learning** | Reusing a pretrained backbone for a different task.                                                     |
+| **fine-tuning**       | Continuing to train some or all pretrained weights on the new task, usually with a small learning rate. |
+
+The same idea, scaled up enormously, is how LLMs work: pretrain once on huge text, then fine-tune for each use.
+
+---
+
+## Where each idea is covered
+
+| Question                                                             | Page                                                                             |
+| :------------------------------------------------------------------- | :------------------------------------------------------------------------------- |
+| How does a convolution work, and how big is its output?              | [Convolutions](/ai/classical-deep-learning/convolutions)                         |
+| How do augmentation, ResNet, and Inception make vision models work?  | [Vision Architectures](/ai/classical-deep-learning/vision-architectures)         |
+| How do I reuse a pretrained model, combine models, and handle video? | [Transfer, Ensembles, Video](/ai/classical-deep-learning/transfer-and-ensembles) |
+| How do I see what a vision model is looking at?                      | [Interpretability](/ai/classical-deep-learning/interpretability)                 |
+| How can gradients change the image instead of the model?             | [Gradient Manipulation](/ai/classical-deep-learning/gradient-art)                |
+| How does a network read a sequence step by step?                     | [Recurrent Networks](/ai/classical-deep-learning/recurrent-networks)             |
+| How was NLP done before transformers, and why did it hit a wall?     | [Classical NLP and Seq2Seq](/ai/classical-deep-learning/classical-nlp)           |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why not use a dense layer on raw images?">
+
+    It needs millions of weights even for small images, and each weight is tied to one pixel position, so a pattern must be relearned at every location. Convolutions reuse one small filter everywhere.
+
+  </Accordion>
+  <Accordion title="What shape does PyTorch expect for a batch of color images?">
+
+    `(B, C, H, W)`: batch, channels (3 for RGB), height, width. Image libraries usually give `(H, W, C)`, so a transpose is needed.
+
+  </Accordion>
+  <Accordion title="What is an inductive bias? Give an example.">
+
+    An assumption about the data built into the architecture. Convolutions assume locality and that a pattern means the same thing anywhere in the image, which lets them learn from far less data than dense layers.
+
+  </Accordion>
+  <Accordion title="Translation equivariance versus invariance?">
+
+    Equivariance: shift the input and the feature map shifts the same way (convolution). Invariance: shift the input and the output does not change (what pooling and global averaging add, for classification).
+
+  </Accordion>
+  <Accordion title="Classification versus detection versus segmentation?">
+
+    Classification gives one label per image. Detection gives a box and a label per object. Segmentation gives a label per pixel.
+
+  </Accordion>
+  <Accordion title="Why do RNNs suit sequences?">
+
+    They apply the same cell at every time step and carry a hidden state forward, so they handle any length and respect order.
+
+  </Accordion>
+</Accordions>

@@ -1,0 +1,194 @@
+---
+title: PyTorch Basics
+description: What a deep learning framework is, why PyTorch, the five building blocks (tensor, autograd, nn.Module, optimizer, DataLoader), CPU versus GPU, and a complete tiny training run with every line explained.
+---
+
+Phase 1 did the math with NumPy, by hand. That works for a 41-parameter network. It does not work for a 7-billion-parameter one, because you would have to write every derivative yourself and NumPy cannot use a GPU. A **deep learning framework** is the library that removes both problems. PyTorch is the one this curriculum uses.
+
+This page is the map before the details. It covers:
+
+1. **What a framework does**: the three jobs NumPy cannot do for you
+2. **Why PyTorch**: and where TensorFlow, Keras, and JAX fit
+3. **The five building blocks**: tensor, autograd, `nn.Module`, optimizer, `DataLoader`
+4. **CPU and GPU**: why training happens on a graphics card
+5. **Eager versus compiled**: how PyTorch runs your code
+6. **A complete tiny run**: every building block in 25 lines
+7. **Where each idea is covered**: which page goes deeper on what
+
+---
+
+## What a framework does
+
+A deep learning framework gives you three things on top of a plain array library:
+
+| Job                 | Without a framework                             | With PyTorch                                            |
+| :------------------ | :---------------------------------------------- | :------------------------------------------------------ |
+| **Gradients**       | Derive and code every derivative by hand        | `loss.backward()` computes all of them automatically    |
+| **Hardware**        | NumPy runs only on the CPU                      | `.to("cuda")` moves the same code onto a GPU            |
+| **Building blocks** | Write every layer, loss, and optimizer yourself | `nn.Linear`, `nn.CrossEntropyLoss`, `torch.optim.AdamW` |
+
+The math is unchanged. A linear layer is still `x @ W.T + b`, and the gradient is still the chain rule from [Backprop from Scratch](/ai/math-foundations/backprop-from-scratch). The framework just does the bookkeeping, and does it fast.
+
+---
+
+## Why PyTorch
+
+| Framework      | Made by                          | What it is today                                                                                                  |
+| :------------- | :------------------------------- | :---------------------------------------------------------------------------------------------------------------- |
+| **PyTorch**    | Meta, now the PyTorch Foundation | The default for research and most production LLM work. Hugging Face, vLLM, and most model code are written in it. |
+| **TensorFlow** | Google                           | The older industry standard. Still running in many production systems, less common in new work.                   |
+| **Keras**      | Google                           | A high-level, beginner-friendly API. Keras 3 can run on top of TensorFlow, PyTorch, or JAX.                       |
+| **JAX**        | Google                           | NumPy-like functions plus automatic gradients and compilation. Popular for large-scale research on TPUs.          |
+
+PyTorch won mostly because it feels like ordinary Python. Code runs line by line, you can `print` any tensor in the middle of a model, and a normal debugger works. That style is called **eager execution**.
+
+---
+
+## The five building blocks
+
+Every PyTorch training script is built from the same five pieces, in this order:
+
+<Mermaid
+  chart={`
+flowchart LR
+    D["DataLoader: serves batches"] --> M["nn.Module: the model"]
+    M --> L["loss function: one number"]
+    L --> A["autograd: computes gradients"]
+    A --> O["optimizer: updates weights"]
+    O --> M
+`}
+/>
+
+| Block            | What it is                                                                       | Plain analogy                               | Page                                                   |
+| :--------------- | :------------------------------------------------------------------------------- | :------------------------------------------ | :----------------------------------------------------- |
+| **Tensor**       | An array of numbers with a dtype, a device, and optional gradient tracking       | A spreadsheet that knows where it is stored | [Tensor Fundamentals](/ai/pytorch/tensor-fundamentals) |
+| **Autograd**     | The engine that records operations and computes gradients with `backward()`      | A receipt read backwards                    | [Autograd Engine](/ai/pytorch/autograd-engine)         |
+| **`nn.Module`**  | The base class for layers and models; it holds the weights and defines `forward` | A machine with dials                        | [Training Loop](/ai/pytorch/training-loop)             |
+| **Optimizer**    | The object that reads gradients and updates weights (`SGD`, `Adam`, `AdamW`)     | The hand that turns the dials               | [Training Loop](/ai/pytorch/training-loop)             |
+| **`DataLoader`** | The object that reads, shuffles, and batches your data in background processes   | The kitchen feeding the dining room         | [Data Pipelines](/ai/pytorch/data-pipelines)           |
+
+---
+
+## CPU and GPU
+
+A **CPU** (central processing unit) has a few powerful cores, each good at complicated step-by-step work. A **GPU** (graphics processing unit) has thousands of simple cores built to do the same arithmetic on many numbers at once. It was designed to color millions of pixels in parallel, and a matrix multiply turns out to be the same kind of job.
+
+| Term       | Plain meaning                                                                                            |
+| :--------- | :------------------------------------------------------------------------------------------------------- |
+| **CUDA**   | NVIDIA's platform for general-purpose GPU computing. In PyTorch, `"cuda"` means an NVIDIA GPU.           |
+| **MPS**    | Apple's GPU backend on M-series Macs. `"mps"` in PyTorch.                                                |
+| **VRAM**   | The GPU's own memory. The model, its gradients, and the batch must all fit here during training.         |
+| **device** | Where a tensor lives: `"cpu"`, `"cuda"`, or `"mps"`. Two tensors must be on the same device to interact. |
+
+The standard way to pick a device:
+
+```python title="device.py"
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+x = torch.randn(3, 4, device=device)   # created directly on that device
+print(x.device)                        # cuda:0 on a GPU machine, cpu otherwise
+```
+
+---
+
+## Eager versus compiled
+
+**Eager mode** is the default: each line runs the moment Python reaches it. It is easy to read and debug, but every operation launches its own small GPU program (a **kernel**), with some overhead each time.
+
+**Compiled mode** (`torch.compile(model)`, added in PyTorch 2.0) looks at the whole model first, merges many small operations into fewer large ones, and generates faster code. Same results, often noticeably faster, at the cost of a slow first call. [Autograd Engine](/ai/pytorch/autograd-engine) covers how it works.
+
+---
+
+## A complete tiny run
+
+The task: learn `y = 2x + 1` from examples. Every building block appears once.
+
+```python title="tiny_run.py"
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+
+torch.manual_seed(0)                                  # same random numbers every run
+
+# 1. Data: 100 examples of y = 2x + 1
+x = torch.randn(100, 1)                               # (100, 1)  inputs
+y = 2 * x + 1                                         # (100, 1)  targets
+loader = DataLoader(TensorDataset(x, y), batch_size=10, shuffle=True)
+
+# 2. Model: one weight and one bias
+model = nn.Linear(1, 1)                               # computes x @ W.T + b
+
+# 3. Loss and optimizer
+criterion = nn.MSELoss()                              # mean squared error
+optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+
+# 4. Training loop: 20 epochs of 10 batches
+for epoch in range(20):
+    for xb, yb in loader:                             # xb, yb: (10, 1)
+        optimizer.zero_grad()                         # clear old gradients
+        loss = criterion(model(xb), yb)               # forward + loss
+        loss.backward()                               # autograd fills .grad
+        optimizer.step()                              # nudge W and b
+
+print(round(model.weight.item(), 2), round(model.bias.item(), 2))   # 2.0 1.0
+```
+
+The data has no noise, so after 200 small steps the weight and bias land on `2.0` and `1.0`. Every real training script, up to a billion-parameter LLM, is this same skeleton with a bigger model, a bigger dataset, and more machinery around each line.
+
+<Callout type="warn">
+  ### Beginner mistakes this tiny script avoids
+
+- Forgetting `optimizer.zero_grad()`: gradients from every past batch pile up.
+- Putting the model on the GPU but leaving the data on the CPU (or the reverse): PyTorch raises a device mismatch error.
+- Calling `loss.backward()` on a tensor with more than one number: `backward()` needs a single number, which is why losses are averaged.
+
+</Callout>
+
+---
+
+## Where each idea is covered
+
+| Question                                                  | Page                                                           |
+| :-------------------------------------------------------- | :------------------------------------------------------------- |
+| What is inside a tensor, and how much memory does it use? | [Tensor Fundamentals](/ai/pytorch/tensor-fundamentals)         |
+| How do I pick out parts of a tensor or change its shape?  | [Indexing and Shapes](/ai/pytorch/indexing-and-shapes)         |
+| How do I join tensors or reorder their axes?              | [Combining and Permuting](/ai/pytorch/combining-and-permuting) |
+| What is the difference between `*` and `@`?               | [Matrix Multiplication](/ai/pytorch/matrix-multiplication)     |
+| How does `backward()` find every gradient?                | [Autograd Engine](/ai/pytorch/autograd-engine)                 |
+| Why GPUs, and what are FP16 and BF16?                     | [Devices and Precision](/ai/pytorch/devices-and-precision)     |
+| How is a real training loop structured?                   | [Training Loop](/ai/pytorch/training-loop)                     |
+| How do I feed data fast enough?                           | [Data Pipelines](/ai/pytorch/data-pipelines)                   |
+| How do I save and reload a model safely?                  | [Checkpointing](/ai/pytorch/checkpointing)                     |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What does a deep learning framework give you that NumPy does not?">
+
+    Automatic gradients through autograd, GPU execution, and ready-made layers, losses, and optimizers. The underlying math is the same.
+
+  </Accordion>
+  <Accordion title="What are the five steps inside one training iteration?">
+
+    Zero the gradients, run the forward pass, compute the loss, call `backward()` to compute gradients, and call `optimizer.step()` to update the weights.
+
+  </Accordion>
+  <Accordion title="Why are neural networks trained on GPUs?">
+
+    Training is dominated by matrix multiplies, which are millions of independent multiply-adds. A GPU has thousands of simple cores that do those in parallel, while a CPU has a few cores optimized for sequential work.
+
+  </Accordion>
+  <Accordion title="What is eager execution?">
+
+    Each operation runs immediately when Python reaches it, like normal code. It makes debugging easy. `torch.compile` trades it for speed by compiling the whole model ahead of time.
+
+  </Accordion>
+  <Accordion title="What is the difference between a Dataset and a DataLoader?">
+
+    A `Dataset` returns one example by index. A `DataLoader` wraps it to produce shuffled batches, using background worker processes to prepare them in parallel.
+
+  </Accordion>
+</Accordions>

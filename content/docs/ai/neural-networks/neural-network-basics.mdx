@@ -1,0 +1,255 @@
+---
+title: Neural Network Basics
+description: What a neural network is, the perceptron and the XOR problem, input, hidden, and output layers, counting parameters, why depth needs non-linearity, universal approximation, and the problems depth creates that the rest of this phase solves.
+---
+
+The rest of this phase builds neural networks out of raw math and then fixes everything that goes wrong when they get deep. This page is the picture before the parts: what a neural network is, where the idea came from, how its pieces are named, and why "just stack more layers" needs four more pages of engineering to actually work.
+
+It covers, in order:
+
+1. **What a neural network is**: a function built from many simple adjustable units
+2. **The brain analogy, and where it stops**
+3. **The perceptron and the XOR problem**: why one neuron is not enough
+4. **Anatomy of a network**: input, hidden, and output layers, width, and depth
+5. **Counting parameters**: how many numbers a network learns
+6. **Why the activation function matters**: depth without bends collapses to one layer
+7. **Universal approximation**: what a network can represent in principle
+8. **How a network learns**: the training loop, in one picture
+9. **What goes wrong with depth**: the problems each later page solves
+
+---
+
+## What a neural network is
+
+A **neural network** is a function with many adjustable numbers inside it, built by connecting lots of tiny, identical units called **neurons**. Each neuron does something trivial: weigh its inputs, add them up, and pass the sum through a simple curve. The power comes from having thousands or billions of them, wired in layers, with every weight tuned by training.
+
+You do not program what a network does. You choose its shape, show it examples, and let training set the weights. A network that recognizes cats was never told what whiskers are; it adjusted millions of weights until its outputs matched the labels.
+
+---
+
+## The brain analogy, and where it stops
+
+The name comes from biology. A brain cell receives signals through many connections of different strengths, and fires when the combined input is strong enough. An artificial neuron copies that outline: inputs, connection strengths (**weights**), a total, and a firing rule (**activation function**).
+
+The analogy stops there. Real neurons spike in time, use chemistry, and learn by mechanisms nobody fully understands. Artificial neurons are a few lines of arithmetic and learn by gradient descent. Treat "neural" as a historical name, not a claim about brains.
+
+---
+
+## The perceptron and the XOR problem
+
+The **perceptron** (Frank Rosenblatt, 1958) was the first trainable artificial neuron: a weighted sum followed by a hard step that outputs 1 if the sum is positive and 0 otherwise. It could learn to separate two classes with a straight line.
+
+That is also its limit. In 1969 Minsky and Papert pointed out that a single perceptron cannot learn **XOR** ("exclusive or": true when exactly one input is true), because no straight line separates XOR's outputs:
+
+| `x1` | `x2` | XOR |
+| :--- | :--- | :-- |
+| 0    | 0    | 0   |
+| 0    | 1    | 1   |
+| 1    | 0    | 1   |
+| 1    | 1    | 0   |
+
+Plot the four points: the two 1s sit on one diagonal, the two 0s on the other. Any straight line that puts both 1s on one side puts at least one 0 there too.
+
+Add a **hidden layer** of two neurons with a ReLU between them, and the problem becomes easy. One hidden neuron counts how many inputs are on; the other fires only when both are; the output subtracts twice the second from the first:
+
+```python title="xor.py"
+import numpy as np
+
+X = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=float)   # (4, 2)
+y = np.array([0, 1, 1, 0], dtype=float)                       # XOR targets
+
+# Best possible straight-line fit: least squares on [x1, x2, 1]
+A = np.hstack([X, np.ones((4, 1))])                           # (4, 3)
+w, *_ = np.linalg.lstsq(A, y, rcond=None)
+print("linear fit  ", np.round(A @ w, 2))
+
+# Two hidden ReLU neurons with hand-picked weights
+W1 = np.array([[1.0, 1.0],
+               [1.0, 1.0]])                                   # (2 hidden, 2 inputs)
+b1 = np.array([0.0, -1.0])
+W2 = np.array([1.0, -2.0])                                    # (2,) output weights
+
+h = np.maximum(0.0, X @ W1.T + b1)                            # (4, 2) hidden activations
+out = h @ W2                                                  # (4,)
+print("hidden      ", h.tolist())
+print("network     ", out.tolist())
+```
+
+```text
+linear fit   [0.5 0.5 0.5 0.5]
+hidden       [[0.0, 0.0], [1.0, 0.0], [1.0, 0.0], [2.0, 1.0]]
+network      [0.0, 1.0, 1.0, 0.0]
+```
+
+The best straight line can do no better than answer `0.5` for everything. The two-neuron hidden layer gets all four exactly right. Check the last row by hand: input `[1, 1]` gives hidden `[relu(2), relu(1)] = [2, 1]`, and `2 - 2 * 1 = 0`.
+
+That is the whole case for hidden layers: **each layer re-describes the input so the next layer's job becomes simpler**. Here the hidden layer turned an impossible problem into a trivial subtraction. The fix for training such networks, backpropagation, was popularized by Rumelhart, Hinton, and Williams in 1986, and it is what [Backprop from Scratch](/ai/math-foundations/backprop-from-scratch) builds.
+
+---
+
+## Anatomy of a network
+
+<Mermaid
+  chart={`
+flowchart LR
+    subgraph Input["Input layer: the data"]
+      x1["x1"]
+      x2["x2"]
+      x3["x3"]
+    end
+    subgraph Hidden["Hidden layer: learned features"]
+      h1["h1"]
+      h2["h2"]
+      h3["h3"]
+      h4["h4"]
+    end
+    subgraph Output["Output layer: predictions"]
+      o1["class A score"]
+      o2["class B score"]
+    end
+    Input --> Hidden --> Output
+`}
+/>
+
+| Term                        | Plain meaning                                                                                                                                  |
+| :-------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- |
+| **input layer**             | The data itself, one number per feature. It has no weights; it is just where values enter.                                                     |
+| **hidden layer**            | A layer between input and output. Its values are not given by the data; the network invents them during training.                              |
+| **output layer**            | The final layer. For classification, one score per class (the logits). For regression, the predicted number.                                   |
+| **width**                   | How many neurons a layer has.                                                                                                                  |
+| **depth**                   | How many layers the network has. "Deep learning" means networks with many layers.                                                              |
+| **fully connected (dense)** | Every neuron in a layer reads every output of the previous layer.                                                                              |
+| **feed-forward**            | Data flows one way, input to output, with no loops. An MLP is feed-forward.                                                                    |
+| **MLP**                     | Multi-layer perceptron: a feed-forward network of fully connected layers with activations between them. The name survives from the perceptron. |
+| **architecture**            | The design: how many layers, how wide, which kinds, and how they connect. MLP, CNN, RNN, and transformer are architectures.                    |
+
+The diagram shows a **3-4-2 network**: 3 inputs, a hidden layer of 4 neurons, and 2 outputs. Networks are often described that way, by the width of each layer in order.
+
+---
+
+## Counting parameters
+
+Every connection has a weight, and every neuron (outside the input layer) has a bias. A fully connected layer from `n_in` inputs to `n_out` outputs therefore has `n_in * n_out` weights plus `n_out` biases.
+
+For a classic digit classifier, 784 pixels in, one hidden layer of 128, and 10 digit classes out:
+
+| Layer             | Weights               | Biases | Total       |
+| :---------------- | :-------------------- | :----- | :---------- |
+| 784 to 128        | `784 * 128 = 100,352` | 128    | 100,480     |
+| 128 to 10         | `128 * 10 = 1,280`    | 10     | 1,290       |
+| **Whole network** |                       |        | **101,770** |
+
+The first layer holds almost all of it, because it is the widest connection. The same arithmetic, at larger widths and more layers, gives "a 7-billion-parameter model".
+
+---
+
+## Why the activation function matters
+
+Without an activation function, every layer is a matrix multiply plus a bias, and two of those in a row are just another matrix multiply plus a bias. A hundred layers without activations collapse into one layer, no more powerful than a single straight-line model. That is exactly why the linear fit on XOR above was stuck at `0.5`.
+
+The activation function bends each layer's output, so stacking layers builds up more and more complex shapes instead of collapsing. [Neurons and Activations](/ai/neural-networks/neurons-and-activations) covers which curves are used and why.
+
+---
+
+## Universal approximation
+
+The **universal approximation theorem** (Cybenko, 1989, for sigmoid; Hornik, 1991, more generally) says that a network with **one** hidden layer and a non-linear activation can approximate any continuous function on a bounded region as closely as you like, given enough hidden neurons.
+
+Two cautions keep it in proportion:
+
+- It says such weights **exist**. It does not say training will find them.
+- "Enough neurons" can be absurdly many. Deep networks usually reach the same accuracy with far fewer total neurons, which is the practical reason for depth.
+
+---
+
+## How a network learns
+
+Training is the same loop on every page of this phase:
+
+<Steps>
+<Step>
+
+**Forward pass.** Feed a batch through the layers to get predictions.
+
+</Step>
+<Step>
+
+**Loss.** Measure how wrong the predictions are with one number.
+
+</Step>
+<Step>
+
+**Backward pass.** Backpropagation computes every weight's gradient with the chain rule.
+
+</Step>
+<Step>
+
+**Update.** The optimizer moves each weight a small step against its gradient, scaled by the learning rate.
+
+</Step>
+</Steps>
+
+---
+
+## What goes wrong with depth
+
+Two layers train easily. Forty do not, unless several things are set up correctly. Each remaining page in this phase handles one failure:
+
+| Problem                                                                                           | Page that fixes it                                                         |
+| :------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------- |
+| Which curve to put between layers, and how some curves stop learning (dead and saturated neurons) | [Neurons and Activations](/ai/neural-networks/neurons-and-activations)     |
+| Signals shrink to zero or blow up across many layers before training even starts                  | [Layers and Initialization](/ai/neural-networks/layers-and-initialization) |
+| Getting every gradient right, with the right shape                                                | [MLP from Scratch](/ai/neural-networks/mlp-from-scratch)                   |
+| Activation sizes drift during training, making it slow and fragile                                | [Normalization](/ai/neural-networks/normalization)                         |
+| One fixed step size is too big at the start and too big at the end                                | [Learning Rate Schedules](/ai/neural-networks/lr-schedules)                |
+| Plain gradient steps zigzag and crawl on real loss surfaces                                       | [Optimizers](/ai/neural-networks/optimizers)                               |
+| The settings nothing can learn (learning rate, width, decay) still have to be chosen              | [Hyperparameter Search](/ai/neural-networks/hyperparameter-search)         |
+
+<Callout type="warn">
+  ### Interview pitfall
+
+"More layers always means a better model" is wrong. Without good initialization, normalization, and residual connections, a deeper network often trains **worse** than a shallow one: the extra layers make the signal vanish or explode. The 2015 ResNet paper (He et al., arXiv:1512.03385) showed a 56-layer plain network with higher training error than a 20-layer one, which is what motivated residual connections.
+
+</Callout>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is a neural network, in one sentence?">
+
+    A function built from layers of simple units, each computing a weighted sum followed by a non-linear curve, whose weights are learned from examples by gradient descent.
+
+  </Accordion>
+  <Accordion title="Why can a single perceptron not learn XOR?">
+
+    A single perceptron draws one straight line between classes, and XOR's two classes sit on opposite diagonals, so no straight line separates them. One hidden layer with a non-linearity solves it.
+
+  </Accordion>
+  <Accordion title="What does MLP stand for, and what is it?">
+
+    Multi-layer perceptron: a feed-forward network of fully connected layers with an activation function between them.
+
+  </Accordion>
+  <Accordion title="How many parameters does a fully connected layer from 784 to 128 units have?">
+
+    `784 * 128` weights plus `128` biases, which is 100,480.
+
+  </Accordion>
+  <Accordion title="Why do networks need activation functions?">
+
+    Without them, every layer is linear and a stack of linear layers equals one linear layer, so depth adds nothing. The activation bends each layer's output so stacking builds complexity.
+
+  </Accordion>
+  <Accordion title="What does the universal approximation theorem say, and what does it not say?">
+
+    One hidden layer with enough neurons and a non-linear activation can approximate any continuous function on a bounded region. It does not say training will find those weights, or that the required width is practical.
+
+  </Accordion>
+  <Accordion title="Why can a deeper network train worse than a shallow one?">
+
+    Signals and gradients shrink or grow at every layer, so across many layers they vanish or explode. Careful initialization, normalization, and residual connections are what make depth trainable.
+
+  </Accordion>
+</Accordions>

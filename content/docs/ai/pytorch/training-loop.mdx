@@ -7,6 +7,56 @@ Everything on the previous pages exists to support about forty lines of code. Th
 
 ---
 
+## The plain-language version
+
+Training is a loop. Show the model some examples, measure how wrong it was, work out which way to nudge every weight, nudge them, repeat. PyTorch splits that job across three objects:
+
+- **The model** (`nn.Module`): holds the weights and defines how input becomes output.
+- **The loss function** (often called the **criterion**): turns predictions and correct answers into one "how wrong" number.
+- **The optimizer**: reads each weight's gradient and updates the weight.
+
+The **training loop** is the code that calls those three in the right order, batch after batch. The **validation loop** runs the model on held-out data, without updating anything, to check it is actually learning rather than memorizing.
+
+This page covers, in order:
+
+1. **What `nn.Module` gives you**: the base class every model is built on
+2. **Registration**: how a module automatically finds its own weights
+3. **Loss functions**: which one to use for which task
+4. **Optimizers**: SGD, Adam, AdamW
+5. **The five steps**: zero the gradients, forward, loss, backward, step
+6. **A complete toy run**: the five steps training a real model
+7. **Validation**: `model.eval()`, `torch.no_grad()`, and why both
+8. **Learning rate schedules**: changing the step size during training
+9. **Gradient clipping and accumulation**: capping huge gradients, and simulating big batches
+10. **The full harness**: everything above in one script
+11. **Failure modes**: the bugs that silently ruin a run
+
+| Word                          | Plain meaning                                                                                                                              |
+| :---------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------- |
+| **`nn.Module`**               | PyTorch's base class for anything with weights: a layer, a block, a whole model. Modules can contain other modules.                        |
+| **`forward`**                 | The method that defines the computation. You call `model(x)`, and PyTorch calls `forward(x)` for you.                                      |
+| **parameter**                 | A weight tensor the optimizer should train. Wrapping a tensor in `nn.Parameter`, or using a built-in layer, registers it.                  |
+| **buffer**                    | A tensor the module stores but does not train, such as BatchNorm's running averages. Saved with the model, never updated by the optimizer. |
+| **loss function / criterion** | Takes predictions and targets, returns one number. `CrossEntropyLoss` for classification, `MSELoss` for predicting numbers.                |
+| **optimizer**                 | The object that applies the update rule. `optimizer.step()` moves every parameter using its `.grad`.                                       |
+| **`zero_grad`**               | Clears the previous step's gradients. Needed because gradients add up instead of replacing.                                                |
+| **epoch**                     | One full pass over the training data.                                                                                                      |
+| **`train()` / `eval()` mode** | A switch on the model. Dropout and BatchNorm behave differently in each: random and batch-based in training, fixed in evaluation.          |
+| **dropout**                   | During training, randomly zero some activations so the network cannot rely on any single one. Turned off in `eval()`.                      |
+| **learning rate scheduler**   | An object that changes the learning rate as training progresses, typically warming up and then decaying.                                   |
+| **gradient clipping**         | If the gradients' total size is above a limit, scale them down. Protects against one bad batch wrecking the weights.                       |
+| **gradient accumulation**     | Run several small batches, add up their gradients, then step once. Acts like one large batch that would not fit in memory.                 |
+| **overfitting**               | Training loss keeps falling while validation loss rises: the model is memorizing instead of learning.                                      |
+
+<Callout type="warn">
+  ### Beginner mistake
+
+Forgetting `model.eval()` before validation. Dropout stays on, BatchNorm keeps updating its statistics from the validation data, and the validation numbers come out noisy and wrong.
+
+</Callout>
+
+---
+
 ## What `nn.Module` gives you
 
 A `nn.Module` subclass needs two methods. `__init__` builds the pieces, `forward` composes them.

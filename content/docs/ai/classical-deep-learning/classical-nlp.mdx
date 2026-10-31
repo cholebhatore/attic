@@ -7,6 +7,75 @@ Before transformers, NLP was a pipeline of separate pieces: an embedding table l
 
 ---
 
+## The plain-language version
+
+**NLP (Natural Language Processing)** is the field of AI that enables computers to understand, interpret, and generate human language. Typical tasks:
+
+| Task                    | Input → output                             | Example                                       |
+| :---------------------- | :----------------------------------------- | :-------------------------------------------- |
+| **text classification** | text → one label                           | spam or not spam; positive or negative review |
+| **sequence labeling**   | text → one label per word                  | marking every person and place name           |
+| **machine translation** | text in one language → text in another     | English to French                             |
+| **summarization**       | long text → short text                     | a news article to two sentences               |
+| **language modeling**   | text so far → probability of the next word | autocomplete                                  |
+| **image captioning**    | image → text                               | a photo to "a dog catching a frisbee"         |
+
+Every one of these needs text turned into numbers first. This page follows how that was done before transformers: counting words, then learned **word embeddings** (Word2Vec, GloVe), then **encoder-decoder** networks (Seq2Seq) that read one sequence and write another. It ends at the weakness of that design, which is what attention was invented to fix.
+
+| Word                     | Plain meaning                                                                                                                           |
+| :----------------------- | :-------------------------------------------------------------------------------------------------------------------------------------- |
+| **corpus**               | The collection of text a model learns from.                                                                                             |
+| **token / tokenization** | A token is one unit of text (a word, or part of one). Tokenization splits text into tokens.                                             |
+| **vocabulary (`V`)**     | The fixed list of all tokens the model knows, each with an integer ID.                                                                  |
+| **one-hot vector**       | A vector of length `V` with a 1 at the token's ID and 0 elsewhere. Identifies a word but says nothing about meaning.                    |
+| **embedding**            | A short, dense, learned vector for each token, placed so similar words get similar vectors.                                             |
+| **context window**       | The words on either side of a word that count as its "context" when learning embeddings.                                                |
+| **static embedding**     | One fixed vector per word regardless of the sentence (Word2Vec, GloVe). `bank` gets the same vector by a river and in finance.          |
+| **contextual embedding** | A vector computed from the whole sentence, so the same word gets different vectors in different sentences (BERT, transformers).         |
+| **encoder / decoder**    | The encoder reads the input sequence into a vector; the decoder writes the output sequence from it, one token at a time.                |
+| **Seq2Seq**              | Sequence-to-sequence: an encoder-decoder for tasks where input and output are both sequences, such as translation.                      |
+| **teacher forcing**      | During training, feeding the decoder the correct previous word rather than its own guess.                                               |
+| **greedy / beam search** | Ways to choose the output words at inference: always take the most likely word (greedy), or keep the best few partial sentences (beam). |
+| **bottleneck**           | A point where all information must squeeze through a fixed-size vector. Long inputs lose detail there.                                  |
+| **BLEU**                 | A translation score counting how many word sequences in the output also appear in reference translations.                               |
+| **perplexity**           | A language-model score: roughly, how many words the model is choosing between on average. Lower is better.                              |
+
+---
+
+## Before neural NLP: counting words
+
+Before any network learned an embedding, text was represented by counting. These methods are still in daily use as fast baselines and in search engines, and their weaknesses explain why embeddings were needed.
+
+Take three short documents:
+
+```text
+d1: the cat sat on the mat
+d2: the dog sat on the log
+d3: the cat chased the dog
+```
+
+**Bag of words.** Represent a document by how many times each vocabulary word appears, ignoring order. With the vocabulary `[cat, chased, dog, log, mat, on, sat, the]`, `d1` becomes `[1, 0, 0, 0, 1, 1, 1, 2]`. Word order is lost entirely: "dog bites man" and "man bites dog" get the same vector.
+
+**N-grams.** Keep a little order by counting runs of `n` consecutive words. The **bigrams** (`n = 2`) of `d3` are `the cat`, `cat chased`, `chased the`, `the dog`. Now "dog bites" and "bites dog" are different features, at the cost of a much larger vocabulary.
+
+**TF-IDF.** Raw counts overweight words like `the` that appear everywhere and say nothing. TF-IDF (term frequency times inverse document frequency) scales each count by how rare the word is across documents:
+
+```text
+idf(word) = log(N / number of documents containing the word)        N = 3 documents
+
+the  : in all 3      -> log(3/3) = 0.000     carries no information
+cat  : in d1 and d3  -> log(3/2) = 0.405
+mat  : in d1 only    -> log(3/1) = 1.099     most distinctive
+```
+
+So in `d1`, `mat` gets the highest weight and `the` gets zero. Search engines ranked documents with this idea (and its refinement, BM25) for decades. Libraries differ in small details, such as adding 1 inside the log, so exact values vary.
+
+**N-gram language models.** Predict the next word from counts of what followed the previous words. From the corpus above, `cat` is followed once by `sat` and once by `chased`, so `P(sat | cat) = 1 / 2 = 0.5`. This was how autocomplete and speech recognition worked before neural networks.
+
+**What counting cannot do.** Every one of these treats words as unrelated symbols. `cat` and `dog` share nothing, so a model that learned something about cats learns nothing about dogs. Vectors are as long as the vocabulary and mostly zeros. Embeddings fix both problems, and the next section starts there.
+
+---
+
 ## From one-hot to embeddings
 
 A vocabulary of `V` words represented as one-hot vectors has `V` dimensions, and every pair of words is exactly orthogonal. The dot product of `cat` and `dog` is `0`, the same as the dot product of `cat` and `aircraft`. There is no similarity to learn from and the input dimension grows with the vocabulary.

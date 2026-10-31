@@ -7,6 +7,58 @@ Two operators that both look like multiplication do completely different work. `
 
 ---
 
+## The plain-language version
+
+There are two kinds of "multiply" for tensors, and mixing them up is the most common bug in model code.
+
+- **Element-wise multiply (`*`)**, also called the **Hadamard product**: multiply numbers in matching positions. Same shape in, same shape out. `[1, 2] * [3, 4] = [3, 8]`.
+- **Matrix multiply (`@`)**: each output number is a **dot product** of a row of the left matrix with a column of the right one. The shared axis is multiplied pairwise and added up until it disappears. `[1, 2] @ [3, 4] = 1*3 + 2*4 = 11`.
+
+That disappearing axis is what "**contracts an axis**" means. Every linear layer, every attention score, every projection in a transformer is a matrix multiply. That is why GPUs are built around them.
+
+A 2 by 2 example you can check by hand:
+
+```text
+A = [[1, 2],      B = [[5, 6],
+     [3, 4]]           [7, 8]]
+
+A * B = [[ 5, 12],        element-wise: 1*5, 2*6, 3*7, 4*8
+         [21, 32]]
+
+A @ B = [[19, 22],        row 0 of A with column 0 of B: 1*5 + 2*7 = 19
+         [43, 50]]        row 1 of A with column 1 of B: 3*6 + 4*8 = 50
+```
+
+This page covers, in order:
+
+1. **Hadamard product versus matmul**: the two operators side by side
+2. **The matmul family**: `mm` (two matrices), `bmm` (a batch of matrices), `matmul` / `@` (handles any of these and broadcasts)
+3. **Linear layers store weights transposed**: why `nn.Linear` computes `x @ W.T`
+4. **einsum**: writing any multiply-and-sum by naming its axes
+5. **Attention written three ways**: the same computation with `@`, `bmm`, and `einsum`
+6. **Counting the cost**: how many operations a matmul takes
+7. **Why shape and layout matter**: why the same math can run at very different speeds
+
+| Word                             | Plain meaning                                                                                                                                                                                    |
+| :------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **dot product**                  | Multiply two equal-length vectors position by position and add the results into one number.                                                                                                      |
+| **batch matmul**                 | Many independent matrix multiplies done in one call, one per item in the batch.                                                                                                                  |
+| **einsum**                       | Einstein summation. You label every axis with a letter; letters that appear in the inputs but not the output are multiplied and summed away. `"ik,kj->ij"` is ordinary matmul.                   |
+| **Q, K, V**                      | Query, key, and value: the three matrices attention computes from its input. Scores are `Q @ K.T`; the output mixes the rows of `V`.                                                             |
+| **FLOP**                         | One floating-point operation: a single add or multiply. A `(m, k) @ (k, n)` matmul takes about `2 * m * k * n` FLOPs. **FLOP/s** is FLOPs per second, a speed.                                   |
+| **kernel**                       | One small program that runs on the GPU. Each PyTorch operation launches one or more kernels.                                                                                                     |
+| **Tensor Core**                  | A specialized unit inside NVIDIA GPUs that does small matrix multiplies extremely fast, mostly in low precision.                                                                                 |
+| **compute-bound / memory-bound** | Compute-bound: the chip is busy doing arithmetic. Memory-bound: the chip is idle, waiting for numbers to arrive from memory. Matmul is usually compute-bound; element-wise ops are memory-bound. |
+
+<Callout type="warn">
+  ### Interview pitfall
+
+`A * B` on two square matrices runs without any error and gives a perfectly plausible-looking wrong answer. Shape errors only catch `*` versus `@` mix-ups when the shapes are not square, so check which operator you meant every time.
+
+</Callout>
+
+---
+
 ## Hadamard product versus matmul
 
 ```python title="hadamard_vs_matmul.py"

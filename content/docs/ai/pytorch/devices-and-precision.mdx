@@ -7,6 +7,56 @@ A tensor carries its device and its dtype with it. Those two attributes decide w
 
 ---
 
+## The plain-language version
+
+Two questions decide how fast training runs and whether it works at all: **where** do the numbers live (CPU or GPU), and **how many bits** does each number get?
+
+**CPU versus GPU.** A CPU is a handful of expert chefs: each can cook anything, quickly, one dish at a time. A GPU is thousands of line cooks: each is simple, but together they chop ten thousand onions at once. Neural networks are mostly the same simple arithmetic repeated millions of times (matrix multiplies), which is exactly the line-cook job. That is why training happens on GPUs.
+
+**Precision.** Every number is stored in a fixed number of bits. Fewer bits means half the memory and roughly double the speed, but less room: numbers can get too big (overflow to `inf`), too small (underflow to `0`), or too coarse. **Mixed precision** does most of the work in 16-bit numbers and keeps the sensitive parts in 32-bit.
+
+This page covers, in order:
+
+1. **Where a tensor lives**: CPU or GPU, and moving tensors between them
+2. **Why the GPU wins**: parallel arithmetic and memory bandwidth
+3. **The decode ceiling**: when generation is limited by memory speed, not arithmetic
+4. **Crossing the PCIe boundary**: the cost of copying between CPU and GPU, and pinned memory
+5. **Numerical formats**: FP32, TF32, BF16, FP16, FP8 and what each trades away
+6. **Why FP16 needs help and BF16 does not**: loss scaling
+7. **Automatic mixed precision**: `autocast` and which operations it changes
+8. **TF32**: a free speedup on modern GPUs
+9. **Memory accounting**: what fills GPU memory during training
+10. **`torch.compile` and the backend**: how compilation interacts with precision
+
+| Word                           | Plain meaning                                                                                                                                           |
+| :----------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **host / device**              | Host is the CPU and its RAM. Device is the GPU and its memory.                                                                                          |
+| **CUDA**                       | NVIDIA's software platform for running computations on its GPUs. `"cuda"` in PyTorch means an NVIDIA GPU.                                               |
+| **VRAM / HBM**                 | The GPU's own memory. HBM (High Bandwidth Memory) is the very fast kind on data-center GPUs.                                                            |
+| **PCIe**                       | The connection (bus) between the CPU side and the GPU card. Much slower than the GPU's own memory, so every CPU-to-GPU copy costs time.                 |
+| **pinned memory**              | CPU memory locked in place so the GPU can copy from it directly and in the background. Makes transfers faster and lets them overlap with compute.       |
+| **bandwidth**                  | How many bytes per second memory can deliver. Often the real speed limit, not arithmetic.                                                               |
+| **FLOP/s**                     | Floating-point operations per second: how much arithmetic the chip can do.                                                                              |
+| **kernel**                     | A single program launched on the GPU. Each PyTorch operation runs one or more.                                                                          |
+| **sign / exponent / mantissa** | The three parts of a float, like scientific notation. Exponent bits set the **range**, mantissa bits set the **precision** (how many digits are exact). |
+| **FP32, FP16, BF16**           | 32-bit, 16-bit, and "brain float" 16-bit numbers. BF16 keeps FP32's range but drops precision; FP16 keeps more precision but has a tiny range.          |
+| **subnormal**                  | Extra-tiny numbers below a format's normal minimum, stored with reduced precision. Below them, values become exactly 0.                                 |
+| **binade**                     | The span between two consecutive powers of two, like 1 to 2, or 2 to 4. Multiplying by 2 moves a number up exactly one binade.                          |
+| **loss scaling**               | Multiply the loss by a large number before backward so tiny FP16 gradients do not round to zero, then divide the gradients back down.                   |
+| **Tensor Core**                | Special matrix-multiply hardware inside NVIDIA GPUs that runs low-precision math many times faster than ordinary cores.                                 |
+| **compute capability**         | NVIDIA's version number for a GPU generation (7.5 Turing, 8.0 Ampere, 9.0 Hopper). It decides which number formats run fast.                            |
+
+A quick feel for range: FP16 cannot store anything above `65504`. A value of `70000` is ordinary in FP32 and becomes `inf` in FP16. BF16 stores it fine, just rounded: it keeps only about 2 to 3 correct decimal digits.
+
+<Callout type="warn">
+  ### Beginner mistake
+
+"It runs on my laptop, so the GPU must be in use." Tensors are created on the CPU by default. If you never call `.to("cuda")` on both the model and the data, everything runs on the CPU, slowly and without any error.
+
+</Callout>
+
+---
+
 ## Where a tensor lives
 
 Every tensor has exactly one device. Operations between tensors on different devices raise rather than silently copying:

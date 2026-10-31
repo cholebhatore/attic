@@ -7,6 +7,53 @@ A checkpoint is a resumable description of a training run, not a snapshot of a P
 
 ---
 
+## The plain-language version
+
+A **checkpoint** is a saved file of a model's learned numbers, written to disk so the work is not lost. You save checkpoints for two reasons:
+
+- **To resume training** after a crash or a pause. This needs more than the weights: the optimizer's memory, the learning rate schedule's position, the step count, and the random number generators.
+- **To use the model** later for predictions (**inference**). This needs only the weights.
+
+Think of a video game save. A full save stores your position, inventory, and quest progress so you can continue exactly where you stopped. A screenshot of your character is enough to show it off, but not to keep playing.
+
+This page covers, in order:
+
+1. **What `state_dict` is**: the dictionary of named tensors every model and optimizer can produce
+2. **What goes in a resumable checkpoint**: and why the optimizer state is most of the file
+3. **Loading**: restoring a model and optimizer
+4. **Why `torch.save(model)` is wrong**: saving the object instead of its numbers
+5. **Safetensors**: a format that is fast and cannot run hidden code
+6. **Format comparison**: `.pt`, safetensors, GGUF, ONNX, and others side by side
+7. **Partial loads and architecture changes**: loading weights into a slightly different model
+8. **Distributed and sharded checkpoints**: saving a model split across many GPUs
+9. **Exporting for inference**: producing a file a serving system can run
+10. **Cross-framework: Keras 3 and legacy TensorFlow**: moving weights between PyTorch and other frameworks
+
+| Word                    | Plain meaning                                                                                                                                          |
+| :---------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **`state_dict`**        | A Python dictionary from names like `"layer1.weight"` to tensors. The model's numbers, without its code.                                               |
+| **serialization**       | Turning objects in memory into bytes that can be written to a file, and back again (**deserialization**).                                              |
+| **pickle**              | Python's built-in serialization format. Loading a pickle file can **run arbitrary code**, so never load one from a source you do not trust.            |
+| **`weights_only=True`** | A `torch.load` option that refuses to load anything except plain tensors and simple types, blocking the code-execution risk.                           |
+| **safetensors**         | A file format holding only tensors and a small header. It cannot carry code, and it can be read without copying the data.                              |
+| **optimizer state**     | Extra numbers the optimizer keeps per weight. Adam keeps two (a running average of gradients and of squared gradients), so it is twice the model size. |
+| **RNG state**           | The current position of each random number generator, so a resumed run makes exactly the same random choices as an uninterrupted one.                  |
+| **inference**           | Using a trained model to make predictions, with no training.                                                                                           |
+| **sharded checkpoint**  | One checkpoint split into many files, typically one per GPU, because the model was split across GPUs.                                                  |
+| **export**              | Converting a model into a standalone form (such as ONNX or `torch.export`) that can run without your Python training code.                             |
+| **ONNX**                | Open Neural Network Exchange: a common file format that many runtimes and frameworks can load.                                                         |
+| **Keras / TensorFlow**  | Google's deep learning frameworks. TensorFlow is the engine; Keras is the high-level API on top. Keras 3 can also run on PyTorch and JAX.              |
+| **SavedModel**          | TensorFlow's directory format for a model: its graph plus its weights.                                                                                 |
+
+<Callout type="warn">
+  ### Beginner mistake
+
+Saving only `model.state_dict()` and expecting to resume training. The model restarts with the right weights, but the optimizer starts from scratch, the learning rate schedule jumps back to the beginning, and the loss usually spikes.
+
+</Callout>
+
+---
+
 ## What `state_dict` is
 
 Every `nn.Module` and every `Optimizer` exposes a `state_dict()`: a flat mapping from dotted string keys to tensors.

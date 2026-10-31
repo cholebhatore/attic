@@ -15,6 +15,10 @@ _Objective: Formulate deep geometric and analytical intuition for high-dimension
 
 ### Core Modules
 
+- **AI Basics & Vocabulary**
+  - **The Field Map:** AI vs. Machine Learning vs. Deep Learning, NLP, Computer Vision, Generative AI, and LLMs.
+  - **Data, Models & Training:** Features, labels, data splits, kinds of learning, parameters vs. hyperparameters, the training loop, batches, epochs, and overfitting.
+  - **Language to Vectors:** Corpus, tokens, vocabulary, embeddings, and static (GloVe) vs. contextual (BERT) embeddings.
 - **Linear Algebra & Vector Spaces**
   - **Vectors:** Unit vectors, basis vectors, dimensionality, and geometric representations.
   - **Matrices:** Linear transformations, rank, invertibility, and matrix factorizations (SVD, Eigen-decomposition).
@@ -49,6 +53,9 @@ _Objective: Translate mathematical arrays into GPU-accelerated computational gra
 
 ### Core Modules
 
+- **PyTorch Basics**
+  - **The Framework Map:** What a deep learning framework adds to NumPy, PyTorch vs. TensorFlow, Keras, and JAX, eager vs. compiled execution, and why training runs on GPUs.
+  - **The Five Building Blocks:** Tensor, autograd, `nn.Module`, optimizer, and `DataLoader`, assembled into a complete tiny training run.
 - **PyTorch Tensor Fundamentals**
   - **Creating Tensors:** Data types (`float32`, `float16`, `bfloat16`, `int8`), device allocation, and memory layout (strides and contiguity).
   - **Special Tensors:** Identity (`eye`), uniform/normal distributions (`rand`, `randn`), and sequence builders (`arange`, `linspace`).
@@ -82,6 +89,9 @@ _Objective: Strip away framework abstractions to build forward passes, normaliza
 
 ### Core Modules
 
+- **Neural Network Basics**
+  - **The Big Picture:** What a neural network is, the perceptron and the XOR problem, input/hidden/output layers, width and depth, counting parameters, and universal approximation.
+  - **Why Depth Is Hard:** The vanishing/exploding signal, saturation, and optimization problems that the rest of the phase solves.
 - **Architecture Primitives**
   - **Single Neuron from Scratch:** Affine transformations ($z = Wx + b$) and non-linear activations (`ReLU`, `GELU`, `SiLU`/`SwiGLU`).
   - **Building a Layer:** Vectorized dense layers and variance-preserving weight initializations (Xavier/Glorot, He/Kaiming).
@@ -111,6 +121,9 @@ _Objective: Master spatial convolutions, recurrent memory, internal activation a
 
 ### Core Modules
 
+- **Vision & Sequence Basics**
+  - **Data as Tensors:** Pixels, channels, and the $(B, C, H, W)$ layout; text, audio, and time series as $(B, T, F)$ sequences.
+  - **The Field Map:** Computer vision and NLP tasks (classification, detection, segmentation, translation), standard datasets (MNIST, CIFAR-10, ImageNet), inductive bias, and the CNN, RNN, and transformer families.
 - **Convolutional Architectures & Computer Vision**
   - **CNNs:** Spatial filters/kernels, stride, padding, pooling, and receptive field progression.
   - **CIFAR-10 Classification Pipeline:** End-to-end training with data augmentation (`torchvision.transforms.v2`) and Residual Connections (ResNet).
@@ -126,7 +139,7 @@ _Objective: Master spatial convolutions, recurrent memory, internal activation a
 - **Classical Sequence & Time-Series Modeling**
   - **RNNs & LSTMs:** Recurrent hidden states, vanishing/exploding gradients in Backpropagation Through Time (BPTT), gradient clipping, and LSTM gating (forget, input, output gates).
   - **Time Series Prediction:** Sliding-window autoregression over continuous temporal data.
-  - **Classical NLP, Machine Translation & Image Captioning:** Word2Vec/GloVe embeddings, Seq2Seq encoder-decoders, and CNN-to-RNN captioning (demonstrating the fixed-vector information bottleneck that motivated Attention).
+  - **Classical NLP, Machine Translation & Image Captioning:** Count-based text representations (bag of words, n-grams, TF-IDF), Word2Vec/GloVe embeddings, Seq2Seq encoder-decoders, and CNN-to-RNN captioning (demonstrating the fixed-vector information bottleneck that motivated Attention).
 
 ### Canonical Resources
 

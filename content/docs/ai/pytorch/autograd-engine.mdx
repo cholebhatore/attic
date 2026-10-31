@@ -9,6 +9,56 @@ Every pitfall on this page comes from one of those three facts.
 
 ---
 
+## The plain-language version
+
+Training needs the **gradient** of the loss with respect to every weight: for each weight, which direction to nudge it and how strongly. Writing those derivatives by hand for millions of weights is impossible. **Autograd** (automatic differentiation) does it for you.
+
+It works like a receipt. While your forward pass runs, PyTorch writes down every operation on a list: "multiplied these, added that, applied ReLU". That list is the **computational graph**. When you call `loss.backward()`, PyTorch reads the receipt **backwards**, applies the chain rule at every line, and leaves each weight's gradient in its `.grad` field.
+
+```python title="receipt.py"
+import torch
+
+w = torch.tensor(3.0, requires_grad=True)   # a weight: "please track me"
+loss = (w - 1) ** 2                          # forward pass, recorded
+loss.backward()                              # read the receipt backwards
+print(w.grad)                                # tensor(4.)  since d/dw (w-1)^2 = 2*(w-1) = 4
+```
+
+This page covers, in order:
+
+1. **Leaves and non-leaves**: which tensors keep their gradients
+2. **The graph is dynamic**: the receipt is rewritten on every forward pass
+3. **backward()**: running it, running it twice, and second derivatives
+4. **Turning autograd off**: `no_grad` and `inference_mode` for evaluation
+5. **Freezing parameters**: stopping some weights from training
+6. **Hooks**: running your own function when a gradient is computed
+7. **torch.compile**: turning the model into faster code, graph breaks, and compile modes
+
+| Word                         | Plain meaning                                                                                                                                          |
+| :--------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **requires_grad**            | A flag on a tensor meaning "track operations on me, I will want my gradient". Model weights have it on.                                                |
+| **leaf tensor**              | A tensor you created directly, not computed from others. Weights are leaves. By default only leaves keep `.grad` after `backward`.                     |
+| **non-leaf (intermediate)**  | A tensor produced by an operation, like `w - 1` above. Its gradient is used during backward, then thrown away.                                         |
+| **`.grad`**                  | Where the gradient lands after `backward()`. It **adds** to whatever is already there, which is why training loops zero it each step.                  |
+| **`grad_fn`**                | The note on a non-leaf saying which operation made it, so backward knows which derivative rule to apply.                                               |
+| **dynamic graph**            | The graph is built fresh each forward pass, so ordinary Python `if` statements and loops can change the model's computation from step to step.         |
+| **detach**                   | Make a tensor that shares the numbers but is cut off from the graph. Gradients will not flow back through it.                                          |
+| **no_grad / inference_mode** | Turn recording off, for evaluation and serving. Saves memory and time because no receipt is kept.                                                      |
+| **freezing**                 | Setting `requires_grad=False` on some weights so training leaves them unchanged. Used heavily in fine-tuning.                                          |
+| **hook**                     | A function you register that PyTorch calls automatically at a certain moment, for example when a gradient is computed. Used for logging and debugging. |
+| **compiler**                 | A program that translates code into a faster form. `torch.compile` translates your Python model into optimized GPU code.                               |
+| **kernel / fusion**          | A kernel is one GPU program. Fusion merges several small kernels into one, so intermediate results never take a round trip through memory.             |
+| **graph break**              | A spot where `torch.compile` meets Python it cannot translate. It splits the model there and runs that part normally, losing some speed.               |
+
+<Callout type="warn">
+  ### Beginner mistake
+
+Calling `backward()` in a loop without clearing `.grad` first. Gradients **accumulate**: the second call adds to the first. The result is a model steered by the sum of old and new gradients.
+
+</Callout>
+
+---
+
 ## Leaves and non-leaves
 
 Setting `requires_grad=True` marks a tensor as something the optimizer will later update. Any tensor computed from it inherits the flag, and the operations that produced it get recorded.

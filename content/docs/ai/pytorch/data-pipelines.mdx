@@ -9,6 +9,57 @@ The data pipeline exists to keep those two activities off each other's critical 
 
 ---
 
+## The plain-language version
+
+A model can only train as fast as it is fed. Before each step, somebody has to read files from disk, decode them (turn a JPEG into pixel numbers, text into token IDs), maybe alter them randomly, and group them into a batch. That somebody is the **data pipeline**.
+
+PyTorch splits it into two pieces:
+
+- **`Dataset`**: knows how to fetch **one** example. "Give me item 42" returns one image and its label.
+- **`DataLoader`**: turns a dataset into a stream of **batches**. It shuffles the order, groups examples, and runs several **worker** processes in parallel so the next batch is ready before the GPU asks for it.
+
+Think of a restaurant. The GPU is the dining room; the workers are the kitchen. If the kitchen is slow, diners wait no matter how fast they eat.
+
+This page covers, in order:
+
+1. **Two dataset styles**: map-style (look up by index) and iterable-style (read as a stream)
+2. **A map-style dataset**: writing your own `Dataset` class
+3. **DataLoader**: batch size, shuffle, workers, pinned memory
+4. **What the workers do**: separate processes preparing batches ahead of time
+5. **Sizing `num_workers`**: how many workers to use
+6. **Collation**: how single examples are merged into one batch
+7. **Determinism and worker seeding**: getting the same random order every run
+8. **Epoch boundaries**: what happens at the end of a pass
+9. **Distributed sampling**: giving each GPU a different slice of the data
+10. **Iterable datasets**: streaming data too big to index
+11. **WebDataset**: streaming from large archive files, shuffling, and shard sizing
+12. **Choosing**: which approach fits which situation
+
+| Word                          | Plain meaning                                                                                                                              |
+| :---------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------- |
+| **`__len__` / `__getitem__`** | The two methods a map-style `Dataset` defines: how many items there are, and how to fetch item `i`.                                        |
+| **batch**                     | A group of examples processed in one training step. The DataLoader builds them.                                                            |
+| **shuffle**                   | Visit examples in a random order each epoch, so the model does not learn the order of the file.                                            |
+| **worker**                    | A separate Python process that prepares batches in parallel with training. `num_workers=0` means everything runs in the main process.      |
+| **prefetch**                  | Preparing the next batches before they are needed.                                                                                         |
+| **collate**                   | Merge a list of single examples into one batched tensor, usually by stacking them. Variable-length examples need padding first.            |
+| **padding**                   | Adding filler values so sequences of different lengths fit into one rectangular tensor.                                                    |
+| **augmentation**              | Random changes to training examples (flip, crop, change brightness) that make the model see more variety without collecting more data.     |
+| **sampler**                   | The object that decides the order of indices the DataLoader requests.                                                                      |
+| **seed**                      | The starting number for a random generator. Same seed, same "random" sequence, so runs can be reproduced.                                  |
+| **I/O**                       | Input/output: reading from disk or network. Often the slowest part of a pipeline.                                                          |
+| **shard**                     | One file out of many that together hold a big dataset, such as 1,000 archive files of 10,000 examples each.                                |
+| **WebDataset**                | A library that stores data as `.tar` archive shards and streams them in sequence, which is far faster than opening millions of tiny files. |
+
+<Callout type="warn">
+  ### Beginner mistake
+
+Leaving `num_workers=0` and blaming the model for slow training. If GPU utilization sits well below 100% while training, the GPU is waiting for data, and more workers (or a faster data format) is the fix.
+
+</Callout>
+
+---
+
 ## Two dataset styles
 
 |                     | Map-style                    | Iterable-style                         |
