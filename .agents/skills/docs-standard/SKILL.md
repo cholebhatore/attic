@@ -87,14 +87,10 @@ prose.
 
 Breadth over depth. There is no limit to the number of code lines, but avoid writing unnecessarily.
 
-- Prefer tables, formulas in backticks, and compact API snippets over prose derivation.
-- One short paragraph per idea. Skip a worked example when a formula plus one sentence carries the
-  same information.
 - Keep boilerplate low: no repeated "in this section we will" framing, no recap paragraphs.
 - Break explanations down into a logical story: start with a real-world system failure or puzzle, explain the root cause, and then show the working solution.
 - Keep the language conversational, clear, and easy to follow, but never omit important technical terms. Instead, define them immediately using the analogy.
 - Highlight common developer mistakes and practical interview pitfalls.
-- Use bullet points when appropriate, bold key phrases, and direct headings. No fluff, no robotic introductions.
 - First lay out the hierarchy, then dive into the subtopics. For example, if a topic has four subtopics, list all four before you start explaining each one, instead of jumping straight into the first and then the second and so on.
 - Use tooltips, callouts, and accordions to provide additional information without overwhelming the main content.
 
