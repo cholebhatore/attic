@@ -51,6 +51,13 @@ function getNodeText(node: React.ReactNode): string {
   return '';
 }
 
+function isMermaidCode(text: string): boolean {
+  const trimmed = text.trim();
+  return /^(?:flowchart(?:\s+(?:TD|TB|BT|RL|LR))?|graph(?:\s+(?:TD|TB|BT|RL|LR))?|sequenceDiagram|classDiagram|stateDiagram(?:-v2)?|erDiagram|journey|gantt|pie|quadrantChart|requirementDiagram|gitGraph|C4Context|mindmap|timeline|zenuml|sankey-beta|xychart-beta|block-beta|packet-beta|kanban|architecture-beta)\b/m.test(
+    trimmed,
+  );
+}
+
 function MdxImageZoom({ children, ...props }: React.ComponentProps<typeof ImageZoom>) {
   if (children || (props.width && props.height)) {
     return <ImageZoom {...props}>{children}</ImageZoom>;
@@ -84,8 +91,9 @@ export function getMDXComponents(components?: MDXComponents) {
             ) || (props.children.props as Record<string, unknown>)?.['data-language'] === 'mermaid',
           ));
 
-      if (isMermaid) {
-        const chart = getNodeText(props.children);
+      const chart = getNodeText(props.children);
+
+      if (isMermaid || isMermaidCode(chart)) {
         return <Mermaid chart={chart} />;
       }
 
