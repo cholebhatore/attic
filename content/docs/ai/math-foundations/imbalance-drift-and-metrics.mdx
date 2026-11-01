@@ -1,0 +1,100 @@
+---
+title: Imbalance, Drift, and Metrics
+description: Imbalanced datasets, concept drift, and evaluation metrics such as precision, recall, PR-AUC, and precision at k.
+---
+
+Anomalies are rare, normal changes over time, and the usual metrics hide both problems. This page covers all three, and the [fraud detection project](/ai/math-foundations/fraud-detection-project) shows them on real output.
+
+The page covers, in order:
+
+1. **Imbalanced datasets**: the accuracy paradox, resampling, class weights, and thresholds
+2. **Concept drift**: when normal itself changes
+3. **Evaluation metrics**: precision, recall, F1, ROC-AUC, PR-AUC, and precision at k
+
+---
+
+## Imbalanced datasets
+
+In anomaly problems the interesting class is rare: fraud under 1% of transactions, faults far rarer. That breaks the usual training and evaluation habits.
+
+**The accuracy paradox.** With 1% fraud, a model that always says "normal" is 99% accurate and catches nothing. The [fraud detection project](/ai/math-foundations/fraud-detection-project) prints exactly that: accuracy 0.990, recall 0.00.
+
+Fixes, in the order to try them:
+
+1. **Use the right metric** (see Evaluation metrics below): precision, recall, PR-AUC, precision at k. Never accuracy alone.
+2. **Move the threshold.** A model trained on imbalanced data often ranks well but is miscalibrated; lowering the threshold trades precision for recall at no training cost.
+3. **Class weights.** Make each mistake on the rare class cost more in the loss (`class_weight="balanced"` in scikit-learn).
+4. **Resampling.** **Undersample** the majority class (fast, discards data) or **oversample** the minority class. **SMOTE** (Chawla et al., 2002) creates synthetic minority examples by interpolating between a minority point and its minority neighbours. Resample the **training** split only, never the test set, or the test score no longer reflects reality.
+5. **Treat it as anomaly detection** when positives are too few or too varied to learn from: model normal, flag what does not fit.
+
+---
+
+## Concept drift
+
+A detector learns what normal looks like **at training time**. Normal changes: new products, new customers, seasons, a pandemic, and fraudsters adapting to the detector. **Drift** is the name for that change, and it quietly ruins anomaly detectors, because a shift in normal looks like a flood of anomalies, or hides real ones.
+
+| Kind                             | What changes                                        | Example                                                       |
+| :------------------------------- | :-------------------------------------------------- | :------------------------------------------------------------ |
+| **Data drift** (covariate shift) | The input distribution `P(x)`                       | Average basket size rises after a price change                |
+| **Concept drift**                | The relation between input and label `P(y given x)` | A purchase pattern that used to be safe is now a fraud tactic |
+| **Label drift** (prior shift)    | The base rate `P(y)`                                | Fraud rate doubles during the holidays                        |
+
+Drift can be **sudden** (a new policy), **gradual** (slowly changing tastes), **incremental**, or **recurring** (seasons). Detecting it:
+
+- Compare feature distributions between a reference window and the current one: the **population stability index** (PSI), the **Kolmogorov-Smirnov test**, or KL divergence. A common industry rule of thumb reads PSI below 0.1 as stable and above 0.25 as a significant shift.
+- Track model **performance** once labels arrive (chargebacks can take weeks).
+- Track the **alert rate**: a detector that suddenly flags three times as many cases has usually met drift, not a crime wave.
+
+Responses are retraining on recent data on a schedule or when drift is detected, weighting recent data more, and keeping a human review loop so new labels keep arriving. The production side is covered in [data drift and concept drift](/ai/mlops/telemetry-and-cost#data-drift-and-concept-drift) in the MLOps phase.
+
+---
+
+## Evaluation metrics
+
+Every metric starts from the **confusion matrix**, with "anomaly" as the positive class:
+
+|                      | Predicted anomaly                  | Predicted normal            |
+| :------------------- | :--------------------------------- | :-------------------------- |
+| **Actually anomaly** | True positive (TP)                 | False negative (FN): a miss |
+| **Actually normal**  | False positive (FP): a false alarm | True negative (TN)          |
+
+| Metric                         | Formula                                            | Question it answers                                             |
+| :----------------------------- | :------------------------------------------------- | :-------------------------------------------------------------- |
+| **Precision**                  | `TP / (TP + FP)`                                   | Of the alerts, how many were real?                              |
+| **Recall** (sensitivity)       | `TP / (TP + FN)`                                   | Of the real anomalies, how many did we catch?                   |
+| **F1**                         | `2 * P * R / (P + R)`                              | One number balancing the two (harmonic mean)                    |
+| **False positive rate**        | `FP / (FP + TN)`                                   | Of the normal points, how many did we wrongly flag?             |
+| **ROC-AUC**                    | Area under recall against FPR, over all thresholds | Probability a random anomaly scores above a random normal point |
+| **PR-AUC** (average precision) | Area under precision against recall                | Ranking quality, focused on the rare class                      |
+| **Precision at k**             | Precision among the top `k` scores                 | How useful are the alerts analysts actually review?             |
+
+**Why PR-AUC over ROC-AUC for rare anomalies.** The false positive rate divides by the huge number of normal points, so thousands of false alarms barely move it, and ROC-AUC looks excellent. Precision divides by the number of alerts, so those false alarms show up directly. A random ranking scores ROC-AUC 0.5 whatever the imbalance, but PR-AUC equal to the **base rate**, so always compare PR-AUC against the base rate. The fraud project shows the gap: ROC-AUC 0.936, PR-AUC 0.643.
+
+**Precision against recall is a trade-off** set by the threshold. Which matters more depends on the costs: missing fraud costs money, but a false alarm costs an analyst's time and annoys a real customer whose card gets blocked.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Your fraud model is 99% accurate. Is it good?">
+
+    Not necessarily. With 1% fraud, always predicting "not fraud" gives 99% accuracy and zero recall. Report precision, recall, PR-AUC compared against the base rate, and precision at the number of alerts analysts can review. Also check how the data was split: a random split can leak future patterns into training, so test on a later time period.
+
+  </Accordion>
+  <Accordion title="Why prefer PR-AUC over ROC-AUC for imbalanced problems?">
+
+    ROC-AUC uses the false positive rate, whose denominator is the huge normal class, so many false alarms barely move it. PR-AUC uses precision, which counts every false alarm against the alerts. A random model's PR-AUC equals the base rate rather than 0.5. In the fraud example, ROC-AUC was 0.936 while PR-AUC was 0.643, against a base rate of 0.033.
+
+  </Accordion>
+  <Accordion title="How do you handle class imbalance?">
+
+    Pick metrics that respect the rare class, tune the decision threshold, weight the rare class more in the loss, and resample the training split (undersample the majority, oversample the minority, or SMOTE, which interpolates new minority examples). Never resample the test set. When positives are too few or keep changing, model normal data and treat it as anomaly detection.
+
+  </Accordion>
+  <Accordion title="What is concept drift, and how does it differ from data drift?">
+
+    Data drift is a change in the input distribution; concept drift is a change in the relation between inputs and the correct label, so the same input now deserves a different answer. Fraudsters changing tactics is concept drift. Detect drift by comparing feature distributions (PSI, KS test), tracking performance as labels arrive, and watching the alert rate. Respond by retraining on recent data.
+
+  </Accordion>
+</Accordions>

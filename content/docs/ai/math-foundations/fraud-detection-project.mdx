@@ -1,0 +1,139 @@
+---
+title: Fraud Detection Project
+description: A fraud detection project worked end to end, and what outliers mean in LLM work.
+---
+
+The last page of the group puts everything together on one synthetic dataset: the [metrics](/ai/math-foundations/imbalance-drift-and-metrics), an [Isolation Forest](/ai/math-foundations/ml-anomaly-detection), and an autoencoder baseline. It ends with the other meaning of outlier that comes up in LLM interviews.
+
+The page covers, in order:
+
+1. **A fraud detection project, end to end**: every step on one synthetic dataset
+2. **Outliers in LLM work**: the other meaning of the word, and where anomaly detection appears in AI systems
+
+---
+
+## A fraud detection project, end to end
+
+A synthetic credit card dataset, so every step can be checked. Four features per transaction: log of the amount, hour of the day, distance from home in km, and transactions in the last hour. Fraud is 1% of 10,000 rows, and it overlaps with normal behaviour on purpose: larger amounts, odd hours, further from home, more bursts, but none of these alone gives it away.
+
+The steps, which are the same in a real project:
+
+1. **Define the problem and the cost.** What counts as fraud, how quickly it must be caught, how many alerts analysts can review per day.
+2. **Explore** each feature (histograms, box plots), and how fraud differs from normal.
+3. **Preprocess**: impute, scale where the method needs it, and engineer features (amount compared with the customer's usual amount, counts per time window).
+4. **Split by time** in a real project, so the model is tested on the future, not on shuffled past data. Fit preprocessing on training data only.
+5. **Train** an unsupervised detector on normal data (novelty detection), and a supervised model if labels exist.
+6. **Evaluate** with the base rate, PR-AUC, and precision and recall at the alert budget.
+7. **Deploy and monitor** the alert rate, precision on reviewed cases, and drift. Retrain as fraud patterns change.
+
+```python
+import numpy as np
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import average_precision_score, precision_score, recall_score, roc_auc_score
+
+rng = np.random.default_rng(7)
+n_normal, n_fraud = 9_900, 100
+# features: log amount, hour of day, km from home, transactions in the last hour
+normal = np.column_stack([
+    rng.normal(3.5, 0.8, n_normal),
+    rng.normal(14, 4, n_normal),
+    rng.exponential(5, n_normal),
+    rng.poisson(1, n_normal),
+])
+fraud = np.column_stack([
+    rng.normal(4.6, 1.0, n_fraud),
+    rng.normal(8, 6, n_fraud),
+    rng.exponential(25, n_fraud),
+    rng.poisson(2.5, n_fraud),
+])
+X = np.vstack([normal, fraud])
+y = np.r_[np.zeros(n_normal), np.ones(n_fraud)].astype(int)
+
+# The do-nothing model: predict "not fraud" every time
+always_zero = np.zeros_like(y)
+print(f"always 'normal': accuracy={np.mean(always_zero == y):.3f}  recall={recall_score(y, always_zero):.2f}")
+
+# Train only on transactions believed normal (here: a random 70% of the normal rows)
+idx = rng.permutation(n_normal)
+train = normal[idx[:6_930]]
+test_X = np.vstack([normal[idx[6_930:]], fraud])
+test_y = np.r_[np.zeros(n_normal - 6_930), np.ones(n_fraud)].astype(int)
+
+model = IsolationForest(n_estimators=200, random_state=0).fit(train)
+score = -model.score_samples(test_X)             # higher means more anomalous
+print(f"base rate in test={test_y.mean():.3f}")
+print(f"ROC-AUC={roc_auc_score(test_y, score):.3f}  PR-AUC={average_precision_score(test_y, score):.3f}")
+
+for budget in (50, 100, 200):                    # analysts can review this many alerts
+    threshold = np.sort(score)[-budget]
+    pred = (score >= threshold).astype(int)
+    print(f"review top {budget:3d}: precision={precision_score(test_y, pred):.2f}  "
+          f"recall={recall_score(test_y, pred):.2f}")
+
+# A linear autoencoder (PCA) flags rows it cannot rebuild
+mu, sd = train.mean(axis=0), train.std(axis=0)
+Z = (train - mu) / sd
+_, _, Vt = np.linalg.svd(Z, full_matrices=False)
+W = Vt[:2].T                                       # encode 4 features into 2 numbers
+
+
+def reconstruction_error(rows):
+    z = (rows - mu) / sd
+    return np.sum((z - z @ W @ W.T) ** 2, axis=1)
+
+
+err = reconstruction_error(test_X)
+print(f"reconstruction error: median normal={np.median(err[test_y == 0]):.2f}  "
+      f"median fraud={np.median(err[test_y == 1]):.2f}  PR-AUC={average_precision_score(test_y, err):.3f}")
+```
+
+```text
+always 'normal': accuracy=0.990  recall=0.00
+base rate in test=0.033
+ROC-AUC=0.936  PR-AUC=0.643
+review top  50: precision=0.84  recall=0.42
+review top 100: precision=0.59  recall=0.59
+review top 200: precision=0.36  recall=0.72
+reconstruction error: median normal=1.32  median fraud=15.88  PR-AUC=0.687
+```
+
+Reading the output:
+
+- **Accuracy is useless here.** Doing nothing scores 0.990.
+- **The test set is 3.3% fraud**, because all 100 fraud cases went to the 3,070-row test set. A random ranking would score PR-AUC about 0.033; Isolation Forest scores 0.643, about 19 times better, while ROC-AUC (0.936) makes it look nearly solved.
+- **The alert budget is the real decision.** Reviewing the top 50 alerts, 84% are real fraud but only 42% of fraud is caught. Reviewing 200 catches 72%, but almost two in three reviews are wasted.
+- **The PCA autoencoder** gives fraud a median reconstruction error 12 times that of normal rows, and a PR-AUC (0.687) close to Isolation Forest's. A cheap baseline worth running alongside.
+
+In a real project, the next step would be a supervised model on the labelled cases, with the anomaly score as one of its features, evaluated on a later time period.
+
+---
+
+## Outliers in LLM work
+
+"Outlier" means two different things in AI interviews. Make sure you know which one is being asked about.
+
+**1. Activation and weight outliers in quantization.** Large language models develop a few hidden-state channels with values far larger than the rest. When a block of numbers shares one quantization scale, one huge value forces a coarse scale on everything else and destroys their precision. LLM.int8(), SmoothQuant, and AWQ exist to handle this. It is the heavy-tail idea from [Probability and Distributions](/ai/math-foundations/probability-and-distributions#shape-skewness-and-kurtosis) applied to model internals, and it is covered in [the outlier problem](/ai/inference/quantization-math#the-outlier-problem).
+
+**2. Anomaly detection inside AI systems.** The classical methods on this page keep appearing around LLMs:
+
+- **Training data cleaning**: filtering documents with unusual statistics (extreme length, repeated lines, symbol ratios) and near-duplicates before pretraining.
+- **Out-of-distribution inputs**: flagging a query whose embedding is far from anything in the RAG corpus or the evaluation set, so the system can refuse or route it.
+- **Production monitoring**: spikes in token usage, cost, latency, refusal rate, or error rate per user, which point to abuse, a prompt-injection campaign, or a broken deployment.
+- **Training stability**: loss and gradient-norm spikes during a run are outliers in a time series, and are watched exactly like the [sales example](/ai/math-foundations/anomaly-scores-and-time-series#time-series-anomaly-detection).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Walk me through building a fraud detection system.">
+
+    Define fraud, the cost of a miss and of a false alarm, and the daily review capacity. Explore the features and how fraud differs. Engineer features per customer and time window. Split by time and fit preprocessing on training data only. Train an unsupervised detector on normal data and a supervised model if labels exist, using the anomaly score as a feature. Evaluate with PR-AUC against the base rate and precision and recall at the alert budget. Deploy, monitor alert rate, precision on reviewed cases, and drift, and retrain as tactics change.
+
+  </Accordion>
+  <Accordion title="An interviewer asks about outliers in LLMs. What might they mean?">
+
+    Either activation and weight outliers that make quantization hard (a few huge channels force a coarse scale on all values; LLM.int8(), SmoothQuant, and AWQ handle them), or classical anomaly detection used around LLM systems: cleaning pretraining data, flagging out-of-distribution queries by embedding distance, and spotting spikes in cost, latency, or loss. Ask which one, then answer.
+
+  </Accordion>
+</Accordions>

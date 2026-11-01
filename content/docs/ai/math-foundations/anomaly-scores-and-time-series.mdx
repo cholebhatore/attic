@@ -1,0 +1,112 @@
+---
+title: Anomaly Scores and Time Series
+description: Turning anomaly scores into alerts, time-series anomaly detection, and multivariate and high-dimensional data.
+---
+
+The [detectors](/ai/math-foundations/ml-anomaly-detection) output scores; this page turns scores into alerts, then covers the two settings that need extra care: data ordered in time, and data with many features.
+
+The page covers, in order:
+
+1. **Anomaly scores and thresholds**: turning a score into an alert
+2. **Time-series anomaly detection**: trend, seasonality, and comparing against the right baseline
+3. **Multivariate and high-dimensional data**: scaling, the curse of dimensionality, and mixed types
+
+---
+
+## Anomaly scores and thresholds
+
+Most detectors output a **score**, not a yes or no. Turning scores into alerts needs a **threshold**, and choosing it is a business decision as much as a statistical one.
+
+- **Contamination or percentile.** Flag the top `p`% of scores (scikit-learn's `contamination` parameter). Only right if you roughly know the anomaly rate.
+- **Statistical cutoff.** A z of 3, a modified z of 3.5, a chi-square quantile for Mahalanobis.
+- **Alert budget.** Flag the top `k` per day, where `k` is how many cases the analysts can actually review. Common in fraud and security, and the [fraud detection project](/ai/math-foundations/fraud-detection-project) evaluates exactly this.
+- **Cost-based.** Choose the threshold that minimizes `cost of a miss * misses + cost of a false alarm * false alarms`.
+
+Scores from different methods live on different scales, so to combine detectors convert each to a rank or a percentile first, then average. Scores are also not probabilities; a probability needs calibration against labelled data.
+
+---
+
+## Time-series anomaly detection
+
+Time series add trend (a steady rise), **seasonality** (daily and weekly cycles), and order. A value is anomalous **relative to what was expected at that time**, which makes most time-series anomalies contextual.
+
+Approaches, from simple to complex:
+
+1. **Rolling statistics**: a z-score or modified z-score against a moving window of recent values.
+2. **Seasonal baseline**: compare with the same hour yesterday or the same weekday last week.
+3. **Decompose, then score the residual**: split the series into trend, seasonality, and residual (STL decomposition), and run a robust rule on the residual.
+4. **Forecast, then score the error**: predict each point (ARIMA, Prophet, or a neural forecaster) and flag large forecast errors.
+5. **Change-point detection**: find the moment the series' level or variance shifts for good (CUSUM, PELT), as opposed to one spike.
+
+A daily sales series with a trend, a weekly cycle, and one real spike on day 90:
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(3)
+days = np.arange(120)
+sales = 200 + 1.5 * days + 30 * np.sin(2 * np.pi * days / 7) + rng.normal(0, 8, 120)
+sales[90] += 60
+
+# Naive: one z-score over the whole series
+z = (sales - sales.mean()) / sales.std()
+print(f"global z at day 90: {z[90]:.2f}   flags: {np.flatnonzero(np.abs(z) > 3).tolist()}")
+
+
+def seasonal_flags(series, clean_baseline):
+    """Compare each day with the same weekday last week, scored robustly."""
+    base = series.copy()
+    flags = []
+    for t in range(63, len(series)):
+        diffs = base[t - 56:t] - base[t - 63:t - 7]      # eight weeks of week-over-week changes
+        expected = base[t - 7] + np.median(diffs)
+        mad = np.median(np.abs(diffs - np.median(diffs)))
+        score = 0.6745 * (series[t] - expected) / mad
+        if abs(score) > 3.5:
+            flags.append(t)
+            if clean_baseline:
+                base[t] = expected                      # do not let the spike become next week's baseline
+    return flags
+
+
+print("week-over-week flags:            ", seasonal_flags(sales, clean_baseline=False))
+print("week-over-week, cleaned baseline:", seasonal_flags(sales, clean_baseline=True))
+```
+
+```text
+global z at day 90: 1.38   flags: []
+week-over-week flags:             [90, 97, 116]
+week-over-week, cleaned baseline: [90, 116]
+```
+
+Three lessons in three lines:
+
+- **The global z-score misses the spike** (z = 1.38). The trend makes late values large anyway, so the series' overall spread swallows a 60-unit jump.
+- **The seasonal baseline finds it** on day 90, but also flags day 97, an **echo**: day 97 is compared with the inflated day 90 and looks too low. Replacing a flagged value with its expected value before it becomes a baseline removes the echo.
+- **Day 116 is a false alarm.** Nothing was planted there; comparing with a single day last week doubles the noise, and at a threshold of 3.5 some normal days cross it. Lower thresholds catch more and alarm more. That trade-off never goes away.
+
+---
+
+## Multivariate and high-dimensional data
+
+- **Scale features first** for any distance or boundary method (LOF, One-Class SVM, DBSCAN, Mahalanobis without a covariance, k-NN). Otherwise the feature with the largest unit decides everything. Use robust scaling when outliers are present, so they do not set the scale.
+- **The curse of dimensionality.** In hundreds of dimensions, distances between random points become nearly equal, so "far" loses meaning for distance-based methods. Isolation Forest, PCA or autoencoder reconstruction error, and reducing dimensions first hold up better.
+- **Mixed types.** Encode categories (see [Encoding and Decoding](/ai/math-foundations/encoding-and-decoding#encoding-categories)) or use tree-based methods that handle them.
+- **Explaining an alert.** Analysts need to know **why** a point was flagged. Report which features contributed most (per-feature z-scores, per-feature reconstruction error, or SHAP values on a tree model).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="How do you choose a threshold for an anomaly score?">
+
+    Flag a fixed top percentage if the anomaly rate is known (scikit-learn's contamination), use a statistical cutoff (modified z of 3.5, a chi-square quantile), match the number of cases reviewers can handle per day (an alert budget), or minimize the expected cost of misses plus false alarms. Scores from different detectors must be converted to ranks or percentiles before combining, and they are not probabilities unless calibrated on labels.
+
+  </Accordion>
+  <Accordion title="How would you detect anomalies in a time series with seasonality?">
+
+    Not with one global threshold: the trend and seasonal cycle hide spikes and create false alarms. Compare each value with an expected value for its time (same weekday last week, an STL decomposition, or a forecast) and score the residual with a robust rule. Stop flagged values from becoming the next baseline, or they cause echo alerts. Use change-point detection for permanent level shifts.
+
+  </Accordion>
+</Accordions>

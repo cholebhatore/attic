@@ -1,0 +1,152 @@
+---
+title: Statistical Outlier Detection
+description: Z-score, modified z-score, the IQR rule, and Mahalanobis distance, with masking and swamping.
+---
+
+Four rules, each a spread measure from [Descriptive Statistics](/ai/math-foundations/descriptive-statistics) turned into a threshold.
+
+| Method                   | Score                                            | Usual threshold                       | Assumes                                       | Robust to the outliers themselves?     |
+| :----------------------- | :----------------------------------------------- | :------------------------------------ | :-------------------------------------------- | :------------------------------------- |
+| **Z-score**              | `(x - mean) / std`                               | `abs(z) > 3`                          | Roughly normal data                           | No                                     |
+| **Modified z-score**     | `0.6745 * (x - median) / MAD`                    | `abs(M) > 3.5`                        | Roughly symmetric data                        | Yes                                    |
+| **IQR rule**             | Below `Q1 - 1.5 * IQR` or above `Q3 + 1.5 * IQR` | Tukey's fences (1.5; 3 for "far out") | Nothing about shape                           | Yes                                    |
+| **Mahalanobis distance** | `sqrt((x - mean)^T * inverse(Cov) * (x - mean))` | Chi-square cutoff                     | Roughly elliptical (multivariate normal) data | No, unless a robust covariance is used |
+
+They follow [Outlier Fundamentals](/ai/math-foundations/outlier-fundamentals), which defines what is being detected.
+
+The page covers, in order:
+
+1. **Z-score**
+2. **Modified z-score**
+3. **IQR rule**
+4. **The three univariate rules on the same data**
+5. **Mahalanobis distance**
+
+---
+
+## Z-score
+
+The z-score counts standard deviations from the mean. By the empirical rule, only about 0.3% of normal data is beyond 3, so `abs(z) > 3` flags a value as suspicious. It is simple and fast, and it fails in two ways:
+
+- **The outlier inflates the statistics used to judge it.** The mean moves toward the outlier and the standard deviation grows, so the outlier's own z-score shrinks.
+- **With few points, it cannot fire.** In a sample of size `n`, no z-score (computed with the sample standard deviation) can exceed `(n - 1) / sqrt(n)` (Shiffler, 1988). For `n = 10` that limit is 2.85, so a threshold of 3 can never flag anything, however extreme the value.
+
+---
+
+## Modified z-score
+
+Iglewicz and Hoaglin (_How to Detect and Handle Outliers_, 1993) replaced the mean with the median and the standard deviation with the MAD, which outliers cannot move. The constant 0.6745 rescales MAD to match the standard deviation on normal data (`1 / 1.4826`). Their recommended cutoff is 3.5.
+
+---
+
+## IQR rule
+
+Tukey's rule draws **fences** at `Q1 - 1.5 * IQR` and `Q3 + 1.5 * IQR` and flags anything outside. These are the box plot's whiskers. It makes no assumption about the shape of the distribution, and quartiles are robust. On heavily skewed data it flags many values in the long tail; apply it to `log(x)` instead.
+
+---
+
+## The three univariate rules on the same data
+
+The ten salaries from [Descriptive Statistics](/ai/math-foundations/descriptive-statistics#one-worked-example), in thousands:
+
+```python
+import numpy as np
+
+x = np.array([32, 35, 38, 40, 40, 43, 45, 48, 52, 250], dtype=float)
+
+z = (x - x.mean()) / x.std(ddof=1)
+print("z-scores:", np.round(z, 2).tolist())
+print("z > 3 flags:", x[np.abs(z) > 3].tolist())
+n = len(x)
+print(f"largest possible |z| with n={n}: {(n - 1) / np.sqrt(n):.2f}")
+
+med = np.median(x)
+mad = np.median(np.abs(x - med))
+mz = 0.6745 * (x - med) / mad
+print("modified z:", np.round(mz, 2).tolist())
+print("modified z > 3.5 flags:", x[np.abs(mz) > 3.5].tolist())
+
+q1, q3 = np.percentile(x, [25, 75])
+iqr = q3 - q1
+lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+print(f"IQR fences: [{lo}, {hi}]  flags: {x[(x < lo) | (x > hi)].tolist()}")
+
+# Masking: two large values hide each other from the z-score
+y = np.array([32, 35, 38, 40, 40, 43, 45, 48, 52, 240, 250, 41, 39, 44, 37, 46, 42, 36, 47, 43], dtype=float)
+zy = (y - y.mean()) / y.std(ddof=1)
+my = 0.6745 * (y - np.median(y)) / np.median(np.abs(y - np.median(y)))
+print(f"n=20 with 240 and 250: max |z|={np.abs(zy).max():.2f}  z>3 flags={y[np.abs(zy) > 3].tolist()}  "
+      f"modified-z flags={y[np.abs(my) > 3.5].tolist()}")
+```
+
+```text
+z-scores: [-0.46, -0.41, -0.37, -0.34, -0.34, -0.29, -0.26, -0.22, -0.16, 2.83]
+z > 3 flags: []
+largest possible |z| with n=10: 2.85
+modified z: [-1.28, -0.88, -0.47, -0.2, -0.2, 0.2, 0.47, 0.88, 1.42, 28.13]
+modified z > 3.5 flags: [250.0]
+IQR fences: [25.375, 60.375]  flags: [250.0]
+n=20 with 240 and 250: max |z|=2.99  z>3 flags=[]  modified-z flags=[240.0, 250.0]
+```
+
+The salary of 250 is six times the typical salary, yet its z-score is 2.83, just under the 2.85 ceiling, and the z rule flags nothing. The modified z-score scores it 28.13 and the IQR rule flags it. The last line shows **masking**: with twenty values, two large ones inflate the standard deviation together so neither reaches 3, while the modified z-score flags both.
+
+The opposite failure is **swamping**: an outlier drags the mean so far that normal points on the other side start to look extreme and get flagged. Both are reasons to prefer robust statistics, or to remove the most extreme point and re-test one at a time (Grubbs' test does this formally for normal data).
+
+---
+
+## Mahalanobis distance
+
+The z-score generalized to many correlated features. It measures distance from the mean in units of the data's own spread, **taking correlations into account**: moving along the direction the data naturally stretches costs little, moving across it costs a lot. With `d` features of normal data, the squared distance follows a chi-square distribution with `d` degrees of freedom, which gives a principled cutoff. For 2 features, the 99% cutoff on the squared distance is 9.21, so a distance above about 3.03 is flagged.
+
+```python
+rng = np.random.default_rng(0)
+height = rng.normal(170, 10, 500)
+weight = 0.9 * height - 85 + rng.normal(0, 5, 500)
+data = np.column_stack([height, weight])
+mu = data.mean(axis=0)
+cov_inv = np.linalg.inv(np.cov(data, rowvar=False))
+
+
+def mahalanobis(p):
+    d = p - mu
+    return float(np.sqrt(d @ cov_inv @ d))
+
+
+for name, p in [("tall and heavy", np.array([190.0, 86.0])),
+                ("tall and light", np.array([190.0, 52.0]))]:
+    zs = (p - mu) / data.std(axis=0, ddof=1)
+    print(f"{name}: z per feature={np.round(zs, 2).tolist()}  "
+          f"euclidean from mean={np.linalg.norm(p - mu):.1f}  mahalanobis={mahalanobis(p):.2f}")
+```
+
+```text
+tall and heavy: z per feature=[2.0, 1.81]  euclidean from mean=27.5  mahalanobis=2.00
+tall and light: z per feature=[2.0, -1.5]  euclidean from mean=25.5  mahalanobis=7.45
+```
+
+Both people look ordinary column by column: every z-score is 2 or less. By plain Euclidean distance, the tall and light person is even **closer** to the average. Mahalanobis distance sees that tall and heavy follows the correlation (2.00, normal) and tall and light breaks it (7.45, far beyond 3.03). This is a multivariate outlier, caught.
+
+Its weakness is the same as the z-score's: the mean and covariance are themselves pulled by outliers. The **Minimum Covariance Determinant** estimator (scikit-learn's `EllipticEnvelope`) fits them on the most central subset of the data instead. It also needs more rows than features to invert the covariance matrix, and assumes one elliptical cloud.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why can the z-score fail to detect an obvious outlier?">
+
+    The outlier inflates the mean and standard deviation used to judge it, so its own z-score shrinks (masking). With `n` points no z-score can exceed `(n - 1) / sqrt(n)`, which is 2.85 for ten points, so a threshold of 3 can never fire. The z rule also assumes normal data. Use the modified z-score (median and MAD) or the IQR rule instead.
+
+  </Accordion>
+  <Accordion title="Explain the IQR method.">
+
+    Compute Q1 and Q3, then `IQR = Q3 - Q1`. Flag anything below `Q1 - 1.5 * IQR` or above `Q3 + 1.5 * IQR` (Tukey's fences; 3 times IQR for extreme outliers). Quartiles are robust and the rule assumes no distribution shape, which is why box plot whiskers use it. On skewed data it over-flags the long tail; apply it to the log of the data instead.
+
+  </Accordion>
+  <Accordion title="What is Mahalanobis distance, and when do you use it instead of Euclidean?">
+
+    Distance from the mean scaled by the inverse covariance matrix, so it accounts for each feature's spread and the correlations between features. Use it when features are correlated: a 190 cm, 52 kg person has ordinary per-feature z-scores and a smaller Euclidean distance than a 190 cm, 86 kg person, but a Mahalanobis distance of 7.45 against 2.00. Squared, it follows a chi-square distribution for normal data, which gives a cutoff.
+
+  </Accordion>
+</Accordions>

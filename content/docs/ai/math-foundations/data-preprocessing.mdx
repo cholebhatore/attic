@@ -1,0 +1,129 @@
+---
+title: Data Preprocessing
+description: Missing values, duplicates, data cleaning, feature scaling, feature engineering, and leakage.
+---
+
+Preprocessing turns raw data into something a model can learn from without being misled. It is the "clean" step of the workflow, and in practice it decides model quality more often than the choice of model does.
+
+It follows [Exploratory Data Analysis](/ai/math-foundations/exploratory-data-analysis), which is where the missing values, duplicates, and odd scales are found.
+
+The page covers, in order:
+
+1. **Missing values**
+2. **Duplicates**
+3. **Data cleaning**
+4. **Feature scaling**
+5. **Feature engineering**
+6. **Fit on train, apply to test**
+
+---
+
+## Missing values
+
+First ask **why** values are missing, because the reason decides what is safe:
+
+| Type     | Stands for                   | Meaning                                         | Example                                   |
+| :------- | :--------------------------- | :---------------------------------------------- | :---------------------------------------- |
+| **MCAR** | Missing completely at random | Missingness is unrelated to anything            | A sensor randomly drops readings          |
+| **MAR**  | Missing at random            | Missingness depends on other, observed columns  | Older users skip the income question more |
+| **MNAR** | Missing not at random        | Missingness depends on the missing value itself | High earners skip the income question     |
+
+Then pick a strategy:
+
+- **Drop rows** with missing values: simple, but loses data and biases the sample unless the data is MCAR.
+- **Drop the column** when most of it is missing.
+- **Impute** (fill in): with the median for numbers (robust to extreme values), the mode for categories, or a model that predicts the value from other columns (k-nearest neighbours, iterative imputation).
+- **Add an indicator column** (`income_was_missing = 1`). When data is MNAR, the fact that it is missing is itself information.
+- Some models (gradient-boosted trees) handle missing values natively.
+
+---
+
+## Duplicates
+
+- **Exact duplicates** are identical rows, often from a pipeline that loaded the same file twice. They overweight some examples.
+- **Near duplicates** differ only trivially: the same customer with "St." and "Street", or the same web page with a different date. Finding them needs normalization or similarity hashing (MinHash).
+- **Duplicates across the train and test split** are the worst kind: the model is tested on examples it trained on, and the score measures memory. LLM pretraining pipelines deduplicate at massive scale for this reason and to stop the model memorizing repeated text. [Ingestion Pipeline](/ai/rag/ingestion-pipeline#deduplication) covers the same problem for RAG.
+
+---
+
+## Data cleaning
+
+- **Fix types**: numbers stored as text, dates as strings.
+- **Unify units and formats**: kilograms and pounds in one column, dates as `01/02` meaning January in one source and February in another.
+- **Unify categories**: "USA", "U.S.", "United States".
+- **Check validity**: negative ages, a heart rate of 0, timestamps in the future. These are often the "outliers" that are really errors.
+- **Trim whitespace and fix encodings** (see [character encodings](/ai/math-foundations/encoding-and-decoding#character-encodings)).
+
+---
+
+## Feature scaling
+
+Features on different scales cause problems. Distance-based methods (k-NN, k-means, LOF, SVMs) let the largest-scale feature dominate the distance: in dollars and years, a 1-year age gap is invisible next to a 1,000-dollar income gap. Gradient descent also converges slower when features have very different scales.
+
+| Method              | Formula                   | Result                    | Use when                                        |
+| :------------------ | :------------------------ | :------------------------ | :---------------------------------------------- |
+| **Standardization** | `(x - mean) / std`        | Mean 0, std 1             | The default for most models                     |
+| **Min-max scaling** | `(x - min) / (max - min)` | Range 0 to 1              | Bounded inputs are needed, such as pixel values |
+| **Robust scaling**  | `(x - median) / IQR`      | Median 0                  | The data has extreme values                     |
+| **Log transform**   | `log(1 + x)`              | Long right tail pulled in | Right-skewed, positive data                     |
+
+Tree models (decision trees, random forests, gradient boosting) split on thresholds, so they do not need scaling. Neural networks rescale inside the network too: that is what [normalization layers](/ai/neural-networks/normalization) do.
+
+---
+
+## Feature engineering
+
+**Feature engineering** creates new input columns that make the pattern easier for a model to find: ratios (`amount / average_amount_for_this_customer`), counts over a time window (transactions in the last hour), date parts (hour of day, day of week, encoded cyclically), aggregates per group, and text lengths. In fraud detection the engineered features usually matter more than the model. Deep learning reduced hand-engineering for images and text, because the network learns its own features, but it remains central for tabular data.
+
+---
+
+## Fit on train, apply to test
+
+Every statistic used in preprocessing (the median for imputation, the mean and standard deviation for scaling, the categories seen) must be computed on the **training** data only, then applied unchanged to validation and test data. Computing them on all data leaks information about the test set into training: **data leakage**.
+
+```python
+import numpy as np
+
+train = np.array([[25, 40_000], [32, np.nan], [47, 85_000], [51, 62_000], [38, 51_000]], dtype=float)
+test = np.array([[29, np.nan], [60, 120_000]], dtype=float)
+
+medians = np.nanmedian(train, axis=0)
+train_filled = np.where(np.isnan(train), medians, train)
+test_filled = np.where(np.isnan(test), medians, test)
+print("train medians:", medians)
+
+mu, sigma = train_filled.mean(axis=0), train_filled.std(axis=0)
+lo, hi = train_filled.min(axis=0), train_filled.max(axis=0)
+print("standardized test:", np.round((test_filled - mu) / sigma, 2).tolist())
+print("min-max test:     ", np.round((test_filled - lo) / (hi - lo), 2).tolist())
+```
+
+```text
+train medians: [3.80e+01 5.65e+04]
+standardized test: [[-1.01, -0.16], [2.25, 4.09]]
+min-max test:      [[0.15, 0.37], [1.35, 1.78]]
+```
+
+The missing test income was filled with the **training** median, 56,500. The second test row falls outside the training range, so min-max scaling gives 1.35 and 1.78, outside 0 to 1. That is correct behaviour: new data is allowed to be more extreme than the training data, and a standardized value of 4.09 is already a hint that this row is unusual.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="How do you handle missing values?">
+
+    First ask why they are missing: completely at random, at random given other columns, or because of the missing value itself. Then drop rows (only safe for MCAR and small amounts), drop mostly empty columns, impute with the median, mode, or a model, and add a was-missing indicator when missingness may carry signal. Compute imputation values on the training split only.
+
+  </Accordion>
+  <Accordion title="Standardization or min-max scaling? Which models need scaling at all?">
+
+    Standardization (mean 0, std 1) is the default; min-max (0 to 1) suits bounded inputs like pixels; robust scaling (median and IQR) suits data with extreme values, since one extreme value squeezes min-max for everyone else. Distance-based models (k-NN, k-means, SVM, LOF) and gradient-trained models need scaling; tree models do not, because splits ignore scale.
+
+  </Accordion>
+  <Accordion title="What is data leakage in preprocessing?">
+
+    Using information from the validation or test data while training. Common forms: fitting a scaler or imputer on all data before splitting, duplicates shared across the split, and features that would not exist at prediction time (a "refund issued" flag used to predict fraud). The fix is to split first, fit every preprocessing step on the training split, and apply it unchanged to the rest.
+
+  </Accordion>
+</Accordions>

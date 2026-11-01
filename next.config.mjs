@@ -28,6 +28,16 @@ const config = {
         permanent: true,
       },
       {
+        source: '/ai/math-foundations/statistics-and-probability',
+        destination: '/ai/math-foundations/data-and-data-analysis',
+        permanent: true,
+      },
+      {
+        source: '/ai/math-foundations/outliers-and-anomaly-detection',
+        destination: '/ai/math-foundations/outlier-fundamentals',
+        permanent: true,
+      },
+      {
         source: '/tracker',
         destination: '/ai/curriculum',
         permanent: false,
