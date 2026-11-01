@@ -1,0 +1,602 @@
+---
+title: Statistics and Probability
+description: What data is and what data analysis does, structured versus unstructured data, population versus sample, data types and levels of measurement, descriptive statistics (mean, median, mode, range, variance, standard deviation, percentiles, quartiles, IQR, MAD), basic probability and Bayes' rule, distributions and the empirical rule, skewness and kurtosis, exploratory data analysis with histograms, box plots, scatter and density plots, covariance and correlation, and data preprocessing.
+---
+
+Every model learns from data, and every claim about a model is a claim about data: "the loss went down", "accuracy is 94%", "this input looks unusual". Statistics is the language for those claims. It answers three questions: what does this data look like, how sure can we be about it, and is this one value normal or strange?
+
+The rest of the notes lean on this page without saying so. Normalization layers subtract a mean and divide by a standard deviation. Weight initialization picks a variance. Evaluation reports an average over a sample of test questions. Drift monitoring compares two distributions. And outlier detection, covered on the [next page](/ai/math-foundations/outliers-and-anomaly-detection), is built directly on the spread measures defined here.
+
+No formula on this page needs more than arithmetic. Every number in the examples was printed by the code next to it.
+
+The page covers, in order:
+
+1. **What is data?**: data, datasets, records, variables, and data versus information
+2. **What is data analysis?**: the four kinds of analysis and the workflow from question to answer
+3. **Structured, semi-structured, and unstructured data**: tables, JSON, and free text, images, and audio
+4. **Population versus sample**: parameters, statistics, sampling bias, and why variance divides by `n - 1`
+5. **Data types**: numerical (discrete, continuous), categorical (nominal, ordinal), and the four levels of measurement
+6. **Descriptive statistics**: center (mean, median, mode), spread (range, variance, standard deviation), position (percentiles, quartiles, IQR, MAD), with one worked example
+7. **Basic probability**: events, the rules, conditional probability, independence, and Bayes' rule with base rates
+8. **Random variables and distributions**: PMF, PDF, and CDF, the normal distribution, the empirical rule, z-scores, other common distributions, and the central limit theorem
+9. **Shape: skewness and kurtosis**: lopsided and heavy-tailed data, measured
+10. **Exploratory data analysis (EDA)**: histograms, box plots, scatter plots, density plots, covariance, and correlation
+11. **Data preprocessing**: missing values, duplicates, cleaning, feature scaling, feature engineering, and leakage
+12. **Where this shows up in AI**: the later pages that use each idea
+
+---
+
+## What is data?
+
+**Data** is recorded observations of the world: numbers, words, categories, images, sounds, clicks, timestamps. One recorded value is a **datum**; the plural is data. A **dataset** is a collection of observations gathered for a purpose.
+
+Most datasets are easiest to picture as a table:
+
+| Term in statistics          | Term in ML                      | Term in databases | Meaning                                                 |
+| :-------------------------- | :------------------------------ | :---------------- | :------------------------------------------------------ |
+| **Observation**, unit, case | Example, sample, data point     | Row, record       | One thing that was measured: a customer, a transaction  |
+| **Variable**, attribute     | Feature (input), label (output) | Column, field     | One property measured on every observation: age, amount |
+| **Value**                   | Feature value                   | Cell              | One variable's measurement on one observation           |
+
+So "10,000 transactions with 4 features and a fraud label" is a table of 10,000 rows, 4 input columns, and 1 output column. The same three words cover data that is not a table: in a text corpus each document is an observation, and in an image dataset each pixel's brightness is a value.
+
+**Data versus information.** Data is the raw record: `38.9`. Information is data with context that makes it mean something: "the patient's temperature is 38.9 °C, which is a fever". Analysis is the work of turning the first into the second.
+
+**Where data comes from.** Measurements (sensors, instruments), transactions (purchases, logs), surveys and forms, human labelling, and, for language models, text collected from the web, books, and code. How data was collected decides what it can tell you. A survey answered only by people who chose to answer describes those people, not everyone.
+
+---
+
+## What is data analysis?
+
+**Data analysis** is inspecting, cleaning, summarizing, and modelling data to answer a question or support a decision. It comes in four kinds, each answering a harder question than the last:
+
+| Kind             | Question it answers         | Example                                         |
+| :--------------- | :-------------------------- | :---------------------------------------------- |
+| **Descriptive**  | What happened?              | Average order value last month was 42 dollars   |
+| **Diagnostic**   | Why did it happen?          | Orders fell because the checkout page was slow  |
+| **Predictive**   | What is likely to happen?   | This transaction has a 3% chance of being fraud |
+| **Prescriptive** | What should we do about it? | Hold transactions above 2% risk for review      |
+
+Machine learning lives mostly in the predictive row. The other three rows are what you do before and after training a model: describe the data, find out why a model fails, and decide what to do with its outputs.
+
+**The workflow.** Every analysis, from a spreadsheet to an LLM pretraining run, follows the same loop:
+
+<Mermaid
+  chart={`
+flowchart LR
+    Q["1. Ask a question"] --> C["2. Collect data"]
+    C --> P["3. Clean and preprocess"]
+    P --> E["4. Explore (EDA)"]
+    E --> M["5. Model or test"]
+    M --> R["6. Communicate the result"]
+    R -->|"new question"| Q
+    E -->|"data problem found"| P
+`}
+/>
+
+Steps 3 and 4 usually take most of the time. A model trained on data that was never explored inherits every problem in it.
+
+**Data analysis, data science, and ML.** Data analysis answers questions about data you have. Data science adds programming and modelling at scale. Machine learning is the part where a program learns a function from data so it can make predictions on data it has not seen. The statistics on this page are shared by all three.
+
+---
+
+## Structured, semi-structured, and unstructured data
+
+| Kind                | Shape                                            | Examples                              | How a model reads it                                    |
+| :------------------ | :----------------------------------------------- | :------------------------------------ | :------------------------------------------------------ |
+| **Structured**      | Fixed columns, one value per cell                | SQL tables, CSV files, spreadsheets   | Directly, after encoding categories and scaling numbers |
+| **Semi-structured** | Labelled fields, but nesting and optional fields | JSON, XML, logs, HTML                 | Flattened into columns, or read as text                 |
+| **Unstructured**    | No predefined fields                             | Free text, PDFs, images, audio, video | Converted to vectors by a learned model (an embedding)  |
+
+Classical ML, including most outlier detection, works on structured data. Deep learning made unstructured data usable, because a network learns its own features from pixels or tokens. Most of the world's data is unstructured, which is why language and vision models matter. Turning documents into usable pieces is the subject of [Parsing and Extraction](/ai/rag/parsing-and-extraction) in the RAG phase.
+
+---
+
+## Population versus sample
+
+The **population** is every item you want to draw a conclusion about: all transactions your bank will ever process, all users of an app, all questions people will ask a chatbot. You almost never have the whole population. You have a **sample**: the subset you actually measured.
+
+| Word          | Describes      | Symbol        | Example                                         |
+| :------------ | :------------- | :------------ | :---------------------------------------------- |
+| **Parameter** | The population | `mu`, `sigma` | The true average transaction amount (unknown)   |
+| **Statistic** | The sample     | `x̄`, `s`      | The average of the 10,000 transactions you have |
+
+The whole point of a sample is to **estimate** the population's parameters. That only works if the sample is **representative**. **Sampling bias** breaks it: training a fraud model only on transactions from one country, or evaluating a chatbot only on questions the team wrote. A train and test split is exactly this idea. The test set is a sample that stands in for future data, and a test score is an estimate, not a fact.
+
+**Why sample variance divides by `n - 1`.** The sample mean is computed from the same data, so the data sits closer to its own mean than to the true population mean. Dividing by `n` therefore underestimates the spread on average. Dividing by `n - 1` (Bessel's correction) removes that bias. In NumPy, `ddof=0` divides by `n` and `ddof=1` divides by `n - 1`. With large `n` the difference disappears.
+
+---
+
+## Data types
+
+The type of a variable decides which statistics and which encodings make sense.
+
+<Mermaid
+  chart={`
+flowchart TD
+    D["Variable"] --> N["Numerical (quantitative)"]
+    D --> C["Categorical (qualitative)"]
+    N --> ND["Discrete: counts. 0, 1, 2 children"]
+    N --> NC["Continuous: measurements. 72.4 kg"]
+    C --> CN["Nominal: no order. red, green, blue"]
+    C --> CO["Ordinal: ordered. small, medium, large"]
+`}
+/>
+
+- **Numerical** values are quantities, so arithmetic on them is meaningful. **Discrete** ones are counts and take whole values. **Continuous** ones are measurements and can take any value in a range.
+- **Categorical** values are labels. **Nominal** categories have no order. **Ordinal** categories have an order, but the gaps between them are not equal or known: the step from "poor" to "fair" is not necessarily the same size as "good" to "excellent".
+- **Binary** (yes or no) is a categorical variable with two values, often stored as 0 and 1.
+
+**Levels of measurement** refine this into four steps. Each level allows everything the one before it does, plus one more operation:
+
+| Level        | What you can do                      | Example                          | Meaningful center  |
+| :----------- | :----------------------------------- | :------------------------------- | :----------------- |
+| **Nominal**  | Count, check equal or not            | Country, product ID              | Mode               |
+| **Ordinal**  | Also order                           | Ratings 1 to 5, education level  | Median, mode       |
+| **Interval** | Also add and subtract                | Temperature in °C, calendar year | Mean, median, mode |
+| **Ratio**    | Also multiply and divide (true zero) | Height, price, duration          | All, plus ratios   |
+
+The interval and ratio difference catches people out: 20 °C is not "twice as hot" as 10 °C, because 0 °C is not "no temperature". 20 kg is twice 10 kg, because 0 kg means no mass.
+
+Why this matters for AI: a model multiplies its inputs by weights, so it treats every input as a ratio-level number. Feeding it a nominal category as an integer (`red = 0, green = 1, blue = 2`) tells it that blue is twice green. [Encoding and Decoding](/ai/math-foundations/encoding-and-decoding#encoding-categories) covers the fixes.
+
+---
+
+## Descriptive statistics
+
+Descriptive statistics summarize a column of numbers in a few values. They answer three questions: where is the middle, how spread out is it, and where does one value sit relative to the rest?
+
+### Center: mean, median, mode
+
+| Measure    | Definition                                                           | Pulled by extreme values? | Use it for                               |
+| :--------- | :------------------------------------------------------------------- | :------------------------ | :--------------------------------------- |
+| **Mean**   | Sum divided by count: `x̄ = (x_1 + ... + x_n) / n`                    | Yes, strongly             | Symmetric data with no extreme values    |
+| **Median** | The middle value once sorted (average the middle two if `n` is even) | No                        | Skewed data: incomes, prices, latencies  |
+| **Mode**   | The most frequent value                                              | No                        | Categories, and spotting repeated values |
+
+### Spread: range, variance, standard deviation
+
+- **Range** is `max - min`. It uses only two values, so a single extreme value decides it.
+- **Variance** is the average squared distance from the mean: `s^2 = sum of (x_i - x̄)^2 / (n - 1)`. Squaring makes every distance positive and punishes far values more. Its unit is the data's unit squared (dollars squared), which is hard to read.
+- **Standard deviation** is the square root of the variance, `s`. It is back in the data's unit, so "the average salary is 41 thousand with a standard deviation of 6 thousand" reads naturally.
+
+### Position: percentiles, quartiles, IQR, MAD
+
+- The **p-th percentile** is the value below which `p`% of the data falls. The median is the 50th percentile. Latency targets are written this way: "p99 under 2 seconds" means 99% of requests finish within 2 seconds.
+- **Quartiles** split sorted data into four equal parts: **Q1** is the 25th percentile, **Q2** the median, **Q3** the 75th.
+- The **interquartile range**, `IQR = Q3 - Q1`, is the spread of the middle half. Extreme values on either end do not touch it.
+- The **median absolute deviation**, `MAD = median(|x_i - median(x)|)`, is the typical distance from the median. It is the robust version of the standard deviation. For normally distributed data, `1.4826 * MAD` estimates the standard deviation.
+
+A statistic is **robust** when a few extreme values cannot move it far. The median, IQR, and MAD are robust. The mean, variance, standard deviation, and range are not.
+
+### One worked example
+
+Ten salaries in thousands per year, where one person is a senior executive:
+
+```python
+import numpy as np
+
+salaries = np.array([32, 35, 38, 40, 40, 43, 45, 48, 52, 250])
+
+mean = salaries.mean()
+median = np.median(salaries)
+values, counts = np.unique(salaries, return_counts=True)
+mode = values[counts.argmax()]
+print(f"mean={mean:.1f}  median={median:.1f}  mode={mode}")
+
+print(f"range={salaries.max() - salaries.min()}")
+print(f"variance (population, ddof=0)={salaries.var(ddof=0):.1f}")
+print(f"variance (sample, ddof=1)={salaries.var(ddof=1):.1f}")
+print(f"std (sample)={salaries.std(ddof=1):.1f}")
+
+q1, q2, q3 = np.percentile(salaries, [25, 50, 75])
+print(f"Q1={q1}  Q2={q2}  Q3={q3}  IQR={q3 - q1}")
+mad = np.median(np.abs(salaries - median))
+print(f"MAD={mad}")
+
+without = salaries[:-1]
+print(f"without 250: mean={without.mean():.1f}  median={np.median(without):.1f}  "
+      f"std={without.std(ddof=1):.1f}  IQR={np.subtract(*np.percentile(without, [75, 25]))}  "
+      f"MAD={np.median(np.abs(without - np.median(without)))}")
+```
+
+```text
+mean=62.3  median=41.5  mode=40
+range=218
+variance (population, ddof=0)=3946.2
+variance (sample, ddof=1)=4384.7
+std (sample)=66.2
+Q1=38.5  Q2=41.5  Q3=47.25  IQR=8.75
+MAD=5.0
+without 250: mean=41.4  median=40.0  std=6.3  IQR=7.0  MAD=5.0
+```
+
+Read the last line against the others. Removing one salary moves the mean from 62.3 to 41.4 and the standard deviation from 66.2 to 6.3, a tenfold change. The median moves by 1.5, the IQR by 1.75, and the MAD not at all. A mean of 62.3 describes nobody in the room: nine of the ten people earn less than 53. **When data may contain extreme values, report the median and IQR or MAD.** This is the whole reason the robust outlier rules on the next page work and the plain z-score often does not.
+
+---
+
+## Basic probability
+
+**Probability** measures how likely something is, on a scale from 0 (impossible) to 1 (certain).
+
+| Word             | Meaning                            | Example: rolling one die |
+| :--------------- | :--------------------------------- | :----------------------- |
+| **Experiment**   | A process with an uncertain result | Rolling the die          |
+| **Outcome**      | One possible result                | 4                        |
+| **Sample space** | The set of all outcomes            | 1, 2, 3, 4, 5, 6         |
+| **Event**        | A set of outcomes you care about   | "Even": 2, 4, 6          |
+| **P(A)**         | The probability of event A         | P(even) = 3/6 = 0.5      |
+
+**The rules:**
+
+- **Complement:** `P(not A) = 1 - P(A)`.
+- **Addition (or):** `P(A or B) = P(A) + P(B) - P(A and B)`. Subtract the overlap so it is not counted twice.
+- **Conditional probability:** `P(A | B) = P(A and B) / P(B)`, read "the probability of A given that B happened". Knowing B shrinks the sample space to B.
+- **Independence:** A and B are independent when knowing one tells you nothing about the other, so `P(A and B) = P(A) * P(B)`.
+- **Multiplication (and):** in general `P(A and B) = P(A | B) * P(B)`.
+
+**Bayes' rule** turns a conditional around:
+
+```text
+P(A | B) = P(B | A) * P(A) / P(B)
+```
+
+It is the most useful formula on this page for anomaly detection, because of **base rates**. Suppose 1% of transactions are fraud. A detector catches 99% of fraud, and wrongly flags 5% of normal transactions. A transaction is flagged. How likely is it to be fraud?
+
+```text
+P(flag)          = P(flag | fraud) * P(fraud) + P(flag | normal) * P(normal)
+                 = 0.99 * 0.01 + 0.05 * 0.99
+                 = 0.0099 + 0.0495 = 0.0594
+
+P(fraud | flag)  = 0.0099 / 0.0594 = 0.167
+```
+
+Only about 1 flag in 6 is real fraud, even with a detector that sounds excellent. The rare class is so rare that a small false-alarm rate on the huge normal class swamps it. This is the **base rate fallacy**, and it is why the [outliers page](/ai/math-foundations/outliers-and-anomaly-detection#evaluation-metrics) judges detectors by precision and PR-AUC rather than accuracy.
+
+---
+
+## Random variables and distributions
+
+A **random variable** is a number whose value depends on chance: the result of a die roll, a person's height, the number of fraud cases tomorrow. Its **distribution** says which values it can take and how likely each is.
+
+| Function | Stands for                       | For                  | Answers                                                                  |
+| :------- | :------------------------------- | :------------------- | :----------------------------------------------------------------------- |
+| **PMF**  | Probability mass function        | Discrete variables   | `P(X = x)`: the probability of exactly this value                        |
+| **PDF**  | Probability density function     | Continuous variables | How densely probability is packed near `x`; area under it is probability |
+| **CDF**  | Cumulative distribution function | Both                 | `P(X ≤ x)`: the probability of this value or less                        |
+
+The PDF trips people up: for a continuous variable the probability of any single exact value is 0. The PDF's height is a **density**, not a probability, and can be greater than 1. Probability is the **area** under the curve between two values, and the total area is 1. The percentile from the last section is the CDF read backwards: the 90th percentile is the `x` where the CDF reaches 0.9.
+
+### The normal distribution
+
+The **normal** (Gaussian) distribution is the symmetric bell curve. Two parameters fix it completely: the mean `mu` sets the center, and the standard deviation `sigma` sets the width. Its mean, median, and mode are the same value.
+
+It is everywhere for a reason. The **central limit theorem** says that the average of many independent random effects is approximately normal, whatever the distribution of each effect, as long as each has a finite variance. Heights, measurement errors, and averages of samples are all sums of many small effects.
+
+The **standard normal** has `mu = 0` and `sigma = 1`. Any normal value can be converted to it with the **z-score**:
+
+```text
+z = (x - mu) / sigma
+```
+
+`z` counts how many standard deviations a value sits from the mean. A height of 190 cm, with mean 170 and standard deviation 10, has `z = 2`. The z-score is also called **standardization**, and it is the same operation as the standard scaling in preprocessing below.
+
+### The empirical rule
+
+For normal data, about **68%** of values fall within 1 standard deviation of the mean, **95%** within 2, and **99.7%** within 3. This is the **68-95-99.7 rule**. Checked on 100,000 simulated heights:
+
+```python
+import numpy as np
+
+rng = np.random.default_rng(0)
+normal = rng.normal(loc=170, scale=10, size=100_000)   # heights in cm
+for k in (1, 2, 3):
+    share = np.mean(np.abs(normal - normal.mean()) <= k * normal.std())
+    print(f"within {k} std: {share:.3f}")
+```
+
+```text
+within 1 std: 0.684
+within 2 std: 0.955
+within 3 std: 0.997
+```
+
+The flip side is the basis of the z-score outlier rule: only about 0.3% of normal data lies beyond 3 standard deviations, so such a value is suspicious. The rule only holds for normal data. For skewed or heavy-tailed data, far more than 0.3% can sit beyond 3 standard deviations.
+
+### Other distributions worth recognizing
+
+| Distribution                           | Shape                                         | Typical data                                     |
+| :------------------------------------- | :-------------------------------------------- | :----------------------------------------------- |
+| **Uniform**                            | Flat: every value equally likely              | Random number generators, random initial weights |
+| **Bernoulli**                          | One trial, two outcomes                       | Is this transaction fraud: yes or no             |
+| **Binomial**                           | Count of successes in `n` trials              | Correct answers out of 100 test questions        |
+| **Poisson**                            | Count of events in a fixed interval           | Transactions per hour, requests per second       |
+| **Exponential**                        | Time between Poisson events                   | Time until the next request arrives              |
+| **Lognormal**                          | Right-skewed; its log is normal               | Incomes, prices, file sizes, latencies           |
+| **Heavy-tailed** (Student's t, Pareto) | Extreme values far more often than the normal | Financial returns, city sizes, word frequencies  |
+
+---
+
+## Shape: skewness and kurtosis
+
+Mean and standard deviation describe the center and width. Two more numbers describe the shape.
+
+**Skewness** measures lopsidedness: the average of `z^3`. Cubing keeps the sign, so far values on one side dominate.
+
+- **0**: symmetric, like the normal.
+- **Positive (right-skewed)**: a long tail to the right. Most values are small, a few are very large. Mean is greater than median. Incomes, prices, latencies.
+- **Negative (left-skewed)**: a long tail to the left. Mean is less than median. Scores on an easy exam.
+
+**Kurtosis** measures tail weight: the average of `z^4`, which is about how often extreme values occur. The normal distribution has kurtosis 3, so **excess kurtosis** subtracts 3 to make the normal the zero point.
+
+- **Excess kurtosis near 0**: tails like the normal.
+- **Positive (heavy-tailed, leptokurtic)**: extreme values happen far more often than the normal predicts. This is the important case.
+- **Negative (light-tailed, platykurtic)**: fewer extremes than the normal, like the uniform distribution.
+
+```python
+def skew(x):
+    z = (x - x.mean()) / x.std()
+    return np.mean(z**3)
+
+
+def excess_kurtosis(x):
+    z = (x - x.mean()) / x.std()
+    return np.mean(z**4) - 3
+
+
+incomes = rng.lognormal(mean=10.5, sigma=0.8, size=100_000)
+heavy = rng.standard_t(df=5, size=100_000)
+print(f"normal:    skew={skew(normal):+.2f}  excess kurtosis={excess_kurtosis(normal):+.2f}")
+print(f"lognormal: skew={skew(incomes):+.2f}  excess kurtosis={excess_kurtosis(incomes):+.2f}  "
+      f"mean={incomes.mean():,.0f}  median={np.median(incomes):,.0f}")
+print(f"t (df=5):  skew={skew(heavy):+.2f}  excess kurtosis={excess_kurtosis(heavy):+.2f}")
+```
+
+```text
+normal:    skew=-0.00  excess kurtosis=+0.02
+lognormal: skew=+3.57  excess kurtosis=+26.70  mean=50,112  median=36,435
+t (df=5):  skew=-0.05  excess kurtosis=+5.67
+```
+
+This block continues the empirical-rule block above, reusing `rng` and `normal`. In the right-skewed lognormal data, the mean sits well above the median. The Student's t is symmetric (skew near 0) but heavy-tailed (excess kurtosis near 6). Sample estimates of skew and kurtosis are themselves noisy on heavy-tailed data, because a handful of extreme values dominate `z^3` and `z^4`.
+
+**What to do with skewed data.** A **log transform** (`log(x)`, or `log(1 + x)` when zeros occur) pulls in a long right tail, and turns lognormal data into normal data. Then mean-based statistics and z-score rules behave again. Heavy tails are also why LLM activations need special care when quantized: a few channels produce values far outside the rest (see [the outlier problem](/ai/inference/quantization-math#the-outlier-problem)).
+
+---
+
+## Exploratory data analysis (EDA)
+
+**EDA** is looking at data before modelling it: plotting each variable, then pairs of variables, to find its shape, its problems, and its surprises. The name and the practice come from John Tukey's 1977 book _Exploratory Data Analysis_, which also introduced the box plot.
+
+### The four plots
+
+| Plot             | Shows                                               | Look for                                                 |
+| :--------------- | :-------------------------------------------------- | :------------------------------------------------------- |
+| **Histogram**    | One numeric variable: bars counting values per bin  | Shape, skew, several peaks, gaps, impossible values      |
+| **Box plot**     | One variable's five-number summary                  | Median, spread, and points beyond the whiskers           |
+| **Scatter plot** | Two numeric variables, one dot per observation      | Trends, clusters, curved relations, points off the cloud |
+| **Density plot** | A smoothed histogram (kernel density estimate, KDE) | Shape without bin artifacts; comparing groups overlaid   |
+
+**Histogram.** The bin width changes the picture: too wide hides structure, too narrow shows noise. Try more than one. Two peaks (bimodal) usually means two groups mixed together, such as weekday and weekend traffic.
+
+**Box plot.** The box runs from Q1 to Q3, with a line at the median. The **whiskers** extend to the most extreme values still within `1.5 * IQR` of the box. Points beyond the whiskers are drawn individually as possible outliers. This is exactly the IQR outlier rule on the next page, drawn as a picture.
+
+```text
+           Q1   median   Q3
+   |--------[=====|=======]-----------|        o      o
+  min within                     max within   points beyond
+  the fence                      the fence    Q3 + 1.5 * IQR
+```
+
+**Scatter plot.** The only one of the four that shows how two variables relate. A point can look ordinary on each axis separately and still sit far from the cloud. That is a **multivariate outlier**, and the reason a single-variable rule cannot find it.
+
+**Density plot.** A **kernel density estimate** places a small bump (usually a normal curve) on every data point and adds them up. The bump width (bandwidth) plays the role of the histogram's bin width.
+
+### Covariance and correlation
+
+**Covariance** measures whether two variables move together:
+
+```text
+cov(x, y) = sum of (x_i - x̄)(y_i - ȳ) / (n - 1)
+```
+
+When both are above their means together, or below together, the products are positive and covariance is positive. When one is high while the other is low, it is negative. Near 0 means no **linear** relation. The problem is the unit: covariance is in x's unit times y's unit, so its size cannot be read.
+
+**Correlation** (Pearson's `r`) fixes that by dividing by both standard deviations:
+
+```text
+r = cov(x, y) / (s_x * s_y)          always between -1 and +1
+```
+
+`+1` is a perfect rising straight line, `-1` a perfect falling one, `0` no linear relation. Changing units cannot change it:
+
+```python
+height_cm = rng.normal(170, 10, size=1_000)
+weight_kg = 0.9 * height_cm - 85 + rng.normal(0, 7, size=1_000)
+height_m = height_cm / 100
+print(f"cov(cm, kg)={np.cov(height_cm, weight_kg)[0, 1]:.2f}  "
+      f"cov(m, kg)={np.cov(height_m, weight_kg)[0, 1]:.3f}")
+print(f"corr(cm, kg)={np.corrcoef(height_cm, weight_kg)[0, 1]:.3f}  "
+      f"corr(m, kg)={np.corrcoef(height_m, weight_kg)[0, 1]:.3f}")
+
+x = np.linspace(-3, 3, 101)
+print(f"corr(x, x**2)={np.corrcoef(x, x**2)[0, 1]:.3f}")
+```
+
+```text
+cov(cm, kg)=88.83  cov(m, kg)=0.888
+corr(cm, kg)=0.777  corr(m, kg)=0.777
+corr(x, x**2)=-0.000
+```
+
+Measuring height in metres instead of centimetres divides the covariance by 100, but the correlation is identical. The last line is the classic trap: `y = x^2` is completely determined by `x`, yet the correlation is 0, because the relation is a curve, not a line. **Correlation 0 means no linear relation, not no relation.** Always look at the scatter plot.
+
+Three more points interviewers check:
+
+- **Correlation is not causation.** Ice cream sales and drownings are correlated because both rise in summer. A third variable (a **confounder**) drives both.
+- **Spearman's rank correlation** is Pearson's `r` computed on the ranks of the values instead of the values. It catches any monotonic relation (always rising, even if curved) and resists extreme values.
+- **A covariance matrix** holds the covariance of every pair of features. Its diagonal holds each feature's variance. The Mahalanobis distance on the next page and PCA (see [Vectors and Matrices](/ai/math-foundations/vectors-and-matrices)) are both built on it.
+
+---
+
+## Data preprocessing
+
+Preprocessing turns raw data into something a model can learn from without being misled. It is the "clean" step of the workflow, and in practice it decides model quality more often than the choice of model does.
+
+### Missing values
+
+First ask **why** values are missing, because the reason decides what is safe:
+
+| Type     | Stands for                   | Meaning                                         | Example                                   |
+| :------- | :--------------------------- | :---------------------------------------------- | :---------------------------------------- |
+| **MCAR** | Missing completely at random | Missingness is unrelated to anything            | A sensor randomly drops readings          |
+| **MAR**  | Missing at random            | Missingness depends on other, observed columns  | Older users skip the income question more |
+| **MNAR** | Missing not at random        | Missingness depends on the missing value itself | High earners skip the income question     |
+
+Then pick a strategy:
+
+- **Drop rows** with missing values: simple, but loses data and biases the sample unless the data is MCAR.
+- **Drop the column** when most of it is missing.
+- **Impute** (fill in): with the median for numbers (robust to extreme values), the mode for categories, or a model that predicts the value from other columns (k-nearest neighbours, iterative imputation).
+- **Add an indicator column** (`income_was_missing = 1`). When data is MNAR, the fact that it is missing is itself information.
+- Some models (gradient-boosted trees) handle missing values natively.
+
+### Duplicates
+
+- **Exact duplicates** are identical rows, often from a pipeline that loaded the same file twice. They overweight some examples.
+- **Near duplicates** differ only trivially: the same customer with "St." and "Street", or the same web page with a different date. Finding them needs normalization or similarity hashing (MinHash).
+- **Duplicates across the train and test split** are the worst kind: the model is tested on examples it trained on, and the score measures memory. LLM pretraining pipelines deduplicate at massive scale for this reason and to stop the model memorizing repeated text. [Ingestion Pipeline](/ai/rag/ingestion-pipeline#deduplication) covers the same problem for RAG.
+
+### Data cleaning
+
+- **Fix types**: numbers stored as text, dates as strings.
+- **Unify units and formats**: kilograms and pounds in one column, dates as `01/02` meaning January in one source and February in another.
+- **Unify categories**: "USA", "U.S.", "United States".
+- **Check validity**: negative ages, a heart rate of 0, timestamps in the future. These are often the "outliers" that are really errors.
+- **Trim whitespace and fix encodings** (see [character encodings](/ai/math-foundations/encoding-and-decoding#character-encodings)).
+
+### Feature scaling
+
+Features on different scales cause problems. Distance-based methods (k-NN, k-means, LOF, SVMs) let the largest-scale feature dominate the distance: in dollars and years, a 1-year age gap is invisible next to a 1,000-dollar income gap. Gradient descent also converges slower when features have very different scales.
+
+| Method              | Formula                   | Result                    | Use when                                        |
+| :------------------ | :------------------------ | :------------------------ | :---------------------------------------------- |
+| **Standardization** | `(x - mean) / std`        | Mean 0, std 1             | The default for most models                     |
+| **Min-max scaling** | `(x - min) / (max - min)` | Range 0 to 1              | Bounded inputs are needed, such as pixel values |
+| **Robust scaling**  | `(x - median) / IQR`      | Median 0                  | The data has extreme values                     |
+| **Log transform**   | `log(1 + x)`              | Long right tail pulled in | Right-skewed, positive data                     |
+
+Tree models (decision trees, random forests, gradient boosting) split on thresholds, so they do not need scaling. Neural networks rescale inside the network too: that is what [normalization layers](/ai/neural-networks/normalization) do.
+
+### Feature engineering
+
+**Feature engineering** creates new input columns that make the pattern easier for a model to find: ratios (`amount / average_amount_for_this_customer`), counts over a time window (transactions in the last hour), date parts (hour of day, day of week, encoded cyclically), aggregates per group, and text lengths. In fraud detection the engineered features usually matter more than the model. Deep learning reduced hand-engineering for images and text, because the network learns its own features, but it remains central for tabular data.
+
+### Fit on train, apply to test
+
+Every statistic used in preprocessing (the median for imputation, the mean and standard deviation for scaling, the categories seen) must be computed on the **training** data only, then applied unchanged to validation and test data. Computing them on all data leaks information about the test set into training: **data leakage**.
+
+```python
+train = np.array([[25, 40_000], [32, np.nan], [47, 85_000], [51, 62_000], [38, 51_000]], dtype=float)
+test = np.array([[29, np.nan], [60, 120_000]], dtype=float)
+
+medians = np.nanmedian(train, axis=0)
+train_filled = np.where(np.isnan(train), medians, train)
+test_filled = np.where(np.isnan(test), medians, test)
+print("train medians:", medians)
+
+mu, sigma = train_filled.mean(axis=0), train_filled.std(axis=0)
+lo, hi = train_filled.min(axis=0), train_filled.max(axis=0)
+print("standardized test:", np.round((test_filled - mu) / sigma, 2).tolist())
+print("min-max test:     ", np.round((test_filled - lo) / (hi - lo), 2).tolist())
+```
+
+```text
+train medians: [3.80e+01 5.65e+04]
+standardized test: [[-1.01, -0.16], [2.25, 4.09]]
+min-max test:      [[0.15, 0.37], [1.35, 1.78]]
+```
+
+The missing test income was filled with the **training** median, 56,500. The second test row falls outside the training range, so min-max scaling gives 1.35 and 1.78, outside 0 to 1. That is correct behaviour: new data is allowed to be more extreme than the training data, and a standardized value of 4.09 is already a hint that this row is unusual.
+
+---
+
+## Where this shows up in AI
+
+| Idea from this page               | Where it is used later                                                                                                                              |
+| :-------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Mean, variance, standardization   | [Normalization](/ai/neural-networks/normalization) (BatchNorm, LayerNorm, RMSNorm), [initialization](/ai/neural-networks/layers-and-initialization) |
+| Distributions and sampling        | [Softmax and Logits](/ai/math-foundations/softmax-and-logits), [decoding strategies](/ai/llm/decoding)                                              |
+| Distributions compared            | KL divergence in [Information Theory and Loss](/ai/math-foundations/information-the-and-loss)                                                       |
+| Heavy tails                       | [The outlier problem](/ai/inference/quantization-math#the-outlier-problem) in quantization                                                          |
+| Population versus sample          | Train, validation, and test splits, and evaluation sets for LLMs                                                                                    |
+| Comparing distributions over time | [Data drift and concept drift](/ai/mlops/telemetry-and-cost#data-drift-and-concept-drift)                                                           |
+| Spread, percentiles, base rates   | [Outliers and Anomaly Detection](/ai/math-foundations/outliers-and-anomaly-detection)                                                               |
+| NumPy for all of the above        | [Statistics and Selection](/ai/python/numpy/statistics-and-selection) in the NumPy notes                                                            |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between a population and a sample, and a parameter and a statistic?">
+
+    The population is every item you want to draw conclusions about; the sample is the part you measured. A parameter describes the population (the true mean, usually unknown); a statistic is computed from the sample (the sample mean) and estimates the parameter. The estimate is only trustworthy if the sample is representative. A test set is a sample standing in for future data.
+
+  </Accordion>
+  <Accordion title="Mean or median: which would you report for salaries or latencies, and why?">
+
+    The median. Both are right-skewed, and a few very large values pull the mean far above the typical value. In the ten-salary example one executive moves the mean from 41.4 to 62.3 thousand while the median moves from 40 to 41.5. For latency, report percentiles (p50, p95, p99), because users feel the tail.
+
+  </Accordion>
+  <Accordion title="Why does sample variance divide by n - 1?">
+
+    The sample mean is fitted to the same data, so squared distances to it are on average smaller than distances to the true mean. Dividing by `n` underestimates the population variance; dividing by `n - 1` (Bessel's correction) makes the estimate unbiased. The data has `n - 1` degrees of freedom left after estimating the mean.
+
+  </Accordion>
+  <Accordion title="What are IQR and MAD, and why are they called robust?">
+
+    IQR is `Q3 - Q1`, the spread of the middle half of the data. MAD is the median of absolute distances from the median. Both ignore how extreme the extreme values are, so a few outliers cannot inflate them, unlike the standard deviation, which went from 6.3 to 66.2 when one salary was added. `1.4826 * MAD` estimates the standard deviation for normal data.
+
+  </Accordion>
+  <Accordion title="State the empirical rule. When does it not apply?">
+
+    For normal data, about 68%, 95%, and 99.7% of values lie within 1, 2, and 3 standard deviations of the mean. It does not apply to skewed or heavy-tailed data (incomes, latencies, financial returns), where many more values lie beyond 3 standard deviations, so a 3-sigma rule produces too many alerts or the wrong ones.
+
+  </Accordion>
+  <Accordion title="What do skewness and kurtosis measure?">
+
+    Skewness is the average cubed z-score: lopsidedness. Positive skew means a long right tail and a mean above the median. Kurtosis is the average fourth-power z-score: how heavy the tails are. The normal has kurtosis 3, so excess kurtosis subtracts 3. High excess kurtosis means extreme values are much more common than the normal predicts.
+
+  </Accordion>
+  <Accordion title="What is the difference between a PDF and a CDF? Can a PDF be greater than 1?">
+
+    A PDF gives the density of probability around a value; probability is the area under it between two points. A CDF gives `P(X ≤ x)`, rising from 0 to 1. Yes, a PDF can exceed 1: a uniform distribution on 0 to 0.5 has density 2, because the area still has to be 1. For a continuous variable, the probability of any exact single value is 0.
+
+  </Accordion>
+  <Accordion title="Covariance versus correlation?">
+
+    Both measure whether two variables move together linearly. Covariance is in the product of the two units, so its size depends on units (metres versus centimetres changed it by 100 times). Correlation divides by both standard deviations, so it is unitless and lies in -1 to 1. Correlation 0 means no linear relation; `y = x^2` has correlation 0 yet is fully determined by `x`.
+
+  </Accordion>
+  <Accordion title="Explain Bayes' rule with a base-rate example.">
+
+    `P(A | B) = P(B | A) * P(A) / P(B)`. With 1% fraud, a detector that catches 99% of fraud and falsely flags 5% of normal transactions gives `P(fraud | flag) = 0.0099 / 0.0594 ≈ 0.17`. Most alerts are false because the normal class is 99 times larger. That is why accuracy misleads on rare events and precision matters.
+
+  </Accordion>
+  <Accordion title="How do you handle missing values?">
+
+    First ask why they are missing: completely at random, at random given other columns, or because of the missing value itself. Then drop rows (only safe for MCAR and small amounts), drop mostly empty columns, impute with the median, mode, or a model, and add a was-missing indicator when missingness may carry signal. Compute imputation values on the training split only.
+
+  </Accordion>
+  <Accordion title="Standardization or min-max scaling? Which models need scaling at all?">
+
+    Standardization (mean 0, std 1) is the default; min-max (0 to 1) suits bounded inputs like pixels; robust scaling (median and IQR) suits data with extreme values, since one extreme value squeezes min-max for everyone else. Distance-based models (k-NN, k-means, SVM, LOF) and gradient-trained models need scaling; tree models do not, because splits ignore scale.
+
+  </Accordion>
+  <Accordion title="What is data leakage in preprocessing?">
+
+    Using information from the validation or test data while training. Common forms: fitting a scaler or imputer on all data before splitting, duplicates shared across the split, and features that would not exist at prediction time (a "refund issued" flag used to predict fraud). The fix is to split first, fit every preprocessing step on the training split, and apply it unchanged to the rest.
+
+  </Accordion>
+</Accordions>

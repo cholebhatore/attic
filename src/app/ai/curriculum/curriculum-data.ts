@@ -285,6 +285,22 @@ export const curriculumData: CurriculumGroup[] = [
             status: 'written',
             interview: false,
           },
+          {
+            id: 'p1-statistics-probability',
+            title: 'Statistics and Probability',
+            url: '/ai/math-foundations/statistics-and-probability',
+            desc: 'What data and data analysis are, structured vs unstructured data, population vs sample, data types and levels of measurement, mean, median, mode, variance, standard deviation, percentiles, IQR, MAD, probability and Bayes, distributions and the empirical rule, skewness and kurtosis, EDA plots, covariance vs correlation, and preprocessing.',
+            status: 'written',
+            interview: true,
+          },
+          {
+            id: 'p1-outliers-anomaly',
+            title: 'Outliers and Anomaly Detection',
+            url: '/ai/math-foundations/outliers-and-anomaly-detection',
+            desc: 'Point, contextual, and collective outliers, outlier vs anomaly vs novelty, univariate vs multivariate, z-score, modified z-score, IQR, Mahalanobis, Isolation Forest, LOF, One-Class SVM, DBSCAN, autoencoders, anomaly scoring, time-series anomalies, imbalanced data, concept drift, evaluation metrics, and a fraud detection project.',
+            status: 'written',
+            interview: true,
+          },
         ],
       },
       {
