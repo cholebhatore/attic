@@ -7,6 +7,38 @@ Vector search understands that "how do I reset my password" and "credential reco
 
 ---
 
+## The plain-language version
+
+**Where this sits:** query pipeline, the retrieval step. It searches the indexes built by the indexing pipeline and hands a merged candidate list to [Reranking](/ai/rag/reranking).
+
+There are two ways to find relevant text. **Dense retrieval** (embeddings) matches meaning: it knows "car" and "automobile" are the same. **Keyword retrieval** (BM25) matches the exact words: it knows `ERR-4032` must appear literally, which an embedding blurs. Each fails exactly where the other succeeds, so **hybrid search** runs both and merges their results.
+
+Think of asking two librarians. One understands what you mean but is vague about exact names. The other only matches the exact words you said but never confuses one product code with another. Asking both and combining their lists beats either one alone.
+
+This page covers, in order:
+
+1. **What each side misses**: synonyms against exact identifiers
+2. **BM25**: the keyword-scoring formula and its two tuning constants
+3. **Fusion**: merging two ranked lists, by score or by rank (Reciprocal Rank Fusion)
+4. **Learned sparse retrieval**: SPLADE and models that add related words to keyword search
+5. **Engine support**: which databases run both kinds of search
+6. **Tuning**: how to weight the two sides
+
+| Word                                 | Plain meaning                                                                                                                                 |
+| :----------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------- |
+| **dense vector**                     | An embedding: a few hundred to a few thousand numbers, almost all non-zero.                                                                   |
+| **sparse vector**                    | A vector as long as the vocabulary, almost all zeros, with weights only for the words present. Keyword search uses these.                     |
+| **inverted index**                   | For every word, the list of documents containing it. What keyword search engines are built on.                                                |
+| **term frequency (TF)**              | How often a word appears in a document.                                                                                                       |
+| **inverse document frequency (IDF)** | How rare a word is across the corpus. Rare words count more. [Classical NLP](/ai/classical-deep-learning/classical-nlp) shows TF-IDF by hand. |
+| **BM25**                             | The standard keyword-scoring formula: TF-IDF with saturation (repeating a word helps less each time) and document-length normalization.       |
+| **`k1`, `b`**                        | BM25's two knobs: how fast term frequency saturates, and how strongly long documents are penalized.                                           |
+| **fusion**                           | Combining several ranked lists into one.                                                                                                      |
+| **RRF**                              | Reciprocal Rank Fusion: each document scores `1 / (k + rank)` in each list, summed. Uses ranks only, so scores need no rescaling.             |
+| **SPLADE**                           | A learned sparse model that also gives weight to related words not in the text, so keyword search gains some synonym power.                   |
+
+---
+
 ## What each side misses
 
 | Query type                         | Dense    | Sparse BM25 | Why                                   |
@@ -89,6 +121,21 @@ with `k = 60` as the published default. The constant damps the influence of the 
 | E   | absent     | 3           | 0              | 0.01587         | 0.01587 |
 
 Fused order: **A, C, B, E, D**. C was third in the dense list but first in the sparse one, and RRF promotes it above B, which was second dense and fourth sparse. That is the whole point: a document two independent systems both rank highly beats one that a single system ranks slightly higher.
+
+The same computation in code, which is all RRF is:
+
+```python title="rrf.py"
+def rrf(rankings, k=60):
+    scores = {}
+    for ranking in rankings:                      # each ranking: chunk ids, best first
+        for rank, cid in enumerate(ranking, start=1):
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank)
+    return sorted(scores, key=scores.get, reverse=True)
+
+dense = ["A", "B", "C", "D"]                      # E is absent from the dense list
+sparse = ["C", "A", "E", "B"]                     # D is absent from the sparse list
+print(rrf([dense, sparse]))                       # ['A', 'C', 'B', 'E', 'D']   same order as the table
+```
 
 | Property                      | RRF        | Weighted score fusion      |
 | :---------------------------- | :--------- | :------------------------- |

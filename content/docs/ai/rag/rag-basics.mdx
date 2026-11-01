@@ -1,0 +1,439 @@
+---
+title: RAG Basics
+description: What retrieval-augmented generation is, the offline indexing pipeline and the online query pipeline stage by stage, the vocabulary, a RAG system in 40 lines, the tech stack for every stage, naive versus advanced versus modular RAG, and how RAG compares with fine-tuning and long context.
+---
+
+A language model only knows what was in its training data, frozen on the day training stopped. Ask it about your company's refund policy, last week's incident report, or a private codebase, and it either refuses or, worse, invents a confident answer.
+
+**Retrieval-augmented generation (RAG)** fixes this without retraining the model. Before the model answers, the system **retrieves** the passages from your own documents that are most relevant to the question and pastes them into the prompt. The model then **generates** an answer from those passages. The term comes from _Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks_ (Lewis et al., arXiv:2005.11401).
+
+Think of it as turning a closed-book exam into an open-book exam. The student (the model) is the same. What changes is that, before each question, a librarian (the retriever) finds the three most relevant pages in the textbook and puts them on the desk.
+
+This page is the map for the whole phase. It covers, in order:
+
+1. **The two pipelines**: indexing (offline, once per document) and querying (online, once per question)
+2. **The retrieval funnel**: cheap and wide first, expensive and narrow last
+3. **Every stage, in order**: load, parse, clean, chunk, embed, index, then transform, retrieve, rerank, assemble, generate, evaluate
+4. **The vocabulary**: the words every later page uses
+5. **A RAG system in 40 lines**: every stage in plain Python, so the moving parts are visible
+6. **The tech stack**: which tools sit at each stage, and what each category actually does
+7. **Naive, advanced, and modular RAG**: how systems grow from the simple version, and the RAG variants at a glance
+8. **RAG, fine-tuning, or long context**: and the other alternatives (cached prefixes, SQL and tools, BM25, knowledge graphs, memory)
+9. **How to tell whether it works**: retrieval and generation metrics, a gold set, and the order to debug in
+10. **What production adds**: access control, freshness, observability, versioning, cost, privacy, caching
+11. **A baseline to build first**: one sensible default, and the rule for adding anything to it
+12. **Where each stage is covered**
+
+---
+
+## The two pipelines
+
+Every RAG system is two programs that share one index.
+
+<Mermaid
+  chart={`
+flowchart LR
+    subgraph OFF["Indexing pipeline: offline, runs when documents change"]
+        direction LR
+        S["Sources: files, web, SaaS, databases"] --> L["Load"]
+        L --> P["Parse and extract"]
+        P --> C["Clean, deduplicate, enrich"]
+        C --> K["Chunk"]
+        K --> E["Embed"]
+        E --> I[("Index: vectors + text + metadata")]
+    end
+    subgraph ON["Query pipeline: online, runs on every question"]
+        direction LR
+        Q["User question"] --> QT["Transform the query"]
+        QT --> R["Retrieve: dense + keyword"]
+        R --> RR["Rerank"]
+        RR --> A["Assemble the context"]
+        A --> G["Generate with citations"]
+    end
+    I --> R
+`}
+/>
+
+- The **indexing pipeline** (also called the **ingestion pipeline**) runs ahead of time. It turns a pile of PDFs, web pages, and database rows into small, searchable pieces with vectors and metadata. It is a data engineering job: slow, batch, and re-run whenever documents change.
+- The **query pipeline** runs per request, inside the user's latency budget. It finds the right pieces and gets the model to answer from them.
+
+**Most RAG quality problems are born in the indexing pipeline.** A table that was flattened into nonsense at parse time, or a heading separated from its paragraph at chunk time, cannot be rescued by a better model at query time. That is why this phase spends four pages on indexing before it reaches retrieval.
+
+---
+
+## The retrieval funnel
+
+The query pipeline is a funnel. Each stage spends more compute per candidate on fewer candidates: cheap and wide first, expensive and narrow last.
+
+| Stage                      | Candidates in (typical)   | Candidates out (typical) | Cost per candidate                    |
+| :------------------------- | :------------------------ | :----------------------- | :------------------------------------ |
+| ANN vector search and BM25 | The whole index, millions | 50 to 100 per retriever  | Tiny: a few distance computations     |
+| Fusion (RRF)               | Two lists of 50 to 100    | 50 to 100                | Negligible: arithmetic on ranks       |
+| Reranking (cross-encoder)  | 50 to 100                 | 5 to 10                  | One transformer forward pass per pair |
+| Generation (LLM)           | 5 to 10 chunks            | One answer               | The whole prompt, every token         |
+
+The counts are common starting points, not rules; tune them against your evaluation set and latency budget. The shape is what matters: a reranker over the whole corpus would take hours per query, and an LLM given a thousand chunks would be slow, expensive, and worse at finding the answer.
+
+---
+
+## Every stage, in order
+
+| #   | Stage                    | Pipeline | What it does                                                                                 | Main decision                                                        | Page                                                         |
+| :-- | :----------------------- | :------- | :------------------------------------------------------------------------------------------- | :------------------------------------------------------------------- | :----------------------------------------------------------- |
+| 1   | **Load**                 | Indexing | Fetch raw content from each source and wrap it as a document with metadata                   | Which connectors; full or incremental sync                           | [Document Loaders](/ai/rag/document-loaders)                 |
+| 2   | **Parse and extract**    | Indexing | Turn bytes (PDF, HTML, DOCX, images, spreadsheets) into clean text with structure            | Fast text extraction or layout-aware parsing; what to do with tables | [Parsing and Extraction](/ai/rag/parsing-and-extraction)     |
+| 3   | **Clean and enrich**     | Indexing | Normalize text, remove duplicates and personal data, attach metadata, keep the index in sync | What metadata every chunk carries; how updates propagate             | [Ingestion Pipeline](/ai/rag/ingestion-pipeline)             |
+| 4   | **Chunk**                | Indexing | Split documents into retrievable pieces                                                      | Chunk size and where boundaries fall                                 | [Chunking](/ai/rag/chunking)                                 |
+| 5   | **Embed**                | Indexing | Turn each chunk into a vector that captures its meaning                                      | Which embedding model; what text to embed                            | [Embeddings](/ai/rag/embeddings)                             |
+| 6   | **Index**                | Indexing | Store vectors so nearest-neighbour search is fast                                            | Which vector database and index type                                 | [Vector Databases](/ai/rag/vector-databases)                 |
+| 7   | **Retrieve**             | Query    | Find candidate chunks by meaning (dense) and by exact words (keyword), then merge            | Dense, sparse, or hybrid; how many candidates                        | [Hybrid Search](/ai/rag/hybrid-search)                       |
+| 8   | **Rerank**               | Query    | Re-score the candidates with a slower, more accurate model                                   | Which reranker; how many to keep                                     | [Reranking](/ai/rag/reranking)                               |
+| 9   | **Transform the query**  | Query    | Rewrite the user's question into queries the index can match                                 | Rewrite, expand, decompose, or route                                 | [Query Transformation](/ai/rag/query-transformation)         |
+| 10  | **Assemble the context** | Query    | Decide what goes in the prompt, in what order, within the token budget                       | Ordering, compaction, caching                                        | [Context Engineering](/ai/rag/context-engineering)           |
+| 11  | **Generate**             | Query    | Answer from the context only, with citations, and refuse when the answer is not there        | Prompt, citation format, verification                                | [Generation and Citations](/ai/rag/generation-and-citations) |
+| 12  | **Evaluate**             | Both     | Measure retrieval and answer quality, and catch regressions                                  | Which metrics; which test set                                        | [RAG and Agent Evaluation](/ai/agents/rag-and-agent-eval)    |
+
+Query transformation runs first at request time (step 9 happens before step 7), but it is taught after retrieval and reranking because you can only judge a rewritten query once you know what the retriever does with it.
+
+---
+
+## The vocabulary
+
+| Word                           | Plain meaning                                                                                                                                                                                              |
+| :----------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **corpus**                     | All the documents the system can answer from.                                                                                                                                                              |
+| **source / connector**         | Where documents live (a folder, a website, Confluence, a database) and the code that knows how to talk to it.                                                                                              |
+| **loader**                     | The code that fetches content from a source and returns standard `Document` objects: text plus metadata.                                                                                                   |
+| **parser / extractor**         | The code that turns a file format into text, keeping structure such as headings and tables.                                                                                                                |
+| **ingestion**                  | The whole indexing pipeline, from source to searchable index. Sometimes used for just the load-and-parse part.                                                                                             |
+| **chunk**                      | A piece of a document, typically a few hundred tokens, that is retrieved as one unit. Also called a passage, node, or split.                                                                               |
+| **metadata**                   | Facts about a chunk that are not its text: source, title, section, page, date, permissions. Used for filtering and citations.                                                                              |
+| **embedding**                  | A vector of numbers representing a chunk's meaning, so similar meanings land close together. [Encoding and Decoding](/ai/math-foundations/encoding-and-decoding) explains how it differs from an encoding. |
+| **vector database / index**    | Storage that finds the vectors nearest to a query vector quickly, without comparing against every one.                                                                                                     |
+| **dense retrieval**            | Finding chunks by embedding similarity: matches meaning, even with different words.                                                                                                                        |
+| **sparse / keyword retrieval** | Finding chunks by shared words, usually with BM25: matches exact terms such as error codes and product names.                                                                                              |
+| **hybrid search**              | Running dense and keyword retrieval together and merging the two result lists.                                                                                                                             |
+| **top-k**                      | The number of chunks kept at a stage, such as "retrieve the top 50, keep the top 5 after reranking".                                                                                                       |
+| **reranker**                   | A slower, more accurate model that re-scores a short list of candidates against the question.                                                                                                              |
+| **context window**             | The maximum number of tokens the model can read at once; the retrieved chunks must fit in it with everything else.                                                                                         |
+| **grounding**                  | Making the answer rely only on the retrieved text, so every claim can be traced to a source.                                                                                                               |
+| **hallucination**              | A fluent, confident claim that is not supported by the sources.                                                                                                                                            |
+| **citation**                   | A pointer from a sentence in the answer to the chunk that supports it.                                                                                                                                     |
+| **recall / precision**         | Recall: of the chunks that should have been found, how many were. Precision: of the chunks returned, how many were actually relevant.                                                                      |
+
+---
+
+## A RAG system in 40 lines
+
+No libraries beyond NumPy, and a word-count vector stands in for a real embedding model. Every stage of the query pipeline is still there.
+
+```python title="tiny_rag.py"
+import re
+import numpy as np
+
+docs = [
+    "Refunds are available within 30 days of purchase with a receipt.",
+    "Our office is open Monday to Friday, 9am to 5pm.",
+    "Shipping to Europe takes 5 to 7 business days.",
+    "Gift cards cannot be refunded or exchanged for cash.",
+]
+STOP = {"a", "are", "to", "of", "with", "is", "or", "for", "our", "the", "how", "many", "do", "i", "have", "get", "can", "be", "within"}
+
+def tokens(text):
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    words = [re.sub(r"(ed|s)$", "", w) for w in words]       # crude stemming: refunds, refunded -> refund
+    return [w for w in words if w not in STOP]
+
+# ---- indexing (offline) ----
+vocab = sorted({w for d in docs for w in tokens(d)})
+col = {w: i for i, w in enumerate(vocab)}
+
+def embed(text):                                  # stand-in for an embedding model
+    v = np.zeros(len(vocab))
+    for w in tokens(text):
+        if w in col:
+            v[col[w]] += 1
+    n = np.linalg.norm(v)
+    return v / n if n else v
+
+index = np.stack([embed(d) for d in docs])        # (4, V) the "vector database"
+
+# ---- query (online) ----
+query = "How many days do I have to get a refund?"
+scores = index @ embed(query)                     # cosine similarity, vectors are unit length
+top = np.argsort(-scores)[:2]
+print(np.round(scores, 2).tolist())               # [0.58, 0.0, 0.27, 0.29]
+print(top.tolist())                               # [0, 3]
+
+context = "\n".join(f"[{i}] {docs[i]}" for i in top)
+prompt = f"Answer using only the context. Cite sources like [0].\n\nContext:\n{context}\n\nQuestion: {query}"
+print(prompt)                                     # this string is what the LLM receives
+```
+
+Check the top score by hand. The query keeps two words after stop-word removal and stemming, `day` and `refund`. Document 0 keeps six words and shares both, so cosine is `2 / (sqrt(6) * sqrt(2)) = 0.58`. Document 3 shares only `refund`: `1 / (sqrt(6) * sqrt(2)) = 0.29`.
+
+What this toy gets wrong is exactly what the rest of the phase fixes:
+
+| Weakness in the toy                                       | Real fix                               | Page                                                                                                   |
+| :-------------------------------------------------------- | :------------------------------------- | :----------------------------------------------------------------------------------------------------- |
+| Documents arrive as clean strings                         | Loaders and parsers for real files     | [Document Loaders](/ai/rag/document-loaders), [Parsing and Extraction](/ai/rag/parsing-and-extraction) |
+| Each "document" is already one sentence                   | Chunking long documents                | [Chunking](/ai/rag/chunking)                                                                           |
+| Word counts miss synonyms ("reimbursement" would score 0) | A trained embedding model              | [Embeddings](/ai/rag/embeddings)                                                                       |
+| Scoring compares against every document                   | An approximate nearest-neighbour index | [Vector Databases](/ai/rag/vector-databases)                                                           |
+| The second result is only loosely relevant                | Hybrid search and a reranker           | [Hybrid Search](/ai/rag/hybrid-search), [Reranking](/ai/rag/reranking)                                 |
+| Nothing checks that the answer uses the context           | Grounded prompts and citation checks   | [Generation and Citations](/ai/rag/generation-and-citations)                                           |
+
+---
+
+## The tech stack
+
+Each stage has its own category of tools. Knowing the category matters more than knowing the brand, because the brands change every year and the categories do not.
+
+| Stage                | Category and what it does                                                                                | Common tools                                                                                                                                                        |
+| :------------------- | :------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Load                 | **Connectors**: authenticate to a source, list what changed, download it                                 | LangChain document loaders, LlamaIndex readers (LlamaHub), Unstructured connectors, Airbyte, Firecrawl and Crawl4AI for the web                                     |
+| Parse                | **Document parsers**: text layer extraction, layout analysis, OCR, table structure recognition           | PyMuPDF, pypdf, pdfplumber, Docling, Unstructured, Marker, MinerU, LlamaParse, MarkItDown, Tesseract, Azure Document Intelligence, AWS Textract, Google Document AI |
+| Clean and enrich     | **Text processing and data pipelines**: normalization, deduplication, PII redaction, scheduling, retries | ftfy, datasketch (MinHash), Microsoft Presidio, Airflow, Dagster, Prefect, Kafka, Ray                                                                               |
+| Chunk                | **Text splitters**: split by size, by structure, or by meaning                                           | LangChain text splitters, LlamaIndex node parsers, Chonkie                                                                                                          |
+| Embed                | **Embedding models and servers**                                                                         | OpenAI `text-embedding-3`, Cohere Embed, Voyage, BGE-M3, E5, Nomic; `sentence-transformers`; Hugging Face Text Embeddings Inference                                 |
+| Index                | **Vector databases and search engines**                                                                  | pgvector, Qdrant, Weaviate, Milvus, Pinecone, Chroma, LanceDB, FAISS (library), Elasticsearch and OpenSearch, Vespa                                                 |
+| Retrieve (keyword)   | **Lexical search**: inverted index with BM25 scoring                                                     | Elasticsearch, OpenSearch, Postgres full-text search, Tantivy, `bm25s`                                                                                              |
+| Rerank               | **Cross-encoders and rerank APIs**                                                                       | Cohere Rerank, Voyage rerank, BGE reranker, Jina reranker, ColBERT                                                                                                  |
+| Orchestrate          | **RAG frameworks**: glue the stages together with standard interfaces                                    | LangChain and LangGraph, LlamaIndex, Haystack, DSPy                                                                                                                 |
+| Generate             | **LLM APIs and inference servers**                                                                       | Hosted APIs (Anthropic, OpenAI, Google), or self-hosted with vLLM or SGLang                                                                                         |
+| Evaluate and observe | **Evaluation and tracing**                                                                               | RAGAS, DeepEval, TruLens, LangSmith, Arize Phoenix, Langfuse                                                                                                        |
+
+<Callout type="info">
+  ### What a framework actually gives you
+
+LangChain and LlamaIndex do not retrieve better than code you write yourself. They provide **standard interfaces**: a `Document` type, a loader interface, a splitter interface, a retriever interface. Because every vector store and loader implements the same interface, you can swap one for another without rewriting the pipeline. The cost is an extra layer to debug. Many production teams use a framework's loaders and splitters and write the query pipeline by hand.
+
+</Callout>
+
+---
+
+## Naive, advanced, and modular RAG
+
+The survey _Retrieval-Augmented Generation for Large Language Models: A Survey_ (Gao et al., arXiv:2312.10997) names three stages of maturity. They are useful as a vocabulary for "how far along is this system".
+
+| Level            | What it does                                                                                                 | Typical failure it fixes                      |
+| :--------------- | :----------------------------------------------------------------------------------------------------------- | :-------------------------------------------- |
+| **Naive RAG**    | Fixed-size chunks, one embedding search, top-k straight into the prompt                                      | (the baseline)                                |
+| **Advanced RAG** | Adds work before retrieval (better parsing, chunking, query rewriting) and after it (reranking, compression) | Wrong chunks retrieved; right chunks buried   |
+| **Modular RAG**  | Stages become swappable modules with routing, loops, and multiple sources; retrieval becomes a decision      | One pipeline cannot serve every question type |
+
+The advanced pages of this phase sit at the modular end: [Self-RAG and Agentic RAG](/ai/rag/agentic-rag) makes retrieval a decision, [GraphRAG](/ai/rag/graphrag) adds a graph index, and [Vectorless RAG](/ai/rag/vectorless-rag) retrieves from SQL and file systems without embeddings.
+
+### The RAG variants at a glance
+
+| Variant            | Mechanism                                                                                                                    | Use when                                       | Page                                                                                       |
+| :----------------- | :--------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------- | :----------------------------------------------------------------------------------------- |
+| **Adaptive RAG**   | A classifier routes each query to no retrieval, one retrieval, or multi-step retrieval by complexity                         | Mixed traffic where most questions are easy    | [Self-RAG and Agentic RAG](/ai/rag/agentic-rag)                                            |
+| **Corrective RAG** | A grader labels retrieved chunks correct, ambiguous, or incorrect; incorrect triggers a fallback source                      | A confident wrong answer is expensive          | [Self-RAG and Agentic RAG](/ai/rag/agentic-rag)                                            |
+| **Self-RAG**       | A specially fine-tuned model emits reflection tokens deciding when to retrieve and critiquing its own output                 | Research setting; needs that trained model     | [Self-RAG and Agentic RAG](/ai/rag/agentic-rag)                                            |
+| **Agentic RAG**    | Retrieval is a tool inside an agent loop that searches, judges, rewrites, and searches again                                 | Open-ended, multi-source research questions    | [Self-RAG and Agentic RAG](/ai/rag/agentic-rag)                                            |
+| **Multi-hop RAG**  | Each retrieval step's result forms the next query (decomposition, IRCoT)                                                     | Answers that need facts from several documents | [Query Transformation](/ai/rag/query-transformation)                                       |
+| **GraphRAG**       | An entity graph with community summaries; local search walks entities, global search map-reduces summaries                   | Whole-corpus themes and relationship questions | [GraphRAG](/ai/rag/graphrag)                                                               |
+| **Multimodal RAG** | Convert images, tables, and audio to text, or embed them natively (CLIP-style, ColPali) and pass originals to a vision model | Slides, scans, charts, recordings              | [Parsing and Extraction](/ai/rag/parsing-and-extraction), [Embeddings](/ai/rag/embeddings) |
+| **Vectorless RAG** | Text-to-SQL, tables in the prompt, or file-system search instead of embeddings                                               | Structured and numeric data, code              | [Vectorless RAG](/ai/rag/vectorless-rag)                                                   |
+
+---
+
+## RAG, fine-tuning, or long context
+
+| Need                                                                | Best tool                                                                                                                         |
+| :------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------- |
+| Answers from private or frequently changing documents               | **RAG**: update the index, not the model                                                                                          |
+| Citations a user can check                                          | **RAG**: every claim points at a chunk                                                                                            |
+| Per-user permissions on what can be read                            | **RAG**: filter the index by the user's access before retrieval                                                                   |
+| A new style, format, or skill (always answer in this JSON shape)    | **Fine-tuning**: behaviour lives in the weights. See [Why Fine-Tune](/ai/fine-tuning/why-fine-tune)                               |
+| A few documents, asked about once                                   | **Long context**: paste them in. See [RAG vs Long Context](/ai/rag/rag-vs-long-context)                                           |
+| A small, stable corpus every user may see, asked about constantly   | **Cache-augmented generation**: keep it in a cached prompt prefix. See [RAG vs Long Context](/ai/rag/rag-vs-long-context)         |
+| Structured, numeric, or live data ("total revenue by region")       | **Text-to-SQL or a tool or API call**: query the source of truth. See [Vectorless RAG](/ai/rag/vectorless-rag)                    |
+| Users who know the exact terms; a first baseline                    | **Plain lexical search (BM25)**: deterministic, cheap, and debuggable. Hybrid search already contains it                          |
+| Relationship-heavy domains (compliance, supply chains, biomedicine) | **A knowledge graph**, traversed directly or through [GraphRAG](/ai/rag/graphrag)                                                 |
+| Remembering a user or a conversation across sessions                | **A memory system** (summarized state, user-fact stores): a different problem from document QA, using similar retrieval machinery |
+
+<Callout type="warn">
+  ### Common mistake
+
+Fine-tuning a model to "teach it the documents". Fine-tuning is poor at storing facts reliably, it cannot cite, it cannot be updated without retraining, and it cannot respect per-user permissions. Retrieval is the default for knowledge; fine-tuning is for behaviour.
+
+The two combine well. RAFT (Zhang et al., arXiv:2403.10131) fine-tunes the generator to answer from retrieved documents while ignoring distractor documents, and keeps the facts themselves in the index.
+
+</Callout>
+
+---
+
+## How to tell whether it works
+
+A RAG answer can be wrong because retrieval missed, or because generation ignored what retrieval found. Measure them separately.
+
+| Stage      | Metric                              | Question it answers                                             |
+| :--------- | :---------------------------------- | :-------------------------------------------------------------- |
+| Retrieval  | **Recall@k** (context recall)       | Did the right chunk appear in the top `k` at all?               |
+| Retrieval  | **Precision@k** (context precision) | How much of what was retrieved is relevant?                     |
+| Retrieval  | **MRR, nDCG**                       | Was the right chunk near the top?                               |
+| Generation | **Faithfulness** (groundedness)     | Is every claim in the answer supported by the retrieved chunks? |
+| Generation | **Answer relevancy**                | Does the answer address the question?                           |
+| End to end | **Answer correctness**              | Does the answer match a reference answer?                       |
+
+[RAG and Agent Evaluation](/ai/agents/rag-and-agent-eval) covers how each is computed with RAGAS and DeepEval, and [Production Debugging](/ai/rag/production-debugging) uses them to localize failures.
+
+Both retrieval metrics are a few lines of code over a labeled set of questions and their relevant chunk IDs:
+
+```python title="retrieval_metrics.py"
+def recall_at_k(retrieved, relevant, k):         # share of the relevant chunks found in the top k
+    return len(set(retrieved[:k]) & relevant) / len(relevant)
+
+def mrr(retrieved, relevant):                    # 1 / rank of the first relevant chunk
+    for i, cid in enumerate(retrieved, start=1):
+        if cid in relevant:
+            return 1 / i
+    return 0.0
+
+retrieved = ["c7", "c2", "c9", "c4", "c1"]
+relevant = {"c2", "c4", "c8"}
+print(round(recall_at_k(retrieved, relevant, 3), 3))   # 0.333   only c2 is in the top 3
+print(round(recall_at_k(retrieved, relevant, 5), 3))   # 0.667   c2 and c4; c8 was never retrieved
+print(mrr(retrieved, relevant))                        # 0.5     first relevant chunk is at rank 2
+```
+
+Average them over the whole question set. Build that set with real questions from logs where possible, or LLM-generated question and source-chunk pairs reviewed by a person, and deliberately include hard cases: multi-hop questions, exact-identifier lookups, questions whose answer is not in the corpus, and questions a given user is not allowed to answer. Run it in CI so a chunking or model change cannot silently lower quality.
+
+**Debug in pipeline order.** When an answer is wrong, ask in turn: was the right chunk in the index at all (ingestion), was it in the top `k` (retrieval), did it survive reranking (ranking), was it in the final prompt (assembly), and did the model use it faithfully (generation)? Logging the retrieved chunk IDs for every production request makes each of these questions answerable after the fact.
+
+---
+
+## What production adds
+
+| Concern            | What it requires                                                                                                                                                                       | Page                                                                                                 |
+| :----------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------- |
+| **Access control** | ACL and `tenant_id` filters applied at retrieval time on every query; never rely on the model to withhold what it was shown                                                            | [Production Debugging](/ai/rag/production-debugging)                                                 |
+| **Freshness**      | Scheduled or streaming ingestion, hash-based change detection, tombstones for deletes, an `updated_at` field to filter or boost on                                                     | [Ingestion Pipeline](/ai/rag/ingestion-pipeline)                                                     |
+| **Observability**  | A trace per request: latency per stage, candidate IDs and scores, the final prompt, the answer; a sample for human review                                                              | [Production Debugging](/ai/rag/production-debugging)                                                 |
+| **Versioning**     | Index version, embedding model, chunking configuration, and prompt version recorded together, so any answer can be reproduced                                                          | [Ingestion Pipeline](/ai/rag/ingestion-pipeline#index-versioning-and-re-indexing)                    |
+| **Cost model**     | Embedding at ingest, reranking per query, LLM tokens per query: know which one dominates before optimizing                                                                             | [RAG vs Long Context](/ai/rag/rag-vs-long-context)                                                   |
+| **Privacy**        | PII redacted or restricted at ingestion, because anything embedded can be retrieved                                                                                                    | [Ingestion Pipeline](/ai/rag/ingestion-pipeline#personal-and-sensitive-data)                         |
+| **Caching**        | Cached query embeddings and popular retrieval results, provider prompt caching for stable prefixes, and semantic caching only with tenant and ACL scoping and a conservative threshold | [Context Budgeting](/ai/rag/context-budgeting), [Production Debugging](/ai/rag/production-debugging) |
+
+---
+
+## A baseline to build first
+
+One sensible default for a first serious system. It is a starting point to measure against, not the only correct design.
+
+<Steps>
+<Step>
+
+**Build the evaluation set and harness first**: a gold set, recall@k and MRR for retrieval, faithfulness for generation, run in CI. Every later choice is judged by it.
+
+</Step>
+<Step>
+
+**One store for vectors, text, and metadata**, such as Postgres with pgvector plus its full-text search: transactional upserts and easy metadata and ACL filtering in one system. Move to a dedicated engine (Qdrant, OpenSearch, and others) when scale or filtered-search performance requires it.
+
+</Step>
+<Step>
+
+**Layout-aware parsing and structure-aware chunking** of a few hundred tokens with the heading path prepended. Add contextual retrieval once the evaluation shows ambiguous chunks are a real failure.
+
+</Step>
+<Step>
+
+**A good embedding model with its query and passage prefixes applied correctly**, plus BM25 over the same chunks.
+
+</Step>
+<Step>
+
+**Hybrid retrieval fused with RRF**, about 50 candidates, then a cross-encoder reranker down to 5 to 8.
+
+</Step>
+<Step>
+
+**A grounded prompt with structured citations**, verified on the server.
+
+</Step>
+</Steps>
+
+Only after this baseline's failures are measured and sorted by stage should you add query rewriting, parent-child retrieval, GraphRAG, or an agentic loop. Each addition should be justified by a failure it measurably fixes.
+
+---
+
+## Where each stage is covered
+
+<Mermaid
+  chart={`
+flowchart TD
+    B["RAG Basics"] --> L["Document Loaders"]
+    L --> P["Parsing and Extraction"]
+    P --> IP["Ingestion Pipeline"]
+    IP --> CH["Chunking"]
+    CH --> EM["Embeddings"]
+    EM --> VD["Vector Databases"]
+    VD --> HS["Hybrid Search"]
+    HS --> RR["Reranking"]
+    RR --> QT["Query Transformation"]
+    QT --> CE["Context Engineering"]
+    CE --> GC["Generation and Citations"]
+    GC --> ADV["Advanced: Agentic RAG, GraphRAG, Vectorless RAG"]
+    ADV --> PD["Production Debugging"]
+`}
+/>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is RAG, and what problem does it solve?">
+
+    Retrieval-augmented generation retrieves relevant passages from an external corpus and puts them in the prompt so the model answers from them. It gives the model knowledge it was not trained on (private, recent, or niche), makes answers citable, and lets the knowledge be updated by re-indexing rather than retraining.
+
+  </Accordion>
+  <Accordion title="Walk through the stages of a RAG pipeline.">
+
+    Offline indexing: load from sources, parse files into structured text, clean and deduplicate, attach metadata, chunk, embed, and store in a vector index (often with a keyword index beside it). Online query: optionally transform the query, retrieve with dense and keyword search, merge, rerank, assemble the context within the token budget, generate a grounded answer with citations, and evaluate both retrieval and generation.
+
+  </Accordion>
+  <Accordion title="Where do most RAG quality problems come from?">
+
+    Usually the indexing side: bad parsing (tables flattened, columns interleaved, headers repeated), poor chunk boundaries, missing metadata, or stale documents. These cannot be repaired at query time. On the query side, the most common cause is a mismatch between the user's wording and the document's wording.
+
+  </Accordion>
+  <Accordion title="Naive versus advanced versus modular RAG?">
+
+    Naive: chunk, embed, retrieve top-k, generate. Advanced: adds pre-retrieval work (parsing, chunking, query rewriting) and post-retrieval work (reranking, compression). Modular: stages are swappable modules with routing and loops, as in agentic RAG.
+
+  </Accordion>
+  <Accordion title="When would you choose fine-tuning over RAG?">
+
+    When the goal is behaviour, not knowledge: a style, an output format, a domain's way of reasoning, or a smaller model imitating a larger one. For facts that change, need citations, or need permission filtering, RAG is the right tool. The two combine well: fine-tune for behaviour, retrieve for knowledge.
+
+  </Accordion>
+  <Accordion title="How do you evaluate a RAG system?">
+
+    Separately per stage. Retrieval: recall@k, precision@k, MRR or nDCG on a labeled set of question-to-chunk pairs. Generation: faithfulness to the retrieved context and answer relevancy, often with an LLM judge. End to end: correctness against reference answers. Separating them tells you which stage to fix.
+
+  </Accordion>
+  <Accordion title="Describe the retrieval funnel and why it has that shape.">
+
+    Cheap, wide retrieval (ANN plus BM25) cuts millions of chunks to 50 to 100 candidates per retriever; RRF fuses the lists; a cross-encoder reranks them to 5 to 10; the LLM answers from those. Each stage spends more compute per candidate on fewer candidates. A cross-encoder over the whole corpus, or an LLM over thousands of chunks, would be far too slow and expensive.
+
+  </Accordion>
+  <Accordion title="What would you build first for a new RAG system?">
+
+    The evaluation harness, then a simple strong baseline: layout-aware parsing, structure-aware chunks with heading paths, one store holding vectors, text, and metadata (such as pgvector with full-text search), hybrid retrieval with RRF, a cross-encoder reranker, and a grounded prompt with verified citations. Add query rewriting, parent-child retrieval, GraphRAG, or agents only for failures the evaluation measures.
+
+  </Accordion>
+  <Accordion title="In what order do you debug a wrong RAG answer?">
+
+    Was the right chunk in the index (ingestion), in the top k (retrieval), kept by the reranker (ranking), in the final prompt (assembly), and used faithfully (generation)? Logging retrieved chunk IDs per request makes each step checkable.
+
+  </Accordion>
+  <Accordion title="What does a RAG framework such as LangChain or LlamaIndex give you?">
+
+    Standard interfaces (document, loader, splitter, embedder, vector store, retriever) and many ready-made integrations, so components can be swapped. It does not improve retrieval quality by itself, and it adds a layer to debug.
+
+  </Accordion>
+</Accordions>

@@ -1,0 +1,244 @@
+---
+title: Transformer Basics
+description: Why transformers replaced recurrent networks, attention explained in plain words, the full data flow from text to the next token with GPT-2's shapes, attention computed by hand, the vocabulary, how a transformer trains in parallel but generates one token at a time, the three families, and a short history.
+---
+
+Every modern language model, and most modern vision and speech models, is a **transformer**. The architecture was introduced in _Attention Is All You Need_ (Vaswani et al., arXiv:1706.03762) in 2017 for translation, and within a few years it had replaced recurrent networks almost everywhere.
+
+The pages in this phase build it piece by piece with full mathematical detail. This page is the map: what problem the transformer solves, what its parts are called, how data flows through it, and how the parts connect, so each later page has a place to attach to.
+
+It covers, in order:
+
+1. **Why transformers**: the three problems of recurrent networks that attention removes
+2. **Attention in plain words**: queries, keys, and values as a search over the sentence
+3. **The whole data flow**: from text to the next token, with GPT-2's real shapes
+4. **Attention by hand**: three tokens, every number checkable
+5. **The vocabulary**: every word the later pages use
+6. **Training versus generation**: why a transformer trains on a whole sentence at once but writes one token at a time
+7. **The three families**: encoder-only, decoder-only, encoder-decoder, and transformers beyond text
+8. **A short history**: from 2017 to today's LLMs
+9. **Where each idea is covered**
+
+---
+
+## Why transformers
+
+[Recurrent Networks](/ai/classical-deep-learning/recurrent-networks) read a sentence one word at a time, carrying a hidden state forward. That design has three problems, and [Classical NLP and Seq2Seq](/ai/classical-deep-learning/classical-nlp) ends at the worst of them.
+
+| Problem with RNNs               | What goes wrong                                                                                  | How the transformer fixes it                                                           |
+| :------------------------------ | :----------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------- |
+| **Sequential computation**      | Word 50 cannot be processed until words 1 to 49 are done, so a GPU's thousands of cores sit idle | Every position is processed at the same time; training becomes large matrix multiplies |
+| **Long-range forgetting**       | Information from word 1 must survive 49 updates of the hidden state to reach word 50             | Every word can look at every other word directly, in one step                          |
+| **The fixed-vector bottleneck** | Seq2Seq squeezes the whole input sentence into one vector before decoding                        | The decoder keeps every input position and chooses what to read at each step           |
+
+The key move came first as an add-on to RNNs: Bahdanau attention (Bahdanau et al., arXiv:1409.0473) let a translation decoder look back at every encoder state. The transformer's insight was that attention alone, with no recurrence at all, is enough.
+
+---
+
+## Attention in plain words
+
+Read the sentence "The animal didn't cross the street because **it** was too tired." To understand `it`, you look back and decide it refers to `animal`, not `street`. **Attention** is that lookup, done by every word, for every other word, at once.
+
+Each token produces three vectors from its embedding:
+
+| Vector        | Plain meaning                       | Library analogy                        |
+| :------------ | :---------------------------------- | :------------------------------------- |
+| **Query (Q)** | What this token is looking for      | The search you type into the catalogue |
+| **Key (K)**   | What this token offers, as a label  | The label on each book's spine         |
+| **Value (V)** | The content this token passes along | The book's actual contents             |
+
+Each token compares its query with every key (a dot product: a large number means a good match), turns the match scores into weights that add up to 1 (softmax), and takes the weighted average of the values. The result is a new vector for the token that blends in information from the tokens it found relevant. In one line, the formula the next page derives:
+
+```text
+Attention(Q, K, V) = softmax(Q K^T / sqrt(d_k)) V
+```
+
+Dividing by `sqrt(d_k)` keeps the scores from growing with the vector size; [Attention Internals](/ai/transformers/attention-internals) proves why that particular factor.
+
+**Multi-head attention** runs several of these lookups side by side, each with its own Q, K, V projections, so one head can track grammar while another tracks which noun a pronoun refers to. [Masking and Multi-Head](/ai/transformers/masking-and-multihead) covers it.
+
+---
+
+## The whole data flow
+
+<Mermaid
+  chart={`
+flowchart TD
+    T["Text: 'The cat sat'"] --> TK["Tokenizer: text to token IDs"]
+    TK --> E["Token embedding: one vector per ID"]
+    E --> P["+ position information"]
+    P --> B1["Transformer block 1"]
+    B1 --> B2["Transformer block 2"]
+    B2 --> BN["... block N"]
+    BN --> FN["Final normalization"]
+    FN --> H["Output head: vector to one score per vocabulary token"]
+    H --> S["Softmax: scores to probabilities"]
+    S --> NX["Next token"]
+    subgraph BLOCK["Inside every block"]
+        direction TB
+        N1["Norm"] --> AT["Multi-head attention: tokens exchange information"]
+        AT --> R1["+ residual"]
+        R1 --> N2["Norm"]
+        N2 --> FF["Feed-forward network: each token processed on its own"]
+        FF --> R2["+ residual"]
+    end
+`}
+/>
+
+Shapes through GPT-2 small, whose published configuration has a vocabulary of 50,257 tokens, `d_model = 768`, 12 blocks, 12 heads, and a 1,024-token context (Radford et al., 2019). Take a batch of `B` sequences of `T` tokens:
+
+| Step                         | What happens                                                                                                                                | Shape                    |
+| :--------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------ | :----------------------- |
+| Token IDs                    | Integers from the tokenizer                                                                                                                 | `(B, T)`                 |
+| Token embedding              | Each ID looks up its row in a `(50257, 768)` table                                                                                          | `(B, T, 768)`            |
+| + positions                  | Add a learned position vector per position (GPT-2) or rotate Q and K (RoPE, modern models)                                                  | `(B, T, 768)`            |
+| 12 transformer blocks        | Each block: attention mixes information across positions, the feed-forward network transforms each position, residuals add the results back | `(B, T, 768)` throughout |
+| Final norm                   | Normalizes each vector                                                                                                                      | `(B, T, 768)`            |
+| Output head                  | A `(768, 50257)` matrix scores every vocabulary token at every position                                                                     | `(B, T, 50257)`          |
+| Softmax at the last position | Probabilities for the next token                                                                                                            | `(B, 50257)`             |
+
+The shape `(B, T, d_model)` never changes inside the stack. Each block reads the vectors, computes an update, and **adds** it back. That running sum is called the **residual stream**: a shared workspace that every block reads from and writes to. [Blocks and Positions](/ai/transformers/blocks-and-positions) covers it.
+
+---
+
+## Attention by hand
+
+Three tokens with two-dimensional vectors, and no learned projections (each token's query, key, and value are its own vector), so every number can be checked by hand.
+
+```python title="attention_by_hand.py"
+import numpy as np
+
+X = np.array([[1.0, 0.0],     # "the"
+              [0.0, 1.0],     # "cat"
+              [1.0, 1.0]])    # "sat"
+Q, K, V = X, X, X                                  # real models use learned projections X @ W_q, X @ W_k, X @ W_v
+scores = Q @ K.T / np.sqrt(K.shape[1])             # (3, 3) similarity of every pair
+scores[np.triu_indices(3, k=1)] = -np.inf          # causal mask: a token cannot see later tokens
+weights = np.exp(scores) / np.exp(scores).sum(axis=1, keepdims=True)   # softmax per row
+out = weights @ V                                  # (3, 2) each row: weighted mix of value vectors
+print(weights.round(2).tolist())   # [[1.0, 0.0, 0.0], [0.33, 0.67, 0.0], [0.25, 0.25, 0.5]]
+print(out.round(2).tolist())       # [[1.0, 0.0], [0.33, 0.67], [0.75, 0.75]]
+```
+
+Check the last row by hand. `sat = [1, 1]` has dot product 1 with `the`, 1 with `cat`, and 2 with itself. Divided by `sqrt(2)`: `[0.71, 0.71, 1.41]`. Softmax: `e^0.71 = 2.03` twice and `e^1.41 = 4.11`, total 8.17, so weights `[0.25, 0.25, 0.50]`. The output is `0.25 * [1, 0] + 0.25 * [0, 1] + 0.5 * [1, 1] = [0.75, 0.75]`: `sat` is now a blend of itself and the words before it.
+
+Row 1 shows the **causal mask** at work: `the` is the first word, it may not look at later words, so it attends only to itself with weight 1.0.
+
+---
+
+## The vocabulary
+
+| Word                                | Plain meaning                                                                                                                                                                                                |
+| :---------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **token**                           | The unit the model reads and writes: a word or a piece of one. [Tokenization](/ai/llm/tokenization) covers how text is split.                                                                                |
+| **embedding**                       | The learned vector each token ID is mapped to.                                                                                                                                                               |
+| **`d_model`** (hidden size)         | The length of every token's vector inside the model: 768 in GPT-2 small, 4,096 in Llama 3.1 8B.                                                                                                              |
+| **sequence length `T`**             | How many tokens are processed together.                                                                                                                                                                      |
+| **context window**                  | The maximum sequence length the model can handle.                                                                                                                                                            |
+| **self-attention**                  | Attention where queries, keys, and values all come from the same sequence.                                                                                                                                   |
+| **cross-attention**                 | Attention where queries come from one sequence (the decoder) and keys and values from another (the encoder).                                                                                                 |
+| **head / `d_head`**                 | One of several parallel attention computations, each on a slice of size `d_head = d_model / n_heads`.                                                                                                        |
+| **causal mask**                     | Blocks each token from attending to later tokens, so the model cannot cheat by reading the answer.                                                                                                           |
+| **padding mask**                    | Blocks attention to filler tokens added to make sequences the same length.                                                                                                                                   |
+| **feed-forward network (FFN, MLP)** | Two or three linear layers applied to each token separately, after attention. Holds most of the parameters.                                                                                                  |
+| **residual connection**             | Adding a layer's input to its output (`x + f(x)`), so information and gradients can flow straight through.                                                                                                   |
+| **layer normalization / RMSNorm**   | Rescaling each token's vector to a standard size, which keeps training stable.                                                                                                                               |
+| **block (layer)**                   | One unit of norm, attention, residual, norm, feed-forward, residual. Models stack 12 to over 100 of them.                                                                                                    |
+| **positional encoding**             | How the model learns word order, since attention by itself ignores it. Sinusoidal, learned, or rotary (RoPE).                                                                                                |
+| **logits**                          | The raw scores the output head gives every vocabulary token, before softmax.                                                                                                                                 |
+| **autoregressive**                  | Generating one token at a time, each conditioned on all the tokens before it.                                                                                                                                |
+| **encoder / decoder**               | Encoder: sees the whole input in both directions. Decoder: causal, generates left to right. [Encoding and Decoding](/ai/math-foundations/encoding-and-decoding) separates the other meanings of these words. |
+
+---
+
+## Training versus generation
+
+**Training is parallel.** Take the sentence "the cat sat on the mat". The model is asked to predict every next token at once: after `the` predict `cat`, after `the cat` predict `sat`, and so on, five predictions from one forward pass. The causal mask is what makes this legal: position 2 cannot see position 3, so predicting position 3 from position 2 is a fair test even though both are in the same input. The loss is the average cross-entropy of the five predictions. This is why transformers train so much faster than RNNs on GPUs.
+
+**Generation is sequential.** At inference the next token is unknown, so the model produces one token, appends it to the input, and runs again. Recomputing everything for every new token would be wasteful, so models store each past token's keys and values in a **KV cache** and only compute the new token's. [Inference Lifecycle](/ai/llm/inference-lifecycle) covers prefill (processing the prompt in parallel) and decode (one token at a time).
+
+<Callout type="warn">
+  ### Common mistake
+
+Thinking a transformer "reads left to right" like an RNN. During training and prompt processing, every position is computed simultaneously; only the mask enforces that information flows left to right. Order exists only because positional information was added.
+
+</Callout>
+
+---
+
+## The three families
+
+The block is the same in all three. What differs is the mask, the training objective, and whether there are one or two stacks. [Architectures](/ai/transformers/architectures) compares them in detail.
+
+| Family              | Attention                                                  | Trained to                                  | Example models               | Good at                                |
+| :------------------ | :--------------------------------------------------------- | :------------------------------------------ | :--------------------------- | :------------------------------------- |
+| **Encoder-only**    | Bidirectional: every token sees every token                | Fill in masked-out words                    | BERT                         | Classification, search embeddings      |
+| **Decoder-only**    | Causal: each token sees only earlier tokens                | Predict the next token                      | GPT, Llama, Qwen, Claude     | Generating text; every modern chat LLM |
+| **Encoder-decoder** | Encoder bidirectional, decoder causal plus cross-attention | Map an input sequence to an output sequence | The original transformer, T5 | Translation, summarization             |
+
+Transformers are not only for text. A **Vision Transformer** (ViT, Dosovitskiy et al., arXiv:2010.11929) cuts an image into patches and treats each patch as a token. Whisper (arXiv:2212.04356) is an encoder-decoder transformer over audio. The same block works on anything that can be split into a sequence of vectors.
+
+---
+
+## A short history
+
+| Year         | Model                             | What it established                                                                                                         |
+| :----------- | :-------------------------------- | :-------------------------------------------------------------------------------------------------------------------------- |
+| 2014         | Bahdanau attention                | Attention as an add-on to RNN translation (arXiv:1409.0473)                                                                 |
+| 2017         | Transformer                       | Attention alone, no recurrence (arXiv:1706.03762)                                                                           |
+| 2018         | GPT                               | Pretrain a decoder on unlabeled text, then fine-tune (Radford et al., 2018)                                                 |
+| 2018         | BERT                              | Bidirectional encoder pretrained by masking words (arXiv:1810.04805)                                                        |
+| 2019         | GPT-2, T5                         | Larger decoders generate coherent text (Radford et al., 2019); every task as text-to-text (arXiv:1910.10683)                |
+| 2020         | GPT-3                             | 175 billion parameters; tasks solved from examples in the prompt (arXiv:2005.14165)                                         |
+| 2020         | ViT                               | Transformers for images (arXiv:2010.11929)                                                                                  |
+| 2023 onwards | Llama, Qwen, DeepSeek, and others | Open-weight decoder-only LLMs with RoPE, RMSNorm, SwiGLU, GQA, and mixture of experts; [Frontier LLMs](/ai/llm) covers them |
+
+---
+
+## Where each idea is covered
+
+| Question                                                                                     | Page                                                             |
+| :------------------------------------------------------------------------------------------- | :--------------------------------------------------------------- |
+| How exactly is attention computed, and why divide by `sqrt(d_k)`?                            | [Attention Internals](/ai/transformers/attention-internals)      |
+| How does the causal mask work, and what do multiple heads buy?                               | [Masking and Multi-Head](/ai/transformers/masking-and-multihead) |
+| What are the feed-forward network, residual stream, normalization, and positional encodings? | [Blocks and Positions](/ai/transformers/blocks-and-positions)    |
+| How do BERT, GPT, and T5 differ, and what are the shapes in a full forward pass?             | [Architectures](/ai/transformers/architectures)                  |
+| How do I write and train a whole GPT?                                                        | [GPT from Scratch](/ai/transformers/gpt-from-scratch)            |
+| What changed in modern LLMs?                                                                 | [LLM Basics](/ai/llm/llm-basics)                                 |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What problems of RNNs does the transformer solve?">
+
+    Sequential computation (no parallelism across positions), long-range forgetting (information passes through many state updates), and the fixed-vector bottleneck of Seq2Seq. Attention lets every position read every other position directly, and all positions are computed in parallel.
+
+  </Accordion>
+  <Accordion title="Explain queries, keys, and values in plain words.">
+
+    Each token produces a query (what it is looking for), a key (what it offers), and a value (what it passes on). A token's query is compared with every key by dot product; softmax turns the scores into weights; the output is the weighted average of the values.
+
+  </Accordion>
+  <Accordion title="What does a transformer block contain?">
+
+    Normalization, multi-head attention, a residual addition, normalization, a feed-forward network, and another residual addition. Attention mixes information across positions; the feed-forward network processes each position independently.
+
+  </Accordion>
+  <Accordion title="Why does a transformer need positional information?">
+
+    Attention compares vectors without regard to where they sit, so shuffling the input shuffles the output the same way and word order is invisible. Positions are added as sinusoidal or learned vectors, or applied as rotations to queries and keys (RoPE).
+
+  </Accordion>
+  <Accordion title="How can a decoder train on a whole sentence in one pass?">
+
+    The causal mask stops each position from seeing later ones, so predicting every next token from its prefix can be done simultaneously in one forward pass, with the loss averaged over positions.
+
+  </Accordion>
+  <Accordion title="Encoder-only, decoder-only, encoder-decoder: when is each used?">
+
+    Encoder-only (BERT) for understanding tasks and embeddings, decoder-only (GPT, Llama) for generation and chat, encoder-decoder (T5, the original transformer) for mapping one sequence to another, such as translation.
+
+  </Accordion>
+</Accordions>

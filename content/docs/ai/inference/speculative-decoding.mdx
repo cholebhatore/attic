@@ -7,6 +7,38 @@ Decode produces one token per forward pass because the next token does not exist
 
 ---
 
+## The plain-language version
+
+**Where this sits:** a way around the one-token-at-a-time limit of decode, without changing the output.
+
+Decode is slow because each token needs a full pass over the weights, and checking several tokens costs almost the same as producing one. **Speculative decoding** exploits that: a cheap **draft** (a small model, extra prediction heads, or simple text matching) guesses the next several tokens, and the big model checks all of them in one pass, keeping every guess up to the first wrong one. A clever acceptance rule guarantees the output has exactly the same distribution as the big model alone, so it is a pure speed-up when guesses are often right.
+
+Think of a senior editor and a fast junior writer. The junior drafts the next sentence; the editor reads it in one go and accepts it up to the first word they would have written differently, then writes that word themselves. When the junior is usually right, the editor's work goes several times faster, and the text is exactly what the editor would have written alone.
+
+This page covers, in order:
+
+1. **Why verification is cheap**
+2. **Draft and verify**: with lossless rejection sampling
+3. **The expected-tokens formula**: speed-up from acceptance rate and draft length
+4. **N-gram speculation**: drafting by copying from the prompt
+5. **Medusa**: extra decoding heads
+6. **EAGLE**: drafting from the model's own features
+7. **Tree attention**: verifying several candidate continuations at once
+8. **Other draft-free variants**
+9. **When speculation loses**
+
+| Word                   | Plain meaning                                                                                                     |
+| :--------------------- | :---------------------------------------------------------------------------------------------------------------- |
+| **draft model**        | A small, fast model that proposes tokens.                                                                         |
+| **target model**       | The large model whose output must be preserved.                                                                   |
+| **acceptance rate**    | The share of drafted tokens the target model keeps.                                                               |
+| **rejection sampling** | The acceptance rule that keeps or replaces each draft token so the final distribution matches the target exactly. |
+| **lossless**           | The output distribution is identical to running the target model alone.                                           |
+| **Medusa / EAGLE**     | Draft methods that add small prediction heads to the target model instead of a separate draft model.              |
+| **tree attention**     | Verifying a tree of alternative draft continuations in one pass.                                                  |
+
+---
+
 ## Why verification is cheap
 
 A decode step at batch 1 has arithmetic intensity 1 against an H100 ridge point of 295 FLOP per byte. Verifying `γ + 1` positions in one pass raises intensity to `γ + 1`, still far below the ridge, so the pass remains bandwidth-bound and takes roughly the same wall time. The GPU was idle for 99.66 percent of the step; speculation fills that idle arithmetic.

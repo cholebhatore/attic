@@ -1,0 +1,239 @@
+---
+title: Generation and Citations
+description: The last stage of the query pipeline. The anatomy of a grounded prompt, grounding instructions and the refusal path, citation formats and how to verify them, conflicting and missing sources, generation settings, streaming with citations, post-generation checks, and the generation tech stack.
+---
+
+Retrieval has found the right chunks and the context has been assembled. The model now has to write an answer that uses those chunks, only those chunks, and says which chunk each claim came from. If it cannot find the answer there, it has to say so instead of filling the gap from memory.
+
+That is harder than it sounds. A model's training pushes it to always produce a helpful answer, and its own memory competes with the context you gave it. Generation in RAG is the craft of making the context win, and making it checkable when it does not.
+
+---
+
+## The plain-language version
+
+This is the open-book exam answer. The rules are strict: answer only from the pages on your desk, put a page reference after every claim, and if the pages do not cover the question, write "not in the material" rather than guessing. A good examiner then checks a few references to make sure the pages really say what the answer claims.
+
+The page covers, in order:
+
+1. **The grounded prompt**: what goes in and in what order
+2. **Grounding instructions and the refusal path**
+3. **Citations**: formats, from chunk numbers to exact quotes
+4. **Verifying citations**: catching answers that cite sources that do not support them
+5. **Missing, partial, and conflicting sources**
+6. **Generation settings**: temperature, length, and model choice
+7. **Streaming with citations**
+8. **Post-generation checks and guardrails**
+9. **A grounded generator from scratch**
+10. **The tech stack**
+
+| Word                     | Plain meaning                                                                                                                              |
+| :----------------------- | :----------------------------------------------------------------------------------------------------------------------------------------- |
+| **grounded generation**  | Writing an answer that is supported by the provided sources, and only by them.                                                             |
+| **parametric knowledge** | What the model "knows" from its training, stored in its weights. In RAG it competes with the retrieved context.                            |
+| **citation**             | A marker linking part of the answer to the source that supports it.                                                                        |
+| **attribution**          | Whether the cited source really supports the claim. A citation can exist and still be wrong.                                               |
+| **refusal path**         | An allowed output, such as `NOT_IN_CONTEXT`, for when the sources do not answer the question.                                              |
+| **faithfulness**         | The share of the answer's claims that the sources support. The main generation metric.                                                     |
+| **entailment / NLI**     | Natural language inference: a model that judges whether one text (the source) supports, contradicts, or is neutral to another (the claim). |
+| **structured output**    | Forcing the model's answer into a schema, such as JSON with `answer` and `citations` fields.                                               |
+| **guardrail**            | A check before or after the model call that blocks or fixes unsafe or unsupported output.                                                  |
+
+---
+
+## The grounded prompt
+
+A grounded prompt has four parts:
+
+| Part             | Contents                                                                                               | Why                                                                              |
+| :--------------- | :----------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------- |
+| **Instructions** | Answer only from the sources; cite; refuse when not answerable; format rules                           | Sets the rules before the model reads anything else                              |
+| **Sources**      | Each chunk with a short ID, its title, date, and section, inside clear delimiters (XML tags work well) | IDs make citations possible; metadata lets the model judge authority and recency |
+| **Conversation** | Earlier turns, if any, often compressed                                                                | Follow-up questions depend on them                                               |
+| **Question**     | The user's question, last                                                                              | Placed closest to where the model starts writing                                 |
+
+Two layout details matter. Put the stable instructions first so they can be cached across requests ([Context Budgeting](/ai/rag/context-budgeting) explains prompt caching), and place the most relevant chunks at the start and end of the source list, because information in the middle of a long context is used less reliably (Liu et al., arXiv:2307.03172). [Context Engineering](/ai/rag/context-engineering) covers assembling the whole window.
+
+---
+
+## Grounding instructions and the refusal path
+
+The instructions do two jobs: make the context win over the model's own memory, and make "I cannot answer" a legal output.
+
+```text
+Answer using only the sources in <sources>.
+The sources are authoritative. If they conflict with what you know, follow the sources.
+After each sentence, cite the source numbers it relies on, like [2].
+If the sources do not contain the answer, reply exactly: NOT_IN_CONTEXT.
+Do not add facts that are not in the sources.
+```
+
+Without a refusal path, the model must produce something, and producing something when the sources are silent means inventing. With one, the refusal rate becomes a useful signal: a rising rate means retrieval coverage is falling, not that the model got worse. [Production Debugging](/ai/rag/production-debugging#scenario-1-hallucinating-despite-correct-context) works through the four causes of hallucination despite correct context: attention dilution, position, the parametric prior, and sampling.
+
+---
+
+## Citations
+
+| Format                   | What the answer contains                                                                                                               | Strength                                                    | Weakness                                               |
+| :----------------------- | :------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------- | :----------------------------------------------------- |
+| **Document-level**       | A list of sources at the end                                                                                                           | Simple                                                      | The reader cannot tell which claim came from where     |
+| **Inline chunk IDs**     | `... within 30 days [1].` after each sentence                                                                                          | Claim-level traceability; easy to parse                     | The model can attach a real ID to an unsupported claim |
+| **Quoted spans**         | Each claim followed by the exact supporting quote from the source                                                                      | Mechanically checkable: the quote must appear in the source | Longer answers; more output tokens                     |
+| **Structured output**    | JSON with `answer`, `citations` (IDs), and optionally `quotes`                                                                         | Validated by schema; easy to post-process                   | Needs a model or API that supports structured output   |
+| **Native citation APIs** | The provider returns citations as structured spans pointing into the documents you sent (Anthropic's Citations feature is one example) | Precise character-level spans without prompt engineering    | Provider-specific                                      |
+
+Whatever the format, the citation must resolve to something the user can open: the document title, the page or section, and a link. The chunk metadata from ingestion (`source_id`, `page`, `bbox`, `section_path`, `updated_at`) is what makes that possible. [Production Debugging](/ai/rag/production-debugging#scenario-5-document-updates-and-freshness) lists the fields a user needs per citation.
+
+---
+
+## Verifying citations
+
+Asking for citations does not make them correct. A model will happily cite source `[2]` for a claim that source 2 does not make. Verification turns "the answer has citations" into "the answer is supported":
+
+| Check           | How                                                                                     | Catches                                          |
+| :-------------- | :-------------------------------------------------------------------------------------- | :----------------------------------------------- |
+| **Format**      | Every sentence has a citation; every cited ID exists in the source list                 | Uncited claims; invented source numbers          |
+| **Quote match** | Each quoted span appears in the cited source (exact or fuzzy string match)              | Fabricated quotes                                |
+| **Entailment**  | An NLI model or a narrow judge call scores each sentence against only its cited sources | Real citations attached to unsupported claims    |
+| **Coverage**    | Share of sentences that pass entailment                                                 | Answers that are mostly supported but add extras |
+
+When a check fails: drop the unsupported sentence, regenerate with feedback, or fall back to the refusal answer. Track the failure rate as a metric; it is your faithfulness score in production.
+
+---
+
+## Missing, partial, and conflicting sources
+
+| Situation                      | What the answer should do                                                                                                         |
+| :----------------------------- | :-------------------------------------------------------------------------------------------------------------------------------- |
+| **Nothing relevant retrieved** | Refuse, and say what was searched. Do not answer from memory unless the product explicitly allows it, and then label it.          |
+| **Partial answer**             | Answer the supported part, and state plainly which part the sources do not cover.                                                 |
+| **Sources disagree**           | Present both, with their sources and dates, or prefer the newer or more authoritative one and say why. Never silently blend them. |
+| **Source is outdated**         | Include the document date in the citation, so the user can judge; prefer recent sources when the date is known.                   |
+| **Question is ambiguous**      | Ask a clarifying question, or answer each reading separately with its sources.                                                    |
+
+Including each chunk's `updated_at` and source type in the prompt is what lets the model resolve conflicts sensibly. Without dates, it cannot know which of two policies is current.
+
+---
+
+## Generation settings
+
+- **Temperature low**, roughly 0 to 0.3, for factual answers. Sampling diversity in grounded QA is diversity in how the model fills gaps it should not fill. [Decoding Strategies](/ai/llm/decoding) explains temperature.
+- **Length limits** in the instructions and in `max_tokens`: long answers drift away from the sources.
+- **Model size**: grounded answering over good context is easier than open-ended reasoning, so a smaller, cheaper model often matches a large one. Measure faithfulness on your own test set before paying for the largest model.
+- **Structured output** (JSON schema or constrained decoding) when downstream code parses citations.
+
+---
+
+## Streaming with citations
+
+Users expect tokens to stream. Citations complicate that:
+
+- **Inline markers stream naturally**: `[1]` arrives as part of the text; the client turns it into a link as soon as the closing bracket arrives.
+- **Verification is after the fact**: entailment checks need the full sentence. Common patterns are to verify each sentence as it completes and mark or retract unsupported ones, or to stream the answer and show a "sources verified" indicator when checks finish.
+- **Structured JSON is harder to stream**: either stream the `answer` field's text and parse citations at the end, or use an API that streams citation events separately.
+
+---
+
+## Post-generation checks and guardrails
+
+Beyond citation checks, a production generation step often runs:
+
+- **Refusal and format validation**: the output is either a valid answer or exactly the refusal string.
+- **Groundedness scoring** with an LLM judge or NLI model, logged for every answer and sampled for human review.
+- **Sensitive-content filters**: no PII, secrets, or content the user is not permitted to see should appear, even if a chunk slipped through.
+- **Prompt-injection awareness**: retrieved documents are untrusted input. A web page or uploaded file can contain text such as "ignore previous instructions". Delimit sources clearly, tell the model that sources are data rather than instructions, and never let retrieved text trigger tool calls without checks. [Agent Security](/ai/agents/agent-security) covers this in depth.
+
+---
+
+## A grounded generator from scratch
+
+Building the prompt and checking citation format, the two parts that need no model.
+
+```python title="grounded.py"
+import re
+
+chunks = [
+    {"id": "policy.md#2", "text": "Refunds are available within 30 days of purchase with a receipt."},
+    {"id": "policy.md#5", "text": "Gift cards cannot be refunded or exchanged for cash."},
+]
+
+def build_prompt(question, chunks):
+    context = "\n".join(f"[{i + 1}] (source: {c['id']})\n{c['text']}" for i, c in enumerate(chunks))
+    return (
+        "Answer using only the numbered sources below. After each sentence, cite the sources it uses, like [1].\n"
+        "If the sources do not contain the answer, reply exactly: NOT_IN_CONTEXT.\n\n"
+        f"<sources>\n{context}\n</sources>\n\nQuestion: {question}"
+    )
+
+print(build_prompt("Can I get a refund on a gift card?", chunks))
+
+def check_citations(answer, chunks):
+    problems = []
+    for sentence in re.split(r"(?<=[.!?])\s+", answer.strip()):
+        ids = [int(n) for n in re.findall(r"\[(\d+)\]", sentence)]
+        if not ids:
+            problems.append(f"uncited: {sentence!r}")
+        for n in ids:
+            if not 1 <= n <= len(chunks):
+                problems.append(f"cites missing source [{n}]")
+    return problems
+
+print(check_citations("No, gift cards cannot be refunded [2]. Other items can be returned within 30 days [1].", chunks))
+# []
+print(check_citations("No, gift cards cannot be refunded [3]. Store credit is offered instead.", chunks))
+# ['cites missing source [3]', "uncited: 'Store credit is offered instead.'"]
+```
+
+The second answer fails both ways: it cites a source that does not exist, and it adds a claim ("store credit") with no source at all, which is exactly what an invented fact looks like. A real system adds the entailment check on top, since a correctly formatted citation can still point at a source that says something else.
+
+---
+
+## The tech stack
+
+| Job                         | Tools                                                                                                  |
+| :-------------------------- | :----------------------------------------------------------------------------------------------------- |
+| Generation                  | Hosted LLM APIs, or self-hosted models served with vLLM or SGLang                                      |
+| Structured output           | Provider JSON-schema modes, Pydantic models with Instructor, constrained decoding (Outlines, XGrammar) |
+| Native citations            | Provider citation features that return source spans with the answer                                    |
+| Entailment and groundedness | NLI cross-encoders, LLM judges, RAGAS faithfulness, DeepEval, TruLens groundedness                     |
+| Guardrails                  | Guardrails AI, NVIDIA NeMo Guardrails, Llama Guard for content safety, Presidio for PII in outputs     |
+| Prompt management           | Versioned prompts in LangSmith, Langfuse, or your own repository                                       |
+| Tracing                     | LangSmith, Langfuse, Arize Phoenix: log the prompt, the sources, the answer, and every check result    |
+
+[RAG and Agent Evaluation](/ai/agents/rag-and-agent-eval) covers measuring faithfulness and answer relevancy offline and as CI gates.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="How do you reduce hallucination in the generation step of RAG?">
+
+    Instruct the model to answer only from the sources and to treat them as authoritative, give it an explicit refusal output, keep temperature low, keep only the most relevant few chunks and place the best at the edges, require citations, and verify each cited claim with an entailment check, refusing or regenerating when it fails.
+
+  </Accordion>
+  <Accordion title="Why is asking for citations not enough?">
+
+    Models attach real source IDs to claims those sources do not make. Citations become meaningful only when checked: the ID must exist, any quote must appear in the source, and an NLI model or judge must find that the cited text supports the sentence.
+
+  </Accordion>
+  <Accordion title="Why does a refusal path matter?">
+
+    Without one, the model has to produce an answer, so it fills gaps from memory. With one, refusing is legal, hallucination drops, and the refusal rate becomes a measurable signal of retrieval coverage.
+
+  </Accordion>
+  <Accordion title="How should the answer handle sources that disagree?">
+
+    Show both with their sources and dates, or choose the newer or more authoritative one and explain the choice. Never blend them silently. Including dates and source types in the prompt is what makes this possible.
+
+  </Accordion>
+  <Accordion title="What is faithfulness, and how is it measured?">
+
+    The share of claims in the answer that the retrieved context supports. Split the answer into claims, check each against the context with an LLM judge or NLI model, and divide supported claims by total claims, as RAGAS does.
+
+  </Accordion>
+  <Accordion title="Why are retrieved documents a security risk at generation time?">
+
+    They are untrusted input that lands in the prompt, so they can carry prompt-injection instructions. Delimit them, tell the model they are data, filter sensitive content, and never let retrieved text trigger actions without validation.
+
+  </Accordion>
+</Accordions>

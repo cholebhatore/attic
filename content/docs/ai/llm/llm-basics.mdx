@@ -1,0 +1,275 @@
+---
+title: LLM Basics
+description: What makes a language model large, the training lifecycle from pretraining to post-training, base versus instruct versus reasoning models, how to read a model name, a model card, and a config.json, parameter, memory, and KV-cache arithmetic on Llama 3.1 8B, what changed from GPT-2 to modern LLMs, and what LLMs cannot do.
+---
+
+Phase 5 ended with a small GPT you can train in an hour. A **large language model (LLM)** is the same kind of model, a decoder-only transformer trained to predict the next token, made far bigger, trained on far more text, refined after training to follow instructions, and changed in a handful of places so that it is affordable to run.
+
+This page is the map for the phase: the words that appear on every model card, the stages a model goes through before you can chat with it, the arithmetic that tells you whether a model fits on your hardware, and the list of design changes the later pages explain one by one.
+
+It covers, in order:
+
+1. **What makes a model "large"**: parameters, training tokens, and compute
+2. **The lifecycle of an LLM**: pretraining, post-training, and deployment
+3. **Base, instruct, and reasoning models**: what each one is and how to tell them apart
+4. **Reading a model name and a model card**: `8B`, `A3B`, `Instruct`, `GGUF`, context length, license
+5. **Reading a config.json**: every field that decides the architecture
+6. **The arithmetic**: parameters, weight memory, and KV-cache memory for Llama 3.1 8B
+7. **From GPT-2 to a modern LLM**: the design changes and the pages that explain them
+8. **What LLMs cannot do**: knowledge cutoff, hallucination, context limits, and the tools that fix each
+9. **The vocabulary**
+10. **Where each idea is covered**
+
+---
+
+## What makes a model "large"
+
+There is no official threshold. "Large" refers to three quantities that grew together:
+
+| Quantity             | What it is                                                                                    | GPT-2 (2019)                  | A modern open model                                                |
+| :------------------- | :-------------------------------------------------------------------------------------------- | :---------------------------- | :----------------------------------------------------------------- |
+| **Parameters**       | The learned numbers in the weights                                                            | 124 million to 1.5 billion    | Billions to hundreds of billions                                   |
+| **Training tokens**  | How much text it learned from                                                                 | Tens of gigabytes of web text | Trillions of tokens (DeepSeek-V3: 14.8 trillion, arXiv:2412.19437) |
+| **Training compute** | The total arithmetic of training, roughly `6 * parameters * tokens` floating-point operations | Small                         | Thousands of GPUs for weeks to months                              |
+
+Scaling all three made capabilities appear that small models lacked: following instructions, answering from examples in the prompt (**in-context learning**, shown at scale by GPT-3, arXiv:2005.14165), writing code, and multi-step reasoning. [Scaling and Parallelism](/ai/llm/scaling-and-parallelism) covers how the three are balanced (the scaling laws) and how training is split across GPUs.
+
+---
+
+## The lifecycle of an LLM
+
+<Mermaid
+  chart={`
+flowchart LR
+    D["Trillions of tokens of text and code"] --> PT["Pretraining: predict the next token"]
+    PT --> BASE["Base model"]
+    BASE --> SFT["Supervised fine-tuning: instruction and response examples"]
+    SFT --> PREF["Preference tuning: RLHF or DPO"]
+    PREF --> RL["Reasoning RL (optional): reward verifiable answers"]
+    RL --> CHAT["Instruct / chat / reasoning model"]
+    CHAT --> DEP["Deployment: quantize, serve, add RAG and tools"]
+`}
+/>
+
+| Stage                            | What the model learns                                                                                         | Data                                                   | Covered in                                                                                                 |
+| :------------------------------- | :------------------------------------------------------------------------------------------------------------ | :----------------------------------------------------- | :--------------------------------------------------------------------------------------------------------- |
+| **Pretraining**                  | Language, facts, code, and patterns, by predicting the next token. Self-supervised: the text is its own label | Huge unlabeled corpora                                 | [Foundation Models](/ai/llm/foundation-models), [Scaling and Parallelism](/ai/llm/scaling-and-parallelism) |
+| **Supervised fine-tuning (SFT)** | To respond helpfully in a conversation format                                                                 | Tens of thousands to millions of written examples      | [Fine-Tuning](/ai/fine-tuning)                                                                             |
+| **Preference tuning**            | Which of two answers people (or a reward model) prefer                                                        | Pairs of answers ranked better and worse               | [Reinforcement Learning](/ai/reinforcement-learning)                                                       |
+| **Reasoning RL**                 | To think step by step before answering, rewarded when the final answer checks out                             | Math, code, and other problems with verifiable answers | [Reinforcement Learning](/ai/reinforcement-learning)                                                       |
+| **Deployment**                   | Nothing new: the weights are compressed (quantized), served, and connected to documents and tools             | -                                                      | [Inference](/ai/inference), [RAG](/ai/rag), [Agents](/ai/agents)                                           |
+
+Think of a new employee. Pretraining is their entire education: they know an enormous amount but have never worked in your office. SFT is job training: here is how we answer customers. Preference tuning is feedback from a manager: this answer was better than that one. Deployment adds the company handbook (RAG) and access to internal systems (tools).
+
+---
+
+## Base, instruct, and reasoning models
+
+| Kind                           | What it does with "What is the capital of France?"                                                        | Use it for                                                            |
+| :----------------------------- | :-------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------- |
+| **Base model**                 | Continues the text. It might answer, or it might add "What is the capital of Spain?" as if writing a quiz | Further fine-tuning; research; text completion                        |
+| **Instruct / chat model**      | Answers the question, in the conversation format it was tuned on                                          | Almost every application                                              |
+| **Reasoning (thinking) model** | Writes out intermediate reasoning (often hidden) before the answer                                        | Math, code, planning, multi-step problems, at higher latency and cost |
+
+Instruct models expect their input wrapped in a **chat template**: special tokens marking where the system prompt, the user turn, and the assistant turn begin and end. Sending raw text to an instruct model, or the wrong template, quietly degrades its answers. [Tokenization](/ai/llm/tokenization#special-tokens-and-chat-templates) shows the templates. Some models, such as Qwen 3, switch between thinking and direct-answer modes inside one set of weights ([Qwen 3 from Scratch](/ai/llm/qwen-from-scratch)).
+
+---
+
+## Reading a model name and a model card
+
+Model names pack a lot of information. Two real examples: `Llama-3.1-8B-Instruct` and `Qwen3-30B-A3B`.
+
+| Part of the name                           | Meaning                                                                                                                                                                                              |
+| :----------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Family and version**                     | `Llama-3.1`, `Qwen3`: the model series and release                                                                                                                                                   |
+| **`8B`**                                   | About 8 billion parameters in total                                                                                                                                                                  |
+| **`30B-A3B`**                              | A mixture-of-experts model: 30 billion parameters in total, about 3 billion **active** per token. Memory follows the 30B; speed follows the 3B. See [Mixture of Experts](/ai/llm/mixture-of-experts) |
+| **`Instruct`, `Chat`, `-it`**              | Post-trained to follow instructions. No suffix (or `Base`) usually means a pretrained base model                                                                                                     |
+| **`GGUF`, `Q4_K_M`, `AWQ`, `GPTQ`, `FP8`** | A quantized copy in a particular format and bit-width, made to run in less memory. See [Inference](/ai/inference)                                                                                    |
+
+A **model card** (the README on Hugging Face) adds what the name cannot: the context length, the languages and benchmarks, the training data cutoff, the chat template, recommended sampling settings, and the **license**. Open-weights licenses differ: some allow any commercial use, others restrict it by company size or use case. [Foundation Models](/ai/llm/foundation-models) compares open-weights and closed models.
+
+---
+
+## Reading a config.json
+
+Every open model ships a `config.json` that fully defines its shape. This is the one for Llama 3.1 8B, abridged to the fields that matter:
+
+```json title="config.json (Llama 3.1 8B, abridged)"
+{
+  "vocab_size": 128256,
+  "hidden_size": 4096,
+  "num_hidden_layers": 32,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "intermediate_size": 14336,
+  "hidden_act": "silu",
+  "max_position_embeddings": 131072,
+  "rope_theta": 500000.0,
+  "rms_norm_eps": 1e-5,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16"
+}
+```
+
+| Field                     | Meaning                                                                                                                                                                                                 |
+| :------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `vocab_size`              | Number of tokens in the vocabulary; the rows of the embedding table                                                                                                                                     |
+| `hidden_size`             | `d_model`, the length of every token vector inside the model                                                                                                                                            |
+| `num_hidden_layers`       | Number of transformer blocks                                                                                                                                                                            |
+| `num_attention_heads`     | Query heads per layer; `head_dim = hidden_size / num_attention_heads = 128`                                                                                                                             |
+| `num_key_value_heads`     | Key and value heads. Fewer than query heads means **grouped-query attention** (here 4 query heads share each KV head), which shrinks the KV cache. See [Attention Variants](/ai/llm/attention-variants) |
+| `intermediate_size`       | Width of the feed-forward network's hidden layer                                                                                                                                                        |
+| `hidden_act: silu`        | The activation inside SwiGLU, the gated feed-forward network                                                                                                                                            |
+| `max_position_embeddings` | The longest context the model was built for (here 131,072 tokens)                                                                                                                                       |
+| `rope_theta`              | The base frequency of rotary position embeddings; larger values suit longer contexts. See [Context Windows](/ai/llm/context-windows)                                                                    |
+| `rms_norm_eps`            | A small constant in RMSNorm that avoids dividing by zero                                                                                                                                                |
+| `tie_word_embeddings`     | Whether the output head reuses the embedding table. `false` means two separate `(vocab, hidden)` matrices                                                                                               |
+| `torch_dtype`             | The precision the weights are stored in                                                                                                                                                                 |
+
+[Reading Model Code](/ai/llm/reading-model-code) maps every field to the line of code that uses it.
+
+---
+
+## The arithmetic
+
+Three numbers decide whether a model fits on your hardware: the parameter count, the memory for the weights, and the memory for the KV cache.
+
+```python title="llama_arithmetic.py"
+V, d, L, H, KV, ffn = 128256, 4096, 32, 32, 8, 14336   # from config.json above
+hd = d // H                                             # head_dim = 128
+
+attn = d * (H * hd) + 2 * d * (KV * hd) + (H * hd) * d  # q, k, v, o projections (no biases)
+mlp = 3 * d * ffn                                       # SwiGLU: gate, up, down
+norms = 2 * d                                           # two RMSNorm weight vectors per block
+per_layer = attn + mlp + norms
+embed = V * d                                           # input embedding table
+head = V * d                                            # untied output head
+total = L * per_layer + embed + head + d                # + the final norm
+
+print(f"{attn:,} {mlp:,} {per_layer:,}")   # 41,943,040 176,160,768 218,112,000
+print(f"{total:,}")                         # 8,030,261,248   the published "8B"
+print(f"bf16: {total * 2 / 1e9:.1f} GB, int4: {total * 0.5 / 1e9:.1f} GB")   # bf16: 16.1 GB, int4: 4.0 GB
+
+kv_bytes_per_token = 2 * L * KV * hd * 2                # keys and values, every layer, 2 bytes each in bf16
+print(kv_bytes_per_token, f"{kv_bytes_per_token * 8192 / 2**30:.2f} GiB per 8,192-token sequence")
+# 131072 1.00 GiB per 8,192-token sequence
+```
+
+Three things to notice:
+
+- **The feed-forward network holds most of the parameters**: 176 million of the 218 million in each layer.
+- **Weights memory is parameters times bytes per parameter**: 2 bytes in bf16, about half a byte at 4 bits. That is why an 8B model needs a 24 GB GPU unquantized but runs on a laptop at 4 bits (plus some overhead the arithmetic ignores).
+- **The KV cache grows with every token of every concurrent request**: 128 KiB per token here, 1 GiB for one 8,192-token conversation. With 8 KV heads instead of 32, grouped-query attention makes it 4 times smaller than it would otherwise be. [What is an LLM](/ai/llm/what-is-an-llm) and [Context Windows](/ai/llm/context-windows) go further.
+
+---
+
+## From GPT-2 to a modern LLM
+
+The GPT in [GPT from Scratch](/ai/transformers/gpt-from-scratch) follows GPT-2's design. Almost every frontier model since 2023 changes the same handful of choices, each for a specific cost:
+
+| Component               | GPT-2 style                           | Modern LLM                                        | Why it changed                                          | Page                                                      |
+| :---------------------- | :------------------------------------ | :------------------------------------------------ | :------------------------------------------------------ | :-------------------------------------------------------- |
+| Positions               | Learned absolute positions            | RoPE (rotary), with scaling for long contexts     | Relative positions generalize; contexts can be extended | [Context Windows](/ai/llm/context-windows)                |
+| Normalization           | LayerNorm                             | RMSNorm, pre-norm; often QK-Norm too              | Cheaper and more stable at scale                        | [Qwen 3 from Scratch](/ai/llm/qwen-from-scratch)          |
+| Feed-forward activation | GELU                                  | SwiGLU (gated)                                    | Better quality per parameter                            | [Llama 4 from Scratch](/ai/llm/llama-from-scratch)        |
+| Attention heads         | Multi-head (one KV per query head)    | Grouped-query (GQA) or latent attention (MLA)     | The KV cache, not compute, limits serving               | [Attention Variants](/ai/llm/attention-variants)          |
+| Feed-forward            | Dense: every parameter used per token | Often mixture of experts: a few experts per token | More total knowledge at the same compute per token      | [Mixture of Experts](/ai/llm/mixture-of-experts)          |
+| Vocabulary              | About 50,000 tokens                   | About 128,000 to 152,000 (Llama 3, Qwen 3)        | Fewer tokens per text, better multilingual coverage     | [Tokenization](/ai/llm/tokenization)                      |
+| Context                 | 1,024 tokens                          | 128,000 tokens and more                           | Long documents, conversations, and agents               | [Context Windows](/ai/llm/context-windows)                |
+| Precision               | fp32 training                         | bf16 training, FP8 in places; quantized serving   | Memory and speed                                        | [DeepSeek-V3 from Scratch](/ai/llm/deepseek-from-scratch) |
+
+---
+
+## What LLMs cannot do
+
+| Limit                             | What happens                                                                                              | Usual fix                                                                              |
+| :-------------------------------- | :-------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------- |
+| **Knowledge cutoff**              | The model knows nothing after its training data ends                                                      | Retrieval ([RAG](/ai/rag)) or tools such as web search                                 |
+| **No private knowledge**          | It has never seen your documents                                                                          | [RAG](/ai/rag)                                                                         |
+| **Hallucination**                 | Fluent, confident statements that are false, because the model predicts plausible text, not checked facts | Grounding in sources, citations, verification                                          |
+| **Bounded context**               | Only so many tokens fit, and quality drops before the limit                                               | [Context Windows](/ai/llm/context-windows), context engineering                        |
+| **Arithmetic and exact lookups**  | Token-by-token prediction is unreliable at exact calculation and counting                                 | Tools: a calculator, code execution, SQL ([Agents](/ai/agents))                        |
+| **Non-determinism**               | Sampling makes outputs vary between runs                                                                  | Low temperature, fixed seeds where supported ([Decoding Strategies](/ai/llm/decoding)) |
+| **Behaviour drift from the task** | Wrong tone, format, or domain style                                                                       | Prompting, then [Fine-Tuning](/ai/fine-tuning)                                         |
+
+---
+
+## The vocabulary
+
+| Word                            | Plain meaning                                                                                            |
+| :------------------------------ | :------------------------------------------------------------------------------------------------------- |
+| **LLM**                         | A large transformer, almost always decoder-only, trained on huge text corpora to predict the next token. |
+| **foundation model**            | A model trained on broad data that can be adapted to many tasks.                                         |
+| **pretraining**                 | The first, largest training stage: next-token prediction on raw text.                                    |
+| **post-training**               | Everything after pretraining that shapes behaviour: SFT, preference tuning, reasoning RL.                |
+| **base / instruct model**       | Before and after post-training.                                                                          |
+| **prompt / system prompt**      | The input text; the system prompt is the fixed instruction block that sets the model's role and rules.   |
+| **chat template**               | The special-token format that marks system, user, and assistant turns.                                   |
+| **in-context learning**         | Doing a new task from instructions or examples in the prompt, with no weight changes.                    |
+| **inference**                   | Running the trained model to produce output.                                                             |
+| **prefill / decode**            | Processing the whole prompt in parallel, then generating output tokens one at a time.                    |
+| **KV cache**                    | Stored keys and values of past tokens, so each new token does not recompute them.                        |
+| **parameters (total / active)** | All learned numbers; in a mixture of experts, only the active ones are used for each token.              |
+| **quantization**                | Storing weights with fewer bits (8, 4) to save memory and time.                                          |
+| **open weights**                | The trained parameters are downloadable; the training data and code may not be.                          |
+| **temperature**                 | A sampling setting: low is focused and repeatable, high is varied.                                       |
+| **hallucination**               | A confident output that is not true or not supported.                                                    |
+
+---
+
+## Where each idea is covered
+
+<Mermaid
+  chart={`
+flowchart TD
+    B["LLM Basics"] --> A["What is an LLM"]
+    A --> FM["Foundation Models"]
+    FM --> IL["Inference Lifecycle"]
+    IL --> TK["Tokenization"]
+    TK --> CW["Context Windows"]
+    CW --> DS["Decoding Strategies"]
+    DS --> AV["Attention Variants"]
+    AV --> MOE["Mixture of Experts"]
+    MOE --> SP["Scaling and Parallelism"]
+    SP --> RM["Llama 4, DeepSeek-V3, Qwen 3 from scratch"]
+    RM --> RC["Reading Model Code"]
+`}
+/>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between a base model and an instruct model?">
+
+    A base model is the output of pretraining: it continues text. An instruct model has been post-trained with supervised examples and preference tuning to follow instructions in a chat format. Applications almost always use instruct models; base models are the starting point for custom fine-tuning.
+
+  </Accordion>
+  <Accordion title="Walk through how an LLM is trained, end to end.">
+
+    Pretraining on trillions of tokens with next-token prediction produces a base model. Supervised fine-tuning on instruction-response examples teaches the conversation format. Preference tuning (RLHF or DPO) aligns answers with human preferences, and reasoning models add reinforcement learning on problems with verifiable answers. Deployment then quantizes and serves the model, often with retrieval and tools.
+
+  </Accordion>
+  <Accordion title="What does 30B-A3B mean?">
+
+    A mixture-of-experts model with about 30 billion total parameters, of which about 3 billion are active for each token. Memory needs follow the total; compute per token follows the active count.
+
+  </Accordion>
+  <Accordion title="How much memory does an 8B model need?">
+
+    Parameters times bytes per parameter for the weights: about 16 GB in bf16, about 4 GB at 4 bits, plus overhead. Add the KV cache, which grows per token and per concurrent request: about 128 KiB per token for Llama 3.1 8B in bf16, so 1 GiB for an 8,192-token sequence.
+
+  </Accordion>
+  <Accordion title="What changed between GPT-2 and modern open LLMs?">
+
+    RoPE instead of learned positions, RMSNorm pre-norm (sometimes QK-Norm), SwiGLU feed-forward layers, grouped-query or latent attention to shrink the KV cache, often mixture-of-experts feed-forward layers, larger vocabularies, much longer contexts, and lower-precision training and serving.
+
+  </Accordion>
+  <Accordion title="Why do LLMs hallucinate?">
+
+    They are trained to produce plausible continuations, not verified facts, and they produce an answer even when their training data did not contain one. Grounding in retrieved sources, a permitted "I don't know", low temperature, and verification reduce it.
+
+  </Accordion>
+</Accordions>

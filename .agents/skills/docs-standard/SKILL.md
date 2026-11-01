@@ -97,6 +97,40 @@ Breadth over depth. There is no limit to the number of code lines, but avoid wri
 The reason to hold a line budget is that a reader scanning for one term should find it. Length is
 not a proxy for rigor, and padding buries the thing they came for.
 
+## Learning notes: basics first, advanced kept
+
+Study material is written for a reader who must reach the advanced content without having been told
+the basics. Medium or advanced level is never a reason to skip a basic term: if a page uses NLP,
+MLP, encoding, or a loader, the notes define it somewhere the reader passes first. Make it easy, and
+leave nothing out.
+
+- **Never delete, only expand.** Keep every topic, number, example, and advanced detail. Rearranging,
+  merging duplicates, and rewording are allowed when every point survives. Before reporting, read the
+  removed lines in `git diff` and confirm each is a rewording, a move, or a deliberate fix.
+- **A basics page opens every section** (for example AI Basics, PyTorch Basics, RAG Basics). It
+  carries: the field or pipeline map, every stage or idea in order with one line each, a vocabulary
+  table, a tiny runnable from-scratch example, the tech stack, a "where each idea is covered" table,
+  and interview questions.
+- **Every content page opens with `## The plain-language version`**, placed before the first deep H2.
+  It says where the page sits in the section's sequence or pipeline, explains the idea in plain words
+  with an everyday analogy, lists the page's topics in order (hierarchy before detail), and gives a
+  `| Word | Plain meaning |` table defining every term the page uses. Add a common-mistake callout
+  where one exists.
+- **Order follows the real flow.** When a section describes a pipeline or process, pages and sidebar
+  groups follow the order data or work moves through it (for RAG: load, parse, ingest, chunk, embed,
+  index, retrieve, rerank, assemble, generate, evaluate). Use `---Label---` separators in the section
+  `meta.json` to group the stages. If a topic is taught out of flow order, say why on the page.
+- **Fill missing stages.** If the sequence has a gap (no page on loaders, parsing, or ingestion while
+  later stages are covered in depth), write the missing page rather than leaving the gap to a later
+  page's aside. Cross-link scattered material from where it lives now to its new home.
+- **Cover the tech stack with theory.** For each stage, name the category of tool, explain how it works
+  inside (what a PDF stores, how MinHash estimates similarity, why a cross-encoder is slower), then list
+  real tools with what each is best at. Categories outlive brands, so the theory comes first.
+- **Define terms where they first appear**, and link to the page that goes deeper rather than
+  re-explaining it.
+- **Mark interview-relevant pages** with `interview: true` in the curriculum data, and the `INTERVIEW`
+  tag in overview listings.
+
 ## Numbers and claims
 
 Never present an invented figure as a measurement. This is the rule most likely to be broken by
@@ -188,7 +222,9 @@ Put such fragments in backticks, or spell them out in words.
 4. `curl` each new route and expect `200`. Derive the URL from the app directory, not the content
    path. A `000` is usually the dev server still compiling — retry one route before believing it.
 5. If you added or reordered a page, update every registration site. Grep the slug of a neighbouring
-   page and fix each hit: folder `meta.json`, the section index, the parent index, and any generated
-   curriculum or toc data file. One miss leaves a page reachable by URL and invisible in the sidebar.
+   page and fix each hit: folder `meta.json`, the section index (reading-order chart, cards, topic
+   map), the parent index, and any generated curriculum data file (in this repo,
+   `src/app/ai/curriculum/curriculum-data.ts`, which is the single scope index; there is no `toc.md`).
+   One miss leaves a page reachable by URL and invisible in the sidebar.
 
 Do not commit unless asked.

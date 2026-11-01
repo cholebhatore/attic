@@ -7,6 +7,38 @@ The KV cache is the only state that grows with conversation length. Weights are 
 
 ---
 
+## The plain-language version
+
+**Where this sits:** the memory that decides how many users a GPU can serve at once and how long their conversations can be.
+
+During generation the model keeps the keys and values of every previous token, in every layer, so it never recomputes them. That store is the **KV cache**. It grows with every token of every active request, and at long contexts or large batches it can take more memory than the model weights. Once memory is full, no more requests fit, so the cache size directly sets throughput and cost. This page computes it exactly and covers the four ways to make it smaller.
+
+Think of an interpreter in a long meeting keeping notes on everything said so far, so they never have to ask anyone to repeat. The notes make each new sentence fast to handle, but with many meetings at once, the notebooks fill the room.
+
+This page covers, in order:
+
+1. **What the cache holds**
+2. **The formula and the per-token constant**: bytes per token from the config
+3. **How many sequences fit**: on a given GPU
+4. **When the cache outgrows the weights**
+5. **Reduction 1: architecture**: GQA, MQA, MLA, sliding windows
+6. **Reduction 2: precision**: quantizing the cache
+7. **Reduction 3: token eviction**: dropping less important tokens
+8. **Reduction 4: storage layout**: paging and sharing
+9. **What the reductions cost**
+
+| Word                | Plain meaning                                                                                                 |
+| :------------------ | :------------------------------------------------------------------------------------------------------------ |
+| **KV cache**        | Stored keys and values for every past token, per layer, per active sequence.                                  |
+| **bytes per token** | `2 x layers x KV heads x head size x bytes per value`: the cache cost of one token.                           |
+| **concurrency**     | How many sequences are being served at the same time.                                                         |
+| **KV quantization** | Storing the cache in 8 or fewer bits.                                                                         |
+| **eviction**        | Dropping cached tokens judged unimportant, to save memory at some accuracy risk.                              |
+| **paged KV cache**  | Storing the cache in fixed-size blocks, like virtual memory pages, so it does not need one contiguous region. |
+| **prefix sharing**  | Several requests reusing the same cached blocks for an identical prompt prefix.                               |
+
+---
+
 ## What the cache holds
 
 Attention at step `t` needs the key and value vectors of every position `1..t`. Recomputing them means rerunning the projection for all previous tokens, which is quadratic work for a linear result. Caching K and V turns each decode step into one new projection plus a read of the stored tensors.

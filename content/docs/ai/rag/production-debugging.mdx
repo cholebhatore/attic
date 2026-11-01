@@ -9,6 +9,39 @@ The discipline is to localize before tuning. Every scenario below starts with a 
 
 ---
 
+## The plain-language version
+
+**Where this sits:** after everything else. The system is built and in front of users, and some answers are wrong.
+
+From the outside every RAG failure looks the same: a wrong answer. Inside, it could have broken at any stage: the document was never ingested, it was parsed badly, retrieval missed it, reranking buried it, or the model had the right chunk and ignored it. The fixes are different, and some make other problems worse: adding more chunks to fix a missed retrieval makes a generation problem worse.
+
+So debugging RAG is like debugging a plumbing leak. First find which pipe is leaking, then fix that pipe. The single most useful step is to **print the retrieved chunks for the failing question and read them**: if the answer is in them, the generation stage is at fault; if it is not, look earlier in the pipeline.
+
+This page covers, in order:
+
+1. **Localizing the failure**: deciding which stage owns the bug
+2. **The harness you need before debugging**: logging and test sets
+3. **Scenario 1**: hallucinating despite correct context (generation)
+4. **Scenario 2**: redundant and duplicate chunks (retrieval and ingestion)
+5. **Scenario 3**: slow retrieval at million-document scale (the index)
+6. **Scenario 4**: per-user access control (security)
+7. **Scenario 5**: document updates and freshness (ingestion)
+8. **An ordered checklist**
+
+| Word                      | Plain meaning                                                                                            |
+| :------------------------ | :------------------------------------------------------------------------------------------------------- |
+| **localization**          | Working out which pipeline stage caused a failure before changing anything.                              |
+| **chunk dump**            | Printing the exact chunks that were retrieved and sent to the model for one question.                    |
+| **golden set**            | A fixed list of questions with known correct answers or known correct chunks, used to test every change. |
+| **grounding failure**     | The right information was in the context and the answer still contradicts or ignores it.                 |
+| **near-duplicate chunks** | Many copies of almost the same text filling the top results and crowding out other sources.              |
+| **sharding**              | Splitting an index across several machines so each searches a part.                                      |
+| **ACL / pre-filter**      | Permission lists on chunks, applied before search so users never retrieve what they cannot open.         |
+| **staleness**             | The index holds an older version of a document than the source does.                                     |
+| **tombstone**             | A record that a document was deleted, so the index deletes it too.                                       |
+
+---
+
 ## Localizing the failure
 
 Run the failing query and dump the retrieved chunks. Read them. That single step splits the space:
@@ -219,7 +252,7 @@ The last one is specific to GraphRAG and to any precomputed summary. A community
 
 ## Scenario 5: document updates and freshness
 
-The corpus changes. The index has to follow, and the failure modes are silent: nothing errors, answers just get stale or contradictory.
+The corpus changes. The index has to follow, and the failure modes are silent: nothing errors, answers just get stale or contradictory. [Ingestion Pipeline](/ai/rag/ingestion-pipeline#idempotent-incremental-sync) designs the sync from the building side, and [Document Loaders](/ai/rag/document-loaders#change-detection) covers how changes and deletions are detected at the source.
 
 **Incremental indexing by hash.** Store a content hash per document and per chunk. On each sync, compare hashes and touch only what changed:
 

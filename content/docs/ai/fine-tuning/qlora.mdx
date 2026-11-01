@@ -9,6 +9,36 @@ QLoRA (Dettmers et al., arXiv:2305.14314) quantizes the frozen weights to 4 bits
 
 ---
 
+## The plain-language version
+
+**Where this sits:** LoRA on a compressed base model, for fine-tuning big models on small GPUs.
+
+LoRA removes the optimizer memory for the base model but still keeps the base weights at 16 bits: 16 GB for an 8B model, 130 GB for a 65B one. **QLoRA** stores those frozen weights in 4 bits instead, using a format called **NF4** designed for the bell-shaped spread of neural network weights, and trains a normal LoRA adapter on top. A 65B model can then be fine-tuned on a single 48 GB GPU while matching 16-bit fine-tuning quality (Dettmers et al., arXiv:2305.14314).
+
+Think of studying from a compressed, pocket-sized edition of a huge reference book while writing your own notes on full-size paper. The reference is smaller but still readable for the purpose; your notes, the part you are actually changing, keep full precision.
+
+This page covers, in order:
+
+1. **The memory wall**: what still does not fit with plain LoRA
+2. **NF4**: 4-bit NormalFloat, and why it suits normally distributed weights
+3. **Double quantization**: compressing the compression constants too
+4. **Paged optimizers**: avoiding out-of-memory crashes from spikes
+5. **The full recipe**: the code and settings
+6. **What QLoRA costs**: speed and the merging catch
+7. **Choosing**: LoRA or QLoRA
+
+| Word                        | Plain meaning                                                                                         |
+| :-------------------------- | :---------------------------------------------------------------------------------------------------- |
+| **quantization**            | Storing numbers in fewer bits, with a scale factor to recover their approximate values.               |
+| **NF4**                     | 4-bit NormalFloat: 16 levels placed so that each holds an equal share of a normal distribution.       |
+| **block-wise quantization** | Each small block of weights gets its own scale factor, so one outlier does not ruin the whole matrix. |
+| **double quantization**     | Quantizing the per-block scale factors as well, saving a little more memory.                          |
+| **dequantize**              | Convert the 4-bit numbers back to 16-bit for computation.                                             |
+| **paged optimizer**         | Optimizer state that can spill from GPU to CPU memory when the GPU is briefly full.                   |
+| **compute dtype**           | The precision used for the actual math (usually bf16), separate from the storage precision.           |
+
+---
+
 ## The memory wall
 
 Rough weights-only figures at BF16 against 4-bit:

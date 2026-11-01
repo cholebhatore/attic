@@ -7,6 +7,35 @@ Static batching pads every request in a batch to the length of the longest one a
 
 ---
 
+## The plain-language version
+
+**Where this sits:** the scheduler of a serving engine, which decides which requests share each forward pass.
+
+With **static batching**, a group of requests starts together and the GPU waits until the longest one finishes before taking new ones, so short requests leave slots idle. **Continuous batching** schedules at every step instead: as soon as one request finishes, a waiting one takes its place. That keeps the GPU full and is the single biggest throughput gain in modern serving. **Prefix caching** adds reuse: requests that share a prompt prefix (the same system prompt, the same document) reuse its cached keys and values instead of recomputing them.
+
+Think of a bus. Static batching waits for every passenger to reach their stop before letting anyone new on. Continuous batching lets people board at every stop as seats free up. Prefix caching is a season ticket: regulars skip the queue at the ticket machine.
+
+This page covers, in order:
+
+1. **What static batching wastes**
+2. **Iteration-level scheduling**: rebuilding the batch every step
+3. **The token budget**: how much work fits in one step
+4. **Preemption**: pausing requests when memory runs out
+5. **Prompt and prefix caching**: reusing shared prefixes, and the block-aligned hit rules
+6. **What caching costs**
+
+| Word                                | Plain meaning                                                                      |
+| :---------------------------------- | :--------------------------------------------------------------------------------- |
+| **static batching**                 | Running a fixed group of requests to completion together.                          |
+| **continuous (in-flight) batching** | Adding and removing requests from the batch at every decode step.                  |
+| **iteration-level scheduling**      | Making scheduling decisions per forward pass rather than per request.              |
+| **token budget**                    | The maximum number of tokens (prefill and decode) processed in one step.           |
+| **preemption**                      | Pausing a running request, freeing or swapping its cache, to make room.            |
+| **prefix caching**                  | Reusing the KV cache of an identical prompt prefix across requests.                |
+| **cache hit**                       | A request whose prefix is already cached, so its prefill is skipped for that part. |
+
+---
+
 ## What static batching wastes
 
 Output lengths are wildly uneven, so padding cost is proportional to the spread. A realistic batch of eight requests:

@@ -1,0 +1,384 @@
+---
+title: Encoding and Decoding
+description: Every meaning of encode and decode in AI. Character encodings (ASCII, Unicode, UTF-8), categorical feature encodings (label, ordinal, one-hot, dummy, binary, frequency, target, hashing), numeric and cyclical encodings, text and positional encodings, encoder and decoder networks, autoencoders, and the four kinds of decoding, from bytes back to text to choosing the next token.
+---
+
+"Encode" and "decode" are some of the most overloaded words in AI. Depending on the page, an encoding is a byte format, a way to feed a category to a model, a fixed pattern of sine waves, or half of a neural network. Decoding is turning bytes back into text, token IDs back into words, logits into a chosen token, or a hidden representation back into an output.
+
+They all share one idea. **To encode is to convert something into a representation a machine can store or compute with. To decode is to convert a representation back into something a person or the next system can use.** What changes from use to use is what goes in, what comes out, and whether the conversion is a fixed rule or learned.
+
+[AI Basics](/ai/math-foundations/ai-basics#encoding-versus-embedding) draws the most important line: an **encoding** is a fixed rule, an **embedding** is learned. This page lists every kind of encoding and decoding you will meet, then points to the page that covers each one in depth.
+
+The page covers, in order:
+
+1. **The big picture**: the encode, compute, decode pipeline, and how to tell the different senses apart
+2. **Character encodings**: ASCII, Unicode, UTF-8, UTF-16, UTF-32, and what goes wrong
+3. **Encoding categories**: label, ordinal, one-hot, dummy, binary, frequency, target, hashing, and learned embeddings
+4. **Encoding numbers**: scaling, binning, log transforms, and cyclical encoding for time
+5. **Encoding text**: the ladder from one-hot to contextual embeddings
+6. **Encoding position**: sinusoidal, learned, and rotary
+7. **Encoder and decoder networks**: when "encoder" means a learned model, autoencoders, and the three transformer families
+8. **Decoding**: bytes to text, token IDs to text, logits to a token, predictions to labels, and the decode phase of inference
+9. **One sentence, end to end**: every encode, embed, and decode step in an LLM call
+
+---
+
+## The big picture
+
+Every AI system has the same three steps. Real-world data is encoded into numbers, a model computes with those numbers, and the result is decoded into something useful.
+
+<Mermaid
+  chart={`
+flowchart LR
+    R["Raw data: text, categories, images, times"] -->|encode| N["Numbers: bytes, IDs, vectors"]
+    N -->|embed / encoder network| H["Learned representation"]
+    H -->|model computes| O["Output numbers: logits, vectors"]
+    O -->|decode| U["Usable result: text, label, image"]
+`}
+/>
+
+| Sense                         | Encode                            | Decode                                  | Fixed or learned?                  | Covered in                                                            |
+| :---------------------------- | :-------------------------------- | :-------------------------------------- | :--------------------------------- | :-------------------------------------------------------------------- |
+| **Character encoding**        | text to bytes                     | bytes to text                           | Fixed                              | This page                                                             |
+| **Feature encoding**          | category or number to model input | prediction back to a category           | Fixed (mostly)                     | This page                                                             |
+| **Tokenization**              | text to token IDs                 | token IDs to text                       | Fixed after training the tokenizer | [Tokenization](/ai/llm/tokenization)                                  |
+| **Embedding**                 | token ID to dense vector          | (the reverse is the output head, below) | Learned                            | [AI Basics](/ai/math-foundations/ai-basics#encoding-versus-embedding) |
+| **Positional encoding**       | position number to vector         | not decoded                             | Fixed or learned                   | [Blocks and Positions](/ai/transformers/blocks-and-positions)         |
+| **Encoder / decoder network** | input to learned representation   | representation to output                | Learned                            | [Architectures](/ai/transformers/architectures)                       |
+| **Decoding strategy**         | n/a                               | logits to one chosen token              | Fixed rule you pick                | [Decoding Strategies](/ai/llm/decoding)                               |
+
+A quick test tells the senses apart: **does it have parameters that training changes?** If not, it is an encoding in the fixed-rule sense. If it does, it is an embedding or an encoder network.
+
+---
+
+## Character encodings
+
+Before a model sees a single token, text has to exist as bytes in a file. A **character encoding** is the agreed rule for turning characters into bytes and back. Get it wrong and a dataset fills with garbage that no model can repair.
+
+The layers, from idea to bytes:
+
+| Term                     | Plain meaning                                                                                                                                                                                |
+| :----------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **character**            | An abstract symbol: `A`, `é`, `猫`, `🐱`.                                                                                                                                                    |
+| **ASCII**                | The original 1960s American standard: 128 characters (English letters, digits, punctuation, control codes), each in 7 bits. No `é`, no `猫`.                                                 |
+| **Unicode**              | One universal list that gives every character in every script a number, its **code point**, written `U+` plus hex. `A` is `U+0041`, `é` is `U+00E9`. The range runs to `U+10FFFF`.           |
+| **code point**           | A character's Unicode number. Python's `ord("é")` gives 233, which is `0xE9`.                                                                                                                |
+| **UTF-8**                | The dominant way to store code points as bytes: 1 to 4 bytes per character (RFC 3629). ASCII characters take 1 byte and keep their ASCII values, so old English text is already valid UTF-8. |
+| **UTF-16**               | 2 or 4 bytes per character. Used inside Windows, Java, and JavaScript strings.                                                                                                               |
+| **UTF-32**               | Always 4 bytes per character. Simple to index, wasteful to store.                                                                                                                            |
+| **Latin-1** (ISO-8859-1) | An older 1-byte encoding for Western European languages. Every byte is a valid character, which is why it silently "succeeds" on the wrong input.                                            |
+
+```python title="character_encoding.py"
+s = "café"
+print([ord(c) for c in s])                 # [99, 97, 102, 233]          Unicode code points
+print(list(s.encode("utf-8")))             # [99, 97, 102, 195, 169]     5 bytes: é takes 2
+print(len(s.encode("utf-16-le")), len(s.encode("utf-32-le")))   # 8 16
+print(len("cat".encode("utf-8")), len("猫".encode("utf-8")), len("🐱".encode("utf-8")))   # 3 3 4
+
+print(s.encode("utf-8").decode("latin-1"))             # cafÃ©      decoded with the wrong rule
+print(b"caf\xc3".decode("utf-8", errors="replace"))    # caf�       cut in the middle of a character
+s.encode("ascii")                                      # UnicodeEncodeError: é is not in ASCII
+```
+
+Three failures to recognize on sight:
+
+- **Mojibake.** Text encoded with one rule and decoded with another. `café` written as UTF-8 and read as Latin-1 becomes `cafÃ©`. Web-scraped corpora are full of it, and cleaning pipelines detect and repair it before training.
+- **The replacement character `�` (`U+FFFD`).** What a decoder emits for bytes that are not valid in its encoding, for example a multi-byte character cut in half.
+- **Encode errors.** Asking a narrow encoding like ASCII to store a character it does not have.
+
+**Why this matters for LLMs.** GPT-2 and most modern tokenizers are **byte-level**: they start from the 256 possible byte values of UTF-8 and merge upwards, so they can encode any string without an unknown token. The cost is uneven. English letters are 1 byte each, while Chinese characters are 3, so the same sentence can cost more tokens in one language than another. A streamed token can also end halfway through a multi-byte character, which is why a chat client briefly shows `�` if it decodes too early. [Tokenization](/ai/llm/tokenization) covers both effects.
+
+---
+
+## Encoding categories
+
+Tabular data is full of **categorical features**: color, city, product type, day of the week. A model needs numbers, so each category must be encoded. The choice matters more than it looks: the wrong encoding invents an order that does not exist, explodes the number of columns, or leaks the answer into the input.
+
+Running example: five rows with a `color` column and a 0/1 target `y`.
+
+```text
+color : red  green  blue  green  red
+y     : 1    0      1     0      0
+```
+
+Sorted categories: `blue`, `green`, `red`, so `k = 3`.
+
+| Encoding                        | Rule                                                                                   | `color` becomes                                   | Columns         |
+| :------------------------------ | :------------------------------------------------------------------------------------- | :------------------------------------------------ | :-------------- |
+| **Label (integer) encoding**    | Each category gets an integer ID.                                                      | `[2, 1, 0, 1, 2]`                                 | 1               |
+| **Ordinal encoding**            | Integer IDs in an order **you** choose because the order is real.                      | `small=0, medium=1, large=2` (for a size column)  | 1               |
+| **One-hot encoding**            | One 0/1 column per category; a single 1 marks the category.                            | `red` is `[0, 0, 1]`, `green` is `[0, 1, 0]`      | `k`             |
+| **Dummy encoding** (drop-first) | One-hot with one column removed; the dropped category is "all zeros".                  | `red` is `[0, 1]`, `blue` is `[0, 0]`             | `k - 1`         |
+| **Binary encoding**             | Write the integer ID in binary, one column per bit.                                    | `red` (2) is `[1, 0]`, `green` (1) is `[0, 1]`    | `ceil(log2 k)`  |
+| **Frequency (count) encoding**  | Replace the category by how often it appears.                                          | `[0.4, 0.4, 0.2, 0.4, 0.4]`                       | 1               |
+| **Target (mean) encoding**      | Replace the category by the average target for that category.                          | red 0.5, green 0.0, blue 1.0                      | 1               |
+| **Hashing (the hashing trick)** | Hash the category name into one of a fixed number of buckets, then one-hot the bucket. | `blue, green, red` land in buckets `0, 1, 3` of 4 | fixed, you pick |
+| **Learned (entity) embedding**  | Integer ID, then a trainable `(k, d)` lookup table, exactly like word embeddings.      | a learned vector per color                        | `d`             |
+
+The numbers in the table come from running this:
+
+```python title="categorical_encoding.py"
+import math, zlib
+from collections import Counter
+import numpy as np
+
+colors = ["red", "green", "blue", "green", "red"]
+y      = [1,      0,       1,      0,       0]
+
+cats = sorted(set(colors))                                   # ['blue', 'green', 'red']
+label = {c: i for i, c in enumerate(cats)}
+ids = [label[c] for c in colors]
+print(ids)                                                   # [2, 1, 0, 1, 2]
+
+onehot = np.eye(len(cats), dtype=int)[ids]
+print(onehot.tolist())       # [[0, 0, 1], [0, 1, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]]
+print(onehot[:, 1:].tolist())   # dummy, blue dropped: [[0, 1], [1, 0], [0, 0], [1, 0], [0, 1]]
+
+nbits = math.ceil(math.log2(len(cats)))                      # 2 bits are enough for 3 categories
+print([[(label[c] >> b) & 1 for b in reversed(range(nbits))] for c in colors])
+# [[1, 0], [0, 1], [0, 0], [0, 1], [1, 0]]
+
+cnt = Counter(colors)
+print([cnt[c] / len(colors) for c in colors])                # [0.4, 0.4, 0.2, 0.4, 0.4]
+
+means = {c: sum(t for cc, t in zip(colors, y) if cc == c) / cnt[c] for c in cats}
+print(means)                                                 # {'blue': 1.0, 'green': 0.0, 'red': 0.5}
+
+print([zlib.crc32(c.encode()) % 4 for c in cats])            # [0, 1, 3]   4 hash buckets
+```
+
+**How to choose.**
+
+- **No natural order, few categories**: one-hot. It is the safe default.
+- **A real order** (sizes, ratings, education levels): ordinal, with the order written down by you, not alphabetical.
+- **Linear or logistic regression with an intercept**: dummy encoding. With full one-hot, the `k` columns always add up to 1, which duplicates the intercept column and makes the solution not unique (the "dummy variable trap"). Tree models and neural networks do not need this.
+- **Thousands of categories** (zip codes, user IDs): one-hot is too wide. Use target encoding, hashing, or a learned embedding.
+- **Neural networks with many categories**: learned embeddings. This is the same `nn.Embedding` used for words, and recommendation systems use it for users and items.
+
+<Callout type="warn">
+  ### Two traps
+
+**Label encoding an unordered category for a linear model or a neural network.** With `blue=0, green=1, red=2`, the model reads red as "twice green" and green as "between blue and red". Tree models can split on any threshold and cope; models that multiply inputs by weights cannot.
+
+**Target encoding with leakage.** If a row's own target is included in its category's average, the feature contains the answer. A rare category seen once gets exactly its own label. Compute target encodings out-of-fold (from other folds of the training data), and add smoothing toward the global mean for rare categories. Scikit-learn's `TargetEncoder` does both.
+
+</Callout>
+
+Unseen categories at inference are a third, operational trap: a city that never appeared in training has no column. Encoders need an explicit policy, such as `OneHotEncoder(handle_unknown="ignore")` (all zeros) or a reserved "unknown" ID, which is the same role the `[UNK]` token plays in older word vocabularies.
+
+| Scikit-learn class | Encoding                                                                                               |
+| :----------------- | :----------------------------------------------------------------------------------------------------- |
+| `LabelEncoder`     | Label encoding, meant for the **target** column, not input features                                    |
+| `OrdinalEncoder`   | Label or ordinal encoding for input features                                                           |
+| `OneHotEncoder`    | One-hot; `drop="first"` gives dummy encoding                                                           |
+| `TargetEncoder`    | Target encoding with built-in cross-fitting and smoothing                                              |
+| `FeatureHasher`    | The hashing trick (Weinberger et al., "Feature Hashing for Large Scale Multitask Learning", ICML 2009) |
+
+---
+
+## Encoding numbers
+
+Numeric features are already numbers, but not always in a form a model learns well from.
+
+| Encoding                      | What it does                                                            | When                                                        |
+| :---------------------------- | :---------------------------------------------------------------------- | :---------------------------------------------------------- |
+| **Standardization** (z-score) | `(x - mean) / std`, so the feature has mean 0 and standard deviation 1. | The default for neural networks and linear models           |
+| **Min-max scaling**           | `(x - min) / (max - min)`, so the feature lies in 0..1.                 | Bounded inputs such as pixel values                         |
+| **Log transform**             | `log(1 + x)` compresses a long tail.                                    | Prices, counts, incomes                                     |
+| **Binning** (discretization)  | Cut the range into buckets, then treat the bucket as a category.        | Age groups; letting a linear model learn a non-linear curve |
+| **Cyclical encoding**         | Map a repeating value onto a circle with `sin` and `cos`.               | Hour of day, day of week, month, compass direction          |
+
+Scaling is usually called "preprocessing" rather than encoding, but it is the same idea: a fixed rule, fitted on the training set only, applied identically at inference.
+
+**Cyclical encoding** deserves a closer look, because it is a small version of the sinusoidal positional encoding used in transformers. Encoding hour of day as the plain number `0..23` says hour 23 and hour 0 are 23 apart, when they are one hour apart. Put the hours on a circle instead:
+
+```python title="cyclical_encoding.py"
+import math
+import numpy as np
+
+def hour(h):
+    angle = 2 * math.pi * h / 24
+    return np.array([math.sin(angle), math.cos(angle)])
+
+print(abs(23 - 0))                                         # 23     raw distance: far apart
+print(round(float(np.linalg.norm(hour(23) - hour(0))), 2)) # 0.26   cyclical distance: neighbors
+print(round(float(np.linalg.norm(hour(12) - hour(0))), 2)) # 2.0    noon is the far side of the circle
+```
+
+Both `sin` and `cos` are needed: `sin` alone gives the same value at 3 a.m. and 9 a.m.
+
+---
+
+## Encoding text
+
+Text gets its own ladder of encodings. Each rung fixes a weakness of the one below it.
+
+| Rung                      | Fixed or learned               | What it captures                                                                | Weakness                                                         | Covered in                                                            |
+| :------------------------ | :----------------------------- | :------------------------------------------------------------------------------ | :--------------------------------------------------------------- | :-------------------------------------------------------------------- |
+| **Bytes** (UTF-8)         | Fixed                          | Exact text                                                                      | No meaning; long sequences                                       | This page                                                             |
+| **Token IDs**             | Fixed after tokenizer training | Words and word pieces                                                           | IDs are arbitrary labels                                         | [Tokenization](/ai/llm/tokenization)                                  |
+| **One-hot**               | Fixed                          | Which token                                                                     | Every pair of words equally unrelated; as long as the vocabulary | [AI Basics](/ai/math-foundations/ai-basics#encoding-versus-embedding) |
+| **Bag of words, n-grams** | Fixed                          | Which words (and short phrases) a document contains                             | Order lost; no similarity between words                          | [Classical NLP](/ai/classical-deep-learning/classical-nlp)            |
+| **TF-IDF**                | Fixed (counted)                | Which words are distinctive for a document                                      | Still no similarity between words                                | [Classical NLP](/ai/classical-deep-learning/classical-nlp)            |
+| **Static embeddings**     | Learned                        | Word meaning; `cat` near `dog`                                                  | One vector per word, whatever the sentence                       | [Classical NLP](/ai/classical-deep-learning/classical-nlp)            |
+| **Contextual embeddings** | Learned                        | Word meaning in this sentence; `bank` by a river differs from `bank` the lender | Needs a large model to compute                                   | [AI Basics](/ai/math-foundations/ai-basics)                           |
+| **Sentence embeddings**   | Learned                        | Meaning of a whole passage as one vector                                        | Detail is averaged away                                          | [RAG: Embeddings](/ai/rag/embeddings)                                 |
+
+Note the name **byte-pair encoding (BPE)**. Despite the word "encoding", it is a tokenizer-training algorithm: it learns which byte sequences to merge into tokens. It started as a data compression method (Gage, 1994) and was adapted for neural machine translation by Sennrich et al. (arXiv:1508.07909).
+
+---
+
+## Encoding position
+
+Attention on its own sees a set of tokens, not a sequence: shuffle the input and each token's output is the same. So transformers add information about **where** each token is.
+
+| Method                             | Fixed or learned | How it works                                                                                                                                                              |
+| :--------------------------------- | :--------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Sinusoidal positional encoding** | Fixed            | Each position gets a vector of `sin` and `cos` waves at different frequencies, added to the token embedding. The original transformer (Vaswani et al., arXiv:1706.03762). |
+| **Learned positional embedding**   | Learned          | A trainable table with one row per position, added to the token embedding. GPT-2, BERT.                                                                                   |
+| **RoPE** (rotary)                  | Fixed            | Rotates query and key vectors by an angle proportional to position, inside attention. Llama, Qwen.                                                                        |
+| **Relative position bias**         | Learned          | Adds a learned bonus to attention scores that depends on the distance between tokens. T5.                                                                                 |
+
+Sinusoidal encoding is cyclical encoding (from the numbers section) done at many frequencies at once: fast waves tell neighbors apart, slow waves tell distant positions apart. [Blocks and Positions](/ai/transformers/blocks-and-positions) derives each method and compares them.
+
+---
+
+## Encoder and decoder networks
+
+In this sense, "encoder" and "decoder" are not fixed rules. They are **learned neural networks**, named for the job they do.
+
+- An **encoder network** reads an input and produces a learned **representation**: a vector or a sequence of vectors that captures what matters about the input. A CNN backbone is an image encoder; BERT is a text encoder.
+- A **decoder network** takes a representation and produces an output: a sentence, an image, a sequence of tokens.
+
+**Autoencoders** make the pairing explicit. The encoder squeezes the input into a small **code** (the **latent** representation, or **bottleneck**), and the decoder tries to rebuild the original input from that code alone. The training loss is the reconstruction error, so no labels are needed. To succeed, the code must keep what matters and drop noise.
+
+<Mermaid
+  chart={`
+flowchart LR
+    X["Input: 784 pixels"] --> E["Encoder network"]
+    E --> Z["Code: 32 numbers"]
+    Z --> D["Decoder network"]
+    D --> XH["Reconstruction: 784 pixels"]
+    XH -.->|"loss = how different from the input"| X
+`}
+/>
+
+| Variant                                                                 | What changes                                                                                                            | Used for                                                                |
+| :---------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------- |
+| **Autoencoder** (Hinton and Salakhutdinov, Science 2006)                | Plain compress-and-rebuild                                                                                              | Compression, anomaly detection (bad reconstruction means unusual input) |
+| **Denoising autoencoder**                                               | The input is corrupted; the target is the clean version                                                                 | Robust features; the idea behind BERT's masked tokens                   |
+| **Variational autoencoder (VAE)** (Kingma and Welling, arXiv:1312.6114) | The code is a probability distribution, so you can sample new codes and decode them                                     | Generating new data                                                     |
+| **Latent diffusion's VAE** (Rombach et al., arXiv:2112.10752)           | Encodes a 512 by 512 image into a 64 by 64 latent; diffusion works there; the decoder turns the result back into pixels | Stable Diffusion                                                        |
+
+**The three transformer families** reuse the words with a twist:
+
+| Family              | Example                      | What "encoder" or "decoder" means here                                                                                                                           |
+| :------------------ | :--------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Encoder-only**    | BERT                         | Every token sees every other token. Output is contextual embeddings, good for classification and search, not for writing text.                                   |
+| **Encoder-decoder** | T5, the original transformer | The encoder reads the input; the decoder writes the output one token at a time, looking back at the encoder through cross-attention. Translation, summarization. |
+| **Decoder-only**    | GPT, Llama, Claude           | There is no separate encoder. "Decoder" means each token can see only the tokens before it (a **causal mask**), so the model can generate left to right.         |
+
+[Architectures](/ai/transformers/architectures) covers all three, and [Classical NLP](/ai/classical-deep-learning/classical-nlp) covers the RNN encoder-decoder that came before them.
+
+---
+
+## Decoding
+
+Decoding is the way back from numbers to something usable. There are five distinct meanings.
+
+**1. Bytes to text.** The inverse of character encoding: `b"caf\xc3\xa9".decode("utf-8")` gives `café`. Decoding with the wrong encoding produces mojibake; decoding invalid bytes produces `�` or an error, depending on the `errors=` setting.
+
+**2. Token IDs to text (detokenization).** The tokenizer's inverse: `tokenizer.decode([15339, 1917])` gives `"hello world"` with GPT-4's `cl100k_base` encoding. It looks up each ID's bytes, joins them, and decodes the bytes as UTF-8. Because a single token can be part of a character, streaming servers hold back bytes until a character is complete.
+
+**3. Logits to a token (decoding strategies).** An LLM's last layer outputs one score (a **logit**) per vocabulary token. Turning those scores into one chosen token is called decoding, and the rule for it is the **decoding strategy**:
+
+| Strategy            | Rule                                                                               |
+| :------------------ | :--------------------------------------------------------------------------------- |
+| **Greedy**          | Always take the highest-scoring token. Deterministic; can repeat itself.           |
+| **Beam search**     | Keep the best few partial sequences and extend all of them. Common in translation. |
+| **Sampling**        | Draw a token at random in proportion to its probability.                           |
+| **Temperature**     | Divide logits by `T` before softmax: low `T` sharpens, high `T` flattens.          |
+| **Top-k**           | Sample only from the `k` most likely tokens.                                       |
+| **Top-p** (nucleus) | Sample only from the smallest set of tokens whose probabilities add up to `p`.     |
+
+The step before it is also a kind of decoding. The final hidden vector is projected back onto the vocabulary by the **output head** (LM head), a `(d, V)` matrix that produces the logits. It mirrors the input embedding table, and in models with **weight tying** it literally is that table, transposed. [Decoding Strategies](/ai/llm/decoding) covers every strategy with the distributions they fail on; [Softmax and Logits](/ai/math-foundations/softmax-and-logits) covers temperature.
+
+**4. Predictions to labels.** A classifier outputs class probabilities. Decoding is `argmax` to get the class index, then the inverse of the label encoding to get the name: index 2 becomes `"red"`. Scikit-learn's `LabelEncoder.inverse_transform` does exactly this.
+
+**5. The decode phase of inference.** LLM serving splits a request into **prefill**, where the whole prompt is processed in one parallel pass, and **decode**, where output tokens are generated one at a time. Decode is slow per token and limited by memory bandwidth, which is why so much inference engineering targets it. [Inference Lifecycle](/ai/llm/inference-lifecycle) covers both phases.
+
+---
+
+## One sentence, end to end
+
+Every sense on this page shows up in a single call to an LLM:
+
+| Step | What happens                                                   | Which word                   | Fixed or learned |
+| :--- | :------------------------------------------------------------- | :--------------------------- | :--------------- |
+| 1    | `"The café"` is stored as UTF-8 bytes                          | character encoding           | Fixed            |
+| 2    | The bytes are split into tokens and mapped to IDs              | tokenization (encode)        | Fixed            |
+| 3    | Each ID looks up its row in the embedding table                | embedding                    | Learned          |
+| 4    | Position information is added or applied                       | positional encoding          | Fixed or learned |
+| 5    | The transformer layers turn the vectors into contextual ones   | decoder-only network         | Learned          |
+| 6    | The last vector is projected to one logit per vocabulary token | output head                  | Learned          |
+| 7    | A sampler picks the next token ID                              | decoding strategy            | Fixed rule       |
+| 8    | The ID is turned back into bytes, then text                    | detokenization, UTF-8 decode | Fixed            |
+
+Steps 5 to 8 repeat once per generated token. That repeated loop is the decode phase.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between encoding and embedding?">
+
+    An encoding is a fixed rule that turns data into numbers: UTF-8, integer IDs, one-hot vectors, sinusoidal positions. It has no parameters and adds no knowledge. An embedding is a learned dense vector, part of the model's parameters, trained so similar items end up close together. An embedding lookup is the same as multiplying a one-hot encoding by the embedding matrix.
+
+  </Accordion>
+  <Accordion title="Why not label-encode an unordered category for a neural network?">
+
+    The network multiplies inputs by weights, so it treats the integer as a quantity: `red = 2` becomes "twice green". Use one-hot for a few categories and a learned embedding for many. Tree models are less affected because they split on thresholds.
+
+  </Accordion>
+  <Accordion title="What is the dummy variable trap?">
+
+    With full one-hot encoding and an intercept, the `k` columns always sum to 1, which equals the intercept column. The design matrix loses rank, so linear regression has no unique solution. Dropping one column (dummy encoding) fixes it. Regularized models, trees, and neural networks are not affected in practice.
+
+  </Accordion>
+  <Accordion title="How does target encoding leak, and how do you prevent it?">
+
+    If a row's own label is included in its category's mean, the feature contains the answer; a category seen once is encoded as its own label. Compute the means out-of-fold and smooth rare categories toward the global mean.
+
+  </Accordion>
+  <Accordion title="How do you handle a category with a million values?">
+
+    One-hot would need a million columns. Options: the hashing trick (fixed number of buckets, accepting some collisions), target or frequency encoding, or a learned embedding table, which is the standard for user and item IDs in recommendation systems.
+
+  </Accordion>
+  <Accordion title="Why encode hour of day with sine and cosine?">
+
+    As a plain number, 23 and 0 look 23 apart. On a circle they are neighbors. Both functions are needed because sine alone maps two different hours to the same value. Sinusoidal positional encoding is the same idea at many frequencies.
+
+  </Accordion>
+  <Accordion title="What is UTF-8, and why do byte-level tokenizers use it?">
+
+    UTF-8 stores each Unicode code point as 1 to 4 bytes and is backward compatible with ASCII. Starting a tokenizer from the 256 byte values means any string can be encoded, so there is never an unknown token. The cost is that non-Latin scripts take more bytes, and usually more tokens, per character.
+
+  </Accordion>
+  <Accordion title="What does decoder mean in decoder-only transformer?">
+
+    It means causal: each token attends only to earlier tokens, which is what allows left-to-right generation. There is no encoder whose output it decodes. In an encoder-decoder model, the decoder additionally reads the encoder's outputs through cross-attention.
+
+  </Accordion>
+  <Accordion title="Name the different things decoding can mean in an LLM system.">
+
+    Bytes to text (UTF-8 decode), token IDs to text (detokenization), logits to a chosen token (decoding strategy, such as greedy or top-p), and the decode phase of serving, where tokens are generated one at a time after the prefill pass.
+
+  </Accordion>
+  <Accordion title="What does an autoencoder learn, and what is it used for?">
+
+    An encoder compresses the input into a small code and a decoder rebuilds the input from it, trained on reconstruction error with no labels. The code becomes a compact representation. Uses include compression, anomaly detection, denoising, and, as a VAE, generation, including the image-to-latent step of Stable Diffusion.
+
+  </Accordion>
+</Accordions>

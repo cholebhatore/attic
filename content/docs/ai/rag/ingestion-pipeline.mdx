@@ -1,0 +1,382 @@
+---
+title: Ingestion Pipeline
+description: The assembly line from loaded documents to a searchable index. Cleaning and normalization, exact, near-duplicate (MinHash) and semantic deduplication, PII redaction, metadata extraction and LLM enrichment, embedding at scale, idempotent incremental sync with hashes and tombstones, index versioning, orchestration, and the ingestion tech stack.
+---
+
+Loading fetched the documents and parsing turned them into structured text. Between that text and a searchable index sits a pipeline of smaller jobs: clean it, remove duplicates, remove personal data, attach metadata, chunk it, embed it, write it, and keep doing all of that correctly every time a document changes.
+
+Each job is simple on its own. The difficulty is running them together, over millions of documents, repeatedly, without duplicating anything, without leaving deleted documents behind, and without re-paying for embeddings that did not change. That is a data engineering problem, and this page treats it as one.
+
+---
+
+## The plain-language version
+
+Think of a restaurant kitchen before service. Deliveries arrive (loading). Someone unpacks and washes everything (parsing and cleaning), throws out duplicates and anything spoiled (deduplication), labels every container with what it is, when it arrived, and who may use it (metadata), cuts everything into portions (chunking), and stores it on labeled shelves where it can be found in seconds (embedding and indexing). When a new delivery replaces an old one, the old stock has to come off the shelf at the same moment, or two versions of the same ingredient sit side by side.
+
+The **ingestion pipeline** is that whole prep line. "Ingestion" is used two ways: for the entire indexing side of RAG, and sometimes for just loading and parsing. On this page it means everything between the loader and the index.
+
+This page covers, in order:
+
+1. **The stages end to end**: the order of operations and why it matters
+2. **Cleaning and normalization**: Unicode, whitespace, boilerplate, language
+3. **Deduplication**: exact hashes, near-duplicates with MinHash, and semantic duplicates
+4. **Personal and sensitive data**: detecting and redacting before anything is embedded
+5. **Metadata extraction and enrichment**: structural, system, and LLM-generated metadata
+6. **Chunk, embed, and write**: embedding at scale, batching, and caching
+7. **Idempotent incremental sync**: stable IDs, content hashes, upserts, and tombstones
+8. **Index versioning and re-indexing**: changing the embedding model without downtime
+9. **Orchestration and scale**: batch versus streaming, queues, retries, monitoring
+10. **A pipeline from scratch**
+11. **The tech stack**
+
+| Word                    | Plain meaning                                                                                                         |
+| :---------------------- | :-------------------------------------------------------------------------------------------------------------------- |
+| **normalization**       | Rewriting text into one consistent form: same Unicode form, same whitespace, same quote characters.                   |
+| **deduplication**       | Removing documents or chunks that are the same, or nearly the same, as another.                                       |
+| **shingle**             | A run of `k` consecutive words (or characters). Two texts that share most shingles are near-duplicates.               |
+| **Jaccard similarity**  | Shared items divided by total distinct items, between two sets. 1 means identical sets, 0 means nothing shared.       |
+| **MinHash / LSH**       | A trick to estimate Jaccard similarity from short signatures, and to find similar pairs without comparing every pair. |
+| **PII**                 | Personally identifiable information: names, emails, phone numbers, ID numbers, addresses.                             |
+| **redaction**           | Removing or masking sensitive text before it is stored.                                                               |
+| **enrichment**          | Adding information that was not in the text: a summary, keywords, likely questions, extracted entities.               |
+| **idempotent**          | Running it twice gives the same result as running it once. Essential for a pipeline that retries.                     |
+| **upsert**              | Insert if new, update if it exists, by ID.                                                                            |
+| **tombstone**           | A record that something was deleted, so every downstream copy can delete it too.                                      |
+| **orchestrator**        | A scheduler that runs pipeline steps in order, retries failures, and shows what ran (Airflow, Dagster, Prefect).      |
+| **dead-letter queue**   | Where items that keep failing are parked for inspection, so they do not block everything else.                        |
+| **blue-green re-index** | Building a complete new index beside the live one, then switching traffic over in one step.                           |
+
+---
+
+## The stages end to end
+
+<Mermaid
+  chart={`
+flowchart LR
+    L["Load"] --> P["Parse"]
+    P --> CL["Clean and normalize"]
+    CL --> DD["Deduplicate"]
+    DD --> PII["Redact PII"]
+    PII --> MD["Extract metadata and enrich"]
+    MD --> CH["Chunk"]
+    CH --> EN["Contextualize chunks (optional)"]
+    EN --> EM["Embed"]
+    EM --> W["Write: vector index + keyword index + document store"]
+`}
+/>
+
+The order is not arbitrary:
+
+- **Clean before deduplicating**, or two copies that differ only in whitespace look different.
+- **Deduplicate before embedding**, because embedding is the expensive step and duplicates waste it.
+- **Redact before embedding and before chunking**, because once a value is embedded and stored, anyone whose query lands near it can retrieve it.
+- **Extract metadata before chunking**, so every chunk inherits its document's title, section path, date, and permissions.
+- **Write to all stores in one logical step**: the vector index, the keyword index, and the document store (the full text, for showing sources) must agree, or a chunk can be found by one and missing from another.
+
+---
+
+## Cleaning and normalization
+
+| Step                                 | What it fixes                                                                                                   | How                                                                                                               |
+| :----------------------------------- | :-------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------- |
+| **Unicode normalization**            | The same visible text stored as different code points: the ligature `ﬁ` versus `fi`, full-width `５` versus `5` | `unicodedata.normalize("NFKC", text)`                                                                             |
+| **Mojibake repair**                  | Text decoded with the wrong encoding: `cafÃ©`                                                                   | `ftfy.fix_text`                                                                                                   |
+| **Whitespace**                       | Runs of spaces, tabs, and blank lines from layout                                                               | Collapse spaces; at most one blank line between paragraphs                                                        |
+| **Hyphenation**                      | Words split across lines: `regu-` newline `lation`                                                              | Rejoin a word fragment ending in `-` at a line break with the next fragment                                       |
+| **Boilerplate**                      | Repeated headers, footers, disclaimers, navigation                                                              | Drop lines that repeat across many pages or many documents from the same source                                   |
+| **Control and invisible characters** | Zero-width spaces, soft hyphens, stray control bytes                                                            | Strip them; they break keyword matching invisibly                                                                 |
+| **Language detection**               | Mixed-language corpora                                                                                          | fastText's language identification model, or `langdetect`; store as metadata, route to a suitable embedding model |
+| **Quality filtering**                | Near-empty pages, pages of symbols from failed parsing, cookie notices                                          | Minimum length, garbage-character ratio, and stop-word ratio thresholds                                           |
+
+```python title="clean.py"
+import re, unicodedata
+
+def clean(text):
+    text = unicodedata.normalize("NFKC", text)          # "ﬁ" ligature -> "fi", full-width "＄５０" -> "$50"
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)          # join words hyphenated across lines
+    text = re.sub(r"[ \t]+", " ", text)                   # collapse runs of spaces
+    return re.sub(r"\n{3,}", "\n\n", text).strip()        # at most one blank line
+
+print(repr(clean("Reﬁnanc-\ning   costs  ＄５０\n\n\n\nPage 3")))
+# 'Refinancing costs $50\n\nPage 3'
+```
+
+`Page 3` survives because it is a page footer, which only the cross-page repetition check catches. Cleaning has to be **conservative**: the goal is consistent text, not rewritten text. Do not lowercase, strip punctuation, or remove stop words here. Embedding models and BM25 handle those themselves, and code, identifiers, and case-sensitive names would be damaged.
+
+---
+
+## Deduplication
+
+Corpora are full of copies: the same policy in three folders, a page reachable by five URLs, an email quoted in every reply, version 3 and version 3.1 of a document that differ by one sentence. Duplicates cost money to embed, and at query time they fill the top-k with the same passage several times, pushing out the second relevant source. [Production Debugging](/ai/rag/production-debugging) treats the query-time symptom; ingestion is where to prevent it.
+
+Three levels, from cheapest to most thorough:
+
+| Level              | Catches                                                     | How                                                                                                                                                       | Cost                                      |
+| :----------------- | :---------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------- |
+| **Exact**          | Byte-identical or identical after normalization             | Hash the normalized text (SHA-256); same hash means same text                                                                                             | One hash per document; a set lookup       |
+| **Near-duplicate** | Same text with small edits, different headers, reformatting | Break text into shingles; estimate Jaccard similarity with MinHash; find candidate pairs with locality-sensitive hashing (LSH); SimHash is an alternative | Linear in corpus size with LSH            |
+| **Semantic**       | Different wording, same meaning                             | Embedding cosine similarity above a threshold, clustered (SemDeDup, Abbas et al., arXiv:2303.09540)                                                       | Needs embeddings; threshold must be tuned |
+
+**How MinHash works.** Represent each document as a set of shingles. The Jaccard similarity of two sets is `|A ∩ B| / |A ∪ B|`. Computing it exactly for every pair of a million documents is `10^12` comparisons. MinHash (Broder, 1997) instead applies many independent hash functions to every shingle and keeps only the **minimum** hash value per function. For any one hash function, the probability that two sets share the same minimum equals their Jaccard similarity. So the fraction of matching minimums across, say, 128 functions estimates the Jaccard similarity from a 128-number signature. LSH then groups signatures into bands so that only documents agreeing on a whole band are compared, which finds similar pairs without comparing all pairs.
+
+```python title="dedup.py"
+import hashlib, re, zlib
+
+a = "Refunds are available within 30 days of purchase with a receipt."
+b = "Refunds are available within 30 days of purchase with a valid receipt."
+c = "Shipping to Europe takes 5 to 7 business days."
+
+def h(text):                                   # exact duplicate key: hash of normalized text
+    return hashlib.sha256(" ".join(text.lower().split()).encode()).hexdigest()
+
+print(h(a) == h("  refunds ARE available within 30 days of purchase with a receipt. "))   # True
+
+def shingles(text, k=3):
+    w = re.findall(r"\w+", text.lower())
+    return {" ".join(w[i:i + k]) for i in range(len(w) - k + 1)}
+
+def jaccard(x, y):
+    return len(x & y) / len(x | y)
+
+def minhash(sh, n=128):                        # 128 "hash functions" made by salting one hash
+    return [min(zlib.crc32(f"{seed}:{s}".encode()) for s in sh) for seed in range(n)]
+
+def estimate(m1, m2):
+    return sum(p == q for p, q in zip(m1, m2)) / len(m1)
+
+A, B, C = shingles(a), shingles(b), shingles(c)
+print(round(jaccard(A, B), 2), round(jaccard(A, C), 2))                           # 0.73 0.0   exact
+print(round(estimate(minhash(A), minhash(B)), 2), round(estimate(minhash(A), minhash(C)), 2))   # 0.77 0.0   estimated
+```
+
+Check `0.73` by hand: `a` has 11 words, so 9 three-word shingles; `b` has 12 words, so 10. They share 8 (every shingle except those around "valid"), and the union has `9 + 10 - 8 = 11`, so `8 / 11 = 0.73`. The 128-number MinHash signature estimates it as 0.77, close enough to flag the pair with a typical threshold of 0.7 to 0.8.
+
+<Callout type="warn">
+  ### Common mistake: deduplicating away versions
+
+Version 3 and version 3.1 of a policy are near-duplicates, and only one of them is current. Deduplication should keep the **newest authoritative** copy (by `updated_at`, or by source priority), not whichever was seen first. When both versions must stay (a legal archive), keep both but mark the old one `superseded` in metadata and filter it out by default.
+
+</Callout>
+
+---
+
+## Personal and sensitive data
+
+Anything embedded can be retrieved by a query that lands near it, and anything retrieved can be repeated by the model. Prompt instructions do not reliably stop a model from repeating what is in its context. The only robust control is to keep the data out of the index, or to keep it behind a permission filter.
+
+| Technique                  | What it does                                                                                                                       | Use when                                                          |
+| :------------------------- | :--------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------- |
+| **Detection**              | Find PII with patterns (emails, phone numbers, card numbers with a checksum) plus named-entity recognition for names and addresses | Always, as the first step                                         |
+| **Redaction**              | Replace with a type label: `[EMAIL]`, `[PHONE]`                                                                                    | The value is never needed to answer questions                     |
+| **Pseudonymization**       | Replace with a consistent fake (`Person_17`), with the mapping stored separately and protected                                     | Relationships matter ("who approved what") but identities do not  |
+| **Access control instead** | Keep the data, restrict who can retrieve it via ACL metadata                                                                       | Authorized users genuinely need it (an HR assistant for HR staff) |
+| **Exclusion**              | Do not ingest the source or field at all                                                                                           | Secrets, credentials, special-category data with no use case      |
+
+Microsoft Presidio is the common open-source toolkit: an analyzer that combines regex recognizers and NER models, and an anonymizer that redacts, masks, or replaces. Cloud providers offer equivalents (Amazon Comprehend PII detection, Google Cloud Sensitive Data Protection). Detection is never perfect, so combine it with access control rather than relying on it alone.
+
+---
+
+## Metadata extraction and enrichment
+
+Metadata is what turns a pile of chunks into something you can filter, cite, and keep fresh. [Chunking](/ai/rag/chunking#metadata-every-chunk-needs) lists the fields every chunk needs; here is where each one comes from.
+
+| Kind                     | Fields                                                                              | Where it comes from                             |
+| :----------------------- | :---------------------------------------------------------------------------------- | :---------------------------------------------- |
+| **System**               | `source_id`, URL or path, `doc_type`, `created_at`, `updated_at`, `acl`, `doc_hash` | The loader, from the source system              |
+| **Structural**           | Title, `section_path`, page, `bbox`, element type (table, list, code)               | The parser, from headings and layout            |
+| **Extracted by rules**   | Dates mentioned, product codes, version numbers, language                           | Regular expressions and language detection      |
+| **Extracted by a model** | Entities (people, companies, products), topic labels, document category             | NER models or an LLM with a fixed output schema |
+| **Generated by an LLM**  | A summary, keywords, questions this chunk answers, a context sentence               | An LLM call per document or per chunk           |
+
+**LLM enrichment** is the expensive kind, and three forms pay for themselves:
+
+- **Contextual chunk headers**: a sentence or two situating each chunk in its document, prepended before embedding. This is Anthropic's contextual retrieval, with its published numbers in [Embeddings](/ai/rag/embeddings#contextual-retrieval).
+- **Hypothetical questions**: generate the questions a chunk answers and index those too, so a question matches a question. [Chunking](/ai/rag/chunking#multi-question-indexing) covers it as multi-question indexing.
+- **Structured fields for filtering**: extract a product, region, or year into metadata, so a query like "EU pricing in 2025" can filter before searching. [Query Transformation](/ai/rag/query-transformation#self-query) shows the query side.
+
+Use a fixed schema for any model-extracted field (an enumerated list of document categories, not free text), or filters will not match.
+
+---
+
+## Chunk, embed, and write
+
+[Chunking](/ai/rag/chunking), [Embeddings](/ai/rag/embeddings), and [Vector Databases](/ai/rag/vector-databases) cover the decisions. The pipeline concerns are throughput and correctness:
+
+- **Batch embedding calls.** Embedding APIs and servers accept many texts per call; send batches of tens to hundreds rather than one request per chunk.
+- **Respect rate limits** with a token-bucket limiter and retries with backoff; the embedding step is usually the bottleneck of the whole pipeline.
+- **Cache embeddings by content hash and model.** Key the cache on `(hash of chunk text, embedding model name and version)`. Re-running the pipeline then re-embeds only chunks whose text changed.
+- **Record the embedding model in metadata.** Vectors from two different models are not comparable; mixing them in one index silently ruins retrieval.
+- **Write in bulk**, and write the vector index, keyword index, and document store together, keyed by the same chunk ID.
+- **Use deterministic chunk IDs**, such as `doc_id` plus chunk index, or a hash of `doc_id` and chunk text, so a re-run overwrites instead of duplicating.
+
+---
+
+## Idempotent incremental sync
+
+The pipeline will run again tomorrow, and again after a crash halfway through. It must converge to the right index every time.
+
+**Rules:**
+
+1. **Stable document IDs** from the source (its own ID, path, or canonical URL), never random IDs generated at ingest.
+2. **A content hash per document** (and per chunk), stored in the index.
+3. **Compare, then act**, per document:
+
+| Situation                            | Action                                                              |
+| :----------------------------------- | :------------------------------------------------------------------ |
+| ID not in the index                  | Insert: parse, chunk, embed, write                                  |
+| ID in the index, same hash           | Skip: no parsing, no embedding, no cost                             |
+| ID in the index, different hash      | Replace: delete all old chunks for the ID, then insert the new ones |
+| ID in the index, missing from source | Delete (tombstone), along with all its chunks                       |
+
+4. **Delete by document ID**, not by a list of chunk IDs, so a document that now has fewer chunks cannot leave orphans.
+5. **Replace atomically** where the store allows it, so a reader never sees both the old and new versions, or neither.
+
+The same rules appear from the debugging side in [Production Debugging](/ai/rag/production-debugging#scenario-5-document-updates-and-freshness), with TTL invalidation and freshness attribution.
+
+Frameworks implement this pattern for you:
+
+- **LangChain's indexing API**: `index(docs, record_manager, vector_store, cleanup="incremental", source_id_key="source")`. A **record manager** (a small SQL table) stores a hash and timestamp per written document; `cleanup="incremental"` deletes old versions of documents that changed, and `cleanup="full"` also deletes anything not seen in this run.
+- **LlamaIndex's `IngestionPipeline`**: a list of transformations (splitter, metadata extractors, embedding model) with an attached **docstore** that skips documents whose hash has not changed, and a cache that skips repeated transformation steps.
+
+---
+
+## Index versioning and re-indexing
+
+Some changes require rebuilding everything: a new embedding model, a new chunk size, a new parser. Vectors from the old and new configurations cannot be mixed.
+
+**Blue-green re-indexing:**
+
+<Steps>
+<Step>
+
+Build a complete new index (`docs_v2`) beside the live one (`docs_v1`), from the same document store, with the new configuration.
+
+</Step>
+<Step>
+
+Keep both in sync during the build: new document changes are written to both.
+
+</Step>
+<Step>
+
+Evaluate `docs_v2` on your retrieval test set. Do not switch on faith.
+
+</Step>
+<Step>
+
+Switch an **alias** (a name such as `docs_live` that points at one index) from `v1` to `v2` in one step. Keep `v1` for a quick rollback, then delete it.
+
+</Step>
+</Steps>
+
+Store the configuration that produced each index (parser version, chunker settings, embedding model) with the index, so any chunk can be traced back to how it was made. [Embeddings](/ai/rag/embeddings#changing-the-model) covers the model-migration case in detail.
+
+---
+
+## Orchestration and scale
+
+| Pattern               | How it runs                                                                                                 | Use when                                                   |
+| :-------------------- | :---------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------- |
+| **Scheduled batch**   | An orchestrator runs the pipeline every hour or night over whatever changed                                 | Most corpora; freshness in hours is fine                   |
+| **Event-driven**      | Each change event (webhook, CDC message, file upload) goes on a queue; workers process items as they arrive | Freshness in seconds or minutes                            |
+| **Distributed batch** | The work is split across many machines (Ray Data, Spark)                                                    | Initial loads and full re-indexes of millions of documents |
+
+What every production pipeline needs, whichever pattern it uses:
+
+- **Per-document isolation**: one failing file is retried a few times, then moved to a **dead-letter queue**; it never stops the run.
+- **Retries with backoff** on transient errors (rate limits, timeouts), and no retries on permanent ones (a corrupt file).
+- **Back-pressure**: when the embedding API is the bottleneck, the queue grows instead of the pipeline crashing.
+- **Observability**: counts in and out of every stage, failures by file type and error, parse quality metrics, embedding cost, and lag between a source change and its appearance in the index.
+- **Lineage**: for any chunk, which document, which version, which parser and model produced it.
+
+---
+
+## A pipeline from scratch
+
+The sync logic, in its smallest form. The index maps document IDs to content hashes; the source is what exists now.
+
+```python title="sync.py"
+import hashlib
+
+def h(text):
+    return hashlib.sha256(" ".join(text.lower().split()).encode()).hexdigest()
+
+index = {"policy": h("refunds within 30 days"), "hours": h("open 9 to 5"), "old-faq": h("call us")}
+source = {"policy": "refunds within 14 days", "hours": "open 9 to 5", "shipping": "5 to 7 days"}
+
+for doc_id, text in source.items():
+    if doc_id not in index:
+        print("insert ", doc_id)
+    elif index[doc_id] != h(text):
+        print("replace", doc_id, "(delete old chunks, insert new)")
+    else:
+        print("skip   ", doc_id)
+for doc_id in index.keys() - source.keys():
+    print("delete ", doc_id)
+# replace policy (delete old chunks, insert new)
+# skip    hours
+# insert  shipping
+# delete  old-faq
+```
+
+Only `policy` and `shipping` are parsed, chunked, and embedded. `hours` costs one hash. `old-faq` leaves the index instead of answering questions forever.
+
+---
+
+## The tech stack
+
+| Job                     | Tools                                                                                                                                                              | Notes                                                                                       |
+| :---------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------ |
+| Text cleanup            | `unicodedata` (standard library), `ftfy`, `charset-normalizer`                                                                                                     | Normalization, mojibake repair, encoding detection                                          |
+| Language detection      | fastText language ID, `langdetect`, `lingua`                                                                                                                       | Store the language as metadata                                                              |
+| Deduplication           | `hashlib` for exact, `datasketch` for MinHash and LSH, `text-dedup` at corpus scale, SemDeDup for semantic                                                         | Deduplicate documents first, then chunks                                                    |
+| PII                     | Microsoft Presidio, spaCy NER, Amazon Comprehend, Google Cloud Sensitive Data Protection                                                                           | Combine with access control                                                                 |
+| Metadata and enrichment | LlamaIndex metadata extractors (title, summary, questions, keywords), LLM calls with structured output                                                             | Fixed schemas for anything used as a filter                                                 |
+| Framework pipelines     | LangChain indexing API with a record manager; LlamaIndex `IngestionPipeline` with docstore and cache; Haystack indexing pipelines; Unstructured's ingest pipelines | Built-in hashing, deduplication, and incremental cleanup                                    |
+| Orchestration           | Airflow, Dagster, Prefect, Temporal                                                                                                                                | Scheduling, retries, dependencies, run history                                              |
+| Queues and streaming    | Kafka, RabbitMQ, Amazon SQS, Celery workers                                                                                                                        | Event-driven ingestion                                                                      |
+| Distributed processing  | Ray Data, Apache Spark                                                                                                                                             | Large initial loads and re-indexes                                                          |
+| Embedding serving       | Hosted embedding APIs; Hugging Face Text Embeddings Inference for self-hosting                                                                                     | Batching and throughput                                                                     |
+| Storage                 | A vector store, a keyword index, and a document store (object storage or a database)                                                                               | Same chunk IDs across all three; pgvector keeps vectors, text, and metadata in one Postgres |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Walk through an ingestion pipeline and justify the order of stages.">
+
+    Load, parse, clean, deduplicate, redact PII, extract metadata, chunk, optionally contextualize, embed, and write to the vector index, keyword index, and document store. Clean before deduplicating so trivial differences do not hide copies; deduplicate and redact before embedding because embedding is expensive and anything embedded is retrievable; extract metadata before chunking so every chunk inherits it.
+
+  </Accordion>
+  <Accordion title="How do you detect near-duplicate documents at scale?">
+
+    Shingle each document, compute a MinHash signature (the minimum hash per hash function, which matches between two documents with probability equal to their Jaccard similarity), and use LSH banding to find candidate pairs without comparing all pairs. Verify candidates with exact Jaccard. Semantic duplicates need embedding similarity instead.
+
+  </Accordion>
+  <Accordion title="How do you make ingestion idempotent and incremental?">
+
+    Stable document IDs from the source, a content hash per document and chunk, and a compare step: insert new IDs, skip unchanged hashes, replace changed documents by deleting all old chunks by document ID before inserting, and delete documents missing from the source. Cache embeddings by text hash and model. LangChain's record manager and LlamaIndex's ingestion pipeline implement this.
+
+  </Accordion>
+  <Accordion title="Why redact PII before embedding rather than at answer time?">
+
+    Once embedded and stored, the text can be retrieved by any query that lands near it and repeated by the model; prompt instructions are not a reliable barrier. Redact, pseudonymize, or exclude at ingestion, and use ACL pre-filtering for data some users are allowed to see.
+
+  </Accordion>
+  <Accordion title="How do you change the embedding model on a live system?">
+
+    Blue-green: build a new index with the new model beside the old one, dual-write changes during the build, evaluate on the retrieval test set, switch an alias in one step, and keep the old index briefly for rollback. Vectors from different models must never be mixed in one index.
+
+  </Accordion>
+  <Accordion title="What metadata would you attach during ingestion, and where does each field come from?">
+
+    From the loader: source ID, URL or path, type, timestamps, ACL, content hash. From the parser: title, section path, page, bounding box, element type. From rules and models: dates, codes, language, entities, categories. From an LLM: summaries, contextual headers, likely questions. Fields used for filtering need fixed schemas.
+
+  </Accordion>
+  <Accordion title="What do you monitor in an ingestion pipeline?">
+
+    Documents in and out per stage, failures by file type and error, dead-letter queue size, parse quality signals (empty pages, garbage ratio), embedding cost and throughput, and lag from a source change to its appearance in the index.
+
+  </Accordion>
+</Accordions>

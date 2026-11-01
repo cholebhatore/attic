@@ -9,6 +9,49 @@ The core tension is granularity. A small chunk embeds precisely and retrieves we
 
 ---
 
+## The plain-language version
+
+**Where this sits:** indexing pipeline, step 4, after [Ingestion Pipeline](/ai/rag/ingestion-pipeline) has produced clean, deduplicated documents with metadata, and before [Embeddings](/ai/rag/embeddings).
+
+Documents are too long to retrieve whole. A 60-page manual cannot be pasted into every prompt, and one vector cannot capture 60 pages of meaning. So the document is cut into **chunks**, each small enough to be about one thing, and each chunk is embedded and retrieved on its own.
+
+Think of cutting a textbook into index cards. Cards that are too small ("see above") are useless on their own. Cards that are too big cover five topics, so they match every question vaguely and none precisely. Cards cut mid-sentence or mid-table lose meaning. Chunking is deciding where to cut and how big each card is, and every strategy on this page is a different rule for that.
+
+This page covers, in order:
+
+1. **The size tradeoff**: why small chunks retrieve precisely and large chunks carry context
+2. **Fixed-size chunking**: cut every N tokens, with overlap
+3. **Recursive character chunking**: cut at the biggest natural boundary that fits (sections, then paragraphs, then sentences)
+4. **Semantic chunking**: cut where the topic changes, measured with embeddings
+5. **Parent-child chunking**: search small chunks, return their larger parent
+6. **Proposition chunking**: break text into single self-contained facts
+7. **Multi-question indexing**: index the questions a chunk answers
+8. **Late chunking**: embed the whole document first, then split the vectors
+9. **RAPTOR**: a tree of summaries over the chunks
+10. **Metadata every chunk needs**
+
+| Word                    | Plain meaning                                                                                                                 |
+| :---------------------- | :---------------------------------------------------------------------------------------------------------------------------- |
+| **chunk**               | One retrievable piece of a document. Also called a passage, split, or node.                                                   |
+| **chunk size**          | How long each chunk is, usually counted in tokens (a few hundred is common).                                                  |
+| **overlap**             | Text repeated at the end of one chunk and the start of the next, so a sentence on a boundary is not lost.                     |
+| **separator**           | A boundary the splitter prefers to cut at: a heading, a blank line, a sentence end.                                           |
+| **recursive splitting** | Try the biggest separator first; if a piece is still too long, split it with the next smaller separator.                      |
+| **semantic splitting**  | Embed consecutive sentences and cut where neighbouring sentences stop being similar.                                          |
+| **parent / child**      | A small child chunk is used for searching; its larger parent is what gets sent to the model.                                  |
+| **proposition**         | One standalone fact rewritten so it makes sense alone ("Refunds on gift cards are not allowed", not "These are not allowed"). |
+| **late chunking**       | Run the embedding model over the whole document, then pool token vectors per chunk, so each chunk's vector "saw" the rest.    |
+| **section path**        | The chain of headings above a chunk ("Handbook > 4. Security > 4.2 Tokens"), stored as metadata and often prepended.          |
+
+<Callout type="warn">
+  ### Common mistake
+
+Picking a chunk size by habit (for example 1,000 characters) without looking at the documents. Chunk boundaries should follow the document's own structure: a FAQ chunks by question, a contract by clause, a table never splits without its header. Look at twenty real chunks before indexing a million.
+
+</Callout>
+
+---
+
 ## The size tradeoff
 
 | Chunk size   | Retrieval precision | Context for the LLM | Embedding quality | Chunks to fill a budget |
@@ -127,6 +170,8 @@ Cost is one embedding call per sentence at index time, which is real money on a 
 
 It underperforms on text with no topic shifts, such as a single-argument essay or a wall of similar log lines, where it either produces one enormous chunk or fragments arbitrarily.
 
+Treat it as a candidate to test, not a default. Chroma's _Evaluating Chunking Strategies for Retrieval_ (January 2025) found that the differences between corpora outweigh the differences between strategies, and a well-tuned recursive splitter is often as good on your own evaluation set at a fraction of the indexing cost.
+
 ---
 
 ## Parent-child chunking
@@ -234,17 +279,21 @@ The costs are the ones GraphRAG has. Indexing calls the LLM once per node at eve
 
 ## Metadata every chunk needs
 
-| Field          | Purpose                                                                           |
-| :------------- | :-------------------------------------------------------------------------------- |
-| `source_id`    | Citation and deduplication                                                        |
-| `chunk_index`  | Ordering, neighbour expansion                                                     |
-| `parent_id`    | Parent-child retrieval                                                            |
-| `section_path` | "Handbook > 4. Security > 4.2 Tokens"; strong retrieval signal                    |
-| `page`, `bbox` | PDF citation with a clickable location                                            |
-| `doc_hash`     | Incremental re-indexing; see [Production Debugging](/ai/rag/production-debugging) |
-| `updated_at`   | Freshness filters and TTL                                                         |
-| `acl`          | Access control, applied as a pre-filter                                           |
-| `doc_type`     | Routing between corpora                                                           |
+[Ingestion Pipeline](/ai/rag/ingestion-pipeline#metadata-extraction-and-enrichment) shows where each field comes from: the loader, the parser, rules, or an LLM.
+
+| Field             | Purpose                                                                                  |
+| :---------------- | :--------------------------------------------------------------------------------------- |
+| `source_id`       | Citation and deduplication                                                               |
+| `chunk_index`     | Ordering, neighbour expansion                                                            |
+| `parent_id`       | Parent-child retrieval                                                                   |
+| `section_path`    | "Handbook > 4. Security > 4.2 Tokens"; strong retrieval signal                           |
+| `page`, `bbox`    | PDF citation with a clickable location                                                   |
+| `doc_hash`        | Incremental re-indexing; see [Production Debugging](/ai/rag/production-debugging)        |
+| `updated_at`      | Freshness filters and TTL                                                                |
+| `acl`             | Access control, applied as a pre-filter                                                  |
+| `tenant_id`       | Multi-tenant isolation: every query filters on it, or each tenant gets its own namespace |
+| `embedding_model` | Which model and version produced the vector, so a model change can be found and migrated |
+| `doc_type`        | Routing between corpora                                                                  |
 
 `section_path` is the highest-value one relative to its cost. Prepending it to the text before embedding gives the vector the document structure, which is most of what contextual retrieval adds with an LLM call.
 

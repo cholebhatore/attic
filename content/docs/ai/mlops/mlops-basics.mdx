@@ -1,0 +1,228 @@
+---
+title: MLOps Basics
+description: What MLOps and LLMOps are, the lifecycle from data to monitoring and back, everything that must be versioned together, environments and model promotion, evaluation-gated CI/CD and safe rollouts, the four production signals, a cost-per-request calculation with caching, how AI system design interviews work, the vocabulary, the tech stack, and where each idea is covered.
+---
+
+Getting a model to give a good answer once, on your laptop, is the start. **MLOps** (machine learning operations) is everything needed to keep it giving good answers in production: reproducible experiments, versioned data and models, automated tests before every change, safe deployment, and monitoring of quality, latency, cost, and drift once real users arrive. **LLMOps** is the same discipline adapted to LLM systems, where prompts, retrieval indexes, and token bills are as important as model weights.
+
+Think of the difference between cooking a great meal at home and running a restaurant chain. The recipe matters in both, but the chain also needs supplier records, a written version of every recipe, a tasting before any recipe change reaches customers, a way to roll back a bad change, and daily numbers on cost, waiting times, and complaints. MLOps is the restaurant chain's operations manual for AI.
+
+This page is the map for the phase. It covers, in order:
+
+1. **MLOps versus LLMOps**: what changes when the model is an LLM
+2. **The lifecycle**: from data and experiments to monitoring and back
+3. **What must be versioned together**
+4. **Environments and promotion**: development, staging, production, and the model registry
+5. **CI/CD for AI**: evaluation gates and safe rollouts
+6. **The four production signals**: latency, cost, quality, drift
+7. **The cost arithmetic**: cost per request and the effect of caching
+8. **System design interviews**: the framework and the four case studies
+9. **The vocabulary**
+10. **The tech stack**
+11. **Where each idea is covered**
+
+---
+
+## MLOps versus LLMOps
+
+|                           | Classic MLOps (a model you trained) | LLMOps (an LLM application)                                                         |
+| :------------------------ | :---------------------------------- | :---------------------------------------------------------------------------------- |
+| **Main artifact**         | Model weights trained in-house      | Often a hosted model plus prompts, retrieval indexes, tools, and sometimes adapters |
+| **What changes often**    | Data and retraining                 | Prompts, model versions, retrieval content, and provider updates                    |
+| **Testing**               | Accuracy on a held-out set          | Golden question sets scored by rules and LLM judges; outputs vary between runs      |
+| **Main cost**             | Training compute                    | Inference tokens and GPU serving, per request                                       |
+| **Failure in production** | Data drift lowers accuracy          | Drift plus hallucination, prompt injection, provider changes, runaway token spend   |
+
+---
+
+## The lifecycle
+
+<Mermaid
+  chart={`
+flowchart LR
+    D["Data: collect, clean, version"] --> E["Experiment: train or prompt, track runs"]
+    E --> V["Evaluate: golden set, regression suite"]
+    V --> P["Package: container, registry"]
+    P --> DEP["Deploy: shadow, canary, rollout"]
+    DEP --> M["Monitor: latency, cost, quality, drift"]
+    M --> F["Feedback: failures become test cases and training data"]
+    F --> D
+`}
+/>
+
+The loop is the point. Production failures become new evaluation cases and new training or prompt changes, and every change goes through the same gates before it reaches users again.
+
+---
+
+## What must be versioned together
+
+An answer from an LLM system depends on far more than the model. To reproduce or roll back any answer, all of these need versions, recorded together:
+
+| Artifact                      | Why it changes the output                                 | Tool                                                                                                           |
+| :---------------------------- | :-------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------- |
+| **Code**                      | Pipeline logic, parsing, post-processing                  | Git                                                                                                            |
+| **Data and datasets**         | Training data, evaluation sets, documents                 | DVC, lakeFS ([Dataset and Prompt Versioning](/ai/mlops/data-and-prompt-versioning))                            |
+| **Prompts and templates**     | A one-word change can change every answer                 | A prompt registry ([Dataset and Prompt Versioning](/ai/mlops/data-and-prompt-versioning))                      |
+| **Model and adapter weights** | The model itself, or the provider's model version string  | A model registry ([Experiment Tracking and Registries](/ai/mlops/experiment-tracking))                         |
+| **Configuration**             | Temperature, top-k, chunk size, retrieval settings        | Config files in Git, recorded per run                                                                          |
+| **Retrieval index**           | Which documents can be found, with which embedding model  | Index versions and aliases ([Ingestion Pipeline](/ai/rag/ingestion-pipeline#index-versioning-and-re-indexing)) |
+| **Environment**               | Library and driver versions change numerics and behaviour | Container images ([Containers and GPU Scheduling](/ai/mlops/containers-and-gpu-scheduling))                    |
+
+---
+
+## Environments and promotion
+
+Changes move through **environments**: development (your machine or a notebook), staging (a production copy with test traffic), and production (real users). A **model registry** records every candidate model with its metrics and lineage, and **promotes** it from one stage to the next only when it passes gates. A **run record** from experiment tracking says exactly which data, code, and settings produced each candidate. [Experiment Tracking and Registries](/ai/mlops/experiment-tracking) covers both.
+
+---
+
+## CI/CD for AI
+
+**Continuous integration** runs tests on every change; **continuous delivery** ships changes that pass. For AI systems the key test is an **evaluation gate**: run the changed system on a fixed **golden dataset** and block the change if quality drops.
+
+| Stage                 | What it catches                                                                                |
+| :-------------------- | :--------------------------------------------------------------------------------------------- |
+| **Unit tests**        | Broken code, parsing, prompt templates that fail to render                                     |
+| **Evaluation gate**   | Quality regressions on the golden set, scored by rules and LLM judges                          |
+| **Shadow deployment** | Problems on real traffic: the new version answers in parallel, but users never see its answers |
+| **Canary rollout**    | Problems at small scale: a few percent of users get the new version first                      |
+| **A/B test**          | Whether the change actually improves user outcomes                                             |
+| **Rollback**          | Anything that slipped through: switch back to the previous version in one step                 |
+
+[CI/CD for AI Systems](/ai/mlops/ci-cd-for-llms) builds each stage.
+
+---
+
+## The four production signals
+
+| Signal      | Examples                                                                     | Page                                                                  |
+| :---------- | :--------------------------------------------------------------------------- | :-------------------------------------------------------------------- |
+| **Latency** | Time to first token, inter-token latency, p95 and p99 end-to-end             | [Production Telemetry and Cost Control](/ai/mlops/telemetry-and-cost) |
+| **Cost**    | Tokens and dollars per request, per user, per feature; GPU utilization       | [Production Telemetry and Cost Control](/ai/mlops/telemetry-and-cost) |
+| **Quality** | Faithfulness and correctness on sampled traffic, user feedback, refusal rate | [Observability and Guardrails](/ai/agents/observability-guardrails)   |
+| **Drift**   | Inputs changing (data drift) or the right answer changing (concept drift)    | [Production Telemetry and Cost Control](/ai/mlops/telemetry-and-cost) |
+
+---
+
+## The cost arithmetic
+
+The prices below are illustrative assumptions, not any provider's real price list; substitute your own.
+
+```python title="cost_per_request.py"
+price_in, price_out = 1.00, 4.00          # dollars per million input and output tokens (assumed)
+requests_per_day = 50_000
+tokens_in, tokens_out = 3_000, 400        # per request: system prompt + retrieved chunks + question; answer
+cache_discount = 0.9                      # cached input tokens cost 90% less (assumed)
+
+def monthly_cost(cached_share):
+    effective_in = tokens_in * (1 - cached_share * cache_discount)
+    per_request = (effective_in * price_in + tokens_out * price_out) / 1e6
+    return per_request, per_request * requests_per_day * 30
+
+for share in (0.0, 0.6):
+    per_req, month = monthly_cost(share)
+    print(f"cached {share:.0%}: ${per_req:.4f} per request, ${month:,.0f} per month")
+# cached 0%: $0.0046 per request, $6,900 per month
+# cached 60%: $0.0030 per request, $4,470 per month
+```
+
+Check the first line by hand: 3,000 input tokens at $1 per million is $0.0030, and 400 output tokens at $4 per million is $0.0016, so $0.0046 per request; times 1.5 million requests a month is $6,900. Two lessons generalize. Input tokens (system prompt, retrieved chunks, history) usually dominate the count, so trimming and caching them is the first lever. And per-request cost multiplied by traffic is the number a design must be judged on, not the model's list price. [Context Budgeting](/ai/rag/context-budgeting) covers prompt caching.
+
+---
+
+## System design interviews
+
+Many AI engineering interviews include a 45 to 60 minute design question such as "design a support copilot for a million users". [AI System Design Framework](/ai/mlops/system-design-framework) gives a repeatable structure: clarify requirements and scale, stress-test each stage of the pipeline (input, retrieval, generation, verification, feedback), then resolve the trade-off between quality, latency, and cost. Four worked case studies apply it:
+
+| Case study                                            | What it stresses                                           |
+| :---------------------------------------------------- | :--------------------------------------------------------- |
+| [Multi-Tenant RAG](/ai/mlops/case-multitenant-rag)    | Access control and tenant isolation in retrieval           |
+| [Content Moderation](/ai/mlops/case-moderation)       | Real-time multimodal classification at scale, human review |
+| [Coding Agent Sandbox](/ai/mlops/case-coding-sandbox) | Running untrusted, model-written code safely               |
+| [Support Copilot](/ai/mlops/case-support-copilot)     | High throughput, routing, caching, and cost per resolution |
+
+---
+
+## The vocabulary
+
+| Word                           | Plain meaning                                                                                               |
+| :----------------------------- | :---------------------------------------------------------------------------------------------------------- |
+| **MLOps / LLMOps**             | The practices and tools for running ML systems, and LLM systems, reliably in production.                    |
+| **experiment tracking**        | Recording every training or evaluation run with its data, code, settings, and results.                      |
+| **model registry**             | A catalogue of model versions with their metrics, lineage, and stage (staging, production, archived).       |
+| **lineage**                    | The record of which data, code, and settings produced an artifact.                                          |
+| **golden dataset**             | A fixed, trusted set of inputs with expected outputs, used to test every change.                            |
+| **evaluation gate**            | A CI step that blocks a change if its evaluation scores fall below a threshold.                             |
+| **shadow / canary / A/B**      | Run the new version unseen beside the old; send it a small share of traffic; compare two versions on users. |
+| **rollback**                   | Returning to the previous version quickly.                                                                  |
+| **container / image**          | A packaged environment with the code and every dependency, run identically anywhere.                        |
+| **Kubernetes**                 | The standard system for running and scheduling containers across many machines.                             |
+| **data drift / concept drift** | The inputs change, or the relationship between inputs and correct outputs changes.                          |
+| **SLO**                        | A service-level objective, such as "p95 latency under 2 seconds".                                           |
+| **observability**              | Being able to see what the system did and why, from logs, metrics, and traces.                              |
+
+---
+
+## The tech stack
+
+| Job                              | Tools                                                                |
+| :------------------------------- | :------------------------------------------------------------------- |
+| Experiment tracking and registry | Weights & Biases, MLflow                                             |
+| Data versioning                  | DVC, lakeFS                                                          |
+| Prompt management                | LangSmith, Langfuse, or prompt files in Git with a registry          |
+| Containers and orchestration     | Docker, Kubernetes, with the NVIDIA device plugin for GPUs           |
+| Model serving on Kubernetes      | KServe, Ray Serve, or a serving engine such as vLLM behind a gateway |
+| CI/CD                            | GitHub Actions, GitLab CI, Argo CD                                   |
+| Evaluation                       | RAGAS, DeepEval, promptfoo, custom golden-set runners                |
+| Metrics and dashboards           | Prometheus, Grafana, OpenTelemetry                                   |
+| LLM tracing                      | LangSmith, Langfuse, Arize Phoenix                                   |
+| Drift detection                  | Evidently, or custom statistics on input distributions               |
+
+---
+
+## Where each idea is covered
+
+<Mermaid
+  chart={`
+flowchart TD
+    B["MLOps Basics"] --> ET["Experiment Tracking and Registries"]
+    ET --> DV["Dataset and Prompt Versioning"]
+    DV --> CG["Containers and GPU Scheduling"]
+    CG --> CI["CI/CD for AI Systems"]
+    CI --> TC["Production Telemetry and Cost Control"]
+    TC --> SD["AI System Design Framework"]
+    SD --> CS["Four case studies"]
+`}
+/>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="How does LLMOps differ from classic MLOps?">
+
+    The artifacts include prompts, retrieval indexes, tools, and hosted model versions, not just trained weights; outputs vary between runs, so testing uses golden sets scored by rules and judges; the main cost is per-request inference tokens; and production failures include hallucination, prompt injection, and provider changes, not only drift.
+
+  </Accordion>
+  <Accordion title="What do you need to version to reproduce an LLM system's answer?">
+
+    Code, prompts, model or provider version, adapter weights, configuration such as temperature and retrieval settings, the retrieval index and its embedding model, datasets and evaluation sets, and the container environment, all recorded together per release.
+
+  </Accordion>
+  <Accordion title="How do you deploy a new prompt or model safely?">
+
+    Pass unit tests and an evaluation gate on a golden dataset, run in shadow mode on real traffic, roll out to a small canary share while watching quality, latency, and cost, optionally A/B test the user outcome, and keep a one-step rollback.
+
+  </Accordion>
+  <Accordion title="What would you monitor for an LLM application in production?">
+
+    Latency (time to first token, inter-token latency, p95 and p99), cost (tokens and dollars per request and user), quality (sampled faithfulness and correctness, user feedback, refusal rate), drift in inputs, and infrastructure health such as GPU utilization and error rates.
+
+  </Accordion>
+  <Accordion title="Where does the money go in a RAG chatbot, and how do you cut it?">
+
+    Usually input tokens: system prompt, retrieved chunks, and history, on every request. Trim and rerank context, cache stable prompt prefixes, route easy questions to smaller models, cache frequent answers carefully, and cap output length.
+
+  </Accordion>
+</Accordions>

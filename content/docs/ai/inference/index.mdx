@@ -1,11 +1,13 @@
 ---
 title: Overview
-description: 'GPU execution and CUDA kernels, quantization math and PTQ methods, KV cache arithmetic, prefill against decode, speculation, batching, and serving engines.'
+description: 'Inference basics, GPU execution and CUDA kernels, quantization math and PTQ methods, KV cache arithmetic, prefill against decode, speculation, batching, and serving engines.'
 ---
 
 Phase 9 assembled the right context and Phase 8 made the model reason. Neither says anything about the cost of running it. This phase is the hardware and systems layer: what a decode step spends, how much of that spend is avoidable, and what the engines that serve at scale do about it.
 
 The whole phase reduces to one observation. Autoregressive decode reads every weight in the model to produce one token, so tokens per second is memory bandwidth divided by bytes per token. Almost every technique here is an attack on one of those two quantities: quantization shrinks the bytes, batching amortizes the read across streams, speculation produces more tokens per read, and SRAM-first silicon buys more bandwidth.
+
+New to this phase? Start with [Inference Basics](/ai/inference/inference-basics). It defines the serving metrics, works out by hand why generating text is limited by memory bandwidth and how batching changes that, lays out the inference stack from silicon to API, and maps every optimization lever to its page. Every page after it also opens with a **plain-language version**: where the page sits, a short explanation with an analogy, the page's topics in order, and a table of the words it uses.
 
 <Callout type="info">
   ### Every number here is published or derived
@@ -23,7 +25,8 @@ Hardware specifications come from vendor datasheets and architecture papers, wit
 flowchart TD
     subgraph HW["Hardware and kernels"]
         direction TB
-        A["GPU Hardware"] --> B["CUDA and Triton"]
+        Z["Inference Basics"] --> A["GPU Hardware"]
+        A --> B["CUDA and Triton"]
         B --> C["Specialized Silicon"]
     end
     subgraph QZ["Compression"]
@@ -48,7 +51,7 @@ flowchart TD
 `}
 />
 
-Read the hardware block first, because the roofline model is what makes every later number predictable instead of mysterious. The compression block depends on it, since the reason to quantize for inference is bandwidth and not model size. The latency and serving blocks assume you can already compute a per-token byte cost.
+Read Inference Basics first: it is the map for the phase. Then read the hardware block, because the roofline model is what makes every later number predictable instead of mysterious. The compression block depends on it, since the reason to quantize for inference is bandwidth and not model size. The latency and serving blocks assume you can already compute a per-token byte cost.
 
 `specialized-silicon` and `gguf-and-local` are the two pages you can read out of order. They are about hardware you probably will not buy and hardware you probably already own.
 
@@ -57,6 +60,12 @@ Read the hardware block first, because the roofline model is what makes every la
 ## Core topics
 
 <Cards>
+  <Card
+    icon={<BookOpen />}
+    title="Inference Basics"
+    description="TTFT, inter-token latency, throughput, and goodput, why decode is memory-bound with the 8B-on-H100 ceiling worked by hand, how batching fills the GPU, the inference stack, and every optimization lever."
+    href="/ai/inference/inference-basics"
+  />
   <Card
     icon={<Cpu />}
     title="GPU Hardware"
@@ -133,6 +142,174 @@ Read the hardware block first, because the roofline model is what makes every la
 
 ---
 
+## The whole phase, topic by topic
+
+Every topic in this phase, in reading order, one line each. Read it first as a preview, or afterwards as a revision sheet.
+
+<Accordions>
+  <Accordion title="Inference Basics">
+
+    - **The metrics** — TTFT, inter-token latency, throughput, goodput, and cost per token
+    - **The two phases of a request** — prefill and decode
+    - **Why decode is memory-bound** — the speed ceiling of an 8B model worked out by hand
+    - **Batching changes the arithmetic** — how serving many users at once fills the GPU
+    - **The inference stack** — from silicon to the API
+    - **The optimization levers** — what each technique saves, and its page
+    - **The vocabulary**
+    - **The tech stack**
+    - **Where each idea is covered**
+
+  </Accordion>
+  <Accordion title="GPU Hardware and CUDA Fundamentals">
+
+    - **The execution hierarchy** — threads, warps, blocks, and streaming multiprocessors (SMs)
+    - **Warps and SIMT** — 32 threads executing one instruction together
+    - **The memory hierarchy** — registers, shared memory, L2, and HBM
+    - **HBM against on-chip SRAM** — capacity against speed
+    - **The roofline** — memory-bound versus compute-bound, and the ridge point
+    - **Where LLM inference sits** — prefill near the compute roof, decode deep in the memory-bound region
+    - **Kernel fusion** — the main lever
+    - **Launch overhead and CUDA graphs**
+    - **Latency hiding and occupancy**
+
+  </Accordion>
+  <Accordion title="Writing Kernels in CUDA and Triton">
+
+    - **When a custom kernel is the answer**
+    - **CUDA C++** — the block model and a shared-memory reduction
+    - **Triton** — the block-programming model in Python
+    - **Tiling and FlashAttention** — computing attention without the full matrix
+    - **torch.compile** — getting fused kernels automatically
+    - **Measuring** — profiling before and after
+    - **Learning path**
+
+  </Accordion>
+  <Accordion title="Specialized Inference Silicon">
+
+    - **The arithmetic that motivates the category**
+    - **Three memory philosophies**
+    - **Groq LPU** — deterministic SRAM token streaming
+    - **Cerebras WSE-3** — wafer scale
+    - **SambaNova SN40L** — three-tier memory
+    - **Google TPU** — systolic arrays at pod scale
+    - **Apple Silicon** — unified memory as the capacity play
+    - **The GPU baseline, for scale**
+    - **The objections** — cost, capacity, and ecosystem
+
+  </Accordion>
+  <Accordion title="Quantization Math">
+
+    - **The mapping** — scale, zero point, symmetric and asymmetric
+    - **Quantization error** — what rounding costs
+    - **Number formats** — INT8, INT4, FP8, NF4
+    - **Granularity** — per-tensor, per-channel, per-group
+    - **Weight-only against weight-and-activation**
+    - **The outlier problem**
+    - **What it saves**
+    - **What it costs**
+    - **When not to quantize**
+
+  </Accordion>
+  <Accordion title="PTQ Against QAT">
+
+    - **Two families** — PTQ and QAT
+    - **Calibration** — choosing scales from example data
+    - **Round-to-nearest** — the simple baseline
+    - **GPTQ** — error-correcting rounding, column by column
+    - **AWQ** — protecting salient weights by activation size
+    - **SmoothQuant and the W8A8 path** — quantizing activations too
+    - **bitsandbytes and the QLoRA path**
+    - **Quantization-aware training**
+    - **Choosing**
+    - **Tooling**
+
+  </Accordion>
+  <Accordion title="GGUF and Local Inference">
+
+    - **GGML, llama.cpp, and GGUF** — the library, the engine, and the file format
+    - **The GGUF container** — header, metadata, and tensors
+    - **Quant types and their real bits per weight** — what `Q4_K_M` actually means
+    - **Executing on CPU** — vector instructions and memory bandwidth
+    - **GPU offload** — splitting layers between GPU and CPU
+    - **Apple Silicon unified memory**
+    - **Ollama**
+    - **Choosing local over an API**
+
+  </Accordion>
+  <Accordion title="KV Cache">
+
+    - **What the cache holds**
+    - **The formula and the per-token constant** — bytes per token from the config
+    - **How many sequences fit** — on a given GPU
+    - **When the cache outgrows the weights**
+    - **Reduction 1: architecture** — GQA, MQA, MLA, sliding windows
+    - **Reduction 2: precision** — quantizing the cache
+    - **Reduction 3: token eviction** — dropping less important tokens
+    - **Reduction 4: storage layout** — paging and sharing
+    - **What the reductions cost**
+
+  </Accordion>
+  <Accordion title="Prefill and Decode">
+
+    - **The two phases**
+    - **Latency vocabulary** — TTFT, TPOT, ITL, end-to-end latency
+    - **Prefill cost**
+    - **Decode cost**
+    - **Arithmetic intensity explains both**
+    - **The first-token penalty** — why the first token costs far more than the rest
+    - **Interference between the phases** — and chunked prefill
+    - **Mixture of experts changes the arithmetic**
+
+  </Accordion>
+  <Accordion title="Speculative Decoding">
+
+    - **Why verification is cheap**
+    - **Draft and verify** — with lossless rejection sampling
+    - **The expected-tokens formula** — speed-up from acceptance rate and draft length
+    - **N-gram speculation** — drafting by copying from the prompt
+    - **Medusa** — extra decoding heads
+    - **EAGLE** — drafting from the model's own features
+    - **Tree attention** — verifying several candidate continuations at once
+    - **Other draft-free variants**
+    - **When speculation loses**
+
+  </Accordion>
+  <Accordion title="Continuous Batching">
+
+    - **What static batching wastes**
+    - **Iteration-level scheduling** — rebuilding the batch every step
+    - **The token budget** — how much work fits in one step
+    - **Preemption** — pausing requests when memory runs out
+    - **Prompt and prefix caching** — reusing shared prefixes, and the block-aligned hit rules
+    - **What caching costs**
+
+  </Accordion>
+  <Accordion title="Prefill-Decode Disaggregation">
+
+    - **What colocation costs** — interference when both phases share GPUs
+    - **The topology** — separate prefill and decode pools
+    - **The KV transfer arithmetic** — when moving the cache pays
+    - **Published systems** — DistServe, Splitwise, Mooncake
+    - **Where disaggregation is the wrong call**
+    - **Other axes of disaggregation**
+
+  </Accordion>
+  <Accordion title="Serving Engines Compared">
+
+    - **The comparison** — the engines side by side
+    - **vLLM and PagedAttention**
+    - **SGLang and RadixAttention**
+    - **TensorRT-LLM and compile-time specialization**
+    - **CUDA graphs**
+    - **Constrained and structured output**
+    - **The rest of the field**
+    - **Choosing**
+
+  </Accordion>
+</Accordions>
+
+---
+
 ## Prerequisites
 
 - [Vectors and Matrices](/ai/math-foundations/vectors-and-matrices) for the shape arithmetic behind every FLOP count here
@@ -155,6 +332,7 @@ Nothing here needs a GPU to read, and PyTorch is not required. The CUDA and Trit
 
 ## What you should be able to do afterwards
 
+- Explain in plain words why LLM decoding is limited by memory bandwidth, compute the single-sequence speed ceiling for a model on a GPU, and name the levers that raise throughput
 - Walk the GPU execution hierarchy from thread to warp to block to SM, and say what limits each level
 - Place an operation on a roofline from its arithmetic intensity and a GPU's ridge point, and predict whether it is compute-bound or bandwidth-bound
 - Compute the batch-1 decode ceiling for any model and GPU from bandwidth and weight size

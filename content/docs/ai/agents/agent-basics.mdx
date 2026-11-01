@@ -1,0 +1,261 @@
+---
+title: Agent Basics
+description: What an AI agent is, the spectrum from a single LLM call through workflows to autonomous agents, the five components, a working agent loop in 30 lines of Python, tools, function calling and MCP, memory, multi-agent systems, why agents fail and how they are secured and evaluated, when not to build one, the vocabulary, the tech stack, and where each idea is covered.
+---
+
+A chatbot answers from what it already knows. An **agent** can act: it decides to search the web, query a database, run code, or call an API, reads the result, and decides what to do next, repeating until the task is done. The model is the same kind of LLM; what makes it an agent is that it is placed in a **loop** with **tools**, and the model itself chooses the next step.
+
+Think of the difference between asking a colleague a question and delegating a task to them. For the question, they answer from memory. For the task ("book me a flight under 500 dollars next Tuesday"), they look things up, compare options, notice when something does not work, try again, and report back when done. Agents are LLMs that can be delegated tasks.
+
+This page is the map for the phase. It covers, in order:
+
+1. **The spectrum**: single call, workflow, agent, multi-agent
+2. **The five components**: model, instructions, tools, memory, loop
+3. **An agent loop in 30 lines**: think, act, observe, with a step budget
+4. **Tools, function calling, and MCP**: how a model asks for an action
+5. **Memory**: what an agent remembers within and across tasks
+6. **Reasoning patterns and multiple agents**
+7. **Why agents fail**: and what keeps them safe
+8. **Evaluating agents**
+9. **When not to build an agent**
+10. **The vocabulary**
+11. **The tech stack**
+12. **Where each idea is covered**
+
+---
+
+## The spectrum
+
+| Level                  | Who decides the steps?                                  | Example                                                                |
+| :--------------------- | :------------------------------------------------------ | :--------------------------------------------------------------------- |
+| **Single LLM call**    | Nobody: one prompt, one answer                          | Summarize this email                                                   |
+| **Workflow (chain)**   | You, in code: fixed steps in a fixed order              | Extract fields, then validate, then write a reply                      |
+| **Router**             | The model picks one of several fixed paths              | Send billing questions to one prompt, technical ones to another        |
+| **Agent**              | The model, step by step, in a loop                      | Investigate why a test is failing: read files, run tests, edit, re-run |
+| **Multi-agent system** | Several agents, coordinated by a supervisor or handoffs | A researcher agent and a writer agent producing a report               |
+
+Each step down the table gives the model more freedom and makes the system less predictable, slower, and harder to test. Anthropic's _Building Effective Agents_ (December 2024) makes the same point: use the simplest level that works, and add autonomy only where fixed steps cannot handle the variety of tasks. [Agent Anatomy](/ai/agents/agent-anatomy#agent-against-workflow) compares agents with workflows.
+
+---
+
+## The five components
+
+| Component         | What it is                                                                                   | Page                                                                   |
+| :---------------- | :------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------- |
+| **Model (brain)** | The LLM that reads the situation and decides the next step                                   | [Agent Anatomy](/ai/agents/agent-anatomy)                              |
+| **Instructions**  | The system prompt: role, rules, how to use the tools, when to stop                           | [Agent Anatomy](/ai/agents/agent-anatomy)                              |
+| **Tools (hands)** | Functions the model can call: search, databases, code execution, APIs                        | [Function Calling](/ai/agents/function-calling), [MCP](/ai/agents/mcp) |
+| **Memory**        | The conversation and tool results so far, plus anything stored across sessions               | [Agent Memory](/ai/agents/agent-memory)                                |
+| **Loop**          | The code that calls the model, runs the tools it asks for, feeds back the results, and stops | [The Agent Loop](/ai/agents/agent-loop)                                |
+
+---
+
+## An agent loop in 30 lines
+
+The model here is faked so the code runs without an API key, but the loop is exactly the shape of a real one: call the model, run any tool it requests, append the result, repeat until it answers or the step budget runs out.
+
+```python title="tiny_agent.py"
+import json
+
+def calculator(expression: str) -> str:
+    return str(eval(expression, {"__builtins__": {}}))   # toy only: never eval untrusted input in production
+
+TOOLS = {"calculator": calculator}
+
+def fake_model(messages):
+    # Stand-in for an LLM API: decides to call a tool, then answers once it sees the result.
+    last = messages[-1]
+    if last["role"] == "user":
+        return {"tool_call": {"name": "calculator", "arguments": {"expression": "23 * 47"}}}
+    return {"content": f"23 times 47 is {last['content']}."}
+
+def run_agent(question, max_steps=5):
+    messages = [{"role": "system", "content": "You can use tools."}, {"role": "user", "content": question}]
+    for step in range(max_steps):                          # the loop, with a step budget
+        reply = fake_model(messages)                       # think
+        if "tool_call" in reply:
+            call = reply["tool_call"]
+            result = TOOLS[call["name"]](**call["arguments"])    # act
+            print(f"step {step}: {call['name']}({json.dumps(call['arguments'])}) -> {result}")
+            messages.append({"role": "tool", "content": result}) # observe
+        else:
+            return reply["content"]                        # finished
+    return "stopped: step budget exhausted"
+
+print(run_agent("What is 23 * 47?"))
+# step 0: calculator({"expression": "23 * 47"}) -> 1081
+# 23 times 47 is 1081.
+```
+
+Every production agent is this loop plus engineering: real model calls with tool schemas, error handling when a tool fails, a stopping rule better than "no tool call", detection of repeated actions, limits on cost and time, and checkpoints so a long task can resume. [The Agent Loop](/ai/agents/agent-loop) adds each guard.
+
+---
+
+## Tools, function calling, and MCP
+
+A model cannot run code or call APIs itself. It outputs a structured **request**: the tool's name and its arguments, as JSON. Your code runs the tool and returns the result as a new message.
+
+- **Function calling** (tool use) is the model-provider feature that makes this reliable: you describe each tool with a name, a description, and a JSON schema for its arguments, and the model emits calls that match. The description is what the model uses to decide when to call the tool, so it is the most important line you write. [Function Calling](/ai/agents/function-calling).
+- **MCP** (Model Context Protocol) is an open standard for packaging tools, data, and prompts as **servers** that any compatible application can connect to, so a tool written once works with many agents and applications. Think of it as USB for AI tools. [MCP](/ai/agents/mcp).
+
+---
+
+## Memory
+
+| Kind                      | Lifetime                       | Example                                                                 |
+| :------------------------ | :----------------------------- | :---------------------------------------------------------------------- |
+| **Short-term (working)**  | One task: the messages so far  | The tool results gathered while fixing this bug                         |
+| **Long-term: episodic**   | Across tasks: what happened    | "Last week the deploy failed because of a missing environment variable" |
+| **Long-term: semantic**   | Across tasks: facts            | "The user prefers Python; the staging database is read-only"            |
+| **Long-term: procedural** | Across tasks: how to do things | A saved checklist or skill for releasing a new version                  |
+
+Short-term memory is limited by the context window, so long tasks need summarizing and pruning. Long-term memory is usually a retrieval system, the same machinery as [RAG](/ai/rag). [Agent Memory](/ai/agents/agent-memory) covers writing and recalling policies.
+
+---
+
+## Reasoning patterns and multiple agents
+
+- **ReAct**: alternate a short reasoning step with an action, observe, repeat. The default pattern.
+- **Plan-and-Execute**: write a plan first, then carry out the steps, revising the plan when needed.
+- **Reflexion**: after a failure, write a short lesson and retry with it in context.
+
+[Reasoning Patterns](/ai/agents/reasoning-patterns) compares them. When one agent's context or toolset becomes too large, the work can be split across agents: a **supervisor** delegating to specialists, an **orchestrator** spawning workers in parallel, or agents **handing off** a conversation to each other. [Multi-Agent Topologies](/ai/agents/multi-agent) covers when that helps and when it only adds cost.
+
+---
+
+## Why agents fail
+
+| Failure                     | What happens                                                        | Defence                                                                    |
+| :-------------------------- | :------------------------------------------------------------------ | :------------------------------------------------------------------------- |
+| **Errors compound**         | A small mistake early is built upon by every later step             | Validation after key steps; shorter loops                                  |
+| **Infinite or stuck loops** | The agent repeats the same action or never decides it is done       | Step and cost budgets, repeat detection, an explicit finish tool           |
+| **Wrong tool or arguments** | Vague tool descriptions lead to wrong choices                       | Clear descriptions, strict schemas, tool-selection tests                   |
+| **Context overflow**        | Long tool outputs push important information out of the window      | Summarize or truncate observations; sub-agents                             |
+| **Prompt injection**        | Text in a web page or document tells the agent to do something else | Treat tool output as data; least privilege; confirmation for risky actions |
+| **Dangerous actions**       | The agent deletes, pays, or sends something it should not           | Sandboxes, scoped credentials, human approval gates                        |
+
+Security deserves special attention. An agent that can read untrusted content, access private data, and send information out has what Simon Willison calls the **lethal trifecta**: an attacker can plant instructions in content the agent reads and use it to exfiltrate data. [Agent Security](/ai/agents/agent-security) covers the threat model and the controls that work.
+
+---
+
+## Evaluating agents
+
+An agent can reach the right answer by a wasteful or unsafe route, or the wrong answer by a reasonable one, so evaluation looks at both the **outcome** and the **trajectory** (the sequence of steps and tool calls).
+
+| What to measure        | How                                                                              | Page                                                                |
+| :--------------------- | :------------------------------------------------------------------------------- | :------------------------------------------------------------------ |
+| Task success           | Did the final state or answer meet the goal? Checked by tests, rules, or a judge | [RAG and Agent Evaluation](/ai/agents/rag-and-agent-eval)           |
+| Trajectory quality     | Right tools, valid arguments, no wasted steps                                    | [RAG and Agent Evaluation](/ai/agents/rag-and-agent-eval)           |
+| Benchmarks             | Fixed public test sets such as SWE-bench                                         | [Evaluation Metrics and Benchmarks](/ai/agents/eval-metrics)        |
+| Human and model judges | Ratings, pairwise comparisons, LLM-as-a-judge with its biases controlled         | [Human and Judge Evaluation](/ai/agents/judge-and-human-eval)       |
+| Production behaviour   | Traces of every step, plus runtime guardrails                                    | [Observability and Guardrails](/ai/agents/observability-guardrails) |
+
+---
+
+## When not to build an agent
+
+- **The steps are known in advance.** Write a workflow: it is cheaper, faster, and testable.
+- **One call with good context answers it.** Use a single prompt, or RAG.
+- **Mistakes are expensive and hard to undo** and there is no human approval step.
+- **Latency matters more than flexibility.** Every loop iteration is another model call.
+
+<Callout type="warn">
+  ### Common mistake
+
+Starting with a multi-agent framework for a problem a single prompt or a short workflow would solve. Agents trade predictability for flexibility; pay that price only where the flexibility is needed, and add autonomy one measured step at a time.
+
+</Callout>
+
+---
+
+## The vocabulary
+
+| Word                            | Plain meaning                                                                                                |
+| :------------------------------ | :----------------------------------------------------------------------------------------------------------- |
+| **agent**                       | An LLM in a loop that chooses actions, uses tools, and observes results until a task is done.                |
+| **workflow / chain**            | A fixed sequence of LLM calls and code, with the steps decided by the developer.                             |
+| **tool**                        | A function the agent may call, described to the model by a name, a description, and an argument schema.      |
+| **function calling / tool use** | The model emitting a structured request to call a tool with specific arguments.                              |
+| **observation**                 | The result of a tool call, fed back to the model.                                                            |
+| **trajectory**                  | The full sequence of thoughts, tool calls, and observations in one task.                                     |
+| **step budget**                 | The maximum number of loop iterations (or tokens, or dollars) before the agent is stopped.                   |
+| **MCP**                         | Model Context Protocol: a standard for exposing tools, resources, and prompts as servers any client can use. |
+| **ReAct**                       | Reason, then act, then observe, repeated.                                                                    |
+| **supervisor / handoff**        | A coordinating agent that delegates to others; passing control of a conversation from one agent to another.  |
+| **prompt injection**            | Malicious instructions hidden in input or content, aimed at changing the agent's behaviour.                  |
+| **guardrail**                   | A check before or after a model or tool call that blocks unsafe or invalid behaviour.                        |
+| **human in the loop**           | Requiring a person to approve certain actions before the agent proceeds.                                     |
+| **trace / span**                | A recorded log of one run, made of spans, one per model call or tool call.                                   |
+
+---
+
+## The tech stack
+
+| Category                 | Tools                                                                                                          |
+| :----------------------- | :------------------------------------------------------------------------------------------------------------- |
+| Model APIs with tool use | Anthropic, OpenAI, Google, and open models served with tool-calling support                                    |
+| Agent frameworks         | LangGraph and LangChain, the OpenAI Agents SDK, the Claude Agent SDK, CrewAI, AutoGen, LlamaIndex, Pydantic AI |
+| Tool protocol            | MCP servers and clients                                                                                        |
+| Code execution sandboxes | Containers, microVMs (Firecracker), hosted sandboxes such as E2B                                               |
+| Tracing and evaluation   | LangSmith, Langfuse, Arize Phoenix, DeepEval, RAGAS                                                            |
+| Guardrails               | NVIDIA NeMo Guardrails, Guardrails AI, Llama Guard, Microsoft Presidio                                         |
+
+[Agent Frameworks](/ai/agents/agent-frameworks) compares the frameworks and includes full lesson series on LangChain, LangGraph, and LangSmith.
+
+---
+
+## Where each idea is covered
+
+<Mermaid
+  chart={`
+flowchart TD
+    B["Agent Basics"] --> AN["Agent Anatomy"]
+    AN --> LP["The Agent Loop"]
+    LP --> ME["Agent Memory"]
+    ME --> RP["Reasoning Patterns"]
+    RP --> FC["Function Calling"]
+    FC --> MCP["MCP"]
+    MCP --> FW["Agent Frameworks"]
+    FW --> MA["Multi-Agent Topologies"]
+    MA --> SEC["Agent Security"]
+    SEC --> EV["Evaluation: metrics, judges, RAG and agent eval"]
+    EV --> OB["Observability and Guardrails"]
+`}
+/>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between a workflow and an agent?">
+
+    In a workflow the developer fixes the steps and their order in code. In an agent the model decides the next step at runtime, in a loop, based on tool results. Workflows are cheaper, faster, and more predictable; agents handle tasks whose steps cannot be known in advance.
+
+  </Accordion>
+  <Accordion title="What are the components of an agent?">
+
+    A model that decides, instructions that set its role and rules, tools it can call, memory of the task so far and across tasks, and a controller loop that calls the model, executes tool calls, feeds back results, and enforces stopping rules and budgets.
+
+  </Accordion>
+  <Accordion title="How does function calling work?">
+
+    The developer describes each tool with a name, a description, and a JSON schema. The model outputs a structured call with the tool name and arguments; the application executes it and returns the result as a message; the model continues. The model never executes anything itself.
+
+  </Accordion>
+  <Accordion title="What is MCP and why does it exist?">
+
+    The Model Context Protocol standardizes how applications expose tools, resources, and prompts to models, as servers that any compatible host can connect to. It replaces one-off integrations per application and model with a shared interface.
+
+  </Accordion>
+  <Accordion title="Why do agents get stuck in loops, and how do you stop it?">
+
+    The model may repeat an action whose result it misreads, or never judge the task complete. Guards: a step and cost budget, detection of repeated identical actions, an explicit finish tool, and summarized observations so the model can see its own progress.
+
+  </Accordion>
+  <Accordion title="What is the lethal trifecta?">
+
+    An agent that can access private data, read untrusted content, and communicate externally. Any untrusted content can carry injected instructions that make it send private data out. Remove one leg, or gate the risky actions with least privilege and human approval.
+
+  </Accordion>
+</Accordions>

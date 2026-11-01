@@ -1,6 +1,6 @@
 ---
 title: AI Basics
-description: The field map (AI, machine learning, deep learning, NLP, LLMs), the vocabulary of data, models, training, and language, and static versus contextual embeddings with GloVe and BERT as the worked example.
+description: The field map (AI, machine learning, deep learning, NLP, LLMs), the vocabulary of data, models, training, and language, encoding versus embedding, and static versus contextual embeddings with GloVe and BERT as the worked example.
 ---
 
 The math pages in this phase say things like "a token embedding is a 4096-dimensional vector" or "the model updates every weight after each batch". Each of those sentences leans on four or five words that are never the topic of any page. This page defines them, so the math has something to attach to.
@@ -14,7 +14,7 @@ The page covers six groups of words, in this order:
 3. **Kinds of learning**: supervised, unsupervised, self-supervised, and reinforcement learning
 4. **The model**: parameters, weights, biases, hyperparameters, neurons, layers, activations
 5. **Training and inference**: forward pass, loss, gradient descent, learning rate, batch, epoch, overfitting
-6. **Language**: corpus, token, vocabulary, embedding, static versus contextual embeddings, language model, transformer, attention
+6. **Language**: corpus, token, vocabulary, encoding versus embedding, static versus contextual embeddings, language model, transformer, attention
 
 ---
 
@@ -214,12 +214,80 @@ The IDs above are illustrative. Real values depend on the tokenizer.
 | **tokenization**    | Splitting text into tokens. The tokenizer is fixed before training and never changes afterwards.                                                                                                                  |
 | **vocabulary**      | The fixed list of every token the model knows, each with an integer ID. Its size is written `V`: GPT-2's is 50,257 (Radford et al., 2019).                                                                        |
 | **one-hot vector**  | A vector of length `V` with a 1 at the token's ID and 0 everywhere else. Identifies a token but says nothing about its meaning.                                                                                   |
+| **encoding**        | A fixed, hand-written rule that turns data into numbers, such as UTF-8 bytes, token IDs, or one-hot vectors. Nothing is learned.                                                                                  |
 | **embedding**       | A short, dense vector of learned numbers that represents a token (or sentence, or image) so that **similar meanings get similar vectors**.                                                                        |
 | **embedding space** | The space all those vectors live in. "Close together in embedding space" means "similar in meaning".                                                                                                              |
 
 **Why one-hot is not enough.** With one-hot vectors every pair of different words is equally unrelated: the dot product of `cat` and `dog` is 0, and so is the dot product of `cat` and `carburetor`. An embedding fixes that by giving `cat` and `dog` nearby vectors. It is also far shorter: a few hundred numbers instead of 50,000.
 
 [Tokenization](/ai/llm/tokenization) in the LLM phase covers how tokenizers are built.
+
+### Encoding versus embedding
+
+Both words describe "turning something into numbers", and they are often mixed up. The difference is **who decides the numbers**.
+
+- An **encoding** is a **fixed rule**, written by a person and never trained. The same input always gives the same numbers, in every model, before and after training. It makes data machine-readable but adds no knowledge about meaning.
+- An **embedding** is a **learned vector**. Its numbers are parameters, adjusted by gradient descent during training, and they end up placing related things close together. Two models trained on different data give different embeddings for the same word.
+
+The common encodings you will meet:
+
+| Encoding                           | What the rule does                                                                | Example                                                     |
+| :--------------------------------- | :-------------------------------------------------------------------------------- | :---------------------------------------------------------- |
+| **character encoding** (UTF-8)     | Maps each character to bytes, so text can be stored at all.                       | `"café"` becomes the bytes `[99, 97, 102, 195, 169]`        |
+| **integer (label) encoding**       | Gives each category or token an ID.                                               | `cat = 0`, `dog = 1`, `milk = 2`; the tokenizer's IDs       |
+| **ordinal encoding**               | Integer encoding where the order is real.                                         | `small = 0`, `medium = 1`, `large = 2`                      |
+| **one-hot encoding**               | A vector of zeros with a 1 at the ID, so no category looks "bigger" than another. | `dog` becomes `[0, 1, 0]`; a city feature becomes 3 columns |
+| **sinusoidal positional encoding** | Turns a position number into a fixed pattern of sine and cosine waves.            | Position 5 always gets the same vector, in every model      |
+
+**Integer encoding for categories with no order is a trap.** If `cat = 0`, `dog = 1`, and `milk = 2`, a model that does arithmetic on the input "sees" that milk is twice dog. One-hot removes the fake order, which is why it is the default encoding for unordered categories.
+
+The two are connected: **an embedding lookup is a one-hot encoding multiplied by a learned matrix.** The table `E` has shape `(V, d)`, one row per token. Multiplying a one-hot vector by `E` picks out one row, which is why frameworks skip the multiply and just index the row.
+
+```python title="encoding_vs_embedding.py"
+import numpy as np
+
+vocab = ["cat", "dog", "milk"]
+ids = {w: i for i, w in enumerate(vocab)}   # integer encoding: cat=0, dog=1, milk=2
+onehot = np.eye(len(vocab))                 # one-hot encoding: row i is word i
+
+print(ids["dog"], onehot[ids["dog"]])                 # 1 [0. 1. 0.]
+print(onehot[ids["cat"]] @ onehot[ids["dog"]])        # 0.0   cat and dog: unrelated
+print(onehot[ids["cat"]] @ onehot[ids["milk"]])       # 0.0   cat and milk: equally unrelated
+
+E = np.array([[0.9, 0.8, 0.1],    # cat    embedding table, shape (V, d) = (3, 3)
+              [0.8, 0.9, 0.2],    # dog    values a trained model might reach
+              [0.1, 0.2, 0.9]])   # milk
+
+def cos(a, b):
+    return a @ b / (np.linalg.norm(a) * np.linalg.norm(b))
+
+print(f"{cos(E[0], E[1]):.2f} {cos(E[0], E[2]):.2f}")   # 0.99 0.30   cat-dog close, cat-milk far
+print(onehot[ids["dog"]] @ E, E[ids["dog"]])            # [0.8 0.9 0.2] [0.8 0.9 0.2]   same row
+```
+
+The encoding says only "this is word 1". The embedding says "word 1 is a lot like word 0". The values in `E` are written by hand here to show what training produces; in a real model they start random and gradient descent moves them.
+
+| Question                        | Encoding                                       | Embedding                                               |
+| :------------------------------ | :--------------------------------------------- | :------------------------------------------------------ |
+| Where do the numbers come from? | A fixed rule                                   | Training (gradient descent)                             |
+| Does it have parameters?        | No                                             | Yes: a `(V, d)` table, often millions of numbers        |
+| Does it capture meaning?        | No. Every pair of one-hot words is equally far | Yes. Similar items get nearby vectors                   |
+| Size per item                   | Often as long as the vocabulary (one-hot)      | Short and dense, typically 50 to a few thousand numbers |
+| Same in every model?            | Yes                                            | No. Each model learns its own                           |
+| Place in the pipeline           | First: make the data numeric                   | Second: turn the IDs into useful vectors                |
+
+So the full path from earlier is **encode, then embed**: text is encoded into token IDs by a fixed tokenizer, and the IDs are embedded by a learned table. Hugging Face tokenizers even name the first step `tokenizer.encode(text)`.
+
+The table above lists only the encodings this page needs. [Encoding and Decoding](/ai/math-foundations/encoding-and-decoding) covers all of them: character encodings, every way to encode a category or a number, positional encodings, encoder and decoder networks, and what decoding means.
+
+<Callout type="warn">
+  ### Three names that look alike
+
+**Positional encoding versus positional embedding.** The original transformer added a fixed sinusoidal **encoding** of each position. GPT-2 and BERT instead learn a table of position vectors, which is a positional **embedding**. Both do the same job; one is a rule, the other is trained. [Blocks and Positions](/ai/transformers/blocks-and-positions) covers both, plus RoPE.
+
+**Encoder** is a third, unrelated use of the word. In "encoder-decoder" or "BERT is an encoder", an encoder is a whole neural network that reads an input and outputs contextual embeddings. It is learned, not a fixed rule.
+
+</Callout>
 
 ### Where embeddings come from: GloVe
 
@@ -374,6 +442,11 @@ Every modern LLM works the contextual way. Each one still begins with a static l
   <Accordion title="How is an LLM trained without human labels?">
 
     Self-supervised learning. Every sentence supplies its own labels: each token is the target for the tokens before it, so next-token prediction turns raw text into billions of training examples for free.
+
+  </Accordion>
+  <Accordion title="What is the difference between an encoding and an embedding?">
+
+    An encoding is a fixed rule that makes data numeric, such as UTF-8, integer IDs, one-hot vectors, or sinusoidal positions. It has no parameters and carries no meaning. An embedding is a learned dense vector, part of the model's parameters, trained so similar items land close together. They connect: an embedding lookup equals a one-hot encoding multiplied by the `(V, d)` embedding matrix.
 
   </Accordion>
   <Accordion title="Why not represent words as one-hot vectors?">

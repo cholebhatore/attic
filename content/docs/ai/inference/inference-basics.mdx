@@ -1,0 +1,220 @@
+---
+title: Inference Basics
+description: What inference and serving are, the metrics that matter (TTFT, inter-token latency, throughput, goodput, cost per token), why generating text is limited by memory bandwidth rather than compute, the speed ceiling of an 8B model on one GPU worked out by hand, the inference stack from silicon to API, the optimization levers, the vocabulary, the tech stack, and where each idea is covered.
+---
+
+Training a model happens once. **Inference**, running the trained model to answer requests, happens every time anyone uses it, so for most products it is where the money and the latency go. **Serving** is inference as a service: many users at once, each expecting the first word quickly and the rest at reading speed, at a cost per request the business can afford.
+
+Think of a restaurant. Training is writing the recipes; inference is cooking every order. A good restaurant is not one that can cook a single dish fast, but one that serves a full dining room quickly and cheaply without the food getting worse. Nearly every technique in this phase is a way to serve more diners per kitchen.
+
+This page is the map for the phase. It covers, in order:
+
+1. **The metrics**: TTFT, inter-token latency, throughput, goodput, and cost per token
+2. **The two phases of a request**: prefill and decode
+3. **Why decode is memory-bound**: the speed ceiling of an 8B model worked out by hand
+4. **Batching changes the arithmetic**: how serving many users at once fills the GPU
+5. **The inference stack**: from silicon to the API
+6. **The optimization levers**: what each technique saves, and its page
+7. **The vocabulary**
+8. **The tech stack**
+9. **Where each idea is covered**
+
+---
+
+## The metrics
+
+| Metric                                                      | Plain meaning                                                    | What the user feels                                 |
+| :---------------------------------------------------------- | :--------------------------------------------------------------- | :-------------------------------------------------- |
+| **TTFT** (time to first token)                              | From sending the request to receiving the first token            | "Is it thinking or broken?"                         |
+| **ITL / TPOT** (inter-token latency, time per output token) | The gap between consecutive output tokens                        | Reading speed of the streamed answer                |
+| **End-to-end latency**                                      | TTFT plus the time for every output token                        | Total wait for a complete answer                    |
+| **Throughput**                                              | Tokens (or requests) per second across all users on the hardware | Nothing directly; it decides the cost               |
+| **Goodput**                                                 | Throughput counting only requests that met their latency targets | Whether the service is actually usable at that load |
+| **Cost per million tokens**                                 | Hardware cost per hour divided by tokens served per hour         | The price of the product                            |
+
+The tension in every serving decision is **latency against throughput**: serving more users per GPU lowers cost but makes each user wait a bit longer. Most systems state a target, such as "TTFT under 1 second and ITL under 50 ms for 95% of requests", and then maximize throughput within it.
+
+---
+
+## The two phases of a request
+
+| Phase       | What happens                                                                                          | Parallel?                           | Limited by                              | Sets |
+| :---------- | :---------------------------------------------------------------------------------------------------- | :---------------------------------- | :-------------------------------------- | :--- |
+| **Prefill** | The whole prompt is processed in one forward pass, and its keys and values are stored in the KV cache | Yes: every prompt token at once     | Compute (lots of math per byte loaded)  | TTFT |
+| **Decode**  | One new token per forward pass, each reading all the model's weights and the whole KV cache           | No: one token at a time per request | Memory bandwidth (little math per byte) | ITL  |
+
+Reading a question takes one glance; writing the answer takes one stroke per word. [Prefill and Decode](/ai/inference/prefill-and-decode) works through both phases, and [Inference Lifecycle](/ai/llm/inference-lifecycle) follows one request from end to end.
+
+---
+
+## Why decode is memory-bound
+
+To produce one token, the GPU must read every weight of the model from its main memory (HBM) into the compute units. For one sequence, that read takes far longer than the math. So the speed limit is the memory bandwidth, not the advertised FLOPs.
+
+```python title="decode_ceiling.py"
+params = 8.03e9                 # Llama 3.1 8B
+bandwidth = 3.35e12             # H100 SXM HBM3, bytes per second (NVIDIA datasheet)
+peak_flops = 989e12             # H100 SXM dense BF16 tensor-core FLOP/s (NVIDIA datasheet)
+
+for name, bytes_per_param in [("bf16", 2), ("int8", 1), ("int4", 0.5)]:
+    weight_bytes = params * bytes_per_param
+    print(f"{name}: {weight_bytes / 1e9:.1f} GB, at most {bandwidth / weight_bytes:.0f} tokens/s for one sequence")
+# bf16: 16.1 GB, at most 209 tokens/s for one sequence
+# int8: 8.0 GB, at most 417 tokens/s for one sequence
+# int4: 4.0 GB, at most 834 tokens/s for one sequence
+
+flops_per_token = 2 * params                       # one multiply and one add per parameter
+print(f"compute ceiling: {peak_flops / flops_per_token:,.0f} tokens/s")   # compute ceiling: 61,582 tokens/s
+print(f"ridge point: {peak_flops / bandwidth:.0f} FLOPs per byte")       # ridge point: 295 FLOPs per byte
+```
+
+Two lessons follow, and most of this phase is built on them:
+
+- **For a single sequence, the GPU is about 300 times faster at math than it can be fed.** The memory ceiling (209 tokens per second) is far below the compute ceiling (about 61,600). These are upper bounds; real numbers are lower because the KV cache must be read too.
+- **Halving the bytes roughly doubles single-sequence decode speed.** That is why quantization speeds up generation, not only saves memory. [Quantization Math](/ai/inference/quantization-math) covers how.
+
+The **ridge point** (295 FLOPs per byte on an H100) is the arithmetic intensity at which a workload stops being limited by memory and starts being limited by compute. [GPU Hardware](/ai/inference/gpu-hardware) derives it with the roofline model.
+
+---
+
+## Batching changes the arithmetic
+
+The weights read for one token can serve every sequence in a batch at the same time. With a batch of `B` sequences, each weight read is reused `B` times, so the arithmetic intensity of the weight multiplications is about `B` FLOPs per byte in bf16 (2B FLOPs per weight, 2 bytes per weight). At a batch of 1 it is 1 FLOP per byte, far below the ridge point of 295; at a batch of a few hundred it approaches the ridge, and the GPU's compute finally gets used.
+
+That is why serving engines batch aggressively, and why the KV cache matters so much: every sequence in the batch needs its own cache, so cache memory decides how large the batch can be. [KV Cache](/ai/inference/kv-cache) computes how many sequences fit, and [Continuous Batching](/ai/inference/continuous-batching) explains how requests join and leave a running batch.
+
+<Callout type="warn">
+  ### Common mistake
+
+Judging a GPU or an engine by single-request speed. A setup that produces 200 tokens per second for one user may produce thousands per second across many users. Measure throughput at your latency target and your real traffic, not the speed of one request.
+
+</Callout>
+
+---
+
+## The inference stack
+
+<Mermaid
+  chart={`
+flowchart TD
+    API["API and gateway: auth, rate limits, routing, streaming"] --> ENG["Serving engine: scheduler, batching, KV cache manager"]
+    ENG --> RT["Model runtime: quantized weights, attention kernels, speculative decoding"]
+    RT --> K["Kernels: CUDA, Triton, FlashAttention"]
+    K --> HW["Hardware: GPU, TPU, LPU, CPU, Apple Silicon"]
+`}
+/>
+
+| Layer              | Decides                                                              | Pages                                                                                                                                                                                          |
+| :----------------- | :------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Hardware**       | Memory size, memory bandwidth, compute                               | [GPU Hardware](/ai/inference/gpu-hardware), [Specialized Silicon](/ai/inference/specialized-silicon)                                                                                           |
+| **Kernels**        | How efficiently each operation uses the hardware                     | [CUDA and Triton](/ai/inference/cuda-and-triton)                                                                                                                                               |
+| **Model runtime**  | How many bytes each token costs and how many tokens each step yields | [Quantization Math](/ai/inference/quantization-math), [PTQ and QAT](/ai/inference/ptq-and-qat), [Speculative Decoding](/ai/inference/speculative-decoding)                                     |
+| **Serving engine** | How requests share the GPU                                           | [KV Cache](/ai/inference/kv-cache), [Continuous Batching](/ai/inference/continuous-batching), [Disaggregation](/ai/inference/disaggregation), [Serving Engines](/ai/inference/serving-engines) |
+| **Local runtimes** | Running on laptops and CPUs                                          | [GGUF and Local Inference](/ai/inference/gguf-and-local)                                                                                                                                       |
+
+---
+
+## The optimization levers
+
+| Lever                               | What it saves                                                                              | Trade-off                                         | Page                                                                                                   |
+| :---------------------------------- | :----------------------------------------------------------------------------------------- | :------------------------------------------------ | :----------------------------------------------------------------------------------------------------- |
+| **Quantization**                    | Bytes per weight (and KV cache): more speed, less memory                                   | Some quality loss, especially at 4 bits and below | [Quantization Math](/ai/inference/quantization-math), [PTQ and QAT](/ai/inference/ptq-and-qat)         |
+| **Kernel fusion, FlashAttention**   | Trips to memory between operations                                                         | Engineering effort, hardware-specific code        | [CUDA and Triton](/ai/inference/cuda-and-triton)                                                       |
+| **KV cache reduction**              | Cache memory per token, so larger batches and longer contexts fit                          | Architecture or precision changes                 | [KV Cache](/ai/inference/kv-cache)                                                                     |
+| **Continuous batching**             | Idle GPU time between requests                                                             | Scheduler complexity                              | [Continuous Batching](/ai/inference/continuous-batching)                                               |
+| **Prefix caching**                  | Recomputing shared prompt prefixes (system prompts, documents)                             | Cache memory                                      | [Continuous Batching](/ai/inference/continuous-batching)                                               |
+| **Speculative decoding**            | Sequential decode steps: a cheap draft proposes tokens, the model verifies several at once | Wasted work when drafts are rejected              | [Speculative Decoding](/ai/inference/speculative-decoding)                                             |
+| **Chunked prefill, disaggregation** | Prefill and decode slowing each other down                                                 | More complex scheduling or more hardware          | [Prefill and Decode](/ai/inference/prefill-and-decode), [Disaggregation](/ai/inference/disaggregation) |
+| **Specialized silicon**             | The memory-bandwidth wall itself, with on-chip SRAM                                        | Capacity, cost, and ecosystem                     | [Specialized Silicon](/ai/inference/specialized-silicon)                                               |
+
+---
+
+## The vocabulary
+
+| Word                       | Plain meaning                                                                                                 |
+| :------------------------- | :------------------------------------------------------------------------------------------------------------ |
+| **inference / serving**    | Running a trained model; doing so as a service for many users.                                                |
+| **HBM**                    | High-bandwidth memory: the GPU's main memory, where weights and the KV cache live.                            |
+| **SRAM**                   | Small, very fast on-chip memory inside the compute units.                                                     |
+| **memory bandwidth**       | How many bytes per second can move from memory to compute.                                                    |
+| **FLOPs / FLOP/s**         | Floating-point operations; and how many the chip can do per second.                                           |
+| **arithmetic intensity**   | FLOPs performed per byte moved. Low means memory-bound; high means compute-bound.                             |
+| **roofline / ridge point** | The model of performance as limited by either memory or compute; the intensity where the two limits meet.     |
+| **kernel**                 | One GPU program, such as a matrix multiply or an attention computation.                                       |
+| **kernel fusion**          | Combining several operations into one kernel so intermediate results never go back to HBM.                    |
+| **KV cache**               | Stored keys and values for every past token of every active sequence.                                         |
+| **batch size**             | How many sequences are processed together in one forward pass.                                                |
+| **quantization**           | Storing weights (and sometimes activations or cache) in fewer bits.                                           |
+| **speculative decoding**   | A fast draft guesses several tokens; the real model checks them all in one pass and keeps the correct prefix. |
+| **p95 / p99 latency**      | The latency that 95% or 99% of requests stay under: the slow tail users notice.                               |
+| **SLO**                    | Service-level objective: the latency or availability target the system must meet.                             |
+
+---
+
+## The tech stack
+
+| Tool                                                  | What it is                                                                          |
+| :---------------------------------------------------- | :---------------------------------------------------------------------------------- |
+| **vLLM**                                              | Open-source serving engine; PagedAttention for KV cache memory, continuous batching |
+| **SGLang**                                            | Open-source serving engine; RadixAttention prefix sharing, fast structured output   |
+| **TensorRT-LLM**                                      | NVIDIA's compiled, highly optimized engine for its GPUs                             |
+| **llama.cpp, Ollama, LM Studio**                      | Local inference on CPUs, laptops, and Apple Silicon, using GGUF files               |
+| **AutoAWQ, GPTQ tools, bitsandbytes, llm-compressor** | Quantization tooling                                                                |
+| **CUDA, Triton**                                      | Writing custom GPU kernels                                                          |
+| **NVIDIA Dynamo, llm-d**                              | Orchestration for distributed and disaggregated serving                             |
+
+[Serving Engines](/ai/inference/serving-engines) compares the engines in depth.
+
+---
+
+## Where each idea is covered
+
+<Mermaid
+  chart={`
+flowchart TD
+    B["Inference Basics"] --> HW["GPU Hardware"]
+    HW --> CU["CUDA and Triton"]
+    CU --> SS["Specialized Silicon"]
+    SS --> QM["Quantization Math"]
+    QM --> PQ["PTQ and QAT"]
+    PQ --> GG["GGUF and Local Inference"]
+    GG --> KV["KV Cache"]
+    KV --> PD["Prefill and Decode"]
+    PD --> SD["Speculative Decoding"]
+    SD --> CB["Continuous Batching"]
+    CB --> DI["Disaggregation"]
+    DI --> SE["Serving Engines"]
+`}
+/>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why is LLM decoding memory-bound?">
+
+    Each new token requires reading every weight from GPU memory, but performs only about two FLOPs per weight. At batch size 1 the arithmetic intensity is about 1 FLOP per byte in bf16, far below an H100's ridge point of about 295, so speed is set by memory bandwidth. An 8B bf16 model on an H100 is capped near 209 tokens per second for one sequence.
+
+  </Accordion>
+  <Accordion title="What is the difference between TTFT and inter-token latency?">
+
+    TTFT is the time to the first token, dominated by prefill of the prompt and queueing. Inter-token latency is the gap between later tokens, set by the decode step. Long prompts hurt TTFT; large batches and long caches hurt inter-token latency.
+
+  </Accordion>
+  <Accordion title="Why does batching increase throughput so much?">
+
+    The weights read for one decode step serve every sequence in the batch, so the cost of the memory read is shared. Arithmetic intensity grows roughly with batch size, moving the workload from memory-bound toward compute-bound, until the KV cache memory limits the batch.
+
+  </Accordion>
+  <Accordion title="Why does quantization speed up generation, not just save memory?">
+
+    Decode is limited by bytes read per token. Halving the bytes per weight roughly halves the time to read the weights, so single-sequence decode speed roughly doubles, minus dequantization overhead.
+
+  </Accordion>
+  <Accordion title="Name the main levers for cheaper, faster serving.">
+
+    Quantization, fused kernels such as FlashAttention, KV cache reduction (GQA, MLA, cache quantization, paging), continuous batching, prefix caching, speculative decoding, chunked prefill or disaggregated prefill and decode, and choosing the right hardware and engine.
+
+  </Accordion>
+</Accordions>

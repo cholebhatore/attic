@@ -19,6 +19,35 @@ Sources: Mixtral (Jiang et al., arXiv:2401.04088), DeepSeek-V3 (arXiv:2412.19437
 
 ---
 
+## The plain-language version
+
+**Where this sits:** the second efficiency change. It targets compute: how to make a model know more without making each token more expensive to process.
+
+In a normal (dense) model every parameter is used for every token. A **mixture of experts (MoE)** replaces each feed-forward network with many smaller ones, the **experts**, plus a **router** that picks a few experts for each token. The model can have a huge total parameter count (more knowledge) while each token only uses a small part of it (less compute). The catch: all the experts must still sit in memory, and the router must spread tokens evenly, or a few experts do all the work while the rest learn nothing.
+
+Think of a hospital. A dense model is one doctor who must handle every case alone. An MoE is a hospital of specialists with a triage nurse (the router) who sends each patient to two or three relevant specialists. The hospital knows far more, each patient takes about the same time, but the building has to hold everyone, and triage must not send every patient to the same doctor.
+
+This page covers, in order:
+
+1. **Routing**: top-k gating, and sigmoid versus softmax scoring
+2. **Load balancing**: the auxiliary loss, DeepSeek's aux-loss-free bias, and capacity factor
+3. **DeepSeek's group-limited routing**: shared experts, dense first layers, and fine-grained experts
+4. **What MoE costs you**: memory, communication, and training instability
+
+| Word                          | Plain meaning                                                                                      |
+| :---------------------------- | :------------------------------------------------------------------------------------------------- |
+| **dense model**               | Every parameter is used for every token.                                                           |
+| **expert**                    | One of many parallel feed-forward networks in an MoE layer.                                        |
+| **router / gate**             | A small layer that scores the experts for each token and picks the top `k`.                        |
+| **total / active parameters** | All parameters in the model, versus those actually used for one token.                             |
+| **load balancing**            | Keeping tokens spread across experts so none is overloaded or idle.                                |
+| **auxiliary loss**            | An extra training penalty that pushes the router toward balanced use.                              |
+| **capacity factor**           | The maximum number of tokens an expert accepts per batch; overflow tokens are dropped or rerouted. |
+| **shared expert**             | An expert every token always uses, alongside the routed ones.                                      |
+| **expert parallelism**        | Placing different experts on different GPUs.                                                       |
+
+---
+
 ## Routing
 
 Two directions, and the difference matters for load balance.

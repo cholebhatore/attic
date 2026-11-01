@@ -1,0 +1,357 @@
+---
+title: Document Loaders
+description: How loaders fetch content from files, cloud storage, websites, SaaS apps, and databases; the Document object; lazy versus eager loading; pull versus push and full versus incremental sync; change detection; file type detection; web crawling; permissions capture; and the loader tech stack.
+---
+
+Before anything can be chunked, embedded, or retrieved, it has to be fetched. Company knowledge lives in a dozen places at once: PDFs on a shared drive, pages in Confluence and Notion, tickets in Jira, threads in Slack, rows in Postgres, a public website. A **document loader** is the code that goes to one of those places, fetches the content, and hands it to the rest of the pipeline in one standard shape.
+
+Loading sounds like plumbing, and it is, but three decisions made here cannot be fixed later: **which metadata is captured** (a permission list not recorded at load time does not exist anywhere downstream), **how changes are detected** (a loader that cannot see deletions keeps serving deleted documents), and **how the file type is identified** (a PDF routed to a text reader becomes garbage).
+
+---
+
+## The plain-language version
+
+A loader is a mail clerk. Every source is a different mailbox with its own key: a folder, a website, an API that needs a login. The clerk opens each mailbox, takes out what is new, and puts each item into the same kind of envelope, with a label on the outside saying where it came from, when, and who is allowed to read it. Everyone downstream works only with envelopes, never with mailboxes.
+
+The envelope is the **Document**: the content plus a dictionary of metadata.
+
+This page covers, in order:
+
+1. **What a loader does**: the four jobs every loader performs
+2. **The Document object**: the standard envelope, in LangChain and LlamaIndex
+3. **Source types**: files, cloud storage, the web, SaaS apps, databases, email, code
+4. **Loading techniques**: eager versus lazy, full versus incremental, pull versus push
+5. **Change detection**: timestamps, ETags, content hashes, change cursors, and CDC
+6. **File type detection and routing**: extensions, MIME types, and magic bytes
+7. **Loading the web**: single pages, crawling, sitemaps, and JavaScript-rendered sites
+8. **Loading databases**: rows as documents versus querying live
+9. **Permissions and operational concerns**: ACLs, rate limits, auth, failures
+10. **A loader from scratch**
+11. **The tech stack**
+
+| Word                        | Plain meaning                                                                                                                       |
+| :-------------------------- | :---------------------------------------------------------------------------------------------------------------------------------- |
+| **source**                  | A place documents live: a folder, a bucket, a website, an app, a database.                                                          |
+| **connector**               | The code that knows how to authenticate to one kind of source and list and download its contents. A loader is built on a connector. |
+| **Document**                | The standard output: text (or raw bytes to be parsed) plus metadata.                                                                |
+| **metadata**                | Facts about the document: source path or URL, title, author, created and modified times, permissions, type.                         |
+| **eager / lazy loading**    | Eager: load everything into memory and return a list. Lazy: return documents one at a time from a generator.                        |
+| **full / incremental sync** | Full: re-read everything each run. Incremental: read only what changed since the last run.                                          |
+| **pull / push**             | Pull: the loader asks the source on a schedule. Push: the source notifies the loader (webhook) when something changes.              |
+| **cursor**                  | A bookmark the source gives you, meaning "everything up to here has been read". The next sync starts from it.                       |
+| **CDC**                     | Change data capture: reading a database's own change log to see every insert, update, and delete as it happens.                     |
+| **MIME type**               | A standard label for a file format, such as `application/pdf` or `text/html`.                                                       |
+| **magic bytes**             | The first few bytes of a file, which identify its real format regardless of its name. Every PDF starts with `%PDF-`.                |
+| **crawler**                 | A program that loads a web page, follows its links, and loads those pages too.                                                      |
+| **ACL**                     | Access control list: who is allowed to read a document. Must be captured at load time.                                              |
+
+---
+
+## What a loader does
+
+Every loader, whatever the source, performs the same four jobs:
+
+<Steps>
+<Step>
+
+**Connect and authenticate.** Open the folder, sign in to the API with an API key or OAuth token, or open a database connection.
+
+</Step>
+<Step>
+
+**Enumerate.** List what exists, or what changed since the last run: files in a folder, pages in a space, rows modified after a timestamp.
+
+</Step>
+<Step>
+
+**Fetch.** Download the content, handling pagination (results in pages of 100), rate limits, and retries.
+
+</Step>
+<Step>
+
+**Wrap.** Return a `Document` with the content and every piece of metadata the source offers: identity, location, timestamps, author, permissions.
+
+</Step>
+</Steps>
+
+Some loaders also **parse** (a PDF loader that returns extracted text). That convenience hides a decision: which parser, with which settings. Production pipelines usually keep loading and parsing separate, so the parser can be swapped or re-run without re-downloading. [Parsing and Extraction](/ai/rag/parsing-and-extraction) covers the second half.
+
+---
+
+## The Document object
+
+Every framework defines the same envelope with slightly different names.
+
+```python title="documents.py"
+from langchain_core.documents import Document
+
+doc = Document(
+    page_content="Refunds are available within 30 days of purchase.",
+    metadata={"source": "handbook/policy.pdf", "page": 4, "updated_at": "2026-09-14", "acl": ["staff"]},
+)
+```
+
+| Framework    | Document type                                                               | Text field     | Metadata field | Smaller unit after chunking      |
+| :----------- | :-------------------------------------------------------------------------- | :------------- | :------------- | :------------------------------- |
+| LangChain    | `langchain_core.documents.Document`                                         | `page_content` | `metadata`     | Still `Document`                 |
+| LlamaIndex   | `llama_index.core.Document`                                                 | `text`         | `metadata`     | `TextNode` (a "node")            |
+| Haystack     | `haystack.Document`                                                         | `content`      | `meta`         | Still `Document`                 |
+| Unstructured | A list of **elements** (`Title`, `NarrativeText`, `Table`, `ListItem`, ...) | `text`         | `metadata`     | Elements are grouped into chunks |
+
+Unstructured's design is worth noticing. Instead of one long string per file, it returns typed elements, so later stages know which text was a title, which was a table, and which was body text. That structure is what good chunking needs.
+
+**One file can become several documents.** A PDF loader commonly emits one document per page (so the page number is in the metadata and citations can link to it). A CSV loader commonly emits one document per row. A Slack loader might emit one per thread. Decide the unit deliberately: it sets the finest citation you can ever give.
+
+---
+
+## Source types
+
+| Source                      | Examples                                                                   | How it is loaded                                                                    | Watch out for                                                               |
+| :-------------------------- | :------------------------------------------------------------------------- | :---------------------------------------------------------------------------------- | :-------------------------------------------------------------------------- |
+| **Local and network files** | A folder of PDFs, a mounted share                                          | Walk the directory tree; read each file                                             | Huge folders (use lazy loading); symlinks; files locked while being written |
+| **Cloud object storage**    | Amazon S3, Google Cloud Storage, Azure Blob                                | List objects under a prefix; download each; use the object's ETag to detect changes | Listing costs and pagination; very large objects                            |
+| **The web**                 | Docs sites, help centers, blogs                                            | HTTP fetch, crawl links or a sitemap; render JavaScript if needed                   | `robots.txt`, rate limits, duplicate URLs, boilerplate (menus, footers)     |
+| **SaaS apps**               | Confluence, Notion, Google Drive, SharePoint, Jira, Zendesk, Slack, GitHub | The app's REST or GraphQL API, with OAuth                                           | Rate limits, permission models, rich-text formats, attachments              |
+| **Databases**               | Postgres, MySQL, MongoDB, a data warehouse                                 | SQL query; template each row into text                                              | Whether rows should be embedded at all (see below)                          |
+| **Email and chat**          | Mailboxes, Slack, Teams                                                    | IMAP or the provider API; group messages into threads                               | Quoted replies repeating earlier messages; attachments; personal data       |
+| **Code repositories**       | GitHub, GitLab                                                             | Clone or use the API; walk files; respect `.gitignore`                              | Generated and vendored files; binary files                                  |
+| **Media**                   | Meeting recordings, videos, podcasts                                       | Download; transcribe with speech recognition                                        | Speaker labels, timestamps for citations                                    |
+
+---
+
+## Loading techniques
+
+Three independent choices define how a loader runs.
+
+**Eager versus lazy.** An eager loader returns a full list (`loader.load()`), so the whole corpus sits in memory at once. A lazy loader returns a generator (`loader.lazy_load()` in LangChain), producing one document at a time, so memory stays flat whether the folder has ten files or ten million. Use lazy loading for anything larger than a test set. It also lets downstream stages start working before loading finishes.
+
+**Full versus incremental.** A full sync re-reads the whole source every run. It is simple and always correct, and it becomes too slow and too expensive once the source is large or the API is rate-limited. An incremental sync reads only what changed since the last run, which needs a reliable **change signal** (next section) and a stored **checkpoint** of where the last run ended. Most systems do incremental syncs often and a full reconciliation occasionally, to catch anything the change signal missed.
+
+**Pull versus push.**
+
+| Mode                | How it works                                                                   | Freshness             | Cost and complexity                                                                                      |
+| :------------------ | :----------------------------------------------------------------------------- | :-------------------- | :------------------------------------------------------------------------------------------------------- |
+| **Pull, scheduled** | A job runs every N minutes and asks the source "what changed since my cursor?" | Up to N minutes stale | Simple; wastes calls when nothing changed                                                                |
+| **Push, webhooks**  | The source calls your endpoint when a document changes                         | Seconds               | Needs a public endpoint, signature checks, and retries; events can be lost, so pair with a periodic pull |
+| **Streaming, CDC**  | Read the database's change log (for example with Debezium into Kafka)          | Seconds               | Most infrastructure; captures deletes precisely                                                          |
+
+<Callout type="warn">
+  ### Common mistake: forgetting deletions
+
+A loader that only asks "what is new or modified?" never learns that a document was deleted, so the index keeps serving it forever. Every sync design needs an answer for deletions: a delete event (webhooks, CDC), a "deleted items" API, or a periodic full listing compared against what the index holds. [Ingestion Pipeline](/ai/rag/ingestion-pipeline) turns that comparison into insert, replace, skip, and delete actions.
+
+</Callout>
+
+---
+
+## Change detection
+
+How a loader knows that something changed, from cheapest to most reliable:
+
+| Signal                            | What it is                                                                                                                   | Reliability                                                                                        |
+| :-------------------------------- | :--------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------- |
+| **Modified time** (`mtime`)       | The timestamp the file system or API reports for the last change                                                             | Cheap. Can be wrong: a copy or restore resets it, and some APIs report coarse times                |
+| **HTTP `ETag` / `Last-Modified`** | Headers a web server returns; send `If-None-Match` or `If-Modified-Since` and get `304 Not Modified` back if nothing changed | Good when the server implements them; many dynamic pages do not                                    |
+| **Object storage ETag**           | S3 and similar return an ETag per object, usually a hash of the content (multipart uploads differ)                           | Good for detecting content changes                                                                 |
+| **API change cursor**             | Many SaaS APIs return a token meaning "changes after this point" (Google Drive's change list, for example)                   | Good; includes deletions when the API reports them                                                 |
+| **Content hash**                  | Hash the downloaded bytes (SHA-256) and compare with the stored hash                                                         | Exact. Requires downloading the content, but also catches "modified time changed, content did not" |
+| **CDC log**                       | The database's write-ahead log                                                                                               | Exact, including deletes, in order                                                                 |
+
+Content hashes are the safety net under every other signal. Store the hash with the document; if it has not changed, skip parsing, chunking, and embedding entirely, which is where the cost is.
+
+---
+
+## File type detection and routing
+
+The loader must decide which parser gets each file. Three signals, in increasing order of trust:
+
+1. **The file extension** (`.pdf`): free, and often wrong (`report.pdf.txt`, files with no extension, files renamed by users).
+2. **The declared MIME type** (the `Content-Type` an HTTP server or API reports): better, but servers mislabel files too.
+3. **Magic bytes**, the first bytes of the content: the real answer.
+
+| Format                              | Starts with                      |
+| :---------------------------------- | :------------------------------- |
+| PDF                                 | `%PDF-`                          |
+| PNG image                           | the byte `0x89` then `PNG`       |
+| DOCX, XLSX, PPTX (and any ZIP)      | `PK` then bytes 3 and 4          |
+| Old Word and Excel (`.doc`, `.xls`) | the OLE2 signature `D0 CF 11 E0` |
+
+Note the ZIP case: DOCX, XLSX, and PPTX are all ZIP archives of XML files, so magic bytes say "ZIP", and you look inside the archive (`word/`, `xl/`, `ppt/`) to tell them apart. Libraries such as `python-magic` (built on libmagic) and Apache Tika do this detection for you.
+
+---
+
+## Loading the web
+
+| Approach              | How it works                                                                                                  | Use when                                                    |
+| :-------------------- | :------------------------------------------------------------------------------------------------------------ | :---------------------------------------------------------- |
+| **Single-page fetch** | HTTP `GET`, keep the HTML                                                                                     | A known list of URLs                                        |
+| **Sitemap**           | Read the site's `sitemap.xml`, which lists every page and often its last-modified date                        | The site publishes one; it is the cheapest complete listing |
+| **Crawl**             | Start at a URL, extract links, follow those on the same domain, up to a depth limit                           | No sitemap; a docs site with consistent linking             |
+| **Headless browser**  | Load the page in a real browser engine (Playwright, Puppeteer) so JavaScript runs before the HTML is captured | Single-page apps whose content is rendered by JavaScript    |
+
+What a well-behaved crawler does:
+
+- **Obeys `robots.txt`** and the site's terms of use, and identifies itself with a clear user agent.
+- **Rate-limits** itself per domain and backs off on `429 Too Many Requests` and `503` responses.
+- **Normalizes URLs** so `https://site.com/a`, `https://site.com/a/`, and `https://site.com/a?utm_source=x` are one page; uses the page's `<link rel="canonical">` when present.
+- **Limits depth and scope** (same domain, path prefix such as `/docs/`), or it will wander into the whole internet.
+- **Keeps the URL and fetch time** in metadata for citations and freshness.
+
+Raw HTML is mostly not content: navigation, footers, cookie banners, scripts. Removing it is a parsing job, covered in [Parsing and Extraction](/ai/rag/parsing-and-extraction#html-and-web-pages).
+
+---
+
+## Loading databases
+
+A database row is already structured, so there are two very different ways to make it answerable.
+
+| Approach                     | How                                                                                           | Good for                                                           | Bad for                                                                |
+| :--------------------------- | :-------------------------------------------------------------------------------------------- | :----------------------------------------------------------------- | :--------------------------------------------------------------------- |
+| **Rows as documents**        | Template each row into a sentence ("Product: Kettle. Price: $39.00. In stock: 12."), embed it | Rows with descriptive text: product descriptions, support tickets  | Counting, summing, filtering ("how many orders over $100 last month?") |
+| **Query live (text-to-SQL)** | Keep the data in the database; the model writes SQL at question time                          | Aggregates, filters, exact numbers, data that changes every minute | Free-text columns; fuzzy questions                                     |
+
+Embedding numeric rows is a common trap: "which product is cheapest?" cannot be answered by similarity search, because similarity does not compare numbers. [Vectorless RAG](/ai/rag/vectorless-rag) covers text-to-SQL end to end. Many systems do both: embed the descriptive columns for search, and route numeric questions to SQL.
+
+---
+
+## Permissions and operational concerns
+
+**Capture permissions at load time.** If a document is readable only by the finance team, that fact exists in the source system (a Google Drive sharing list, a Confluence space permission, a SharePoint group). The loader must copy it into metadata as an ACL, and keep it updated when sharing changes, because permission changes often do not change the document's content or modified time. Retrieval then filters by the asking user's groups before any chunk reaches the model. [Production Debugging](/ai/rag/production-debugging) shows why filtering after retrieval leaks.
+
+**Other concerns every production loader handles:**
+
+- **Rate limits**: respect the API's limits; retry with exponential backoff and jitter on `429` responses.
+- **Pagination**: APIs return results in pages; follow the `next` cursor until it is empty.
+- **Auth**: OAuth tokens expire and need refreshing; service accounts need the narrowest read scope that works.
+- **Partial failure**: one corrupt file must not stop the run. Log it, put it on a retry list, and continue.
+- **Idempotency**: running the same sync twice must produce the same index, which is why documents need stable IDs (the source's own ID or URL, not a random one).
+- **Attachments**: a Confluence page or an email can have attached PDFs. Treat each attachment as its own document, linked to its parent in metadata.
+
+---
+
+## A loader from scratch
+
+Lazy, type-detecting, and metadata-rich in about 30 lines of standard library Python, plus a database loader that templates rows into text.
+
+```python title="loader.py"
+import hashlib, pathlib, sqlite3, tempfile
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+
+@dataclass
+class Document:
+    text: str
+    metadata: dict = field(default_factory=dict)
+
+MAGIC = {b"%PDF-": "pdf", b"PK\x03\x04": "zip-based (docx, xlsx, pptx)", b"\x89PNG": "png"}
+
+def detect_type(path: pathlib.Path) -> str:
+    head = path.read_bytes()[:8]
+    for magic, kind in MAGIC.items():          # trust the bytes first
+        if head.startswith(magic):
+            return kind
+    return {".md": "markdown", ".txt": "text", ".csv": "csv"}.get(path.suffix, "unknown")
+
+def lazy_load(root: pathlib.Path):
+    for path in sorted(root.rglob("*")):        # a generator: one file in memory at a time
+        if not path.is_file():
+            continue
+        kind = detect_type(path)
+        raw = path.read_bytes()
+        text = raw.decode("utf-8", errors="replace") if kind in {"text", "markdown", "csv"} else ""
+        yield Document(text, {                 # binary formats go to a parser, not decode()
+            "source": path.name,
+            "type": kind,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "modified": datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(),
+        })
+
+root = pathlib.Path(tempfile.mkdtemp())
+(root / "policy.md").write_bytes(b"# Refunds\nRefunds within 30 days.")
+(root / "notes.txt").write_bytes(b"Office hours: 9 to 5.")
+(root / "report.pdf").write_bytes(b"%PDF-1.7 ...binary...")
+(root / "renamed.txt").write_bytes(b"%PDF-1.4 ...binary...")    # a PDF with the wrong extension
+
+for doc in lazy_load(root):
+    print(doc.metadata["source"], doc.metadata["type"], repr(doc.text[:20]))
+# notes.txt text 'Office hours: 9 to 5'
+# policy.md markdown '# Refunds\nRefunds w'
+# renamed.txt pdf ''
+# report.pdf pdf ''
+
+db = sqlite3.connect(":memory:")
+db.execute("create table products (id int, name text, price real, stock int)")
+db.executemany("insert into products values (?, ?, ?, ?)", [(1, "Kettle", 39.0, 12), (2, "Toaster", 25.5, 0)])
+for pid, name, price, stock in db.execute("select id, name, price, stock from products"):
+    doc = Document(f"Product: {name}. Price: ${price:.2f}. In stock: {stock}.", {"source": f"products/{pid}"})
+    print(doc.text)
+# Product: Kettle. Price: $39.00. In stock: 12.
+# Product: Toaster. Price: $25.50. In stock: 0.
+```
+
+`renamed.txt` is caught as a PDF by its first bytes, despite its name. A loader that trusted the extension would have decoded binary PDF data as text and indexed garbage. The database rows carry a stable source ID (`products/1`), so re-running the loader updates the same documents instead of creating duplicates.
+
+---
+
+## The tech stack
+
+| Tool                                             | What it is                                                                                                                                                                                     | Strength                                                                  |
+| :----------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------ |
+| **LangChain document loaders**                   | Hundreds of loaders (`PyPDFLoader`, `WebBaseLoader`, `RecursiveUrlLoader`, `SitemapLoader`, `CSVLoader`, `DirectoryLoader`, ...) in `langchain_community`, all with `load()` and `lazy_load()` | Breadth, one interface                                                    |
+| **LlamaIndex readers** (LlamaHub)                | `SimpleDirectoryReader` for local folders, plus a hub of readers for apps and databases                                                                                                        | Folder loading with automatic per-extension parsing                       |
+| **Unstructured**                                 | `partition()` detects the file type and returns typed elements; also offers source connectors                                                                                                  | Structure-preserving output across many formats                           |
+| **Apache Tika**                                  | A Java server that detects and extracts text and metadata from more than a thousand formats                                                                                                    | Format coverage, including legacy Office files                            |
+| **Airbyte, Fivetran**                            | Data-integration platforms with managed connectors and incremental sync for SaaS apps and databases                                                                                            | Production-grade sync, cursors, and scheduling without writing connectors |
+| **Firecrawl, Crawl4AI**                          | Web crawlers built for LLM pipelines: crawl a site and return clean Markdown                                                                                                                   | JavaScript rendering and boilerplate removal in one step                  |
+| **Scrapy, Playwright**                           | A general crawling framework, and a headless-browser library                                                                                                                                   | Full control over crawling and rendering                                  |
+| **Debezium**                                     | Change data capture from Postgres, MySQL, and others into Kafka                                                                                                                                | Exact, ordered database changes including deletes                         |
+| **Cloud SDKs** (`boto3`, `google-cloud-storage`) | Direct access to object storage                                                                                                                                                                | Listing, ETags, and event notifications on upload                         |
+
+A practical default: a framework loader or Unstructured for files, a managed connector (Airbyte or the vendor's API) for SaaS apps, Firecrawl or a sitemap-driven fetch for websites, and text-to-SQL rather than loading for numeric database tables.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What does a document loader do?">
+
+    It connects to a source, enumerates what exists or changed, fetches the content, and wraps it in a standard Document object with metadata: source, location, timestamps, author, type, and permissions. Everything downstream works with Documents, so sources can be added without changing the rest of the pipeline.
+
+  </Accordion>
+  <Accordion title="Eager versus lazy loading?">
+
+    Eager loading returns a full list, so the whole corpus is held in memory. Lazy loading yields one document at a time from a generator, keeping memory constant and letting later stages start immediately. Lazy is the default for anything beyond a test set.
+
+  </Accordion>
+  <Accordion title="How do you keep an index in sync with a changing source?">
+
+    Incremental sync with a reliable change signal (API change cursor, ETag, modified time, or CDC), a content hash per document to skip unchanged content, a stored checkpoint, and explicit handling of deletions. Add a periodic full reconciliation to catch anything the change signal missed.
+
+  </Accordion>
+  <Accordion title="Why are deletions the hardest part of syncing?">
+
+    A "modified since" query never returns deleted items, so a naive incremental loader leaves them in the index forever. You need delete events (webhooks, CDC), a deletions API, or a periodic full listing compared against the index.
+
+  </Accordion>
+  <Accordion title="How should a loader decide a file's type?">
+
+    Trust the content over the name: check magic bytes first (PDF starts with `%PDF-`, Office formats are ZIP archives), then the declared MIME type, then the extension. Misrouted files produce garbage text that silently pollutes the index.
+
+  </Accordion>
+  <Accordion title="Why must permissions be captured at load time?">
+
+    The source system is the only place that knows who can read a document. If the ACL is not copied into metadata during loading, retrieval cannot filter by it, and any user can be shown any chunk. Permission changes often do not change content, so ACLs need their own sync.
+
+  </Accordion>
+  <Accordion title="Should you embed database rows?">
+
+    Only descriptive text columns. Questions that count, sum, filter, or compare numbers need SQL, because similarity search cannot compare values. A common design embeds descriptions for search and routes numeric questions to text-to-SQL.
+
+  </Accordion>
+  <Accordion title="What makes a web crawler production-safe?">
+
+    It obeys robots.txt and terms, rate-limits per domain with backoff, normalizes and canonicalizes URLs to avoid duplicates, limits depth and scope, renders JavaScript only where needed, and records the URL and fetch time for citations and freshness.
+
+  </Accordion>
+</Accordions>

@@ -7,6 +7,36 @@ Full fine-tuning of an 8B model needs the weights, their gradients, and Adam's t
 
 ---
 
+## The plain-language version
+
+**Where this sits:** the core training method of the phase. Most fine-tunes today are LoRA or its 4-bit variant, QLoRA.
+
+Full fine-tuning updates every weight, which needs memory for each weight's gradient and optimizer state: about 128 GB for an 8B model. **LoRA** (low-rank adaptation) freezes all the original weights and learns only a small correction beside some of them. The correction is the product of two thin matrices, `B` and `A`, so it has very few parameters, often under 1% of the model. Because `B` starts at zero, training starts from exactly the original model.
+
+Think of editing a printed book. Instead of reprinting every page, you add sticky notes with corrections next to the paragraphs that need changing. The book stays intact, the notes are small, you can remove them, and you can keep different sets of notes for different readers.
+
+This page covers, in order:
+
+1. **The update**: `h = W0 x + (alpha / r) B A x`, and why `B` starts at zero
+2. **Why low rank works**: the change a fine-tune makes is approximately low rank
+3. **Choosing `alpha`**: how the scaling interacts with the rank
+4. **Choosing target modules**: which weight matrices get adapters
+5. **A minimal implementation**: LoRA from scratch in PyTorch
+6. **DoRA**: splitting each weight into magnitude and direction
+7. **Adapter variants**: other members of the family
+
+| Word                | Plain meaning                                                                                                               |
+| :------------------ | :-------------------------------------------------------------------------------------------------------------------------- |
+| **frozen weights**  | Weights that receive no updates during training.                                                                            |
+| **rank `r`**        | The inner size of the two small matrices. Small values like 8 to 64 are typical.                                            |
+| **`A`, `B`**        | The two trainable matrices; their product `B A` is the learned change to the weight.                                        |
+| **`alpha`**         | A scaling constant; the update is multiplied by `alpha / r`.                                                                |
+| **target modules**  | The weight matrices that receive adapters, such as the attention projections `q_proj`, `v_proj`, and the MLP.               |
+| **low-rank matrix** | A matrix that can be written as the product of two thinner matrices, so it carries less information than its size suggests. |
+| **DoRA**            | Weight-Decomposed LoRA: learn the size and the direction of each weight column separately.                                  |
+
+---
+
 ## The update
 
 LoRA (Hu et al., arXiv:2106.09685) freezes the pretrained weight `W_0` and trains a low-rank correction beside it:

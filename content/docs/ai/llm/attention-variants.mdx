@@ -9,6 +9,34 @@ All three change one thing: how many key and value vectors are stored per token 
 
 ---
 
+## The plain-language version
+
+**Where this sits:** the first of the efficiency changes in modern LLMs. It targets the KV cache, the memory that limits how many users and how long a context a server can handle.
+
+During generation, the model stores keys and values for every earlier token, in every layer, for every head. Reading all of that for each new token is what makes generation slow, and storing it is what limits how many conversations fit on a GPU. The three variants here keep the queries as they are but store **fewer keys and values**. **MQA** shares one key-value head across all query heads. **GQA** shares each key-value head among a group of query heads. **MLA** stores a small compressed vector per token and expands it into keys and values when needed.
+
+Think of a team where every member kept a personal copy of the same reference binder (standard multi-head attention). MQA gives the whole team one shared binder; GQA gives each small group one binder; MLA keeps a compact summary and reconstructs the full binder pages on demand.
+
+This page covers, in order:
+
+1. **The three variants**: MQA, GQA, and MLA, compared with standard multi-head attention
+2. **GQA shapes**: how query heads share key-value heads
+3. **Multi-head Latent Attention**: compression into a latent vector, why RoPE is handled separately, and absorbing the up-projections
+4. **Sliding window and chunked attention**: limiting how far back each token looks
+
+| Word                         | Plain meaning                                                                                                          |
+| :--------------------------- | :--------------------------------------------------------------------------------------------------------------------- |
+| **MHA**                      | Multi-head attention: every query head has its own key and value head.                                                 |
+| **MQA**                      | Multi-query attention: all query heads share one key and value head. Smallest cache, some quality loss.                |
+| **GQA**                      | Grouped-query attention: query heads are split into groups that each share one key and value head.                     |
+| **MLA**                      | Multi-head Latent Attention (DeepSeek): cache one small latent vector per token and project keys and values out of it. |
+| **KV heads**                 | The number of key and value heads, `num_key_value_heads` in a config.                                                  |
+| **latent vector**            | A compressed representation from which larger vectors are reconstructed.                                               |
+| **memory-bandwidth bound**   | Speed limited by reading data from memory rather than by arithmetic.                                                   |
+| **sliding window attention** | Each token attends only to the last `W` tokens, capping the cache size.                                                |
+
+---
+
 ## The three variants
 
 | Variant | KV heads | Source                           | Cached per token per layer   |

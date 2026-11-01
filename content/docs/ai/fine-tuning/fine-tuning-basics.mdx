@@ -1,0 +1,255 @@
+---
+title: Fine-Tuning Basics
+description: What fine-tuning is and how it differs from pretraining, when to use it instead of prompting or RAG, full fine-tuning versus parameter-efficient methods, the memory arithmetic for full fine-tuning, LoRA, and QLoRA, a LoRA update in NumPy, the end-to-end workflow, the vocabulary, the tech stack, and where each idea is covered.
+---
+
+A pretrained model is a generalist: it has read a huge amount of text and can continue any of it. **Fine-tuning** is further training on a much smaller, targeted dataset to change how it behaves: answer in a fixed JSON shape, write SQL for your schema, adopt a clinical writing style, or classify support tickets into your categories.
+
+Think of a doctor who finished medical school (pretraining) and now does a residency in one specialty (fine-tuning). They keep their general knowledge; they gain habits, vocabulary, and judgment for one kind of work. Push the residency too hard on too narrow a diet and they start forgetting general medicine, which is the **catastrophic forgetting** problem this phase returns to.
+
+This page is the map for the phase. It covers, in order:
+
+1. **Pretraining versus fine-tuning**: what changes and what stays the same
+2. **When to fine-tune**: the four levers, and what fine-tuning can and cannot change
+3. **Full fine-tuning versus parameter-efficient fine-tuning**: why almost nobody updates every weight
+4. **The memory arithmetic**: full fine-tuning, LoRA, and QLoRA for an 8B model
+5. **A LoRA update in NumPy**: the core trick in ten lines
+6. **The methods at a glance**: LoRA, QLoRA, DoRA, prefix and prompt tuning, distillation, merging
+7. **The workflow**: from choosing a base model to serving the result
+8. **The vocabulary**
+9. **The tech stack**
+10. **Where each idea is covered**
+
+---
+
+## Pretraining versus fine-tuning
+
+|                 | Pretraining                                    | Fine-tuning                                                                  |
+| :-------------- | :--------------------------------------------- | :--------------------------------------------------------------------------- |
+| **Goal**        | General knowledge of language, facts, and code | One behaviour, format, style, or task                                        |
+| **Data**        | Trillions of tokens of raw text                | Hundreds to hundreds of thousands of curated examples                        |
+| **Labels**      | None: the next token is the label              | Usually prompt and response pairs; the loss is computed on the response only |
+| **Objective**   | Next-token cross-entropy                       | The same next-token cross-entropy, on different data                         |
+| **Cost**        | Thousands of GPUs for weeks or months          | One GPU for hours, often                                                     |
+| **Who does it** | A handful of labs                              | Anyone with a GPU and a dataset                                              |
+
+The loss function is the same. What changes is the data, the scale, and usually which weights are allowed to move. The most common kind is **supervised fine-tuning (SFT)**, also called **instruction tuning**: train on examples of the input and the exact output you want. Alignment methods that learn from preferences or rewards come after SFT and are covered in [Reinforcement Learning](/ai/reinforcement-learning).
+
+---
+
+## When to fine-tune
+
+[Why Fine-Tune](/ai/fine-tuning/why-fine-tune) is the full decision framework. The short version: there are four levers, and fine-tuning is the third, not the first.
+
+| Lever            | What it changes                  | Try it when                                                                                        |
+| :--------------- | :------------------------------- | :------------------------------------------------------------------------------------------------- |
+| **Prompting**    | Behaviour, for one request       | Always first: instructions and a few examples fix more than people expect                          |
+| **RAG**          | The facts the model can see      | The model lacks knowledge: private, recent, or changing documents                                  |
+| **Fine-tuning**  | The weights: behaviour and style | A format, style, or skill that prompting cannot make reliable, or a long prompt you want to remove |
+| **Distillation** | The model's size                 | A big model does the job and you need a small, fast, cheap one                                     |
+
+<Callout type="warn">
+  ### Common mistake
+
+Fine-tuning to add knowledge. Facts learned this way are unreliable, cannot be cited, cannot be updated without retraining, and can increase hallucination (Gekhman et al., _Does Fine-Tuning LLMs on New Knowledge Encourage Hallucinations?_, arXiv:2405.05904). Use [RAG](/ai/rag) for knowledge and fine-tuning for behaviour.
+
+</Callout>
+
+---
+
+## Full fine-tuning versus parameter-efficient fine-tuning
+
+**Full fine-tuning** updates every weight. It is the most expressive option, and the most expensive: every weight needs a gradient and optimizer state, and every fine-tuned version is a full copy of the model.
+
+**Parameter-efficient fine-tuning (PEFT)** freezes the original weights and trains a small number of new ones, typically well under 1% of the model. The result is an **adapter**: a small file of extra weights that only works next to the base model it was trained on. Advantages:
+
+- Far less memory, because frozen weights need no gradients or optimizer state.
+- Many adapters can share one base model: one for SQL, one for summaries, swapped per request.
+- Less catastrophic forgetting, because the original weights never change.
+
+**LoRA** is the default PEFT method, and QLoRA is LoRA on a base model compressed to 4 bits.
+
+---
+
+## The memory arithmetic
+
+For an 8B model, before activations (which depend on batch size and sequence length):
+
+| Method               | What is in memory                                                                                                 | Approximate total                                |
+| :------------------- | :---------------------------------------------------------------------------------------------------------------- | :----------------------------------------------- |
+| **Full fine-tuning** | bf16 weights and gradients, plus AdamW's fp32 master weights and two moment buffers: about 16 bytes per parameter | About 128 GB: several large GPUs                 |
+| **LoRA**             | bf16 frozen weights (2 bytes per parameter), plus a small adapter with its own gradients and optimizer state      | About 16 GB plus the adapter: one large GPU      |
+| **QLoRA**            | 4-bit frozen weights (about half a byte per parameter), plus the adapter                                          | About 4 to 5 GB plus the adapter: a consumer GPU |
+
+The 16-bytes-per-parameter budget is derived on [LoRA](/ai/fine-tuning/lora) and [Training Run](/ai/fine-tuning/training-run); QLoRA's result of fine-tuning a 65B model on one 48 GB GPU is from Dettmers et al. (arXiv:2305.14314), covered on [QLoRA](/ai/fine-tuning/qlora).
+
+---
+
+## A LoRA update in NumPy
+
+LoRA's idea: the change a fine-tune makes to a weight matrix is approximately **low rank**, so instead of learning a full `d x d` change, learn two thin matrices `B` (`d x r`) and `A` (`r x d`) whose product is the change, with a small rank `r`.
+
+```python title="lora_update.py"
+import numpy as np
+
+d, r, alpha = 4096, 16, 32
+rng = np.random.default_rng(0)
+W0 = rng.normal(size=(d, d)).astype(np.float32)               # frozen pretrained weight
+A = rng.normal(scale=0.01, size=(r, d)).astype(np.float32)    # trainable, small random
+B = np.zeros((d, r), dtype=np.float32)                        # trainable, starts at zero
+x = rng.normal(size=d).astype(np.float32)
+
+h = W0 @ x + (alpha / r) * (B @ (A @ x))                      # LoRA forward pass
+print(np.allclose(h, W0 @ x))                                 # True: at step 0 the model is unchanged
+
+full, lora = d * d, r * d + d * r
+print(f"{full:,} {lora:,} {lora / full:.2%}")                 # 16,777,216 131,072 0.78%
+```
+
+Two things to see. Because `B` starts at zero, the fine-tuned model begins exactly equal to the base model, so training starts from a known-good point. And the adapter for this one matrix has 131,072 parameters instead of 16.8 million, 0.78%. [LoRA](/ai/fine-tuning/lora) explains why low rank is enough, what `alpha / r` does, and which matrices to adapt.
+
+---
+
+## The methods at a glance
+
+| Method                       | What it trains                                                          | Strength                                 | Page                                                                 |
+| :--------------------------- | :---------------------------------------------------------------------- | :--------------------------------------- | :------------------------------------------------------------------- |
+| **Full fine-tuning**         | Every weight                                                            | Most expressive                          | [Training Run](/ai/fine-tuning/training-run)                         |
+| **LoRA**                     | Two low-rank matrices beside selected weight matrices                   | The default: cheap, effective, mergeable | [LoRA and DoRA](/ai/fine-tuning/lora)                                |
+| **DoRA**                     | LoRA with the weight split into magnitude and direction                 | Closer to full fine-tuning quality       | [LoRA and DoRA](/ai/fine-tuning/lora)                                |
+| **QLoRA**                    | LoRA on a 4-bit quantized base                                          | Big models on small GPUs                 | [QLoRA](/ai/fine-tuning/qlora)                                       |
+| **Prompt and prefix tuning** | Learned "virtual tokens" added to the input (or to every layer)         | The fewest parameters of all             | [Prefix and Prompt Tuning](/ai/fine-tuning/prefix-and-prompt-tuning) |
+| **Knowledge distillation**   | A small student trained to copy a large teacher's output distribution   | A smaller, faster model                  | [Knowledge Distillation](/ai/fine-tuning/knowledge-distillation)     |
+| **Merging**                  | Nothing new: the adapter is folded into the base weights for deployment | No extra latency at serving              | [Merging and Deployment](/ai/fine-tuning/merging-and-deployment)     |
+
+---
+
+## The workflow
+
+<Steps>
+<Step>
+
+**Decide.** Confirm that prompting and RAG cannot do the job, and write down the metric that defines success. [Why Fine-Tune](/ai/fine-tuning/why-fine-tune).
+
+</Step>
+<Step>
+
+**Choose a base model** that fits your hardware and licence, usually an instruct model of the right size. [Capstone Projects](/ai/fine-tuning/capstone).
+
+</Step>
+<Step>
+
+**Build the data**: prompt and response pairs in the model's chat template, loss masked to the response, deduplicated, and checked against the evaluation set. [Data Preparation](/ai/fine-tuning/data-preparation).
+
+</Step>
+<Step>
+
+**Train** with LoRA or QLoRA, choosing the learning rate, epochs, rank, and batch size, and watching the training and validation loss. [Training Run](/ai/fine-tuning/training-run).
+
+</Step>
+<Step>
+
+**Evaluate** on the task metric, not the loss, and on a regression suite of general abilities to catch forgetting. [Capstone Projects](/ai/fine-tuning/capstone).
+
+</Step>
+<Step>
+
+**Merge and deploy**: fold the adapter into the weights or serve it beside the base model, export, quantize, and roll out gradually. [Merging and Deployment](/ai/fine-tuning/merging-and-deployment).
+
+</Step>
+</Steps>
+
+---
+
+## The vocabulary
+
+| Word                                 | Plain meaning                                                                                                                       |
+| :----------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------- |
+| **base model / instruct model**      | A model straight out of pretraining, versus one already tuned to follow instructions. [LLM Basics](/ai/llm/llm-basics) covers both. |
+| **SFT / instruction tuning**         | Supervised fine-tuning on examples of inputs and the desired outputs.                                                               |
+| **instruction pair**                 | One training example: a prompt (often with a system message) and the ideal response.                                                |
+| **chat template**                    | The special-token format marking system, user, and assistant turns; training data must use the model's own.                         |
+| **loss masking**                     | Computing the loss only on the response tokens, so the model is not trained to reproduce prompts.                                   |
+| **full fine-tuning**                 | Updating every weight.                                                                                                              |
+| **PEFT**                             | Parameter-efficient fine-tuning: freeze the model, train a small set of new weights.                                                |
+| **adapter**                          | The small set of trained weights from PEFT, saved as its own file.                                                                  |
+| **LoRA, rank `r`, `alpha`**          | Low-rank adaptation; `r` is the inner dimension of the two small matrices, and `alpha / r` scales their update.                     |
+| **quantization / 4-bit / NF4**       | Storing weights in fewer bits; NF4 is the 4-bit format QLoRA uses.                                                                  |
+| **epoch, learning rate, batch size** | One pass over the data; the step size of each update; examples per step. [AI Basics](/ai/math-foundations/ai-basics) defines them.  |
+| **gradient accumulation**            | Adding up gradients over several small batches before one update, to simulate a bigger batch in less memory.                        |
+| **overfitting**                      | Memorizing the training examples instead of learning the behaviour; validation loss rises while training loss falls.                |
+| **catastrophic forgetting**          | Losing general abilities while learning the new task.                                                                               |
+| **distillation (teacher / student)** | Training a small model to imitate a large one.                                                                                      |
+| **merging**                          | Adding the adapter's update into the base weights to produce one ordinary model.                                                    |
+| **decontamination**                  | Making sure no evaluation example, or near-copy, is in the training data.                                                           |
+
+---
+
+## The tech stack
+
+| Tool                                | Role                                                                                   |
+| :---------------------------------- | :------------------------------------------------------------------------------------- |
+| **Hugging Face `transformers`**     | Loads models and tokenizers; the `Trainer` training loop                               |
+| **`datasets`**                      | Loads, maps, and streams training data                                                 |
+| **`peft`**                          | LoRA, DoRA, prompt and prefix tuning, and adapter merging                              |
+| **`trl`**                           | `SFTTrainer` for supervised fine-tuning, plus DPO and GRPO trainers for the next phase |
+| **`accelerate`**                    | Runs the same script on one GPU, many GPUs, or many machines                           |
+| **`bitsandbytes`**                  | 4-bit and 8-bit quantization for QLoRA                                                 |
+| **Unsloth**                         | Faster, lower-memory LoRA and QLoRA training through custom kernels                    |
+| **Axolotl, LLaMA-Factory**          | Configuration-file-driven fine-tuning frameworks built on the libraries above          |
+| **Weights & Biases, MLflow**        | Tracking runs, losses, and hyperparameters ([MLOps](/ai/mlops))                        |
+| **vLLM, SGLang, llama.cpp, Ollama** | Serving the fine-tuned model ([Inference](/ai/inference))                              |
+
+[Hugging Face Stack](/ai/fine-tuning/hf-ecosystem) explains what each library owns and how they compose into one script.
+
+---
+
+## Where each idea is covered
+
+<Mermaid
+  chart={`
+flowchart TD
+    B["Fine-Tuning Basics"] --> W["Why Fine-Tune"]
+    W --> HF["Hugging Face Stack"]
+    HF --> DP["Data Preparation"]
+    DP --> L["LoRA and DoRA"]
+    L --> Q["QLoRA"]
+    Q --> PT["Prefix and Prompt Tuning"]
+    PT --> KD["Knowledge Distillation"]
+    KD --> TR["Training Run"]
+    TR --> C["Capstone Projects"]
+    C --> M["Merging and Deployment"]
+`}
+/>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between pretraining and fine-tuning?">
+
+    Both minimize next-token cross-entropy. Pretraining uses trillions of tokens of raw text to learn general knowledge; fine-tuning uses a small curated dataset, usually prompt and response pairs with the loss on the response only, to change behaviour, format, or style.
+
+  </Accordion>
+  <Accordion title="When should you fine-tune rather than prompt or use RAG?">
+
+    When prompting cannot make a format, style, or skill reliable, or when a long prompt should be baked in to cut latency and cost. Not for adding knowledge: use RAG for facts, because fine-tuned facts cannot be cited or updated and can raise hallucination.
+
+  </Accordion>
+  <Accordion title="Why is full fine-tuning so memory hungry?">
+
+    With AdamW in mixed precision each parameter needs its bf16 weight and gradient plus fp32 master weight and two moment buffers, about 16 bytes, so an 8B model needs about 128 GB before activations. LoRA freezes the base weights, so only the small adapter needs gradients and optimizer state.
+
+  </Accordion>
+  <Accordion title="Why does LoRA initialize B to zero?">
+
+    So the product BA is zero and the adapted model starts identical to the base model. Training then moves away from a known-good starting point instead of a randomly perturbed one.
+
+  </Accordion>
+  <Accordion title="What is catastrophic forgetting and how do you limit it?">
+
+    Losing general abilities while training on a narrow task. Limit it with parameter-efficient methods, a low learning rate, few epochs, mixing in general data, and measuring it with a regression suite of general benchmarks.
+
+  </Accordion>
+</Accordions>
