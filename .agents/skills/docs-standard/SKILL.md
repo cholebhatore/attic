@@ -1,7 +1,7 @@
 ---
 name: docs-standard
 description: >-
-  House standard for writing documentation in any fumadocs or fumapress app. Defines how to
+  House standard for writing documentation in any fumadocs app. Defines how to
   discover a repo's own conventions before writing, the breadth-over-depth policy, the rule that
   every number needs a source, how to write code samples when the runtime is unavailable, the MDX
   gotchas that silently break rendering, and the verify-before-done checklist. Use this skill
@@ -93,6 +93,8 @@ Breadth over depth. There is no limit to the number of code lines, but avoid wri
 - Highlight common developer mistakes and practical interview pitfalls.
 - First lay out the hierarchy, then dive into the subtopics. For example, if a topic has four subtopics, list all four before you start explaining each one, instead of jumping straight into the first and then the second and so on.
 - Use tooltips, callouts, and accordions to provide additional information without overwhelming the main content.
+- Keep the pages short and focused, but do not sacrifice completeness. If a topic requires more depth, consider splitting it into multiple pages or sections.
+- Keep the descriptions short.
 
 The reason to hold a line budget is that a reader scanning for one term should find it. Length is
 not a proxy for rigor, and padding buries the thing they came for.
