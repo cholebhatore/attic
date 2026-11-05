@@ -38,6 +38,12 @@ const config = {
         permanent: true,
       },
       {
+        source:
+          '/ai/mlops/:slug(system-design-framework|case-multitenant-rag|case-moderation|case-coding-sandbox|case-support-copilot)',
+        destination: '/ai/system-design/:slug',
+        permanent: true,
+      },
+      {
         source: '/tracker',
         destination: '/ai/curriculum',
         permanent: false,

@@ -1,0 +1,282 @@
+---
+title: Reliability and Scaling
+description: 'Timeouts, retries with backoff and jitter, provider fallbacks, circuit breakers, backpressure, sync against async, autoscaling, and graceful degradation.'
+---
+
+A model provider has a bad afternoon: one request in five comes back as a rate-limit error. The application retries every failure immediately, three times. Traffic to the provider jumps, more requests are rejected, more retries follow, and within minutes a partial slowdown has become a full outage that the application caused itself. The provider recovers at 15:10. The application, still flooding it with retries, recovers at 15:40.
+
+Every LLM system depends on something slow, expensive, and outside its control. Reliability is the set of habits that keep a dependency's bad day from becoming yours.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the third fundamentals page. [Building Blocks](/ai/system-design/building-blocks) named the parts; this page covers how they behave when traffic spikes or something breaks. The [framework](/ai/system-design/system-design-framework) and case studies then assume these patterns.
+
+Think of a busy restaurant on a Saturday. If an order is taking too long, the waiter checks rather than waiting forever (timeout). If the oven fails, they offer the grill menu instead of closing (fallback). If the kitchen is overwhelmed, the host stops seating new tables for a while instead of letting every table wait an hour (backpressure). And they do not send every waiter to shout at the chef at once when a dish is late (backoff and jitter).
+
+This page covers, in order:
+
+1. **Timeouts**: never wait forever
+2. **Retries**: which errors, how often, how far apart
+3. **Fallbacks**: the degradation ladder
+4. **Circuit breakers**: stop calling what is down
+5. **Backpressure and load shedding**
+6. **Sync, streaming, async, and batch**
+7. **Scaling out**: stateless replicas and autoscaling on the right signal
+8. **Multi-region and data residency**
+9. **Idempotency**: making retries safe
+10. **Common mistakes**
+
+| Word                    | Plain meaning                                                                                   |
+| :---------------------- | :---------------------------------------------------------------------------------------------- |
+| **timeout**             | The longest a caller will wait before giving up on a call.                                      |
+| **exponential backoff** | Waiting longer after each failed attempt: 0.5 s, 1 s, 2 s, 4 s.                                 |
+| **jitter**              | Randomness added to the wait so many clients do not retry at the same instant.                  |
+| **retry storm**         | Retries adding so much load that a struggling service cannot recover.                           |
+| **fallback**            | An alternative path when the primary fails: another provider, a smaller model, a cached answer. |
+| **circuit breaker**     | A switch that stops calls to a failing dependency for a while, then tests it again.             |
+| **backpressure**        | Signalling callers to slow down when the system is full.                                        |
+| **load shedding**       | Deliberately rejecting some requests so the rest can succeed.                                   |
+| **autoscaling**         | Adding or removing replicas automatically based on a measured signal.                           |
+| **idempotency key**     | A unique id on a request so that repeating it has no extra effect.                              |
+
+---
+
+## Timeouts
+
+A call without a timeout is a promise to wait forever, and a thread or connection waiting forever is capacity you will not get back. LLM calls need more than one timeout, because a stream that started is different from one that never did.
+
+| Timeout             | What it bounds                                 | Typical setting (assumed)       |
+| :------------------ | :--------------------------------------------- | :------------------------------ |
+| Connect             | Opening the connection                         | 1 to 3 s                        |
+| Time to first token | The provider accepting and starting the answer | A few seconds over the p99 TTFT |
+| Stream idle         | Gap between tokens once streaming              | A few seconds                   |
+| Total               | The whole request, including retries           | The product's end-to-end budget |
+
+The total timeout is the one people forget. Three attempts with a 30-second timeout each is a 90-second request, which the user abandoned long ago. Give the whole request a deadline and let each retry spend only what is left of it.
+
+---
+
+## Retries
+
+Retry what might succeed next time; never retry what cannot.
+
+| Error                         | Retry?                      | Why                                                 |
+| :---------------------------- | :-------------------------- | :-------------------------------------------------- |
+| 429 rate limited              | Yes, with backoff           | Capacity will free up; honour `Retry-After` if sent |
+| 500, 502, 503, 529 overloaded | Yes, with backoff           | Usually transient                                   |
+| Timeout before first token    | Yes, once or twice          | Possibly a stuck request                            |
+| 400 bad request, invalid JSON | No                          | The same request will fail the same way             |
+| 401, 403                      | No                          | Retrying will not fix a key                         |
+| Context length exceeded       | No, trim and resend instead | A different request, not a retry                    |
+
+**Exponential backoff** spaces attempts out; **jitter** spreads clients so they do not all retry at the same instant and recreate the spike. Cap the number of attempts, and cap total retries across the service (a **retry budget**, such as "retries may add at most 10 percent to traffic"), so that a widespread failure does not multiply load.
+
+```python title="retry_with_fallback.py"
+import random
+
+class RateLimited(Exception): ...      # 429: retry later
+class ServerError(Exception): ...      # 5xx: retry later
+class BadRequest(Exception): ...       # 400: retrying will not help
+
+RETRYABLE = (RateLimited, ServerError)
+
+def backoff(attempt, base=0.5, cap=8.0):
+    """Full jitter: a random wait between 0 and the exponential ceiling."""
+    return random.uniform(0, min(cap, base * 2 ** attempt))
+
+def call_with_fallback(providers, prompt, max_attempts=3, sleep=lambda s: None):
+    for name, call in providers:                     # primary first, then fallbacks
+        for attempt in range(max_attempts):
+            try:
+                return name, call(prompt)
+            except BadRequest:
+                raise                                # the request is wrong; no provider will accept it
+            except RETRYABLE as e:
+                wait = backoff(attempt)
+                print(f"{name}: {type(e).__name__}, attempt {attempt + 1}, wait {wait:.2f}s")
+                sleep(wait)
+    raise RuntimeError("all providers failed")
+
+def primary(prompt):  raise RateLimited()          # simulate an overloaded provider
+def secondary(prompt): return f"answer to {prompt!r}"
+
+random.seed(0)
+print(call_with_fallback([("primary", primary), ("secondary", secondary)], "reset password"))
+# primary: RateLimited, attempt 1, wait 0.42s
+# primary: RateLimited, attempt 2, wait 0.76s
+# primary: RateLimited, attempt 3, wait 0.84s
+# ('secondary', "answer to 'reset password'")
+```
+
+The ceilings for attempts 1, 2, and 3 are 0.5, 1, and 2 seconds; the actual waits are random draws below them. In production, `sleep` is `time.sleep` or `asyncio.sleep`, and an LLM gateway such as LiteLLM or Portkey usually does all of this for you from configuration.
+
+<Callout type="warn">
+  ### Retry in one layer only
+
+If the client SDK retries three times, the gateway retries three times, and the application retries three times, one failure becomes 27 calls. Decide which layer owns retries and turn them off elsewhere.
+
+</Callout>
+
+---
+
+## Fallbacks
+
+When retries are exhausted, fall down a ladder rather than off a cliff. Each rung is worse than the one above it, and every rung is better than an error page.
+
+| Rung | Fallback                                                                | What the user loses                     |
+| :--- | :---------------------------------------------------------------------- | :-------------------------------------- |
+| 1    | Same model, another region or provider                                  | Nothing, if the eval suite passed on it |
+| 2    | A different model of similar quality                                    | Small quality or style differences      |
+| 3    | A smaller, faster model                                                 | Quality on hard questions               |
+| 4    | A cached or precomputed answer                                          | Freshness and personalization           |
+| 5    | Retrieval results without generation ("here are the relevant articles") | The synthesized answer                  |
+| 6    | An honest message and a human handoff                                   | Self-service, but not trust             |
+
+Every fallback model must pass the same evaluation suite as the primary before it is allowed to serve traffic. A fallback that has never been tested is a second outage waiting for the first.
+
+---
+
+## Circuit breakers
+
+Retries help with brief blips. When a dependency is properly down, retrying every request just adds latency and load. A **circuit breaker** watches the error rate and, once it crosses a threshold, stops sending traffic for a cooling period.
+
+<Mermaid
+  chart={`
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: error rate over threshold
+    Open --> HalfOpen: cool-down elapsed
+    HalfOpen --> Closed: trial requests succeed
+    HalfOpen --> Open: trial requests fail
+`}
+/>
+
+**Closed** is normal operation. **Open** fails fast, sending requests straight to the fallback with no wait. **Half-open** lets a few trial requests through to test recovery. The result is that users get the fallback in milliseconds instead of after a timeout, and the struggling provider gets room to recover.
+
+---
+
+## Backpressure and load shedding
+
+Every system has a maximum throughput. Beyond it, accepting more work does not produce more answers; it produces slower answers for everyone, then timeouts for everyone.
+
+- **Bound every queue.** An unbounded queue turns overload into unbounded latency. When the queue is full, reject new work with a 429 and a `Retry-After`.
+- **Shed by priority.** Paying customers before free tier, interactive before background, retries last. Rejecting 20 percent of low-priority traffic keeps the other 80 percent fast.
+- **Admit by tokens.** For self-hosted serving, the real capacity is KV-cache memory. Admitting one more long request can evict others mid-generation, so admission should consider prompt length, not just request count.
+- **Degrade before rejecting.** Lower `max_tokens`, skip the reranker, or route to the small model when load is high, and say so in metrics.
+
+---
+
+## Sync, streaming, async, and batch
+
+How the caller receives the answer is a design choice with large consequences for cost and reliability.
+
+| Mode         | The caller                             | Use it for                                       | Watch out for                                          |
+| :----------- | :------------------------------------- | :----------------------------------------------- | :----------------------------------------------------- |
+| Synchronous  | Waits for the whole answer             | Short outputs, classification, structured calls  | Users stare at a spinner; timeouts on long outputs     |
+| Streaming    | Sees tokens as they are generated      | Chat and any human-facing generation             | Errors mid-stream; checks that need the full text      |
+| Asynchronous | Gets a job id, then polls or a webhook | Long agent tasks, document processing            | Job state, retries, and duplicate prevention           |
+| Batch        | Submits many items, collects later     | Offline evaluation, backfills, nightly summaries | Hours of latency; provider batch APIs often discounted |
+
+A useful rule: **if a human is not watching, it should not be synchronous.** Moving summarization of yesterday's tickets from a synchronous loop to a batch job often cuts its cost substantially and removes it from the production rate limit entirely.
+
+---
+
+## Scaling out
+
+**Stateless replicas.** The gateway, orchestrator, and workers should keep no per-user state in memory, so scaling is just adding copies behind a load balancer. State lives in databases, caches, and queues.
+
+**Autoscale on the right signal.** CPU is the wrong signal for an LLM service: the orchestrator mostly waits on network calls, and a GPU engine can be saturated at modest GPU utilization numbers. Better signals:
+
+| Component          | Scale on                                                   |
+| :----------------- | :--------------------------------------------------------- |
+| Orchestrator       | Requests in flight per replica                             |
+| Queue workers      | Queue depth and age of the oldest message                  |
+| Self-hosted engine | Waiting requests and KV-cache usage reported by the engine |
+| Hosted API usage   | Not autoscaled: raise quotas ahead of launches             |
+
+**GPU scaling is slow.** A new GPU replica must be scheduled, pull a large image, and load gigabytes of weights before serving its first token, which can take minutes. Keep a warm minimum, scale on leading signals such as queue growth, and use the hosted API as overflow while new replicas start. [Containers and GPU Scheduling](/ai/mlops/containers-and-gpu-scheduling) covers cold-start arithmetic.
+
+---
+
+## Multi-region and data residency
+
+Two separate reasons to run in more than one region, with different designs.
+
+- **Availability.** Deploy the stateless tier in two or more regions and use providers' regional endpoints, so one region's outage is a failover rather than downtime. The index and conversation store must be replicated, which raises the question of how stale a replica may be.
+- **Residency.** Regulations or contracts may require that a customer's data, including prompts sent to a model, stays in a jurisdiction. Then routing is by tenant, not by load: a European tenant's requests go to European infrastructure and European model endpoints, and the fallback ladder must respect the same boundary.
+
+---
+
+## Idempotency
+
+Retries happen at every layer, so every operation with a side effect must be safe to repeat. Attach an **idempotency key** (a unique id per logical action) to each write; the receiving system stores the keys it has processed and ignores repeats. This matters most for agent tool calls, where a timed-out "refund the customer" that actually succeeded must not be executed again on retry.
+
+For streaming generation, the equivalent rule is: do not commit side effects until the response is complete. If the stream fails halfway, nothing has happened yet, and the retry starts clean.
+
+---
+
+## Common mistakes
+
+| Mistake                                  | What happens                                      | Do this instead                                      |
+| :--------------------------------------- | :------------------------------------------------ | :--------------------------------------------------- |
+| No total deadline                        | Retries stack into minute-long requests           | One deadline per request; retries spend what remains |
+| Immediate retries without jitter         | Synchronized retry waves extend the outage        | Exponential backoff with full jitter                 |
+| Retrying 400s                            | Wasted calls, the same error                      | Retry only rate limits, overloads, and 5xx           |
+| Untested fallback model                  | The failover produces wrong answers               | Same eval suite for every model in the ladder        |
+| Autoscaling on CPU                       | Replicas never scale, or scale too late           | Scale on in-flight requests, queue depth, KV usage   |
+| Unbounded queues                         | Overload becomes infinite latency                 | Bound queues and shed by priority                    |
+| Side effects before the stream completes | Half-finished answers leave half-finished actions | Commit after completion, with idempotency keys       |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Which errors from a model provider should you retry?">
+
+    Rate limits (429), overloads, and server errors (5xx), plus a timeout before the first token. Do not retry 400s, authentication errors, or context-length errors: the same request will fail the same way.
+
+  </Accordion>
+  <Accordion title="Why add jitter to exponential backoff?">
+
+    Without it, every client that failed at the same moment retries at the same moment, recreating the spike. Jitter spreads retries over time so the dependency can recover.
+
+  </Accordion>
+  <Accordion title="Three layers each retry three times. What happens on a persistent failure?">
+
+    One user request becomes up to 27 provider calls, multiplying load on a dependency that is already failing. Retries should be owned by one layer, with a service-wide retry budget.
+
+  </Accordion>
+  <Accordion title="Describe a fallback ladder for a chat product.">
+
+    Same model in another region or provider; a different model of similar quality; a smaller model; a cached answer; retrieval results without generation; finally an honest error with a human handoff. Each fallback model must pass the same evaluation suite as the primary.
+
+  </Accordion>
+  <Accordion title="What does a circuit breaker do that retries do not?">
+
+    It stops calling a dependency that is clearly down, failing fast to the fallback instead of waiting through timeouts. That cuts user latency during outages and gives the dependency room to recover. Half-open trial requests detect recovery.
+
+  </Accordion>
+  <Accordion title="What should a self-hosted LLM service autoscale on?">
+
+    Engine-level signals such as waiting requests and KV-cache usage, not CPU or raw GPU utilization. Because GPU replicas take minutes to start, scale on leading signals, keep a warm minimum, and overflow to a hosted API while replicas load.
+
+  </Accordion>
+  <Accordion title="When should an LLM workload be asynchronous or batch rather than synchronous?">
+
+    Whenever no human is waiting for the answer: long agent tasks, document processing, nightly summaries, offline evaluation. Async needs a job id, durable state, and retries; batch trades hours of latency for lower cost and no pressure on production rate limits.
+
+  </Accordion>
+  <Accordion title="Why do agent tool calls need idempotency keys?">
+
+    A call can succeed and still time out from the caller's view, so the retry repeats it. With an idempotency key the receiving system recognizes the repeat and does nothing, so the customer is refunded once.
+
+  </Accordion>
+  <Accordion title="How does data residency change a multi-region design?">
+
+    Routing becomes per tenant rather than per load: a tenant's prompts, indexes, and model calls must stay in its jurisdiction, and the fallback ladder may only use providers and regions inside the same boundary.
+
+  </Accordion>
+</Accordions>

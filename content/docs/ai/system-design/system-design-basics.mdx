@@ -1,0 +1,330 @@
+---
+title: AI System Design Basics
+description: 'What AI system design is, how it differs from classic system design, the reference architecture, napkin math, the core trade-offs, and the vocabulary.'
+---
+
+A team ships a chatbot demo in a week. It answers well, the founders love it, and it goes live. Within a month the bill is ten times the forecast, one customer has seen another customer's document quoted back at them, and the p95 latency is eleven seconds because every request goes to the largest model. None of these is a model problem. The model did exactly what it was asked. What was missing was the system around it.
+
+AI system design is the discipline of building that system: deciding what surrounds the model, sizing it, pricing it, and stating in advance how each part fails. This page is the map for the section.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first page of the AI System Design section. It uses ideas from every earlier phase (retrieval, inference, agents, MLOps) and asks a different question about them: how do they fit together into one product that is fast, affordable, safe, and measurably good?
+
+A model is an engine. A car needs an engine, but it also needs brakes, a fuel gauge, seatbelts, a steering wheel, and someone who decided whether it is a city car or a lorry before anyone bolted anything together. AI system design is the car, not the engine. You start from what the product must do and how many people use it, do rough arithmetic on traffic and cost, pick the parts, and then walk through each part asking "what happens when this breaks?"
+
+This page covers, in order:
+
+1. **What AI system design is**, and what changes from classic system design
+2. **The reference architecture**: the parts almost every LLM product has
+3. **The design process**: the five steps from vague prompt to defensible design
+4. **Napkin math**: a tiny runnable estimator
+5. **The core trade-offs**: quality, latency, cost, and safety
+6. **The vocabulary**
+7. **The tech stack**
+8. **Where each idea is covered**
+
+| Word                       | Plain meaning                                                                                   |
+| :------------------------- | :---------------------------------------------------------------------------------------------- |
+| **system design**          | Choosing components and how they connect so a product meets its requirements at its scale.      |
+| **functional requirement** | What the system must do: "answer questions about our docs, with citations".                     |
+| **non-functional**         | How well it must do it: latency, cost, availability, privacy, scale.                            |
+| **SLO**                    | Service-level objective, a measurable target such as "p95 time to first token under 1 second".  |
+| **QPS**                    | Queries per second, the arrival rate of requests.                                               |
+| **napkin math**            | Rough arithmetic, rounded on purpose, that sizes a system before anything is built.             |
+| **reference architecture** | A standard arrangement of components that most designs start from and then adapt.               |
+| **failure mode**           | A specific way a component breaks, with what the user sees when it does.                        |
+| **trade-off**              | Gaining on one property, such as quality, by paying on another, such as cost.                   |
+| **guardrail**              | A check before or after the model that blocks unsafe, off-policy, or malformed input or output. |
+
+<Callout type="warn">
+  ### The most common beginner mistake
+
+Starting with the model. "We will use the biggest model" is not a design; it is a purchase. Start with the requirement and the traffic, then let the numbers pick the model.
+
+</Callout>
+
+---
+
+## What AI system design is
+
+Classic system design asks how to store, move, and serve data reliably at scale: load balancers, databases, caches, queues, replication. Every one of those questions still applies. An LLM product adds a component with four awkward properties, and those properties are what the AI half of the discipline is about.
+
+| Property of the model        | Classic service equivalent        | What it forces in the design                                                        |
+| :--------------------------- | :-------------------------------- | :---------------------------------------------------------------------------------- |
+| **Non-deterministic output** | A function returns the same value | Evaluation sets and judges replace unit-test equality; quality is a measured number |
+| **Expensive per call**       | A query costs microcents          | Cost per request is a first-class requirement; routing and caching are mandatory    |
+| **Slow and streaming**       | A response arrives in 50 ms       | Latency is split into time to first token and decode speed; UX streams tokens       |
+| **Can be wrong confidently** | Errors raise exceptions           | Verification, grounding, citations, and human escalation sit on the output path     |
+
+Two more differences matter in practice. The model reads **untrusted text** (user input, retrieved documents, tool results), so prompt injection is a security boundary the classic design never had. And the system **changes without a deploy**: a vendor updates a model, a document is edited, a prompt is tweaked, and behaviour shifts with no code change at all.
+
+<Callout type="info">
+  ### AI system design versus ML system design
+
+ML system design (the older interview) is about training and serving a model you build: feature stores, training pipelines, offline metrics. AI system design, in the sense used here, is mostly about applications built on top of foundation models: retrieval, prompting, routing, verification, and cost. The two overlap in serving, monitoring, and evaluation.
+
+</Callout>
+
+---
+
+## The reference architecture
+
+Almost every LLM product, whether a support bot, a coding agent, or a document search tool, is some subset of the diagram below. Learn it once and every design question becomes "which boxes, how big, and how do they fail?"
+
+<Mermaid
+  chart={`
+flowchart LR
+    U["Client"] --> GW["API gateway<br/>auth, rate limits"]
+    GW --> OR["Orchestrator<br/>prompt assembly"]
+    OR --> IG["Input guardrails"]
+    IG --> CA{"Cache"}
+    CA -->|hit| OUT["Response"]
+    CA -->|miss| RET["Retrieval<br/>vector + keyword"]
+    RET --> RT["Model router"]
+    RT --> SM["Small model"]
+    RT --> LM["Large model"]
+    SM --> OG["Output guardrails<br/>verification"]
+    LM --> OG
+    OR <-.-> TL["Tools"]
+    OG --> OUT
+    OUT --> OBS["Traces, metrics,<br/>feedback"]
+`}
+/>
+
+| Part                  | Job in one line                                                                           |
+| :-------------------- | :---------------------------------------------------------------------------------------- |
+| **API gateway**       | Authenticate, rate-limit per tenant, and reject oversized requests before they cost money |
+| **Orchestrator**      | The application code that assembles the prompt, calls tools, and owns the request flow    |
+| **Input guardrails**  | Redact PII, detect injection and abuse, enforce a token budget                            |
+| **Cache**             | Reuse prompt prefixes (vendor-side) or whole answers (semantic cache, your side)          |
+| **Retrieval**         | Fetch the facts the model needs, filtered by what this user is allowed to see             |
+| **Model router**      | Send each request to the cheapest model that can answer it well                           |
+| **Model serving**     | A hosted API, or a self-hosted engine such as vLLM on your GPUs                           |
+| **Output guardrails** | Schema checks, grounding against retrieved text, policy filters                           |
+| **Tools**             | Functions the model may call: search, databases, code execution, other services           |
+| **Observability**     | Traces per request with prompt, model, and index versions; cost and quality metrics       |
+
+[Building Blocks](/ai/system-design/building-blocks) explains each part, how it works inside, and the real tools that implement it.
+
+---
+
+## The design process
+
+Whether the prompt comes from an interviewer or from your manager, the same five steps take it from a sentence to a design you can defend.
+
+<Steps>
+<Step>
+
+### Clarify the requirements
+
+Who are the users, what is the task, how many requests, how bad is a wrong answer? Write functional and non-functional requirements separately, and attach a metric to every quality word. "Accurate" becomes "90 percent of answers grounded in a cited source on the labeled set".
+
+</Step>
+<Step>
+
+### Estimate the scale
+
+Requests per day, peak QPS, tokens per request, cost per month, storage for the index, concurrent streams. Rounded numbers are fine; skipping them is not. [Requirements and Estimation](/ai/system-design/requirements-and-estimation) has the formulas.
+
+</Step>
+<Step>
+
+### Draw the high-level design
+
+Start from the reference architecture and delete what the problem does not need. A batch summarization job has no gateway latency problem; an internal tool may not need a semantic cache.
+
+</Step>
+<Step>
+
+### Stress-test every stage
+
+For each box: what it does, how it fails, what the user sees, and the mitigation. This is the step that separates a design from a diagram. The [AI System Design Framework](/ai/system-design/system-design-framework) turns it into a checklist over five stages.
+
+</Step>
+<Step>
+
+### Close the loop
+
+How is quality measured before launch, monitored after, and rolled back when it drops? A design with no evaluation plan cannot be improved, only replaced.
+
+</Step>
+</Steps>
+
+---
+
+## Napkin math
+
+Every design rests on a few numbers. The script below sizes a support assistant from five assumptions; change them and the whole design shifts.
+
+```python title="napkin.py"
+# Napkin estimate for an LLM support assistant. Every input is an assumption.
+daily_users = 200_000
+requests_per_user = 5
+tokens_in, tokens_out = 3_000, 300        # prompt (system + retrieved + history), answer
+price_in, price_out = 1.00, 4.00          # dollars per million tokens (assumed)
+peak_factor = 3                           # busiest hour versus the daily average
+e2e_seconds = 6                           # time a request stays open, end to end
+
+requests_per_day = daily_users * requests_per_user
+avg_qps = requests_per_day / 86_400
+peak_qps = avg_qps * peak_factor
+concurrent = peak_qps * e2e_seconds       # Little's law: in flight = arrival rate x time in system
+out_tok_per_s = peak_qps * tokens_out     # decode throughput the serving layer must sustain
+cost_per_req = (tokens_in * price_in + tokens_out * price_out) / 1e6
+monthly = cost_per_req * requests_per_day * 30
+
+print(f"requests/day      {requests_per_day:,}")
+print(f"average QPS       {avg_qps:.1f}")
+print(f"peak QPS          {peak_qps:.1f}")
+print(f"in flight at peak {concurrent:.0f}")
+print(f"output tokens/s   {out_tok_per_s:,.0f}")
+print(f"cost per request  ${cost_per_req:.4f}")
+print(f"cost per month    ${monthly:,.0f}")
+# requests/day      1,000,000
+# average QPS       11.6
+# peak QPS          34.7
+# in flight at peak 208
+# output tokens/s   10,417
+# cost per request  $0.0042
+# cost per month    $126,000
+```
+
+Read the output as design decisions, not trivia:
+
+- **35 QPS at peak** is small for a web service and large for an LLM. It means rate limits per tenant and a provider quota measured in tokens per minute, not requests.
+- **208 requests in flight** is the concurrency a provider account or a GPU fleet must hold at once. That number, not QPS, is what exhausts connection pools and KV-cache memory.
+- **3,000 input tokens against 300 output** means input is 71 percent of the cost here (0.0030 of 0.0042). Trimming the prompt and caching its stable prefix is the first lever, before any model change.
+- **$126,000 a month** is the number that justifies a router, a cache, or self-hosting. Without it, nobody can say whether those are worth building.
+
+---
+
+## The core trade-offs
+
+Every design choice moves at least one of four properties, and usually costs another.
+
+| Property    | Measured by                                               | Main levers                                                        |
+| :---------- | :-------------------------------------------------------- | :----------------------------------------------------------------- |
+| **Quality** | Task success, groundedness, human agreement on a test set | Better retrieval, larger model, verification, fine-tuning          |
+| **Latency** | p95 time to first token, inter-token latency, end-to-end  | Smaller or quantized model, streaming, caching, shorter prompts    |
+| **Cost**    | Dollars per request, per user, per resolved task          | Routing, caching, prompt trimming, batching, self-hosting at scale |
+| **Safety**  | Leak rate, policy violation rate, injection success rate  | Guardrails, access filters in retrieval, sandboxes, human approval |
+
+The rule that makes trade-offs tractable: **set a target on one axis, a floor on a second, and optimize the third**. "p95 under 2 seconds, groundedness at least 90 percent, then as cheap as possible" is a design brief. "Fast, accurate, and cheap" is a wish.
+
+Safety is the exception. It is a constraint, not a dial: you do not trade a cross-tenant data leak for 200 ms.
+
+<Accordions>
+  <Accordion title="Which trade-offs come up in almost every design?">
+
+    - **Hosted API against self-hosting**: zero operations and frontier quality against lower unit cost at high, steady volume
+    - **Synchronous against asynchronous**: the user waits, or the work goes on a queue and the result arrives later
+    - **One large model against a cascade**: simplicity against cost, with router error as the hidden price
+    - **Long context against retrieval**: put everything in the prompt, or fetch only what matters
+    - **Verification on the request path against offline**: safety now against latency now
+
+  </Accordion>
+</Accordions>
+
+---
+
+## The vocabulary
+
+| Word                  | Plain meaning                                                                                   |
+| :-------------------- | :---------------------------------------------------------------------------------------------- |
+| **TTFT**              | Time to first token: how long before the user sees anything.                                    |
+| **ITL / TPOT**        | Inter-token latency, or time per output token: how fast the answer streams once it starts.      |
+| **p95 / p99**         | The latency that 95 or 99 percent of requests stay under. Users feel the tail, not the average. |
+| **throughput**        | Work completed per second: requests, or tokens, per second.                                     |
+| **concurrency**       | Requests in flight at the same moment. Little's law: arrival rate times time in system.         |
+| **TPM / RPM**         | Tokens and requests per minute, the units provider rate limits are written in.                  |
+| **availability**      | The share of time the system works. 99.9 percent allows about 43 minutes of downtime a month.   |
+| **error budget**      | The downtime or failure an SLO allows, spent on risky changes and incidents.                    |
+| **cascade / routing** | Trying a cheap model first and escalating only the hard requests.                               |
+| **prompt cache**      | Vendor-side reuse of the computation for a repeated prompt prefix.                              |
+| **semantic cache**    | Your cache of whole answers, looked up by meaning rather than exact text.                       |
+| **grounding**         | Making the model answer from supplied sources, and checking that it did.                        |
+| **fallback**          | A second path used when the first fails: another provider, a smaller model, a canned answer.    |
+| **backpressure**      | Slowing or rejecting new work when the system is full, instead of collapsing under it.          |
+| **multi-tenancy**     | Many customers on shared infrastructure, each isolated from the others' data and load.          |
+| **human in the loop** | A person reviews or approves before an output takes effect.                                     |
+
+---
+
+## The tech stack
+
+Categories first, because brands change every year and categories do not.
+
+| Category                | What it does inside                                                                 | Real tools                                                   |
+| :---------------------- | :---------------------------------------------------------------------------------- | :----------------------------------------------------------- |
+| Model APIs              | Hosted inference; you pay per token and inherit the vendor's quotas and outages     | Anthropic, OpenAI, Google, AWS Bedrock, Azure OpenAI         |
+| Self-hosted serving     | Batches many requests on one GPU and manages the KV cache                           | vLLM, SGLang, TensorRT-LLM, llama.cpp                        |
+| LLM gateway             | One API in front of many providers: routing, retries, fallbacks, keys, spend limits | LiteLLM, Portkey, Kong AI Gateway, Cloudflare AI Gateway     |
+| Orchestration           | Application code for prompts, tools, and multi-step flows                           | Plain code, LangGraph, LlamaIndex                            |
+| Retrieval               | Approximate nearest-neighbour search plus keyword search, with metadata filters     | pgvector, Qdrant, Weaviate, Elasticsearch, OpenSearch        |
+| Caches                  | Key-value stores for exact and semantic caches, plus vendor prompt caching          | Redis, GPTCache, provider prompt caching                     |
+| Queues and workflows    | Durable work for slow or long-running jobs, retried on failure                      | Kafka, SQS, Celery, Temporal                                 |
+| Guardrails              | Classifiers and rules on input and output                                           | NeMo Guardrails, Llama Guard, Presidio for PII               |
+| Observability and evals | Traces with prompt and model versions, cost, judges, golden sets                    | Langfuse, LangSmith, Arize Phoenix, OpenTelemetry, promptfoo |
+
+---
+
+## Where each idea is covered
+
+| Idea                                               | Page                                                                         |
+| :------------------------------------------------- | :--------------------------------------------------------------------------- |
+| Requirements, SLOs, QPS, token and cost math       | [Requirements and Estimation](/ai/system-design/requirements-and-estimation) |
+| Every box in the reference architecture            | [Building Blocks](/ai/system-design/building-blocks)                         |
+| Timeouts, retries, fallbacks, queues, rate limits  | [Reliability and Scaling](/ai/system-design/reliability-and-scaling)         |
+| The interview structure and five-stage stress-test | [AI System Design Framework](/ai/system-design/system-design-framework)      |
+| Tenant isolation in retrieval                      | [System Design: Multi-Tenant RAG](/ai/system-design/case-multitenant-rag)    |
+| High-volume classification and human review        | [System Design: Content Moderation](/ai/system-design/case-moderation)       |
+| Running model-written code safely                  | [System Design: Coding Agent Sandbox](/ai/system-design/case-coding-sandbox) |
+| Routing, caching, and cost per resolution          | [System Design: Support Copilot](/ai/system-design/case-support-copilot)     |
+| Retrieval internals                                | [RAG Basics](/ai/rag)                                                        |
+| Serving internals: KV cache, batching              | [Inference and Serving](/ai/inference)                                       |
+| Versioning, CI gates, telemetry                    | [MLOps Basics](/ai/mlops/mlops-basics)                                       |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between designing an AI system and designing a classic web service?">
+
+    Everything from classic design still applies, but the model adds four properties: non-deterministic output, high cost per call, slow streaming responses, and confident errors. Those force evaluation sets instead of equality tests, cost per request as a requirement, latency split into TTFT and decode speed, and verification on the output path. The model also reads untrusted text, which makes prompt injection a security boundary.
+
+  </Accordion>
+  <Accordion title="Name the components of a typical LLM application.">
+
+    API gateway with auth and rate limits, an orchestrator that assembles prompts and calls tools, input guardrails, a cache, retrieval, a model router, model serving, output guardrails and verification, and observability with feedback. Most designs are a subset of that list.
+
+  </Accordion>
+  <Accordion title="Why estimate scale before drawing anything?">
+
+    Because the numbers choose the design. Peak QPS and tokens per request set provider quotas or GPU count, concurrency sets memory, and monthly cost decides whether routing, caching, or self-hosting is worth building. A diagram without numbers cannot be judged.
+
+  </Accordion>
+  <Accordion title="1M requests a day, 3,000 input and 300 output tokens, $1 and $4 per million. What is the monthly cost?">
+
+    Per request: 3,000 at $1 per million is $0.0030, plus 300 at $4 per million is $0.0012, so $0.0042. Times 30 million requests a month is about $126,000.
+
+  </Accordion>
+  <Accordion title="Why is concurrency often more important than QPS for an LLM system?">
+
+    Because each request stays open for seconds while it streams. By Little's law, 35 QPS at 6 seconds each is about 210 requests in flight, and it is in-flight requests that consume provider concurrency limits, connections, and KV-cache memory on a GPU.
+
+  </Accordion>
+  <Accordion title="How do you state a trade-off so it can actually be designed against?">
+
+    Set a target on one axis, a floor on another, and optimize the third: for example, p95 TTFT under one second, groundedness at least 90 percent, then minimize cost. Safety is a constraint rather than an axis.
+
+  </Accordion>
+  <Accordion title="What is the first cost lever in most LLM products?">
+
+    Input tokens, because system prompts, retrieved chunks, and history usually dominate the count. Trim and rerank context, then order the prompt so the stable prefix earns the vendor prompt cache. Only then consider a smaller model.
+
+  </Accordion>
+</Accordions>

@@ -1647,9 +1647,9 @@ export const curriculumData: CurriculumGroup[] = [
       {
         id: 'phase-12',
         number: 'Phase 12',
-        title: 'MLOps, LLMOps & AI System Design',
+        title: 'MLOps & LLMOps',
         description:
-          'Architect production pipelines, pass 60-minute AI System Design interviews, and manage cost/latency/quality trade-offs at scale.',
+          'Production pipelines for AI systems: versioning, GPU containers and scheduling, evaluation-gated CI/CD, telemetry, and cost control.',
         folder: 'content/docs/ai/mlops',
         status: 'written',
         topics: [
@@ -1657,7 +1657,7 @@ export const curriculumData: CurriculumGroup[] = [
             id: 'p12-overview',
             title: 'Overview',
             url: '/ai/mlops',
-            desc: 'Production pipelines for AI systems: artifact and prompt versioning, GPU containers and scheduling, evaluation gates, telemetry, and four system designs.',
+            desc: 'Production pipelines for AI systems: artifact and prompt versioning, GPU containers and scheduling, evaluation gates, and telemetry.',
             status: 'written',
             interview: false,
           },
@@ -1665,7 +1665,7 @@ export const curriculumData: CurriculumGroup[] = [
             id: 'p12-mlops-basics',
             title: 'MLOps Basics',
             url: '/ai/mlops/mlops-basics',
-            desc: 'MLOps vs LLMOps, the lifecycle, what to version together, environments and promotion, evaluation-gated CI/CD and safe rollouts, the four production signals, cost per request with caching, and system design interviews.',
+            desc: 'MLOps vs LLMOps, the lifecycle, what to version together, environments and promotion, evaluation-gated CI/CD and safe rollouts, the four production signals, and cost per request with caching.',
             status: 'written',
             interview: true,
           },
@@ -1709,10 +1709,67 @@ export const curriculumData: CurriculumGroup[] = [
             status: 'written',
             interview: false,
           },
+        ],
+      },
+    ],
+  },
+  {
+    group: 'System Design',
+    phases: [
+      {
+        id: 'phase-13',
+        number: 'Phase 13',
+        title: 'AI System Design',
+        description:
+          'Design LLM products end to end, pass 60-minute AI system design interviews, and manage cost, latency, and quality trade-offs at scale.',
+        folder: 'content/docs/ai/system-design',
+        status: 'written',
+        topics: [
+          {
+            id: 'p13-overview',
+            title: 'Overview',
+            url: '/ai/system-design',
+            desc: 'Designing LLM products end to end: requirements and napkin math, building blocks, reliability, the interview framework, and worked case studies.',
+            status: 'written',
+            interview: false,
+          },
+          {
+            id: 'p13-system-design-basics',
+            title: 'AI System Design Basics',
+            url: '/ai/system-design/system-design-basics',
+            desc: 'What changes when a system contains an LLM, the reference architecture, the five-step design process, napkin math, trade-offs, and vocabulary.',
+            status: 'written',
+            interview: true,
+          },
+          {
+            id: 'p13-requirements-estimation',
+            title: 'Requirements and Estimation',
+            url: '/ai/system-design/requirements-and-estimation',
+            desc: 'Clarifying questions, LLM SLOs and error budgets, peak QPS and concurrency, token growth, cost, API against self-hosting, index size, and latency budgets.',
+            status: 'written',
+            interview: true,
+          },
+          {
+            id: 'p13-building-blocks',
+            title: 'Building Blocks',
+            url: '/ai/system-design/building-blocks',
+            desc: 'Gateway, orchestrator, LLM gateway and router, model serving, retrieval, four kinds of cache, guardrails, tools, queues, state, and observability.',
+            status: 'written',
+            interview: true,
+          },
+          {
+            id: 'p13-reliability-scaling',
+            title: 'Reliability and Scaling',
+            url: '/ai/system-design/reliability-and-scaling',
+            desc: 'Timeouts, retries with backoff and jitter, fallback ladders, circuit breakers, backpressure, async and batch, autoscaling, residency, and idempotency.',
+            status: 'written',
+            interview: true,
+          },
+          // Moved from Phase 12; the ids keep their p12- prefix so saved progress survives.
           {
             id: 'p12-pipeline-stress-test',
             title: 'The 5-Stage Pipeline Stress-Test',
-            url: '/ai/mlops/system-design-framework',
+            url: '/ai/system-design/system-design-framework',
             desc: 'Framing every design around Input, Retrieval, Generation, Verification, Feedback, with the failure mode and mitigation stated for each stage.',
             status: 'written',
             interview: true,
@@ -1720,7 +1777,7 @@ export const curriculumData: CurriculumGroup[] = [
           {
             id: 'p12-quality-latency-cost',
             title: 'The Quality-Latency-Cost Triangle',
-            url: '/ai/mlops/system-design-framework',
+            url: '/ai/system-design/system-design-framework',
             desc: 'Cascade routing from a quantized 8B model to a frontier reasoner, prompt and semantic caching, and the arithmetic behind cutting API spend by 70%.',
             status: 'written',
             interview: true,
@@ -1728,7 +1785,7 @@ export const curriculumData: CurriculumGroup[] = [
           {
             id: 'p12-case-study-rag',
             title: 'Case Study: Enterprise Multi-Tenant RAG',
-            url: '/ai/mlops/case-multitenant-rag',
+            url: '/ai/system-design/case-multitenant-rag',
             desc: 'Scale math, isolation models, permission propagation into the vector query, hybrid retrieval, reranking, and the leak failure modes.',
             status: 'written',
             interview: false,
@@ -1736,7 +1793,7 @@ export const curriculumData: CurriculumGroup[] = [
           {
             id: 'p12-case-study-moderation',
             title: 'Case Study: Content Moderation Pipeline',
-            url: '/ai/mlops/case-moderation',
+            url: '/ai/system-design/case-moderation',
             desc: 'Tiered detectors, base-rate arithmetic, frame sampling, queue prioritization, reviewer load, and adversarial drift.',
             status: 'written',
             interview: false,
@@ -1744,7 +1801,7 @@ export const curriculumData: CurriculumGroup[] = [
           {
             id: 'p12-case-study-coding-agent',
             title: 'Case Study: Autonomous Coding Agent Sandbox',
-            url: '/ai/mlops/case-coding-sandbox',
+            url: '/ai/system-design/case-coding-sandbox',
             desc: 'MicroVM isolation, default-deny egress, scoped credentials, protected test harnesses, budgets, and replayable audits.',
             status: 'written',
             interview: false,
@@ -1752,7 +1809,7 @@ export const curriculumData: CurriculumGroup[] = [
           {
             id: 'p12-case-study-support',
             title: 'Case Study: Customer Support Copilot',
-            url: '/ai/mlops/case-support-copilot',
+            url: '/ai/system-design/case-support-copilot',
             desc: 'Intent routing, four answer lanes, cache layers, multi-turn context cost, containment metrics, and cost per resolved conversation.',
             status: 'written',
             interview: false,

@@ -1,0 +1,286 @@
+---
+title: Building Blocks
+description: 'The components of an LLM system: gateway, orchestrator, LLM gateway and router, serving, retrieval, caches, guardrails, tools, queues, state, and observability.'
+---
+
+A design review asks one question about a diagram: "what is in this box?" The candidate who drew a box labelled "LLM" and an arrow to "Vector DB" has no answer, because a box is a placeholder for decisions. Which provider, behind what abstraction, with what timeout, cached how, filtered by whom?
+
+This page opens every box in the [reference architecture](/ai/system-design/system-design-basics#the-reference-architecture). For each one: what it does, how it works inside, which tools implement it, and how it fails.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the second fundamentals page. [Requirements and Estimation](/ai/system-design/requirements-and-estimation) told you how big the system is; this page lists the parts you build it from. [Reliability and Scaling](/ai/system-design/reliability-and-scaling) then covers how those parts behave under load and failure.
+
+Think of a restaurant. The host at the door decides who gets in and how fast (gateway). The head waiter takes the order and coordinates everything (orchestrator). Some dishes are pre-made and just plated (cache), some need ingredients fetched from the store room (retrieval), and the kitchen has a fast line cook for simple dishes and a head chef for hard ones (router and models). Someone checks each plate before it leaves (guardrails), and the manager keeps notes on every complaint (observability and feedback).
+
+This page covers, in order:
+
+1. **Two paths**: the online request path and the offline data path
+2. **API gateway**: auth, quotas, and rate limits
+3. **Orchestrator**: the application logic
+4. **LLM gateway and model router**
+5. **Model serving**: hosted API or self-hosted engine
+6. **Retrieval layer**
+7. **Caches**: four different things with one name
+8. **Guardrails**
+9. **Tools and execution**
+10. **Queues and workers**
+11. **State and memory**
+12. **Observability and feedback**
+
+| Word                    | Plain meaning                                                                                     |
+| :---------------------- | :------------------------------------------------------------------------------------------------ |
+| **online path**         | Work done while the user waits for this request.                                                  |
+| **offline path**        | Work done ahead of time or in the background: ingestion, indexing, evaluation.                    |
+| **token bucket**        | A rate limiter that refills at a fixed rate and lets bursts spend saved-up capacity.              |
+| **stateless**           | A server that keeps nothing between requests, so any replica can serve any request.               |
+| **LLM gateway**         | A proxy in front of model providers that unifies their APIs and adds routing, retries, and spend. |
+| **continuous batching** | Serving many requests together on a GPU, adding and removing them as they start and finish.       |
+| **KV cache**            | Saved attention state for tokens already processed, so they are not recomputed.                   |
+| **guardrail**           | A check that blocks or rewrites unsafe or malformed input or output.                              |
+| **idempotent**          | Safe to run twice: the second run has no extra effect.                                            |
+| **trace**               | The record of one request's journey through every component, with timings and versions.           |
+
+---
+
+## Two paths
+
+Every LLM system has two halves that run on different clocks.
+
+<Mermaid
+  chart={`
+flowchart TB
+    subgraph OFF["Offline path: minutes to hours"]
+        direction LR
+        S["Sources"] --> P["Parse and chunk"] --> E["Embed"] --> IX[("Index")]
+        TR[("Traces")] --> EV["Evaluate and label"] --> GS[("Golden set")]
+    end
+    subgraph ON["Online path: milliseconds to seconds"]
+        direction LR
+        Q["Request"] --> G["Gateway"] --> O["Orchestrator"] --> R["Retrieve"] --> M["Model"] --> V["Verify"] --> A["Answer"]
+    end
+    IX --> R
+    A --> TR
+`}
+/>
+
+The rule: **move everything you can to the offline path**. Parsing, chunking, embedding documents, precomputing summaries, and evaluation all belong there. The online path should only do what depends on this request.
+
+---
+
+## API gateway
+
+**Job:** the front door. Authenticate the caller, identify the tenant, enforce quotas, reject requests that are too large, and terminate TLS.
+
+**How it works inside.** Rate limiting usually uses a **token bucket** per tenant or per user: the bucket holds up to `B` tokens and refills at `r` per second; each request spends one (or, for LLMs, spends its estimated token count). Bursts can spend the saved-up capacity, sustained load is capped at `r`. Limiting on estimated LLM tokens rather than requests matters, because one 100,000-token request costs as much as a hundred small ones.
+
+**Tools:** Kong, Envoy, NGINX, AWS API Gateway, Cloudflare; Redis for shared limiter counters.
+
+| Fails how                          | Mitigation                                                    |
+| :--------------------------------- | :------------------------------------------------------------ |
+| One tenant's burst slows everyone  | Per-tenant buckets, not one shared limit                      |
+| Limits count requests, not tokens  | Estimate tokens at the gateway and charge the bucket for them |
+| Oversized payloads reach the model | Reject above a stated token count before any model call       |
+
+---
+
+## Orchestrator
+
+**Job:** the application itself. It loads conversation state, decides whether to retrieve, assembles the prompt, calls the model, runs tool calls, and returns the stream.
+
+**How it works inside.** Keep it **stateless**: conversation history lives in a store, not in server memory, so any replica can serve any turn and replicas can be added or killed freely. Prompt assembly follows a fixed order: stable parts first (system prompt, tool schemas), then retrieved context, then history, then the user message, which both enforces a token budget and maximizes prompt-cache hits.
+
+**Tools:** plain application code in most production systems; LangGraph or LlamaIndex when the flow has branches, loops, or checkpoints. [The Agent Loop](/ai/agents/agent-loop) covers multi-step orchestration.
+
+| Fails how                    | Mitigation                                          |
+| :--------------------------- | :-------------------------------------------------- |
+| Context exceeds the window   | Token budget with an explicit drop order            |
+| Agent loops forever          | Step, token, and wall-clock budgets per request     |
+| Session stuck to one replica | Externalize state; never rely on in-memory sessions |
+
+---
+
+## LLM gateway and model router
+
+**Job:** one internal API in front of every model provider and self-hosted model. Application code asks for "a model for this task"; the gateway decides which one, holds the keys, retries, falls back, and records spend.
+
+**How it works inside.** The gateway normalizes provider APIs into one request format, tracks per-provider quotas, and applies policy: route by task, tenant tier, or a classifier's difficulty estimate; retry on transient errors; fail over to a second provider when the first is down; enforce per-team budgets. The **router** is the part that chooses between a cheap model and an expensive one. It can be rules (prompt length, intent), a small classifier, or the small model itself deciding to escalate.
+
+**Tools:** LiteLLM, Portkey, Kong AI Gateway, Cloudflare AI Gateway, OpenRouter; RouteLLM-style classifiers for routing.
+
+| Fails how                                    | Mitigation                                                                 |
+| :------------------------------------------- | :------------------------------------------------------------------------- |
+| Router sends a hard query to the small model | Low-confidence escalation path; evaluate the router on its own labeled set |
+| Fallback model behaves differently           | Run the same eval suite against every fallback before enabling it          |
+| Gateway itself becomes the outage            | Run it as replicated stateless instances; keep it thin                     |
+
+---
+
+## Model serving
+
+**Job:** turn a prompt into tokens.
+
+**Hosted API.** You send HTTPS requests and pay per token. The provider handles GPUs, batching, and scaling; you inherit their rate limits, latency variance, outages, and model updates. Pin model versions where the provider allows it, because an unpinned alias can change behaviour without warning.
+
+**Self-hosted engine.** You run an inference engine on your own GPUs. The engine's key tricks are **continuous batching** (many requests share each forward pass, joining and leaving as they start and finish) and **paged KV-cache management** (attention state stored in fixed-size blocks so memory is not wasted). Together they raise throughput many times over naive one-at-a-time serving. The limit on concurrency is KV-cache memory, which is why long prompts reduce how many users one GPU can serve. [Continuous Batching](/ai/inference/continuous-batching) and [Prefill and Decode](/ai/inference/prefill-and-decode) explain the mechanics.
+
+**Tools:** hosted: Anthropic, OpenAI, Google, AWS Bedrock, Azure; self-hosted: vLLM, SGLang, TensorRT-LLM, llama.cpp, with KServe or Ray Serve on Kubernetes.
+
+| Fails how                             | Mitigation                                                         |
+| :------------------------------------ | :----------------------------------------------------------------- |
+| Provider rate limit or outage         | Retry with backoff, then fail over through the LLM gateway         |
+| Silent model update changes behaviour | Pin versions; run the eval suite on a schedule, not just on deploy |
+| Self-hosted cold start takes minutes  | Keep warm replicas; load weights from fast local storage           |
+
+---
+
+## Retrieval layer
+
+**Job:** find the few passages the model needs, from a corpus far too large for the prompt, restricted to what this user may see.
+
+**How it works inside.** Offline, documents are parsed, split into chunks, embedded, and written to an index with metadata (tenant, permissions, source, date). Online, the query is embedded, an approximate nearest-neighbour search (usually HNSW) finds similar chunks, a keyword search (BM25) finds exact terms like error codes, the two lists are fused, and a cross-encoder reranks the top candidates. Access control is a **metadata filter inside the search**, never a filter applied afterwards to the results.
+
+**Tools:** pgvector, Qdrant, Weaviate, Milvus, Pinecone, Elasticsearch and OpenSearch; Cohere Rerank or open cross-encoders. The [RAG section](/ai/rag) covers every stage.
+
+| Fails how                          | Mitigation                                                      |
+| :--------------------------------- | :-------------------------------------------------------------- |
+| Relevant passage not retrieved     | Hybrid search plus reranking; measure recall on labeled queries |
+| User sees another tenant's content | Filter by tenant and permission in the query, before ranking    |
+| Index is stale                     | Incremental re-indexing with a freshness target per source      |
+
+---
+
+## Caches
+
+Four different mechanisms share the word "cache". Naming which one you mean is a small signal of experience.
+
+| Cache                     | Key                       | Stores               | Saves                                   | Risk                                            |
+| :------------------------ | :------------------------ | :------------------- | :-------------------------------------- | :---------------------------------------------- |
+| **Exact response cache**  | Hash of the full prompt   | The final answer     | The whole call                          | Low hit rate on free text                       |
+| **Semantic cache**        | Embedding of the query    | The final answer     | The whole call on a near-duplicate      | Wrong answer for a subtly different query       |
+| **Prompt (prefix) cache** | Token prefix, vendor-side | Prefill computation  | Most of the cached input price and TTFT | Broken by anything variable early in the prompt |
+| **Embedding cache**       | Hash of the text          | The embedding vector | Re-embedding unchanged chunks           | Stale when the embedding model changes          |
+
+A semantic cache needs a similarity threshold, and the threshold is a quality decision: too loose and "cancel my order" returns the cached answer for "cancel my subscription". Scope it per tenant, never cache personalized answers, and expire entries when the underlying documents change.
+
+**Tools:** Redis (exact and semantic, with vector search), GPTCache, provider prompt caching, the engine's automatic prefix caching in vLLM or SGLang.
+
+---
+
+## Guardrails
+
+**Job:** checks before the model (input rails) and after it (output rails), plus checks before any tool executes.
+
+**How it works inside.** Rails are layered from cheapest to most expensive: regex and rules (microseconds), small classifiers for toxicity, PII, and injection (milliseconds), and model-based checks such as groundedness against retrieved passages (one more model call). Run cheap checks on everything and expensive checks only where the stakes justify the latency.
+
+| Position | Typical checks                                                            |
+| :------- | :------------------------------------------------------------------------ |
+| Input    | Size limits, PII redaction, abuse and injection classifiers               |
+| Pre-tool | Argument schema validation, allow-lists, human approval for risky actions |
+| Output   | JSON schema, citation validity, groundedness, policy and leak filters     |
+
+**Tools:** NeMo Guardrails, Llama Guard, Microsoft Presidio, Guardrails AI, provider moderation endpoints. [Observability and Guardrails](/ai/agents/observability-guardrails) and [Agent Security](/ai/agents/agent-security) go deeper.
+
+---
+
+## Tools and execution
+
+**Job:** let the model act: query a database, call an API, run code, send an email.
+
+**How it works inside.** The model emits a structured tool call; your code validates the arguments against a schema, checks permissions, executes, and returns the result as text. The model never holds credentials; the tool layer does, scoped to the current user. Anything with side effects should be **idempotent** (carry a request id so a retry does not send the email twice), and anything that runs model-written code runs in a sandbox. [Function Calling](/ai/agents/function-calling), [Model Context Protocol](/ai/agents/mcp), and the [Coding Agent Sandbox](/ai/system-design/case-coding-sandbox) case cover this in depth.
+
+| Fails how                                  | Mitigation                                                  |
+| :----------------------------------------- | :---------------------------------------------------------- |
+| Injected text tricks the model into a call | Least-privilege tools, confirmation for destructive actions |
+| Retry repeats a side effect                | Idempotency keys on every write                             |
+| Tool hangs                                 | Timeouts per tool, and a step budget per request            |
+
+---
+
+## Queues and workers
+
+**Job:** run work that does not need the user to wait: document ingestion, batch summarization, long agent tasks, evaluation runs.
+
+**How it works inside.** The API writes a job to a durable queue and returns a job id immediately. Workers pull jobs, process them, and write results to a store; the client polls or receives a webhook. Failed jobs retry with backoff, and jobs that keep failing move to a **dead-letter queue** for inspection. For multi-step workflows that must survive crashes, a durable workflow engine records each step so a restart resumes rather than repeats.
+
+**Tools:** SQS, Kafka, RabbitMQ, Redis streams, Celery; Temporal or AWS Step Functions for durable workflows. Provider batch APIs are a queue on the vendor side, often at a discount, for work that can wait hours.
+
+---
+
+## State and memory
+
+**Job:** keep what must survive between requests.
+
+| State                  | Where it usually lives                   | Notes                                              |
+| :--------------------- | :--------------------------------------- | :------------------------------------------------- |
+| Conversation history   | Postgres, DynamoDB, or Redis with TTL    | Keyed by conversation id; trimmed by token budget  |
+| Long-term user memory  | A table or a small vector index per user | Needs consent, deletion, and tenant isolation      |
+| Documents and chunks   | Object storage plus the retrieval index  | Versioned, so an answer can be traced to a version |
+| Job and workflow state | The queue or workflow engine             | Never in a worker's memory                         |
+| Prompts and configs    | A registry or Git, versioned             | Part of the release, not runtime tuning            |
+
+[Agent Memory](/ai/agents/agent-memory) covers what an assistant should remember and how it recalls it.
+
+---
+
+## Observability and feedback
+
+**Job:** know what happened on every request, what it cost, and whether it was good.
+
+**How it works inside.** Every request produces a **trace**: one span per step (retrieval, each model call, each tool call) with timings, token counts, cost, and the versions of the prompt, model, and index used. Quality is measured by sampling traces for automated judges and human review, and by product signals such as thumbs-down, regeneration, and escalation to a human. The failures found there become new rows in the golden set, which then gates the next change.
+
+**Tools:** OpenTelemetry, Prometheus and Grafana for metrics; Langfuse, LangSmith, Arize Phoenix, Helicone for LLM traces; promptfoo, RAGAS, DeepEval for evaluation. [Production Telemetry and Cost Control](/ai/mlops/telemetry-and-cost) defines the metrics.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What belongs on the online path, and what on the offline path?">
+
+    Only work that depends on the current request belongs online: auth, prompt assembly, the query's retrieval, generation, and blocking checks. Parsing, chunking, embedding documents, precomputing summaries, evaluation, and labeling all go offline.
+
+  </Accordion>
+  <Accordion title="Why rate-limit LLM traffic by tokens rather than requests?">
+
+    Because cost and provider quotas scale with tokens. One very long request can cost as much as a hundred short ones, so a request limit lets a single tenant exhaust the shared token quota.
+
+  </Accordion>
+  <Accordion title="What does an LLM gateway add over calling providers directly?">
+
+    One API across providers, central key management, routing by task or difficulty, retries and failover, per-team spend limits, and a single place to log cost and latency.
+
+  </Accordion>
+  <Accordion title="Why keep the orchestrator stateless?">
+
+    So any replica can serve any request. Replicas can then scale up and down or crash without losing conversations, because history lives in a store keyed by conversation id.
+
+  </Accordion>
+  <Accordion title="Name the four kinds of cache in an LLM system.">
+
+    Exact response cache keyed on the prompt hash, semantic cache keyed on query embedding, vendor prompt or prefix cache that reuses prefill computation, and an embedding cache for unchanged text. They differ in what they save and how they fail.
+
+  </Accordion>
+  <Accordion title="What is the main risk of a semantic cache, and how do you limit it?">
+
+    Returning a cached answer for a query that is similar but not the same. Use a strict threshold tuned on labeled pairs, scope the cache per tenant, never cache personalized answers, and invalidate entries when source documents change.
+
+  </Accordion>
+  <Accordion title="Where must access control sit in retrieval, and why?">
+
+    Inside the search, as a metadata filter applied before ranking. Filtering results afterwards can leak through counts, citations, or cached answers, and can leave too few results to answer.
+
+  </Accordion>
+  <Accordion title="Why do tool calls need idempotency keys?">
+
+    Because retries are everywhere: the gateway, the orchestrator, and the queue all retry on failure. Without an idempotency key, a retried tool call can charge a card or send an email twice.
+
+  </Accordion>
+  <Accordion title="What must every trace record to make an LLM failure debuggable?">
+
+    Timings and token counts per step, cost, inputs and outputs, and the versions of the prompt, model, decoding parameters, and index. Without the versions, you cannot tell which change caused a regression.
+
+  </Accordion>
+</Accordions>

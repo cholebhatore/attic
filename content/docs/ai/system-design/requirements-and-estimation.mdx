@@ -1,0 +1,279 @@
+---
+title: Requirements and Estimation
+description: 'Clarifying questions, functional and non-functional requirements, LLM SLOs, and napkin math for traffic, tokens, cost, storage, and latency budgets.'
+---
+
+An internal assistant is sized for its average load: 12 requests a second, comfortably inside the provider quota. At 9:05 on Monday morning, the whole company opens it at once. Traffic hits four times the average, the provider starts returning rate-limit errors, retries double the load, and the assistant is down for the first hour of the week. The architecture was fine. The estimate used the wrong number.
+
+Requirements and estimation are the first fifteen minutes of every design. They are cheap to get right and expensive to skip, because every later choice (which model, how many GPUs, whether to cache) is justified by a number produced here.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first fundamentals page, right after [AI System Design Basics](/ai/system-design/system-design-basics). It covers steps one and two of the design process: pin down what the system must do, then size it.
+
+Before an architect draws a house, they ask how many people will live in it, how many cars need parking, and what the budget is. Then they do quick arithmetic on rooms, square metres, and cost. Nobody minds if the numbers are rounded; everybody minds if they are missing. Designing an AI system works the same way: ask the questions, write down the targets, and turn users into requests, requests into tokens, and tokens into money, memory, and milliseconds.
+
+This page covers, in order:
+
+1. **Clarifying questions**: what to ask before designing
+2. **Functional and non-functional requirements**
+3. **SLOs for LLM systems**: latency, availability, quality, and error budgets
+4. **Traffic**: requests, peak QPS, and concurrency
+5. **Tokens**: what fills a prompt, and how conversations grow
+6. **Cost**: per request, per month, and API against self-hosting
+7. **Storage**: sizing a vector index
+8. **Latency budgets**: where the milliseconds go
+9. **Common mistakes**
+
+| Word               | Plain meaning                                                                                    |
+| :----------------- | :----------------------------------------------------------------------------------------------- |
+| **requirement**    | Something the system must do (functional) or a level it must meet (non-functional).              |
+| **SLO / SLA**      | Service-level objective, an internal target; service-level agreement, a promise with penalties.  |
+| **error budget**   | The failure an SLO allows. 99.9 percent availability leaves 0.1 percent to spend.                |
+| **peak factor**    | How much busier the busiest period is than the average.                                          |
+| **Little's law**   | Requests in flight equal arrival rate times time each request spends in the system.              |
+| **token**          | The unit models read and write; in English, roughly four characters or three quarters of a word. |
+| **duty cycle**     | The fraction of time hardware is doing useful work.                                              |
+| **latency budget** | A target end-to-end time split into allowances for each step.                                    |
+
+---
+
+## Clarifying questions
+
+Ask before drawing. The answers change the design, and asking shows that you know they do.
+
+| Ask about   | Example question                                   | Why the answer changes the design                            |
+| :---------- | :------------------------------------------------- | :----------------------------------------------------------- |
+| Users       | Internal staff, paying customers, or the public?   | Abuse, rate limits, and how much a wrong answer costs        |
+| Task        | Answer, act, classify, generate, or summarize?     | Whether tools, retrieval, or a batch pipeline are needed     |
+| Volume      | How many users, how many requests each, what peak? | Provider quotas, GPU count, whether caching pays             |
+| Interaction | Chat, single shot, or background job?              | Streaming and TTFT targets, or a queue and no latency target |
+| Stakes      | What happens when it is wrong?                     | Verification depth, human review, refusal behaviour          |
+| Data        | Where does knowledge come from, and how fresh?     | Retrieval design, re-indexing cadence, access control        |
+| Privacy     | PII, regulated data, data residency?               | Redaction, which vendors are allowed, self-hosting           |
+| Modality    | Text only, or images, audio, documents?            | Model choice, parsing pipeline, cost per request             |
+| Languages   | One language or many?                              | Embedding model, evaluation sets per language                |
+| Budget      | Is there a cost ceiling per user or per month?     | Whether the frontier model is affordable at all              |
+
+If the interviewer says "you decide", decide out loud and write the assumption down. A stated assumption can be corrected; a silent one is just a guess.
+
+---
+
+## Functional and non-functional requirements
+
+**Functional** requirements are verbs: what the system does. **Non-functional** requirements are adjectives with numbers: how well it does it.
+
+| Functional (example: docs assistant)         | Non-functional (same system)                          |
+| :------------------------------------------- | :---------------------------------------------------- |
+| Answer questions about product documentation | p95 TTFT under 1 second, streamed                     |
+| Cite the source passage for every claim      | 90 percent of answers grounded on the labeled set     |
+| Refuse when the answer is not in the docs    | Cost under $0.01 per answered question                |
+| Hand off to a human on request               | 99.9 percent monthly availability                     |
+| Respect each user's document permissions     | Zero cross-tenant leaks in the adversarial test suite |
+
+The habit worth building: **every quality word gets a metric**. "Accurate" is not a requirement until it becomes "groundedness at least 90 percent on 500 labeled questions". Without the number there is nothing to test, and nothing to trade against cost.
+
+---
+
+## SLOs for LLM systems
+
+A classic service has one latency number. An LLM service needs three, because the user experiences the wait for the first word and the speed of the stream separately.
+
+| SLO             | Typical target (assumed, product-dependent) | Notes                                                        |
+| :-------------- | :------------------------------------------ | :----------------------------------------------------------- |
+| p95 TTFT        | Under 1 second for chat                     | What the user feels as "is it working?"                      |
+| p95 inter-token | Under 50 ms, about 20 tokens a second       | Faster than people read, so streaming feels smooth           |
+| p95 end-to-end  | Seconds for chat, minutes for agents        | Drives timeouts and concurrency                              |
+| Availability    | 99.9 percent                                | Measured as successful responses, not as a server being up   |
+| Quality         | Groundedness or task success on a sample    | Measured continuously on sampled traffic, not just at launch |
+
+An availability target converts directly into an **error budget**:
+
+| Availability | Allowed failure per 30-day month |
+| :----------- | :------------------------------- |
+| 99 percent   | about 7.2 hours                  |
+| 99.9 percent | about 43 minutes                 |
+| 99.99        | about 4.3 minutes                |
+
+Check one by hand: 30 days is 43,200 minutes, and 0.1 percent of that is 43.2. Note what this implies for a product built on a single model provider: your availability cannot exceed theirs unless you add a fallback, which is why [Reliability and Scaling](/ai/system-design/reliability-and-scaling) treats multi-provider fallback as a basic pattern.
+
+---
+
+## Traffic
+
+Three numbers, derived in order.
+
+```text
+requests per day  = daily active users x requests per user
+average QPS       = requests per day / 86,400
+peak QPS          = average QPS x peak factor          (2 to 5 is common; ask)
+in flight         = peak QPS x seconds per request     (Little's law)
+```
+
+Worked example, all inputs assumed: 200,000 daily users at 5 requests each is 1,000,000 requests a day. Divided by 86,400 that is about 11.6 QPS on average, and with a peak factor of 3, about 35 QPS. Each request streams for about 6 seconds, so at peak roughly 35 times 6, about 210, requests are in flight at once.
+
+The last line is the one people forget. Provider accounts limit concurrency and tokens per minute, connection pools hold a fixed number of sockets, and a GPU's KV cache holds a fixed number of sequences. All of those are consumed by requests **in flight**, not by requests per second. A slow model at modest QPS can exhaust them as surely as a fast model at high QPS.
+
+<Callout type="info">
+  ### Rate limits are written in tokens
+
+Provider limits are usually requests per minute (RPM) and tokens per minute (TPM). At 35 QPS with 3,300 tokens each, the system needs about 35 x 60 x 3,300, roughly 7 million tokens per minute at peak. Check the quota against that number, not against the request count.
+
+</Callout>
+
+---
+
+## Tokens
+
+A request's token count is the sum of everything that goes into the prompt, plus what comes out.
+
+| Part of the prompt   | Typical size (assumed) | Notes                                                    |
+| :------------------- | :--------------------- | :------------------------------------------------------- |
+| System prompt        | 500 to 2,000           | Stable across requests, so it is the cache's best friend |
+| Tool definitions     | 200 to 3,000           | Each tool schema costs tokens on every call              |
+| Retrieved chunks     | 1,000 to 8,000         | 5 to 8 chunks of 200 to 1,000 tokens                     |
+| Conversation history | Grows every turn       | The silent cost driver in chat products                  |
+| User message         | 20 to 500              | Usually the smallest part                                |
+| Output               | 100 to 1,000           | Priced several times higher per token than input         |
+
+Two rules of thumb: in English, a token is about four characters, so 1,000 tokens is about 750 words. And output tokens usually cost three to five times as much as input tokens, while input tokens usually outnumber them ten to one.
+
+### Conversations grow quadratically
+
+If every turn resends the whole history, input per turn grows linearly and the conversation's total grows with the square of its length. With a 1,500-token system prompt, a 100-token question, and 250 tokens of history added per turn:
+
+```text
+turn 1 input:   1,500 + 100           = 1,600
+turn 10 input:  1,500 + 9 x 250 + 100 = 3,850
+total over 10 turns                   = 27,250 tokens
+```
+
+Ten turns cost seventeen times a single turn, not ten. The fixes are summarizing old turns, dropping the oldest turns under a token budget, and putting the stable prefix first so the prompt cache covers it.
+
+---
+
+## Cost
+
+```text
+cost per request = (input tokens x input price + output tokens x output price) / 1,000,000
+monthly cost     = cost per request x requests per day x 30
+```
+
+At an assumed $1 per million input and $4 per million output, 3,000 input and 300 output tokens cost 0.0030 + 0.0012 = $0.0042, and a million requests a day costs about $126,000 a month. Express the result per unit the business cares about: per user, per conversation, per resolved ticket. A $0.0042 request means nothing; a $0.40 resolved ticket against a $6 human-handled ticket is a decision.
+
+### API against self-hosting
+
+Self-hosting replaces a per-token price with a per-hour price, so it only wins when the hardware stays busy.
+
+```text
+cost per million output tokens = GPU price per hour / (tokens per second x 3,600 x utilization) x 1,000,000
+```
+
+With an assumed $2.50 per GPU-hour and 2,000 output tokens a second for a small model under continuous batching, a fully busy GPU costs about $0.35 per million output tokens. At 30 percent utilization, typical for spiky daytime traffic, it is about $1.16. Both figures exclude engineers, redundancy, and idle replicas kept warm for latency.
+
+| Self-hosting tends to win when               | A hosted API tends to win when             |
+| :------------------------------------------- | :----------------------------------------- |
+| Volume is high and steady, so GPUs stay busy | Traffic is spiky or small                  |
+| An open model is good enough for the task    | The task needs frontier quality            |
+| Data cannot leave your network               | The team has no GPU operations experience  |
+| Latency must be controlled end to end        | Time to market matters more than unit cost |
+
+Many production systems do both: a self-hosted small model for the high-volume easy traffic, and an API for the hard tail. That is the cascade from the [framework page](/ai/system-design/system-design-framework).
+
+---
+
+## Storage
+
+A vector index's size follows from four numbers.
+
+```text
+vectors      = documents x chunks per document
+vector bytes = vectors x dimensions x bytes per value
+graph bytes  = vectors x links per node x 4 bytes        (HNSW, roughly 2 x M links at the base layer)
+```
+
+Worked example: 1 million documents at 10 chunks each is 10 million vectors. At 1,024 dimensions in float32 (4 bytes), that is about 41 GB of vectors; quantized to int8 it is about 10 GB. An HNSW graph with M = 16 adds about 10 million x 32 x 4 bytes, roughly 1.3 GB. Add the chunk text and metadata, and replicas for availability, and the total is several times the raw vector size.
+
+The design consequences: whether the index fits in one machine's RAM decides between a single Postgres with `pgvector` and a sharded vector database, and the re-embedding cost (every chunk through the embedding model again) decides how often you can afford to change embedding models. [Vector Databases](/ai/rag/vector-databases) and [Quantization Math](/ai/inference/quantization-math) go deeper.
+
+---
+
+## Latency budgets
+
+Pick the end-to-end target, then give every step an allowance. The model's time to first token is usually the largest item, but the steps before it add up.
+
+| Step                          | Allowance (assumed) |
+| :---------------------------- | :------------------ |
+| Gateway, auth, rate limit     | 20 ms               |
+| Input guardrail               | 40 ms               |
+| Query embedding               | 30 ms               |
+| Vector and keyword search     | 60 ms               |
+| Reranking 50 candidates       | 120 ms              |
+| Model time to first token     | 600 ms              |
+| **First token reaches user**  | **about 870 ms**    |
+| 299 more tokens at 25 ms each | about 7.5 s         |
+| **End to end**                | **about 8.3 s**     |
+
+Two things follow. First, the user sees text after under a second, so the 8-second total is acceptable for chat when streamed and unacceptable when it is not. Second, anything that must wait for the full answer (an output guardrail that reads the whole response, a JSON parser) moves the user's wait from 870 ms to 8.3 seconds. Decide which checks can run on the stream and which must block.
+
+---
+
+## Common mistakes
+
+| Mistake                                                     | Why it hurts                                               | Do this instead                                         |
+| :---------------------------------------------------------- | :--------------------------------------------------------- | :------------------------------------------------------ |
+| Sizing on average QPS                                       | The system falls over at the daily peak                    | Multiply by a stated peak factor                        |
+| Counting requests, not tokens                               | Provider quotas and cost are both per token                | Convert every request rate into tokens per minute       |
+| Ignoring conversation history                               | Chat cost grows with the square of conversation length     | Budget history, summarize, cache the stable prefix      |
+| "Accurate" with no metric                                   | Nothing to test, nothing to trade                          | One metric and a labeled set per quality claim          |
+| Comparing GPU price to API price at 100 percent utilization | Real traffic leaves GPUs idle                              | Use measured or assumed utilization, and add operations |
+| Asking no questions                                         | Reads as designing a favourite system rather than this one | Five minutes of questions, assumptions written down     |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What would you ask before designing an LLM-powered assistant?">
+
+    Who the users are, the task, volume and peak, chat or batch, the cost of a wrong answer, where knowledge comes from and how fresh it must be, privacy and residency constraints, modalities, languages, and the budget. Each answer changes a component.
+
+  </Accordion>
+  <Accordion title="Why does an LLM system need more than one latency SLO?">
+
+    Users experience the wait for the first token and the speed of the stream separately. TTFT governs perceived responsiveness, inter-token latency governs whether the stream keeps up with reading, and end-to-end time governs timeouts and concurrency.
+
+  </Accordion>
+  <Accordion title="Convert 99.9 percent monthly availability into minutes.">
+
+    A 30-day month has 43,200 minutes; 0.1 percent of that is about 43 minutes of allowed failure.
+
+  </Accordion>
+  <Accordion title="35 QPS at peak, 6 seconds per request. How many requests are in flight?">
+
+    By Little's law, arrival rate times time in system: about 210. That is the number that consumes provider concurrency, connections, and KV-cache memory.
+
+  </Accordion>
+  <Accordion title="Why do long chats cost more than the number of turns suggests?">
+
+    Each turn resends the growing history, so input per turn grows linearly and the total grows quadratically. Ten turns can cost more than fifteen times one turn. Summarize or drop old turns and cache the stable prefix.
+
+  </Accordion>
+  <Accordion title="When does self-hosting beat a hosted API?">
+
+    When volume is high and steady enough to keep GPUs busy, an open model meets the quality bar, and the team can operate it. At low utilization the per-token cost of a GPU rises sharply, and the API usually wins.
+
+  </Accordion>
+  <Accordion title="Size the vectors for 10 million 1,024-dimensional embeddings.">
+
+    10 million x 1,024 x 4 bytes is about 41 GB in float32, about 10 GB in int8, plus roughly 1.3 GB for an HNSW graph with M = 16, before text, metadata, and replicas.
+
+  </Accordion>
+  <Accordion title="An output guardrail reads the full response before showing it. What does that do to latency?">
+
+    It turns time to first token into end-to-end time, because the user sees nothing until the whole answer is generated and checked. Run checks on the stream where possible, and block only for high-stakes routes.
+
+  </Accordion>
+</Accordions>
