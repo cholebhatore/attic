@@ -237,7 +237,7 @@ A topic `C` is a child of `P` when all of these hold:
 
 Index parents with `Map<string, Topic[]>`, not `Map<string, Topic>`, and skip grouping
 for any url that maps to more than one row. This corpus has two topics sharing
-`/ai/mlops/system-design-framework`, and a single-valued map would silently drop one. A
+`/ai/system-design/system-design-framework`, and a single-valued map would silently drop one. A
 child whose parent is missing stays at top level. Every topic must appear exactly once
 in the output, so assert `flatten(buildTree(phase)).length === phase.topics.length` for
 each phase.
