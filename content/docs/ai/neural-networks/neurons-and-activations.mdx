@@ -3,7 +3,7 @@ title: Neurons and Activations
 description: 'The affine transform, ReLU and dead units, GELU and its tanh approximation, SiLU, and how SwiGLU becomes a transformer feed-forward block.'
 ---
 
-A neuron is two operations. A weighted sum, which is linear, and a <Tip term="squashing function">A function that bends a raw number into a smaller, tamed range: it keeps the sign but rewrites the size. Called squashing because it compresses large inputs toward a fixed ceiling.</Tip>, which is not. Everything interesting about neural networks comes from the second one, and everything interesting about the second one comes from its derivative.
+A neuron is two operations. A weighted sum, which is linear, and a <Tip term="squashing function">A function that bends a raw number into a smaller, tamed range: it keeps the sign but rewrites the size. Called squashing because it compresses large inputs toward a fixed ceiling. Example: Softmax, Sigmoid, Tanh, etc.</Tip>, which is not. Everything interesting about neural networks comes from the second one, and everything interesting about the second one comes from its derivative.
 
 This page works through the four activations you will meet in practice: ReLU, GELU, SiLU, and the gated SwiGLU. Each has a specific shape, a specific derivative, and a specific failure mode.
 
@@ -139,10 +139,12 @@ What the rest of the page settles, in reading order:
 
 Take an input vector `x` of length `n`, a weight vector `w` of the same length, and a scalar bias `b`. The neuron computes a pre-activation `z` and passes it through an activation `a`:
 
-```text
-z = w . x + b        pre-activation, a scalar
-a = f(z)             activation, a scalar
-```
+$$
+\begin{aligned}
+z &= \mathbf{w} \cdot \mathbf{x} + b && \text{(pre-activation, a scalar)} \\
+a &= f(z) && \text{(activation, a scalar)}
+\end{aligned}
+$$
 
 Read that as: "z is each weight times the input it sits on, all added up, plus b; then a is the curve applied to z." The dot product is a <Tip term="projection">The part of one vector that lies along another direction. Projecting x onto w answers: how much of x points the way w does.</Tip>. It measures how much of `x` points along `w`, which is why [Similarity and Norms](/ai/math-foundations/similarity-and-norms) matters here: a neuron with unit-norm weights is computing cosine similarity to `w` scaled by the magnitude of `x`. That claim is checkable with two vectors: `w = [0.6, 0.8]` has length `1.0000`, `x = [1.0, 2.0]` has length `2.2361`, `w . x = 2.2000`, and the cosine between them is `0.9839`, so `2.2361 * 0.9839 = 2.2000`. Length one on `w` is what makes the dot product read as pure direction. The bias `b` slides the decision boundary off the origin, so the neuron fires at `w . x = -b` rather than at `w . x = 0`. On the walk above, `b = 0.5` is why a neuron whose weighted sum was `-1` lands at `-0.5` instead.
 
@@ -182,11 +184,13 @@ learning fast, and it is why tensor shape bugs are the most common bugs you will
 
 Drop `f` and stack two linear layers:
 
-```text
-y = W2 (W1 x + b1) + b2
-  = (W2 W1) x + (W2 b1 + b2)
-  = W' x + b'
-```
+$$
+\begin{aligned}
+y &= \mathbf{W}_2 (\mathbf{W}_1 \mathbf{x} + \mathbf{b}_1) + \mathbf{b}_2 \\
+  &= (\mathbf{W}_2 \mathbf{W}_1) \mathbf{x} + (\mathbf{W}_2 \mathbf{b}_1 + \mathbf{b}_2) \\
+  &= \mathbf{W}' \mathbf{x} + \mathbf{b}'
+\end{aligned}
+$$
 
 Read that as: "layer two multiplies layer one's output and adds its own bias; because everything in between is multiplication and addition, the whole pile re-associates into one weight matrix `W'` and one bias `b'`." Two layers become one, with a combined weight matrix `W' = W2 W1` and a combined bias. This holds for any depth: a hundred linear layers are algebraically one linear layer, and the network can only ever represent <Tip term="affine">A linear map plus a constant shift: `x -> Wx + b`. Straight lines through a point that is not the origin.</Tip> functions.
 
@@ -225,10 +229,13 @@ and rank is already capped by your narrowest layer.
 
 ## ReLU
 
-```text
-ReLU(z) = max(0, z)
-ReLU'(z) = 1 if z > 0, else 0
-```
+$$
+\text{ReLU}(z) = \max(0, z)
+$$
+
+$$
+\text{ReLU}'(z) = \begin{cases} 1 & \text{if } z > 0 \\ 0 & \text{if } z \le 0 \end{cases}
+$$
 
 Read that as: "output the larger of zero and z; send back a one if z was positive and a zero if it was not."
 
@@ -260,10 +267,9 @@ A mean shift of `-2` in the pre-activations kills almost the entire layer, and i
 
 Three fixes exist, and you will see all of them:
 
-```text
-LeakyReLU(z) = z          if z > 0
-             = alpha * z  if z <= 0     alpha = 0.01 by default
-```
+$$
+\text{LeakyReLU}(z) = \begin{cases} z & \text{if } z > 0 \\ \alpha z & \text{if } z \le 0 \quad (\alpha = 0.01 \text{ by default}) \end{cases}
+$$
 
 Leaky ReLU gives the negative side a small slope so the gradient is never exactly zero. `PReLU` makes `alpha` learnable per channel. `ELU` uses `alpha * (exp(z) - 1)` instead, which is smooth at zero and saturates at `-alpha` rather than diverging, at the cost of an exponential. Side by side, at the two things you actually pay for:
 
@@ -280,9 +286,9 @@ Leaky ReLU gives the negative side a small slope so the gradient is never exactl
 
 ## GELU
 
-```text
-GELU(z) = z * Phi(z)
-```
+$$
+\text{GELU}(z) = z \cdot \Phi(z)
+$$
 
 Read that as: "keep z, scaled by the probability that a standard normal draw lands below z."
 
@@ -302,9 +308,9 @@ It is a smooth ReLU, and the smoothness is the reason it displaced ReLU in trans
 
 `Phi` involves an `erf`, which is slow, so nearly every implementation uses the tanh approximation instead:
 
-```text
-GELU(z) ~= 0.5 * z * (1 + tanh( sqrt(2/pi) * (z + 0.044715 * z^3) ))
-```
+$$
+\text{GELU}(z) \approx \frac{z}{2} \left( 1 + \tanh\left( \sqrt{\frac{2}{\pi}} \left( z + 0.044715 z^3 \right) \right) \right)
+$$
 
 Read that as: "half of z, times one plus a tanh of a slightly cubically-warped version of z." The `z^3` term is what pushes the curve back onto the normal CDF at the ends.
 
@@ -334,9 +340,9 @@ GELU also dips below zero. Its minimum is `-0.16997` at `z = -0.75179`, so unlik
 
 ## SiLU
 
-```text
-SiLU(z) = z * sigmoid(z)
-```
+$$
+\text{SiLU}(z) = z \cdot \sigma(z)
+$$
 
 Read that as: "keep z, scaled by how open a logistic gate at z is."
 
@@ -455,9 +461,9 @@ At `z = 0` ReLU's derivative is undefined. PyTorch picks `0`. The choice never m
 
 A gated linear unit splits the input into two paths, applies a linear map to each, passes one through an activation, and multiplies them together element-wise:
 
-```text
-GLU(x, W, V) = (x W) * sigmoid(x V)
-```
+$$
+\text{GLU}(\mathbf{x}, \mathbf{W}, \mathbf{V}) = (\mathbf{x} \mathbf{W}) \odot \sigma(\mathbf{x} \mathbf{V})
+$$
 
 Read that as: "the value path `x W`, multiplied entry by entry by how open a gate is at the other path `x V`." The `*` is <Tip term="element-wise">A multiply between two arrays of the same shape that pairs up positions: output entry i is entry i of the first times entry i of the second. Nothing mixes across positions.</Tip> multiply, not a matrix product: entry `i` of the value path meets entry `i` of the gate path.
 
@@ -474,9 +480,9 @@ A plain sigmoid gate never closes. At a gate pre-activation of `-2` it still pas
 
 SwiGLU replaces the sigmoid gate with SiLU:
 
-```text
-SwiGLU(x, W, V, W2) = ( SiLU(x W) * (x V) ) W2
-```
+$$
+\text{SwiGLU}(\mathbf{x}, \mathbf{W}, \mathbf{V}, \mathbf{W}_2) = \big( \text{SiLU}(\mathbf{x} \mathbf{W}) \odot (\mathbf{x} \mathbf{V}) \big) \mathbf{W}_2
+$$
 
 Read that as: "put one projection through SiLU, multiply it entry by entry into the other projection, then project the result back down with `W2`."
 
