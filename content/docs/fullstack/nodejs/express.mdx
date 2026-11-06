@@ -1,0 +1,119 @@
+---
+title: Express
+description: Express 5 routing and middleware, middleware order, async error handling, validation with Zod, security middleware, project structure by feature, and a complete runnable API.
+---
+
+Express is a thin layer over Node's `http` module: a router plus a chain of middleware functions. Its small surface means most structure is a team's own choice, so this page also covers a structure that scales past a single file.
+
+---
+
+## The plain-language version
+
+Every request passes through a list of **middleware** functions in the order they were added. Each one can read or change `req` and `res`, end the response, or call `next()` to pass control on. **Routers** group routes. An **error-handling middleware** (four arguments) catches errors.
+
+| Word                                        | Plain meaning                                        |
+| :------------------------------------------ | :--------------------------------------------------- |
+| **middleware**                              | `(req, res, next) => ...` run in registration order. |
+| **router**                                  | Mini-app of routes mounted at a path.                |
+| **error middleware**                        | `(err, req, res, next) => ...`, registered last.     |
+| **`req.params` / `req.query` / `req.body`** | Path params / query string / parsed body.            |
+
+---
+
+## Express 5 basics
+
+```ts title="src/app.ts"
+import express from 'express';
+import helmet from 'helmet';
+import { pinoHttp } from 'pino-http';
+import { ordersRouter } from './orders/orders.routes';
+import { errorHandler } from './middleware/error-handler';
+
+export const app = express();
+
+app.use(helmet()); // security headers
+app.use(pinoHttp()); // request logging with req.log
+app.use(express.json({ limit: '100kb' })); // body parsing with a size limit
+app.use('/api/orders', ordersRouter);
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+app.use(errorHandler); // last
+```
+
+```ts title="src/server.ts"
+import { app } from './app';
+const server = app.listen(Number(process.env.PORT ?? 3000));
+```
+
+**Express 5** (current major) forwards rejected promises from async handlers to the error middleware automatically. In Express 4, an unawaited async error crashed the process or hung the request unless wrapped.
+
+---
+
+## Routes, validation, services
+
+```ts title="src/orders/orders.routes.ts"
+import { Router } from 'express';
+import { z } from 'zod';
+import { requireUser } from '../middleware/auth';
+import * as orders from './orders.service';
+
+const CreateOrder = z.object({ productId: z.number().int(), qty: z.number().int().min(1) });
+
+export const ordersRouter = Router();
+
+ordersRouter.post('/', requireUser, async (req, res) => {
+  const input = CreateOrder.parse(req.body); // ZodError -> 422 in errorHandler
+  const order = await orders.create(req.user.id, input);
+  res.status(201).location(`/api/orders/${order.id}`).json(order);
+});
+
+ordersRouter.get('/:id', requireUser, async (req, res) => {
+  const order = await orders.getForUser(req.user.id, req.params.id); // throws NotFound
+  res.json(order);
+});
+```
+
+The handler handles HTTP; `orders.service` holds business rules and has no `req` or `res`, so it is testable and reusable from jobs.
+
+---
+
+## Middleware order matters
+
+1. Request ID, logging
+2. Security headers (`helmet`), CORS
+3. Body parsers with limits
+4. Rate limiting (`express-rate-limit` with a Redis store)
+5. Authentication
+6. Routes
+7. 404 handler
+8. Error handler
+
+Auth registered after the routes it should protect does nothing for them.
+
+---
+
+## Project structure
+
+<Files>
+  <Folder name="src" defaultOpen>
+    <File name="app.ts" />
+    <File name="server.ts" />
+    <File name="env.ts" />
+    <Folder name="orders" defaultOpen>
+      <File name="orders.routes.ts" />
+      <File name="orders.service.ts" />
+      <File name="orders.repo.ts" />
+      <File name="orders.test.ts" />
+    </Folder>
+    <Folder name="users" />
+    <Folder name="middleware" />
+    <Folder name="lib" />
+  </Folder>
+</Files>
+
+Group by **feature** rather than by type (`controllers/`, `models/`, `services/`). Features stay self-contained and easy to delete or extract.
+
+<Callout type="warn">
+  `express.json()` without a limit, trusting `req.ip` without configuring `trust proxy` behind a
+  load balancer, and returning raw errors to clients are the three most common Express production
+  mistakes.
+</Callout>

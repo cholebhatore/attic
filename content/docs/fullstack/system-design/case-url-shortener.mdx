@@ -1,0 +1,81 @@
+---
+title: 'Case: URL Shortener'
+description: Designing a URL shortener - requirements, estimates, API, short code generation strategies, data model, redirect path with caching, click analytics, scaling, and abuse prevention.
+---
+
+A URL shortener looks trivial and still exercises most building blocks: ID generation, a read-heavy hot path, caching, asynchronous analytics, and abuse handling.
+
+---
+
+## Requirements and estimates
+
+- Create a short link for a long URL (optional custom alias, expiry).
+- Redirect `sho.rt/abc123` to the long URL quickly.
+- Click analytics per link.
+- Non-functional: redirects under ~50 ms at p99, highly available, links never collide.
+
+```text
+100 M new links/month ≈ 40 writes/s
+Read:write ≈ 100:1 → ~4,000 redirects/s average, ~10,000 peak
+5 years × 100 M × 12 ≈ 6 B links × ~500 bytes ≈ 3 TB
+Codes: base62, 7 chars → 62^7 ≈ 3.5 trillion, plenty for 6 B
+```
+
+---
+
+## API and data
+
+```text
+POST /api/links        { "url": "...", "alias?": "...", "expiresAt?": "..." } → 201 { "code": "abc123" }
+GET  /{code}           → 301 or 302 Location: long URL
+GET  /api/links/{code}/stats
+```
+
+```sql
+CREATE TABLE links (
+  code       text PRIMARY KEY,
+  long_url   text NOT NULL,
+  owner_id   bigint,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  expires_at timestamptz
+);
+```
+
+---
+
+## Generating codes
+
+| Approach                                   | Pros                        | Cons                                                                              |
+| :----------------------------------------- | :-------------------------- | :-------------------------------------------------------------------------------- |
+| Hash long URL (MD5 → first 7 base62 chars) | Same URL → same code        | Collisions need detection and retry; same URL from different users shares a code  |
+| Counter → base62                           | No collisions, short        | Sequential codes are guessable; central counter (use range allocation per server) |
+| Random 7 chars + unique constraint         | Simple, unguessable         | Retry on rare collision                                                           |
+| Pre-generated key pool                     | Fast, no runtime collisions | Extra service to manage                                                           |
+
+A common choice: random base62 with a unique constraint and retry, or per-server counter ranges encoded and shuffled.
+
+---
+
+## Redirect path
+
+<Mermaid
+  chart={`
+flowchart LR
+    U["Browser"] --> CDN["CDN / edge"] --> LB["Load balancer"] --> R["Redirect service"]
+    R --> C["Redis cache"]
+    R -. miss .-> DB["Links DB"]
+    R -- "click event" --> Q["Queue / log"] --> A["Analytics consumer"] --> W["Analytics store (ClickHouse)"]
+`}
+/>
+
+- **301** (permanent) lets browsers cache, cutting load but hiding repeat clicks from analytics; **302** counts every click. Most shorteners use 302 or 307.
+- Cache hot codes in Redis (and at the edge); links are immutable, so caching is easy. Cache negative lookups briefly.
+- Analytics never block the redirect: emit an event to a queue and aggregate asynchronously.
+
+---
+
+## Scaling and abuse
+
+- The links table shards cleanly by `code` (hash), since every lookup is by code.
+- Replicas and caches handle the read volume; writes are small.
+- Abuse: rate limit creation per user and IP, check URLs against malware and phishing lists (Google Safe Browsing), show interstitial warnings, allow reporting and takedown, block redirects to private IPs.

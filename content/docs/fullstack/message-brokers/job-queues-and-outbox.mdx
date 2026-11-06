@@ -1,0 +1,110 @@
+---
+title: Job Queues and the Outbox
+description: Background job libraries (BullMQ, Celery, RQ, arq, pg-boss), retries, scheduling and concurrency, durable workflow engines, the dual-write problem, the transactional outbox pattern, and change data capture.
+---
+
+An order handler commits the order to Postgres, then publishes `order.created` to the broker. The publish fails because of a network blip. The order exists, but billing and email never hear about it. Writing to two systems without a shared transaction is the **dual-write problem**, and the outbox pattern is the standard fix.
+
+---
+
+## Job queue libraries
+
+| Library                  | Language | Backend           | Notes                                                                                     |
+| :----------------------- | :------- | :---------------- | :---------------------------------------------------------------------------------------- |
+| BullMQ                   | Node     | Redis             | Retries, delays, priorities, repeatable jobs, rate limits, flows, dashboards (Bull Board) |
+| pg-boss, Graphile Worker | Node     | Postgres          | No extra infrastructure; transactional enqueue                                            |
+| Celery                   | Python   | RabbitMQ or Redis | Mature, feature-rich (beat scheduler, chords); heavier                                    |
+| RQ, Dramatiq, arq        | Python   | Redis             | Simpler; arq is asyncio-native                                                            |
+| Procrastinate            | Python   | Postgres          | Postgres-based, async                                                                     |
+| Sidekiq                  | Ruby     | Redis             | Reference design many others copy                                                         |
+
+<Tabs items={['BullMQ', 'Celery']}>
+<Tab value="BullMQ">
+
+```ts
+import { Queue, Worker } from 'bullmq';
+const connection = { url: process.env.REDIS_URL };
+
+export const emailQueue = new Queue('email', { connection });
+await emailQueue.add(
+  'order-confirmation',
+  { orderId: 981 },
+  {
+    attempts: 5,
+    backoff: { type: 'exponential', delay: 2000 },
+    jobId: `order-confirmation:981`, // dedupe
+  },
+);
+
+new Worker(
+  'email',
+  async (job) => {
+    await sendOrderConfirmation(job.data.orderId); // must be idempotent
+  },
+  { connection, concurrency: 10 },
+);
+```
+
+</Tab>
+<Tab value="Celery">
+
+```python
+from celery import Celery
+app = Celery("shop", broker="redis://localhost:6379/0")
+
+@app.task(bind=True, autoretry_for=(TimeoutError,), retry_backoff=True, max_retries=5, acks_late=True)
+def send_order_confirmation(self, order_id: int):
+    ...
+
+send_order_confirmation.delay(981)
+# worker: celery -A shop worker --concurrency=8 ; scheduler: celery -A shop beat
+```
+
+</Tab>
+</Tabs>
+
+**Durable workflow engines** (Temporal, Inngest, Trigger.dev, Restate, AWS Step Functions) handle multi-step processes that span hours or days (sign-up drip, order fulfilment) by persisting each step's result, so a crash resumes mid-workflow instead of restarting.
+
+---
+
+## The transactional outbox
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant API as Order service
+    participant DB as Database
+    participant R as Relay
+    participant B as Broker
+    API->>DB: BEGIN; INSERT order; INSERT outbox(event); COMMIT
+    loop every second, or via CDC
+        R->>DB: SELECT unsent outbox rows FOR UPDATE SKIP LOCKED
+        R->>B: publish events
+        R->>DB: mark sent
+    end
+`}
+/>
+
+```sql
+CREATE TABLE outbox (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  aggregate   text NOT NULL,          -- 'order'
+  event_type  text NOT NULL,          -- 'order.created'
+  payload     jsonb NOT NULL,
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  sent_at     timestamptz
+);
+```
+
+1. The business write and the event row commit in **one database transaction**: both happen or neither does.
+2. A relay process reads unsent rows, publishes them, and marks them sent.
+3. If the relay crashes after publishing but before marking, the event is published again: consumers must be [idempotent](/fullstack/message-brokers/delivery-semantics).
+
+**Change data capture** (Debezium reading the Postgres WAL) can replace the polling relay, streaming outbox inserts to Kafka with low latency.
+
+The mirror image on the consumer side is the **inbox**: record processed message IDs in the same transaction as the side effects.
+
+<Callout type="info">
+  If jobs are enqueued into a Postgres-backed queue (pg-boss, Graphile Worker, Procrastinate), the
+  enqueue can be part of the business transaction directly, which gives outbox semantics for free.
+</Callout>

@@ -1,0 +1,130 @@
+---
+title: Functions and Classes
+description: Defining functions, positional and keyword arguments, defaults, *args and **kwargs, lambdas, closures, decorators, classes, self, dataclasses, dunder methods, properties, and context managers.
+---
+
+FastAPI routes are decorated functions, Pydantic models are classes, and database sessions are context managers. These three features appear on almost every line of a Python web app.
+
+---
+
+## The plain-language version
+
+Functions accept positional and named (**keyword**) arguments. A **decorator** wraps a function to add behaviour, written `@decorator` above it. A **class** bundles data and methods; `self` is the instance, like `this` in JS but always explicit. A **context manager** (`with`) guarantees cleanup.
+
+| Word                       | Plain meaning                                                       |
+| :------------------------- | :------------------------------------------------------------------ |
+| **keyword argument**       | Passed by name: `connect(timeout=5)`.                               |
+| **`*args` / `**kwargs`\*\* | Collect extra positional / keyword arguments.                       |
+| **decorator**              | Function that takes a function and returns a wrapped one.           |
+| **dunder method**          | "Double underscore" hooks such as `__init__`, `__repr__`, `__eq__`. |
+| **dataclass**              | Class with generated `__init__`, `__repr__`, `__eq__`.              |
+| **context manager**        | Object used in `with` that sets up and tears down.                  |
+
+---
+
+## Functions
+
+```python
+def create_user(email: str, *, admin: bool = False, **extra) -> dict:
+    return {"email": email, "admin": admin, **extra}
+
+create_user("ada@example.com", admin=True, team="core")
+# '*' forces everything after it to be passed by keyword
+
+def total(*amounts: float) -> float:
+    return sum(amounts)
+total(1, 2, 3)                  # amounts == (1, 2, 3)
+
+key = lambda u: u["name"]       # small anonymous function
+sorted(users, key=key)
+```
+
+Closures work like JavaScript closures; assigning to an outer variable requires `nonlocal`.
+
+---
+
+## Decorators
+
+```python
+import functools, time
+
+def timed(fn):
+    @functools.wraps(fn)                    # keep name and docstring
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            print(f"{fn.__name__} took {time.perf_counter() - start:.3f}s")
+    return wrapper
+
+@timed
+def report(): ...
+# same as: report = timed(report)
+```
+
+`@app.get("/orders")` in FastAPI is a decorator that registers the function as a route.
+
+---
+
+## Classes
+
+```python
+class Account:
+    fee = 0.01                              # class attribute, shared
+
+    def __init__(self, owner: str, balance: int = 0):
+        self.owner = owner                  # instance attribute
+        self._balance = balance             # leading _ = "internal" by convention
+
+    def deposit(self, amount: int) -> None:
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        self._balance += amount
+
+    @property
+    def balance(self) -> int:               # read like an attribute
+        return self._balance
+
+    def __repr__(self) -> str:
+        return f"Account({self.owner!r}, {self._balance})"
+
+class SavingsAccount(Account):
+    def __init__(self, owner: str, rate: float):
+        super().__init__(owner)
+        self.rate = rate
+```
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass(frozen=True, slots=True)
+class Money:
+    amount: int                 # cents
+    currency: str = "INR"
+    tags: list[str] = field(default_factory=list)
+```
+
+---
+
+## Context managers
+
+```python
+with open("report.csv") as f:          # file closed even if an exception occurs
+    for line in f: ...
+
+from contextlib import contextmanager
+
+@contextmanager
+def transaction(conn):
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+```
+
+Async versions use `async with` (database sessions, HTTP clients). Generators (`yield`) produce values lazily and are how FastAPI dependencies with cleanup are written.
+
+Deeper coverage: [Classes and OOP](/ai/python/fundamentals/classes-and-oop) and [Functions and typing](/ai/python/fundamentals/functions-and-typing).

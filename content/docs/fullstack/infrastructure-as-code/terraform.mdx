@@ -1,0 +1,93 @@
+---
+title: Terraform
+description: Terraform and OpenTofu for application developers - HCL, providers and resources, the plan/apply cycle, state and remote backends with locking, variables and outputs, modules, data sources, importing existing resources, drift, CI workflow, and alternatives such as Pulumi and CDK.
+---
+
+An app needs a Postgres database, a Redis instance, a storage bucket, DNS records, and a deployment on a PaaS. Clicking through five consoles works once; Terraform files make the same setup repeatable for staging, production, and the next project, and every change goes through a pull request.
+
+---
+
+## The plain-language version
+
+Terraform reads `.tf` files describing resources, compares them with its **state** (what it created before) and the real world, shows a **plan** of changes, and **applies** it by calling provider APIs. **OpenTofu** is the open-source fork with the same language, created after Terraform's license change in 2023.
+
+| Word            | Plain meaning                                                     |
+| :-------------- | :---------------------------------------------------------------- |
+| **provider**    | Plugin for an API: AWS, Cloudflare, Vercel, GitHub, Neon, Render. |
+| **resource**    | Something Terraform creates and manages.                          |
+| **data source** | Something Terraform reads but does not manage.                    |
+| **state**       | Terraform's record mapping code to real resources.                |
+| **module**      | Reusable group of resources with inputs and outputs.              |
+
+---
+
+## A small configuration
+
+```hcl title="main.tf"
+terraform {
+  required_providers {
+    cloudflare = { source = "cloudflare/cloudflare", version = "~> 5.0" }
+    aws        = { source = "hashicorp/aws", version = "~> 6.0" }
+  }
+  backend "s3" {                       # remote state with locking
+    bucket       = "acme-tf-state"
+    key          = "shop/prod.tfstate"
+    region       = "ap-south-1"
+    use_lockfile = true
+  }
+}
+
+variable "env" { type = string }
+
+resource "aws_s3_bucket" "uploads" {
+  bucket = "acme-shop-uploads-${var.env}"
+}
+
+resource "cloudflare_dns_record" "api" {
+  zone_id = var.zone_id
+  name    = "api"
+  type    = "CNAME"
+  content = "shop-api.onrender.com"
+  proxied = true
+  ttl     = 1
+}
+
+output "uploads_bucket" { value = aws_s3_bucket.uploads.bucket }
+```
+
+```bash
+terraform init            # download providers, configure backend
+terraform fmt && terraform validate
+terraform plan -var env=prod -out plan.tfplan
+terraform apply plan.tfplan
+```
+
+Provider versions above are illustrative; check the registry for current major versions.
+
+---
+
+## State
+
+- State maps resource addresses (`aws_s3_bucket.uploads`) to real IDs and can contain secrets: store it remotely (S3, GCS, Terraform Cloud/HCP, Spacelift, env0), encrypted, with locking so two applies cannot run at once.
+- Never edit state by hand; use `terraform state mv`, `terraform import` (or `import` blocks), `moved` blocks for renames.
+- **Drift**: a manual console change shows up as a diff in the next plan. Run scheduled plans to detect it.
+
+---
+
+## Workflow
+
+1. Open a PR with `.tf` changes; CI runs `fmt`, `validate`, `tflint`, a security scan (Checkov, Trivy), and `plan`, posting the plan as a comment.
+2. Review the plan, especially any `destroy` or `replace` (a renamed database can mean a deleted database). Use `prevent_destroy` lifecycle rules for stateful resources.
+3. Merge; CI applies with short-lived cloud credentials via OIDC ([GitHub Actions](/fullstack/git-and-github/github-actions)).
+
+---
+
+## Alternatives
+
+| Tool                     | Language                   | Notes                                    |
+| :----------------------- | :------------------------- | :--------------------------------------- |
+| OpenTofu                 | HCL                        | Drop-in Terraform fork, open governance  |
+| Pulumi                   | TypeScript, Python, Go, C# | Real programming languages, loops, tests |
+| AWS CDK / CloudFormation | TS, Python / YAML          | AWS-only                                 |
+| SST                      | TypeScript                 | App-centric, built on Pulumi             |
+| Crossplane               | Kubernetes YAML            | Infrastructure as Kubernetes resources   |

@@ -1,0 +1,300 @@
+---
+title: Streams and Workers
+description: Processing large data and heavy computation in Node.js - Buffers and encodings, the four stream types, readable modes (flowing vs paused), highWaterMark and internal buffers, backpressure end to end with a worked example, pipeline and error handling, Transform streams, object mode, async iteration, Web Streams interop; then worker_threads, message passing and transfer, SharedArrayBuffer and Atomics, worker pools, child processes, and using every core with cluster or replicas.
+---
+
+An endpoint serves a 2 GB export with `fs.readFile`, and memory climbs by 2 GB per concurrent download until the container is killed. A CSV import transforms 5 million rows in one synchronous loop, freezing the API for 40 seconds. Streams fix the first problem by processing data piece by piece with bounded memory; worker threads fix the second by moving computation off the event loop.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after [Runtime and Event Loop](/fullstack/nodejs/runtime-and-event-loop). Streams handle **large data**; workers handle **heavy computation**.
+
+A **stream** moves data in chunks, like water through a pipe, so a 2 GB file never sits in memory at once. **Backpressure** is the pipe's valve: when the consumer is slower than the producer, the producer pauses instead of piling data into memory. A **worker thread** is a second JavaScript thread with its own event loop and memory, for CPU work that would otherwise freeze the main one.
+
+Topics, in order:
+
+1. Buffers and encodings
+2. Stream types
+3. Readable modes and internal buffers
+4. Backpressure
+5. pipeline and error handling
+6. Transform streams and object mode
+7. Async iteration and Web Streams
+8. Worker threads
+9. Shared memory and Atomics
+10. Worker pools
+11. Child processes
+12. Using every core
+
+| Word              | Plain meaning                                                                                                    |
+| :---------------- | :--------------------------------------------------------------------------------------------------------------- |
+| **Buffer**        | Fixed-length sequence of raw bytes, allocated outside the V8 heap.                                               |
+| **chunk**         | One piece of data moving through a stream.                                                                       |
+| **highWaterMark** | Buffer size at which a stream signals it is full (16 KB for byte streams, 16 objects in object mode by default). |
+| **flowing mode**  | Readable pushes data to consumers automatically.                                                                 |
+| **paused mode**   | Consumer pulls data with `read()`.                                                                               |
+| **transferable**  | Object whose memory can be moved to another thread without copying.                                              |
+| **Atomics**       | Operations on shared memory that are safe across threads.                                                        |
+
+---
+
+## Buffers and encodings
+
+```js
+const buf = Buffer.from('héllo', 'utf8'); // <Buffer 68 c3 a9 6c 6c 6f>
+buf.length; // 6 bytes (é is 2 bytes in UTF-8)
+buf.toString('base64'); // 'aMOpbGxv'
+buf.toString('hex'); // '68c3a96c6c6f'
+Buffer.alloc(1024); // zero-filled
+Buffer.allocUnsafe(1024); // uninitialised memory: faster, must be overwritten
+```
+
+- `Buffer` is a subclass of `Uint8Array`; Web APIs accept it.
+- Splitting a UTF-8 byte stream at arbitrary chunk boundaries can cut a multi-byte character in half; decode with `StringDecoder` or `TextDecoder` with `{ stream: true }`, or call `readable.setEncoding('utf8')`, which handles partial characters.
+- Never `allocUnsafe` and send without overwriting: it can leak previous memory contents.
+
+---
+
+## Stream types
+
+| Type      | Direction                                  | Examples                                                                                        |
+| :-------- | :----------------------------------------- | :---------------------------------------------------------------------------------------------- |
+| Readable  | Source                                     | `fs.createReadStream`, HTTP request (server side), HTTP response (client side), `process.stdin` |
+| Writable  | Sink                                       | `fs.createWriteStream`, HTTP response (server side), `process.stdout`                           |
+| Duplex    | Both, independent                          | TCP socket, WebSocket                                                                           |
+| Transform | Duplex where output is computed from input | `zlib.createGzip()`, `crypto.createHash`, CSV parsers                                           |
+
+Streams are `EventEmitter`s: `data`, `end`, `error`, `close` on readables; `drain`, `finish`, `error`, `close` on writables.
+
+---
+
+## Readable modes and internal buffers
+
+A readable keeps an internal buffer. The underlying source (file, socket) fills it up to `highWaterMark`; consumers drain it.
+
+| Mode             | How data moves                                       | Entered by                                                         |
+| :--------------- | :--------------------------------------------------- | :----------------------------------------------------------------- |
+| Paused (default) | Consumer calls `read()`                              | `readable.pause()`, or not attaching a consumer                    |
+| Flowing          | Data emitted via `data` events as fast as it arrives | Attaching a `data` listener, `pipe()`, `resume()`, async iteration |
+
+Attaching a `data` listener without handling backpressure on the consuming side means data flows as fast as the source can produce it, regardless of whether anything can keep up.
+
+---
+
+## Backpressure
+
+Writable `write(chunk)` returns `false` once its internal buffer exceeds `highWaterMark`. The producer must stop and wait for `drain`. Ignoring the return value means the writable keeps buffering everything in memory.
+
+Worked example: reading a file from fast NVMe at about 2 GB/s and sending it to a client on a 10 Mbit/s connection (about 1.25 MB/s).
+
+| Approach                                                           | Memory after 10 s for one download                                          |
+| :----------------------------------------------------------------- | :-------------------------------------------------------------------------- |
+| `readFile` then `res.end(data)`                                    | Entire file (2 GB)                                                          |
+| `data` listener writing to `res` ignoring `write()`'s return value | ~2 GB buffered (the source outruns the socket by ~1,600x)                   |
+| `pipeline(readStream, res)`                                        | About `highWaterMark` of each stream plus socket buffers: tens of kilobytes |
+
+```js
+// Manual backpressure, to understand what pipeline does
+async function copy(readable, writable) {
+  for await (const chunk of readable) {
+    if (!writable.write(chunk)) {
+      await new Promise((resolve) => writable.once('drain', resolve)); // wait until buffer empties
+    }
+  }
+  writable.end();
+}
+```
+
+Backpressure propagates end to end: when the client's TCP receive window is full, the socket stops accepting, the HTTP response's buffer fills, `write` returns false, the file stream pauses, and disk reads stop. This is the same flow-control idea as TCP's window ([TCP](/fullstack/web-fundamentals/tcp-udp-quic)) and queue backpressure in distributed systems ([Traffic Control](/fullstack/building-for-scale/traffic-control)).
+
+---
+
+## pipeline and error handling
+
+```js
+import { createReadStream, createWriteStream } from 'node:fs';
+import { createGzip } from 'node:zlib';
+import { pipeline } from 'node:stream/promises';
+
+await pipeline(createReadStream('access.log'), createGzip(), createWriteStream('access.log.gz'));
+```
+
+`pipeline`:
+
+- Connects streams with backpressure.
+- If any stream errors, **destroys all of them** and rejects, closing file descriptors and sockets.
+- Supports async generator functions as transform steps.
+- Accepts an `AbortSignal` (`pipeline(a, b, c, { signal })`).
+
+Legacy `a.pipe(b)` does **not** forward errors or destroy the other streams; an error in the source leaves the destination open (leaking file handles, hanging HTTP responses). Use `pipeline` or `stream.finished` instead.
+
+In an HTTP handler, a client disconnecting destroys the response stream; `pipeline` then destroys the source too, stopping work for a client that has gone.
+
+---
+
+## Transform streams and object mode
+
+```js
+import { Transform } from 'node:stream';
+
+const toUpper = new Transform({
+  transform(chunk, encoding, callback) {
+    callback(null, chunk.toString().toUpperCase());
+  },
+});
+
+// Async generators are simpler transforms inside pipeline
+await pipeline(
+  createReadStream('orders.ndjson'),
+  splitLines, // e.g. from a small helper
+  async function* (lines) {
+    for await (const line of lines) {
+      const order = JSON.parse(line);
+      if (order.total > 10_000) yield JSON.stringify(order) + '\n';
+    }
+  },
+  createWriteStream('large-orders.ndjson'),
+);
+```
+
+**Object mode** streams carry JavaScript values instead of bytes (`{ objectMode: true }`), with `highWaterMark` counted in objects. Database drivers stream query results as object-mode readables (`pg-query-stream`, Prisma cursors, Mongo cursors), which lets an export of millions of rows run in constant memory.
+
+---
+
+## Async iteration and Web Streams
+
+Readables are async iterables; `for await` reads chunks with built-in backpressure (the next chunk is read only when the loop body finishes).
+
+Node also implements **Web Streams** (`ReadableStream`, `WritableStream`, `TransformStream`), the API used by `fetch`, edge runtimes, and browsers:
+
+```js
+import { Readable } from 'node:stream';
+const webStream = Readable.toWeb(createReadStream('big.csv')); // Node -> Web
+const nodeStream = Readable.fromWeb((await fetch(url)).body); // Web -> Node
+```
+
+Code meant to run on both Node and edge runtimes should use Web Streams; Node streams remain common in the Node ecosystem and have slightly better performance there.
+
+---
+
+## Worker threads
+
+```js title="resize-worker.js"
+import { parentPort } from 'node:worker_threads';
+import sharp from 'sharp';
+
+parentPort.on('message', async ({ id, input }) => {
+  const output = await sharp(input).resize(800).webp().toBuffer();
+  parentPort.postMessage({ id, output }, [output.buffer]); // transfer, do not copy
+});
+```
+
+```js title="main.js"
+import { Worker } from 'node:worker_threads';
+const worker = new Worker(new URL('./resize-worker.js', import.meta.url));
+```
+
+Properties:
+
+- Each worker has its **own V8 isolate, heap, and event loop**; no shared JavaScript objects.
+- Communication via `postMessage` uses the **structured clone** algorithm: data is copied (cost proportional to size) unless the underlying `ArrayBuffer` is listed as **transferable**, which moves ownership with no copy (the sender can no longer use it).
+- Startup costs tens of milliseconds and some megabytes of memory per worker, so creating a worker per request is wasteful; use a pool.
+- Workers help **CPU-bound** JavaScript. They do not speed up I/O, which the main event loop already handles concurrently.
+
+---
+
+## Shared memory and Atomics
+
+```js
+const shared = new SharedArrayBuffer(4 * 1024);
+const counters = new Int32Array(shared);
+worker.postMessage({ shared }); // both threads see the same memory
+
+// in any thread
+Atomics.add(counters, 0, 1); // atomic increment, no lost updates
+Atomics.wait(counters, 1, 0); // block (workers only) until value changes
+Atomics.notify(counters, 1, 1); // wake one waiter
+```
+
+`SharedArrayBuffer` gives true shared memory with the data races that come with it; `Atomics` provides atomic operations and wait/notify primitives. Useful for high-throughput pipelines, ring buffers, and progress counters; most application code is better served by message passing.
+
+---
+
+## Worker pools
+
+```js
+import Piscina from 'piscina';
+const pool = new Piscina({
+  filename: new URL('./resize-worker-task.js', import.meta.url).href,
+  maxThreads: Math.max(1, os.availableParallelism() - 1), // leave a core for the event loop
+  maxQueue: 1000, // bound the queue: backpressure
+});
+
+app.post('/images', async (req, res) => {
+  const output = await pool.run(await readBody(req));
+  res.type('image/webp').send(output);
+});
+```
+
+Size the pool to available cores (not more: CPU-bound threads beyond the core count only add context switching), bound the queue, and reject or shed load when it is full. Libraries: Piscina, Tinypool (used by Vitest), `workerpool`.
+
+---
+
+## Child processes
+
+| API                   | Use                                                                    |
+| :-------------------- | :--------------------------------------------------------------------- |
+| `execFile(cmd, args)` | Run a program with arguments, buffered output (no shell)               |
+| `spawn(cmd, args)`    | Stream stdin/stdout of a long-running program (ffmpeg, Python scripts) |
+| `exec(command)`       | Run through a shell: **command injection risk** with user input        |
+| `fork(module)`        | Another Node process with an IPC channel                               |
+
+Child processes isolate crashes and memory (a separate process can be killed and restarted) and run non-JavaScript tools. Pass user input as **argument arrays**, never interpolated into shell strings.
+
+---
+
+## Using every core
+
+A Node process runs JavaScript on one core. To use a multi-core machine:
+
+| Option                         | How                                                                                                          | Notes                              |
+| :----------------------------- | :----------------------------------------------------------------------------------------------------------- | :--------------------------------- |
+| `node:cluster`                 | Primary process forks N workers that share the listening port (round-robin distribution on Linux by default) | One process per core on a VM       |
+| PM2 cluster mode               | Process manager using cluster, with restarts and zero-downtime reloads                                       | Common on VPS deployments          |
+| Multiple containers / replicas | One process per container; the orchestrator and load balancer distribute traffic                             | Preferred on Kubernetes, ECS, PaaS |
+| Worker threads                 | Parallel CPU work inside one process                                                                         | Complementary to the above         |
+
+In every multi-process setup, in-memory state (sessions, caches, rate-limit counters, WebSocket room membership) is per process. Shared state belongs in Redis or the database ([Sessions](/fullstack/auth/sessions)).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is backpressure in Node.js streams?">
+    The mechanism that slows a fast producer when a consumer cannot keep up: write() returns false
+    when the writable's buffer exceeds highWaterMark, and the producer waits for drain. pipeline and
+    async iteration handle it automatically; ignoring it buffers unbounded data in memory.
+  </Accordion>
+  <Accordion title="Why use pipeline instead of pipe?">
+    pipeline propagates errors, destroys all streams on failure or abort, and returns a promise.
+    pipe does not forward errors or clean up, leaking file descriptors and leaving responses
+    hanging.
+  </Accordion>
+  <Accordion title="When should worker threads be used?">
+    For CPU-bound JavaScript (image processing, parsing, compression, heavy computation) that would
+    block the event loop. Not for I/O, which the event loop already handles concurrently. Use a pool
+    sized to cores rather than a worker per task.
+  </Accordion>
+  <Accordion title="How do worker threads share data?">
+    By message passing with structured cloning (copied), transferring ArrayBuffers (moved without
+    copying), or SharedArrayBuffer with Atomics for genuinely shared memory.
+  </Accordion>
+  <Accordion title="How does a Node.js app use all CPU cores?">
+    Run several processes: cluster or PM2 on a VM, or multiple container replicas behind a load
+    balancer, keeping shared state in external stores; use worker threads for parallel CPU work
+    within a process.
+  </Accordion>
+</Accordions>

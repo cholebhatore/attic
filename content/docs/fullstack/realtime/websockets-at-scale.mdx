@@ -1,0 +1,81 @@
+---
+title: WebSockets at Scale
+description: Stateful connections and load balancing, connection limits and memory, fan-out across servers with a Redis or NATS backplane, rooms and presence, reconnection with backoff and resume, heartbeats, authentication, backpressure, deploys, and managed real-time services.
+---
+
+A chat app works perfectly on one server. Adding a second server splits users: those on server A never see messages sent by users on server B. Unlike HTTP requests, WebSocket connections are long-lived state pinned to one process, and every scaling decision follows from that.
+
+---
+
+## The plain-language version
+
+Each connected client is a phone line held open to one specific server. To reach a user, a message must get to the server holding their line. A **backplane** (pub/sub) lets every server hear every message and forward it to its own connections.
+
+| Word               | Plain meaning                                             |
+| :----------------- | :-------------------------------------------------------- |
+| **backplane**      | Shared pub/sub connecting all real-time servers.          |
+| **room / channel** | Group of connections receiving the same messages.         |
+| **heartbeat**      | Periodic ping to detect dead connections.                 |
+| **presence**       | Tracking who is connected or active.                      |
+| **resume**         | Reconnecting and receiving messages missed while offline. |
+
+---
+
+## Fan-out across servers
+
+<Mermaid
+  chart={`
+flowchart LR
+    U1["User on A"] --> A["WS server A"]
+    U2["User on B"] --> B["WS server B"]
+    A -- "publish room:42" --> R["Redis / NATS pub/sub"]
+    R -- "room:42" --> A
+    R -- "room:42" --> B
+    B --> U2
+`}
+/>
+
+```ts
+import { Server } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
+
+const io = new Server(httpServer, {
+  cors: { origin: 'https://app.example.com', credentials: true },
+});
+io.adapter(createAdapter(pubClient, subClient)); // Redis backplane
+
+io.use(async (socket, next) => {
+  // authenticate during the handshake
+  const user = await verifySession(socket.handshake.headers.cookie);
+  user ? ((socket.data.user = user), next()) : next(new Error('unauthorized'));
+});
+
+io.on('connection', (socket) => {
+  socket.on('join', (room) => canJoin(socket.data.user, room) && socket.join(room));
+  socket.on('message', ({ room, text }) =>
+    io.to(room).emit('message', { from: socket.data.user.name, text }),
+  );
+});
+```
+
+---
+
+## Operational concerns
+
+| Concern             | Practice                                                                                                                       |
+| :------------------ | :----------------------------------------------------------------------------------------------------------------------------- |
+| Load balancing      | LB must support WebSocket upgrades and long idle timeouts; sticky sessions only if the library's fallback transports need them |
+| Connection capacity | Each connection costs memory and a file descriptor; raise `ulimit -n`; measure per-connection memory                           |
+| Heartbeats          | Ping every 20–30 s; close connections that miss pongs; proxies drop idle connections                                           |
+| Reconnection        | Exponential backoff with jitter; after a deploy, thousands reconnecting at once is a self-inflicted DDoS                       |
+| Missed messages     | Give messages IDs; on reconnect, client sends last ID; server replays from a store (Redis Streams, DB)                         |
+| Auth                | Authenticate at handshake (cookie or short-lived token), re-check permissions per room; tokens in query strings end up in logs |
+| Backpressure        | Track `bufferedAmount`; drop or coalesce updates for slow clients instead of buffering forever                                 |
+| Deploys             | Drain: stop accepting, tell clients to reconnect elsewhere, close gradually                                                    |
+| Presence            | Sorted set of user → last-seen timestamp, expire stale entries; publish join/leave events                                      |
+
+---
+
+## Managed services
+
+When real-time is a feature rather than the product, a managed service removes the connection-scaling work: Pusher, Ably, PubNub, Supabase Realtime, Liveblocks (collaboration), Cloudflare Durable Objects (one stateful object per room at the edge), AWS API Gateway WebSockets, Azure Web PubSub, and Centrifugo (self-hosted). The app server publishes events over HTTP; the service holds the connections.

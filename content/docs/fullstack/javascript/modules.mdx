@@ -1,0 +1,284 @@
+---
+title: Modules
+description: Why modules exist, ES modules in depth (static structure, the three loading phases, live bindings, singletons and evaluation order, circular dependencies, top-level await, dynamic import, import.meta, import maps and attributes), CommonJS (require, module caching, exports semantics), interoperability between ESM and CommonJS in Node.js, dual packages and the exports field, and module resolution.
+---
+
+A circular import makes a value `undefined` at startup, but only in production builds. Updating an exported variable in one module shows the new value in another for ESM, but not for CommonJS. A package works with `require` and fails with `import`, or the reverse. Bundlers, Node.js, browsers, and TypeScript all resolve modules, and they follow the same underlying rules that this page explains.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after the execution model. How bundlers process modules is covered in [Module Bundlers](/fullstack/tooling/module-bundlers).
+
+A module is a file with its own private scope that explicitly **exports** some values and **imports** others. JavaScript has two module systems: **ES modules** (ESM, the standard, used by browsers and modern Node) and **CommonJS** (CJS, Node's original system). ESM imports are declared up front and linked before any code runs, like a building's wiring installed before anyone moves in; CJS `require` is an ordinary function call that loads a file when execution reaches it.
+
+Topics, in order:
+
+1. Why modules
+2. ES modules: syntax and static structure
+3. Loading phases: construction, linking, evaluation
+4. Live bindings and singletons
+5. Circular dependencies
+6. Top-level await and dynamic import
+7. import.meta, import maps, import attributes
+8. CommonJS
+9. ESM and CommonJS interop in Node.js
+10. Packages: exports, dual packages, resolution
+
+| Word                 | Plain meaning                                                                 |
+| :------------------- | :---------------------------------------------------------------------------- |
+| **module specifier** | The string in an import: `'./utils.js'`, `'react'`, `'node:fs'`.              |
+| **module graph**     | All modules and their import edges, starting from an entry point.             |
+| **live binding**     | An import that reflects the current value of the exporting module's variable. |
+| **module record**    | The engine's parsed representation of one module.                             |
+| **dual package**     | A package shipping both ESM and CommonJS builds.                              |
+| **bare specifier**   | An import of a package name rather than a path (`'lodash'`).                  |
+
+---
+
+## Why modules
+
+Before modules, scripts shared one global scope: every top-level variable from every `<script>` collided with every other, dependency order was the order of script tags, and libraries used IIFEs and globals (`window.$`) to avoid clashes. Modules give each file its own scope, explicit dependencies, and a graph that tools can analyse (for tree shaking, code splitting, and type checking).
+
+---
+
+## ES modules: syntax and static structure
+
+```js
+// math.js
+export const PI = 3.14159;
+export function area(r) {
+  return PI * r * r;
+}
+export default class Circle {
+  /* ... */
+}
+
+// app.js
+import Circle, { area, PI as pi } from './math.js';
+import * as math from './math.js'; // namespace object
+export { area } from './math.js'; // re-export
+export * from './geometry.js';
+```
+
+Rules that make ESM **static**:
+
+- `import` and `export` appear only at the top level, with string-literal specifiers.
+- The full set of imports and exports is known by **parsing**, without running code.
+- Imported bindings are read-only in the importing module.
+- Modules are always in strict mode, have their own top-level scope, and `this` at the top level is `undefined`.
+
+Static structure enables tree shaking, early errors ("export not found" before any code runs), and parallel fetching of the whole graph.
+
+In browsers, modules load with `<script type="module">` (deferred by default), require full relative or absolute URLs (`./math.js`, not `./math`), and are fetched with CORS.
+
+---
+
+## Loading phases
+
+<Mermaid
+  chart={`
+flowchart LR
+    C["1. Construction: fetch and parse every module in the graph, create module records"] --> L["2. Linking (instantiation): create bindings for all exports, wire imports to them (no code runs)"] --> E["3. Evaluation: run module bodies, dependencies first (post-order), each exactly once"]
+`}
+/>
+
+1. **Construction**: starting from the entry, find each module, fetch it, parse it, discover its imports, and repeat. Browsers fetch the whole graph in parallel; this is why deep import chains without bundling cause waterfalls (each level is discovered only after the parent is parsed), and why `modulepreload` exists.
+2. **Linking**: allocate memory for every exported binding and point every import at the exporter's binding. Missing exports fail here, before anything executes.
+3. **Evaluation**: execute module bodies depth-first, dependencies before dependents. Each module is evaluated **once**, no matter how many modules import it.
+
+---
+
+## Live bindings and singletons
+
+ESM imports are **live views** of the exporter's variables, not copies:
+
+```js
+// counter.js
+export let count = 0;
+export function increment() {
+  count++;
+}
+
+// app.js
+import { count, increment } from './counter.js';
+increment();
+console.log(count); // 1: the import reflects the updated binding
+count = 5; // TypeError: assignment to an imported binding
+```
+
+Because each module evaluates once per graph, module-level state is a **singleton** within that graph: a database pool or cache created at module top level is shared by every importer. Caveats:
+
+- Two copies of a package in `node_modules` (different versions) are two different modules, so "singletons" duplicate, a common cause of "invalid hook call" errors when two Reacts are bundled.
+- In serverless and edge platforms, module scope lives as long as the instance, not forever.
+- Hot module replacement and test runners may re-evaluate modules.
+
+---
+
+## Circular dependencies
+
+ESM supports cycles because linking creates bindings before evaluation. But during evaluation, one module in the cycle runs first, and bindings from modules not yet evaluated are still in the **TDZ** or `undefined`:
+
+```js
+// a.js
+import { b } from './b.js';
+export const a = 'A';
+console.log('a sees', b);
+
+// b.js
+import { a } from './a.js';
+export const b = 'B';
+console.log('b sees', a); // ReferenceError if b.js evaluates first and reads a (TDZ)
+```
+
+Accessing the import later (inside a function called after startup) works; accessing it at module top level during the cycle fails. Cycles commonly appear through barrel files (`index.ts` re-exporting everything) and are a frequent cause of bugs that appear only with certain bundler orderings. Tools like `madge` or `dpdm` detect them; the fix is usually extracting the shared piece into a third module.
+
+---
+
+## Top-level await and dynamic import
+
+```js
+// config.js: top-level await (ESM only)
+const res = await fetch('/config.json');
+export const config = await res.json();
+```
+
+A module with top-level `await` pauses evaluation of itself **and every module that depends on it** until the promise settles; sibling branches of the graph continue. Useful for configuration and conditional dependencies; harmful if it puts a slow network request on the startup path of the whole app.
+
+```js
+// dynamic import: works in ESM and CommonJS, at any point, with computed specifiers
+const { Chart } = await import('./chart.js');
+const locale = await import(`./locales/${lang}.js`);
+```
+
+`import()` returns a promise for the module namespace. Bundlers turn each dynamic import into a separate chunk ([code splitting](/fullstack/optimization/javascript-and-bundles)).
+
+---
+
+## import.meta, import maps, import attributes
+
+```js
+import.meta.url; // URL of the current module
+new URL('./data.json', import.meta.url); // resolve files relative to this module
+(import.meta.dirname, import.meta.filename); // Node.js equivalents of __dirname / __filename
+import.meta.env; // bundler-injected (Vite), not standard
+```
+
+**Import maps** let browsers resolve bare specifiers without a bundler:
+
+```html
+<script type="importmap">
+  { "imports": { "react": "https://esm.sh/react@19", "app/": "/js/app/" } }
+</script>
+```
+
+**Import attributes** declare the type of non-JavaScript modules:
+
+```js
+import data from './data.json' with { type: 'json' };
+```
+
+---
+
+## CommonJS
+
+```js
+// math.cjs
+const PI = 3.14159;
+function area(r) {
+  return PI * r * r;
+}
+module.exports = { PI, area }; // or exports.area = area
+
+// app.cjs
+const { area } = require('./math.cjs');
+```
+
+How it works: Node wraps each file in a function `(function (exports, require, module, __filename, __dirname) { ... })` and runs it on `require`. Properties:
+
+| Property            | CommonJS                                          | ES modules                                   |
+| :------------------ | :------------------------------------------------ | :------------------------------------------- |
+| Loading             | Synchronous, at the `require` call                | Asynchronous graph, linked before evaluation |
+| Structure           | Dynamic: `require` anywhere, computed paths       | Static top-level declarations                |
+| Exports             | A value (`module.exports`) copied at require time | Live bindings                                |
+| Caching             | `require.cache` by resolved filename              | Module map per realm                         |
+| Cycles              | Returns the **partially filled** `module.exports` | Bindings in TDZ until evaluated              |
+| Top-level await     | No                                                | Yes                                          |
+| `this` at top level | `module.exports`                                  | `undefined`                                  |
+| Tree shaking        | Poor                                              | Good                                         |
+
+`exports = { ... }` (reassigning the shorthand) does nothing: it rebinds a local variable; only `module.exports = ...` replaces the export.
+
+---
+
+## ESM and CommonJS interop in Node.js
+
+Node decides a file's format by extension and the nearest `package.json`:
+
+| File                                          | Treated as |
+| :-------------------------------------------- | :--------- |
+| `.mjs`                                        | ESM        |
+| `.cjs`                                        | CommonJS   |
+| `.js` with `"type": "module"` in package.json | ESM        |
+| `.js` otherwise                               | CommonJS   |
+
+Interop rules:
+
+- ESM can `import` CommonJS: `module.exports` becomes the default export; named exports are detected by static analysis where possible.
+- CommonJS can load ESM with `await import()`, and recent Node versions also allow synchronous `require()` of ES modules that do not use top-level await, which removes most of the historic pain.
+- ESM has no `require`, `__dirname`, or `__filename`; use `import.meta.dirname`, `import.meta.filename`, or `createRequire(import.meta.url)`.
+- The **dual package hazard**: if a package ships both formats and an app loads it once via `import` and once via `require`, two separate instances exist (two copies of module state).
+
+---
+
+## Packages: exports, dual packages, resolution
+
+```json title="package.json"
+{
+  "name": "@acme/utils",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./dates": "./dist/dates.js",
+    "./package.json": "./package.json"
+  },
+  "sideEffects": false
+}
+```
+
+- `exports` defines the package's public entry points; anything not listed cannot be imported (deep imports like `@acme/utils/dist/internal.js` fail), making internals truly private.
+- **Conditions** (`import`, `require`, `types`, `browser`, `node`, `development`, `react-server`) select files per environment; order matters (first match wins).
+- `sideEffects: false` tells bundlers unused modules can be dropped.
+
+**Resolution** of `import x from 'pkg'` in Node: look in `./node_modules/pkg`, then parent directories' `node_modules` up to the root; read its `package.json` `exports` (or legacy `main`). Relative specifiers in ESM must include file extensions; bundlers and TypeScript's `moduleResolution: "bundler"` relax this. TypeScript's `"module": "NodeNext"` mirrors Node's rules exactly.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What are the key differences between ES modules and CommonJS?">
+    ESM is static (imports known at parse time), loads asynchronously in phases, exports live
+    bindings, supports top-level await, and enables tree shaking. CommonJS loads synchronously when
+    require runs, exports a value copied at require time, and is dynamic, which limits static
+    analysis.
+  </Accordion>
+  <Accordion title="What is a live binding?">
+    An imported name that refers to the exporting module's variable itself, so later changes in the
+    exporter are visible to importers. Importers cannot assign to it.
+  </Accordion>
+  <Accordion title="How do circular imports fail?">
+    In ESM, the module evaluated first sees bindings from not-yet-evaluated modules in their TDZ,
+    throwing or reading undefined if accessed at top level. In CommonJS, it receives a partially
+    filled exports object.
+  </Accordion>
+  <Accordion title="What does the exports field in package.json do?">
+    Declares a package's public entry points and environment-specific files (import vs require,
+    types, browser, node). Anything not listed cannot be imported, encapsulating internals.
+  </Accordion>
+</Accordions>

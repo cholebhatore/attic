@@ -1,0 +1,72 @@
+---
+title: 'Case: Chat and News Feed'
+description: Designing a chat system (connections, message flow, ordering, storage, delivery receipts, offline push, presence) and a news feed (fan-out on write vs read, the celebrity problem, ranking, caching, pagination).
+---
+
+Chat and feeds are the two classic "many users, many updates" designs. Chat optimises for low-latency delivery to a few recipients; feeds optimise for assembling content from many sources for each reader.
+
+---
+
+## Chat
+
+### Requirements
+
+One-to-one and group messages, online delivery under a few hundred milliseconds, offline delivery via push, message history, delivery and read receipts, presence. Scale assumption: 50 M daily users, about 40 messages each per day ≈ 2 B messages/day ≈ 23,000 messages/s average.
+
+### Flow
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant A as Sender
+    participant G as WS gateway (A's server)
+    participant M as Message service
+    participant DB as Message store
+    participant B as Pub/sub
+    participant G2 as WS gateway (recipient's server)
+    participant P as Push service
+    A->>G: send(convId, clientMsgId, text)
+    G->>M: persist
+    M->>DB: insert (convId, seq, ...)
+    M-->>G: ack(serverMsgId, seq)
+    G-->>A: delivered to server
+    M->>B: publish to recipients
+    B->>G2: deliver if online
+    M->>P: push notification if offline
+`}
+/>
+
+| Concern               | Design                                                                                                                         |
+| :-------------------- | :----------------------------------------------------------------------------------------------------------------------------- |
+| Connections           | WebSocket gateways; a registry (Redis) maps user → gateway; see [WebSockets at scale](/fullstack/realtime/websockets-at-scale) |
+| Ordering              | Per-conversation sequence number assigned by the message service; clients order by it                                          |
+| Idempotency           | Client-generated message ID so retries do not duplicate                                                                        |
+| Storage               | Partition by conversation ID, cluster by sequence; wide-column stores (Cassandra/ScyllaDB) or sharded Postgres                 |
+| Sync after offline    | Client sends last seen sequence per conversation; server returns the gap                                                       |
+| Receipts              | Small events updating per-recipient "delivered up to" and "read up to" sequence                                                |
+| Groups                | Small groups: fan out per member; very large channels: recipients pull                                                         |
+| Presence              | Heartbeats with TTL keys; publish changes only to interested users, throttled                                                  |
+| End-to-end encryption | Signal protocol; server stores ciphertext only (limits search and moderation)                                                  |
+
+---
+
+## News feed
+
+### Fan-out on write vs read
+
+|                    | Fan-out on write (push)                              | Fan-out on read (pull)                         |
+| :----------------- | :--------------------------------------------------- | :--------------------------------------------- |
+| On post            | Insert post ID into every follower's feed list       | Store post once                                |
+| On read            | Read precomputed list: fast                          | Gather from all followed accounts, merge: slow |
+| Costs              | Heavy writes for accounts with millions of followers | Heavy reads                                    |
+| Inactive followers | Wasted work                                          | No cost                                        |
+
+**Hybrid** (the common answer): push for normal accounts, pull for celebrities at read time, and merge. Skip precomputing feeds for users inactive for weeks.
+
+### Pieces
+
+- Feed cache: Redis sorted set or list per user of recent post IDs (capped at, say, 500), hydrated with post and author data from caches in batches.
+- Ranking: start chronological; later a ranking service scores candidates (recency, affinity, engagement), often precomputed.
+- Pagination: cursor-based on (score, post ID), never offset; see [REST in practice](/fullstack/apis/rest-in-practice).
+- Media via object storage and CDN; counters (likes) via sharded counters or write-behind caches.
+- New posts appear via polling for "N new posts" or SSE, not automatic reflow of the list.

@@ -1,0 +1,62 @@
+---
+title: WSGI vs ASGI
+description: Why Python separates web servers from frameworks, the WSGI and ASGI interfaces, Gunicorn, Uvicorn, Granian, worker counts, and production setups.
+---
+
+In Node, `app.listen(3000)` starts a server inside the app. In Python, the app is usually just a callable object, and a separate **server** program imports it and handles sockets. Knowing this split explains commands such as `uvicorn app.main:app` and `gunicorn -w 4`.
+
+---
+
+## The plain-language version
+
+**WSGI** and **ASGI** are contracts between servers and apps. The server accepts connections and parses HTTP; it calls the app with the request; the app returns a response. Any WSGI server runs any WSGI app; the same goes for ASGI.
+
+| Word                   | Plain meaning                                                                                 |
+| :--------------------- | :-------------------------------------------------------------------------------------------- |
+| **WSGI**               | Web Server Gateway Interface: synchronous, one request per call.                              |
+| **ASGI**               | Asynchronous Server Gateway Interface: async, supports WebSockets and long-lived connections. |
+| **worker**             | A server process handling requests.                                                           |
+| **`module:attribute`** | Where the server finds the app object: `app.main:app`.                                        |
+
+---
+
+## The interfaces
+
+```python
+# WSGI: a callable taking environ and start_response
+def app(environ, start_response):
+    start_response("200 OK", [("Content-Type", "text/plain")])
+    return [b"hello"]
+
+# ASGI: an async callable taking scope, receive, send
+async def app(scope, receive, send):
+    await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/plain")]})
+    await send({"type": "http.response.body", "body": b"hello"})
+```
+
+|                 | WSGI                      | ASGI                                         |
+| :-------------- | :------------------------ | :------------------------------------------- |
+| Model           | Sync                      | Async (can wrap sync)                        |
+| WebSockets, SSE | No (workarounds)          | Yes                                          |
+| Frameworks      | Flask, Django (classic)   | FastAPI, Starlette, Django (async), Litestar |
+| Servers         | Gunicorn, uWSGI, Waitress | Uvicorn, Hypercorn, Granian, Daphne          |
+
+---
+
+## Running in production
+
+```bash
+# Development
+uv run fastapi dev src/app/main.py            # auto-reload
+
+# Production: Uvicorn with several worker processes
+uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 --proxy-headers
+
+# Or Gunicorn as process manager with Uvicorn workers
+uv run gunicorn app.main:app -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8000
+```
+
+- **Worker count**: a common start is one to two per CPU core for async apps; sync apps often use `2 × cores + 1`. Measure under load.
+- In Kubernetes, run fewer workers per container and scale replicas instead.
+- Put a reverse proxy (Nginx, Caddy, a load balancer) in front for TLS and buffering; pass `--proxy-headers` so client IPs are correct.
+- **Granian** (Rust) is a newer server supporting both WSGI and ASGI with high throughput.

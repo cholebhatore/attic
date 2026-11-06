@@ -1,0 +1,101 @@
+---
+title: GitHub Actions
+description: Workflows, triggers, jobs, steps, runners, matrix builds, caching, secrets, OIDC to the cloud, reusable workflows, and common mistakes.
+---
+
+GitHub Actions runs automation when something happens in a repository: a push, a PR, a schedule, a manual click. For a web app, that means lint, test, build, and deploy on every change. Deploying to AWS with short-lived credentials is covered in [GitHub Actions OIDC](/cloud/aws/cicd-devops/github-actions-oidc).
+
+---
+
+## The plain-language version
+
+A **workflow** is a YAML file in `.github/workflows/`. **Triggers** decide when it runs. It has **jobs**, which run in parallel on fresh virtual machines (**runners**) unless one `needs` another. Each job has **steps**: shell commands or reusable **actions**.
+
+| Word                | Plain meaning                                                            |
+| :------------------ | :----------------------------------------------------------------------- |
+| **workflow**        | One automation file.                                                     |
+| **event / trigger** | What starts it: `push`, `pull_request`, `schedule`, `workflow_dispatch`. |
+| **job**             | A group of steps on one runner.                                          |
+| **runner**          | The machine: GitHub-hosted (`ubuntu-latest`) or self-hosted.             |
+| **action**          | A reusable step, such as `actions/checkout`.                             |
+| **matrix**          | Run the same job across combinations (Node 20, 22, 24).                  |
+
+---
+
+## A CI workflow
+
+```yaml title=".github/workflows/ci.yml"
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm test
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      - run: pnpm build
+```
+
+For Python, swap in `astral-sh/setup-uv` and `uv sync --locked`, then `uv run pytest`.
+
+---
+
+## Secrets and permissions
+
+- Store secrets under repository or environment settings; reference as `${{ secrets.NAME }}`. They are masked in logs.
+- Set `permissions:` to the minimum. The default `GITHUB_TOKEN` can be broader than needed.
+- **Environments** (`production`) can require manual approval and hold their own secrets.
+- Prefer **OIDC** (`permissions: id-token: write`) over long-lived cloud keys.
+- Pin third-party actions to a full commit SHA; a moved tag can run new code with access to secrets.
+
+---
+
+## Reuse
+
+- **Reusable workflows**: `on: workflow_call`, called with `uses: ./.github/workflows/deploy.yml`.
+- **Composite actions**: bundle steps into `action.yml`.
+- **Artifacts** pass files between jobs; **caches** speed up dependency installs.
+
+---
+
+## Common mistakes
+
+<Callout type="warn">
+  `pull_request_target` runs with the base repository's secrets on code from a fork. Checking out
+  and running the PR's code inside it hands secrets to anyone who opens a PR.
+</Callout>
+
+- No `concurrency` group, so stale runs pile up.
+- Installing without the lockfile (`npm install` instead of `npm ci`), getting different versions than local.
+- Long workflows with no caching; slow CI gets skipped by people.

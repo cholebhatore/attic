@@ -1,0 +1,80 @@
+---
+title: Partitioning and Sharding
+description: Table partitioning in one database (range, list, hash) and partition pruning, sharding across databases, choosing shard keys, routing strategies, cross-shard queries and transactions, hot shards, resharding, and distributed SQL (Citus, Vitess, CockroachDB, Spanner, Aurora, Neon).
+---
+
+An `events` table grows by 50 million rows a month. Deleting old data takes hours of locked `DELETE` statements, and indexes no longer fit in memory. Partitioning by month turns retention into dropping one partition, instantly, and lets queries skip months they do not need.
+
+---
+
+## Partitioning (one database)
+
+```sql
+CREATE TABLE events (
+  id         bigint GENERATED ALWAYS AS IDENTITY,
+  tenant_id  uuid NOT NULL,
+  created_at timestamptz NOT NULL,
+  payload    jsonb,
+  PRIMARY KEY (id, created_at)          -- partition key must be in the primary key
+) PARTITION BY RANGE (created_at);
+
+CREATE TABLE events_2026_11 PARTITION OF events
+  FOR VALUES FROM ('2026-11-01') TO ('2026-12-01');
+
+-- retention: instant, no vacuum
+DROP TABLE events_2025_11;
+```
+
+| Kind  | Split by                              | Use                          |
+| :---- | :------------------------------------ | :--------------------------- |
+| Range | Value ranges (dates)                  | Time-series, logs, retention |
+| List  | Explicit values (region, tenant tier) | Data locality                |
+| Hash  | Hash of a key                         | Even spread                  |
+
+**Partition pruning**: queries filtering on the partition key only scan matching partitions. Queries without it scan all of them. Automate partition creation with `pg_partman`.
+
+---
+
+## Sharding (many databases)
+
+Each shard is a separate database holding a subset of rows. Writes and storage scale with the number of shards, at the cost of cross-shard queries, transactions, and operations.
+
+### Shard key
+
+| Good shard key                                               | Bad shard key                             |
+| :----------------------------------------------------------- | :---------------------------------------- |
+| High cardinality, even distribution                          | Low cardinality (`country`)               |
+| Present in most queries (`tenant_id`, `user_id`)             | Rarely queried                            |
+| Keeps related data together (a tenant's orders on one shard) | Splits data that is joined together       |
+| Not monotonically increasing for hash-based placement        | Timestamps (all new writes hit one shard) |
+
+### Routing
+
+| Strategy  | How                                     | Trade-off                                                           |
+| :-------- | :-------------------------------------- | :------------------------------------------------------------------ |
+| Hash      | `hash(key) mod N` or consistent hashing | Even; resharding moves data                                         |
+| Range     | Key ranges per shard                    | Range scans easy; hotspots                                          |
+| Directory | Lookup table key → shard                | Flexible moves (big tenants get their own shard); lookup dependency |
+
+### Hard parts
+
+- **Cross-shard queries**: scatter-gather to all shards and merge; slow. Design so common queries hit one shard.
+- **Cross-shard transactions**: avoid; use sagas or keep transactional data co-located.
+- **Global uniqueness**: unique constraints only hold per shard; use global ID schemes.
+- **Hot shards**: one huge tenant or celebrity overloads a shard; split it or give it dedicated capacity.
+- **Resharding**: moving data online with dual writes or logical replication. Pre-split into many logical shards mapped to fewer physical servers to make later moves easy.
+
+---
+
+## Distributed SQL and managed options
+
+| Option                        | Model                                                                                                               |
+| :---------------------------- | :------------------------------------------------------------------------------------------------------------------ |
+| Citus (Postgres extension)    | Distributed tables sharded by a column, co-located joins; Azure Cosmos DB for PostgreSQL                            |
+| Vitess / PlanetScale          | Sharding layer for MySQL, used at YouTube scale                                                                     |
+| CockroachDB, YugabyteDB, TiDB | Distributed SQL with automatic range splitting, serializable or strong consistency, Postgres or MySQL compatibility |
+| Google Spanner                | Globally distributed, externally consistent with TrueTime                                                           |
+| Aurora (Limitless), AlloyDB   | Cloud-native storage separating compute; Aurora Limitless adds sharding                                             |
+| Neon                          | Serverless Postgres with storage separation, branching, scale to zero                                               |
+
+These remove much of the manual sharding work but bring their own costs: higher latency per write in strongly consistent systems, compatibility gaps, and price.

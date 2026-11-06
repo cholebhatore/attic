@@ -1,0 +1,79 @@
+---
+title: Delivery Semantics
+description: Message queues vs logs, point-to-point vs publish-subscribe, at-most-once, at-least-once, and effectively-once delivery, idempotent consumers, ordering and partitions, retries with backoff, poison messages, and dead-letter queues.
+---
+
+A consumer charges a card, then crashes before acknowledging the message. The broker redelivers it, and the customer is charged twice. Every broker eventually delivers some message twice or out of order; correct systems are built for it.
+
+---
+
+## Queues vs logs
+
+|                         | Queue (RabbitMQ, SQS)                                   | Log (Kafka, Redis Streams, Kinesis)           |
+| :---------------------- | :------------------------------------------------------ | :-------------------------------------------- |
+| After consumption       | Message removed                                         | Message retained for a period                 |
+| Multiple consumer types | Each needs its own queue (fan-out via exchanges/topics) | Each consumer group reads independently       |
+| Replay                  | No                                                      | Yes: reset offsets                            |
+| Ordering                | Per queue, weakened by multiple consumers               | Per partition                                 |
+| Typical use             | Tasks, commands, work distribution                      | Event streams, analytics, change data capture |
+
+**Point-to-point**: one message, one consumer (work queue). **Publish-subscribe**: one message, every subscriber gets a copy.
+
+---
+
+## Delivery guarantees
+
+| Guarantee     | Meaning                         | How                                                                                                                               |
+| :------------ | :------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------- |
+| At most once  | May be lost, never duplicated   | Ack before processing                                                                                                             |
+| At least once | Never lost, may be duplicated   | Ack after processing; redeliver on failure (the common default)                                                                   |
+| Exactly once  | Each message affects state once | Not achievable end to end over a network in general; approximated as **effectively once** = at least once + idempotent processing |
+
+Kafka offers exactly-once semantics **within Kafka** (idempotent producers and transactions across topics); side effects outside Kafka still need idempotency.
+
+---
+
+## Idempotent consumers
+
+```sql
+CREATE TABLE processed_messages (message_id text PRIMARY KEY, processed_at timestamptz DEFAULT now());
+```
+
+```ts
+await db.transaction(async (tx) => {
+  const inserted = await tx.query(
+    'INSERT INTO processed_messages (message_id) VALUES ($1) ON CONFLICT DO NOTHING RETURNING 1',
+    [msg.id],
+  );
+  if (inserted.rowCount === 0) return; // already handled
+  await applyBusinessChange(tx, msg); // same transaction as the dedupe record
+});
+await channel.ack(msg);
+```
+
+Other idempotency techniques: natural keys with unique constraints, conditional updates (`WHERE status = 'pending'`), and idempotency keys passed to external APIs (Stripe accepts them).
+
+---
+
+## Ordering
+
+Global ordering does not scale. Brokers order **within a partition or queue**. Send all messages for one entity (an order ID) with the same partition key so they stay in sequence. Parallel consumers on one queue break ordering; use per-key partitioning or single active consumers where order matters. Include versions or timestamps so consumers can ignore out-of-date events.
+
+---
+
+## Retries and dead letters
+
+<Mermaid
+  chart={`
+flowchart LR
+    Q["Main queue"] --> C["Consumer"]
+    C -- "success" --> A["Ack"]
+    C -- "transient error" --> R["Retry with backoff (delay queue)"] --> Q
+    C -- "failed N times or invalid" --> D["Dead-letter queue"] --> H["Alert + inspect + replay"]
+`}
+/>
+
+- Retry transient failures (timeouts, 503s) with exponential backoff and jitter.
+- Do not retry permanent failures (invalid payload); send them straight to the DLQ.
+- A **poison message** that crashes the consumer every time blocks a queue forever without a retry limit.
+- Monitor DLQ depth and queue age (oldest message), not just queue length.

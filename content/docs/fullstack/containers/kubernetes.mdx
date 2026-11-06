@@ -1,0 +1,88 @@
+---
+title: Kubernetes
+description: Kubernetes for application developers - the control loop, Pods, Deployments, Services, Ingress and Gateway API, ConfigMaps and Secrets, probes, resources, autoscaling, rolling updates, Helm and Kustomize, and when it is worth the complexity.
+---
+
+Kubernetes keeps a cluster in the state described in YAML: "run four copies of this image, expose them on this port, restart any that fail". An application developer rarely runs the cluster but writes the manifests, and a misconfigured probe or memory limit is the most common cause of mysterious restarts.
+
+---
+
+## The plain-language version
+
+A **control loop** compares the desired state (manifests) with the actual state and acts to close the gap. Apps run in **Pods**; a **Deployment** keeps N Pods running and rolls out new versions; a **Service** gives Pods a stable address; an **Ingress** or **Gateway** routes outside HTTP traffic in.
+
+| Object                  | Role                                                                     |
+| :---------------------- | :----------------------------------------------------------------------- |
+| Pod                     | One or more containers sharing network and storage; disposable           |
+| Deployment              | Desired replicas + rolling updates for stateless apps                    |
+| Service                 | Stable virtual IP and DNS name load-balancing to matching Pods           |
+| Ingress / Gateway API   | HTTP routing and TLS from outside the cluster                            |
+| ConfigMap / Secret      | Configuration and sensitive values, as env vars or files                 |
+| Job / CronJob           | Run to completion / on a schedule (migrations, reports)                  |
+| StatefulSet             | Stable identity and storage (databases; usually use managed DBs instead) |
+| HorizontalPodAutoscaler | Scale replicas on CPU, memory, or custom metrics                         |
+| Namespace               | Grouping and isolation within a cluster                                  |
+
+---
+
+## A Deployment and Service
+
+```yaml title="deploy.yaml"
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: shop-api }
+spec:
+  replicas: 3
+  selector: { matchLabels: { app: shop-api } }
+  strategy: { rollingUpdate: { maxUnavailable: 0, maxSurge: 1 } }
+  template:
+    metadata: { labels: { app: shop-api } }
+    spec:
+      containers:
+        - name: api
+          image: ghcr.io/acme/shop-api:1.4.0
+          ports: [{ containerPort: 3000 }]
+          envFrom:
+            - configMapRef: { name: shop-api-config }
+            - secretRef: { name: shop-api-secrets }
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe: { httpGet: { path: /readyz, port: 3000 }, periodSeconds: 5 }
+          livenessProbe: { httpGet: { path: /livez, port: 3000 }, periodSeconds: 10 }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: shop-api }
+spec:
+  selector: { app: shop-api }
+  ports: [{ port: 80, targetPort: 3000 }]
+```
+
+---
+
+## Things that bite application developers
+
+| Issue                           | Cause                                                     | Fix                                                                      |
+| :------------------------------ | :-------------------------------------------------------- | :----------------------------------------------------------------------- |
+| `OOMKilled` restarts            | Memory over the limit (Node heap defaults, Python caches) | Raise the limit or set `--max-old-space-size`; profile memory            |
+| CPU throttling, slow p99        | Tight CPU limits                                          | Set requests; many teams omit CPU limits                                 |
+| Restart loops when the DB blips | Liveness probe checks dependencies                        | Liveness = process alive only; readiness may check dependencies          |
+| Dropped requests during deploys | No graceful shutdown, Pod removed from endpoints late     | Handle `SIGTERM`, short `preStop` sleep, `terminationGracePeriodSeconds` |
+| Config change not applied       | Env from ConfigMap read only at start                     | Roll the Deployment (checksum annotation)                                |
+| Secrets "encrypted"             | Kubernetes Secrets are base64 by default                  | External Secrets Operator, sealed secrets, cloud secret stores           |
+
+---
+
+## Packaging and delivery
+
+- **Helm**: templated charts with values per environment.
+- **Kustomize**: overlays patching base YAML (built into `kubectl`).
+- **GitOps** (Argo CD, Flux): the cluster pulls desired state from Git.
+- `kubectl get pods`, `kubectl logs -f deploy/shop-api`, `kubectl describe pod <name>` (events explain most failures), `kubectl rollout undo deploy/shop-api`.
+
+---
+
+## Worth it?
+
+Kubernetes pays off with many services, multiple teams, and a platform team to run it. For one app or a few services, a PaaS, Cloud Run, ECS/Fargate, or a VPS with Compose delivers most of the value with a fraction of the operations. Cluster setup, networking, and managed offerings: [Cloud: Kubernetes](/cloud/advanced/kubernetes).

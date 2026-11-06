@@ -1,0 +1,82 @@
+---
+title: Expiry, Eviction, Persistence
+description: Setting TTLs, how Redis expires keys lazily and actively, maxmemory and eviction policies (LRU, LFU, volatile vs allkeys), RDB snapshots, AOF and fsync policies, hybrid persistence, and choosing durability settings.
+---
+
+A Redis instance used for both caching and job queues hits its memory limit. With `allkeys-lru` eviction, it quietly deletes unprocessed jobs to make room for cache entries. Expiry, eviction, and persistence settings decide what Redis keeps, what it drops, and what survives a restart.
+
+---
+
+## The plain-language version
+
+**Expiry** removes keys whose TTL ran out. **Eviction** removes keys when memory is full, even if they have no TTL, according to a policy. **Persistence** writes data to disk so a restart does not empty the server.
+
+| Word          | Plain meaning                                                  |
+| :------------ | :------------------------------------------------------------- |
+| **maxmemory** | Memory limit for data.                                         |
+| **LRU**       | Least recently used: evict what has not been read for longest. |
+| **LFU**       | Least frequently used: evict what is read least often.         |
+| **RDB**       | Point-in-time snapshot file.                                   |
+| **AOF**       | Append-only file logging every write.                          |
+| **fsync**     | Forcing the OS to flush writes to physical disk.               |
+
+---
+
+## Expiry
+
+```text
+SET session:abc "u_19" EX 3600     # set with TTL
+EXPIRE cart:19 86400               # add TTL to existing key
+PERSIST cart:19                    # remove TTL
+TTL cart:19                        # -1 no TTL, -2 key missing
+```
+
+Redis expires keys two ways: **lazily** (checked when accessed) and **actively** (a background cycle samples keys with TTLs and deletes expired ones). Memory from expired keys is reclaimed gradually, not instantly. Most writes that overwrite a key (`SET` without `KEEPTTL`) clear its TTL.
+
+Add random **jitter** to TTLs for keys created together, so they do not all expire at the same instant and cause a [stampede](/fullstack/caching/invalidation-and-stampedes).
+
+---
+
+## Eviction
+
+| Policy                               | Evicts                              | Use when                                                  |
+| :----------------------------------- | :---------------------------------- | :-------------------------------------------------------- |
+| `noeviction`                         | Nothing; writes fail with OOM error | Redis holds data that must not be lost (queues, sessions) |
+| `allkeys-lru`                        | Any key, least recently used        | Pure cache                                                |
+| `allkeys-lfu`                        | Any key, least frequently used      | Cache with a stable hot set                               |
+| `volatile-lru` / `volatile-lfu`      | Only keys with a TTL                | Mixed cache + persistent data                             |
+| `volatile-ttl`                       | Keys with the nearest expiry        | Mixed, prefer dropping soon-to-expire                     |
+| `allkeys-random` / `volatile-random` | Random                              | Rarely                                                    |
+
+LRU and LFU are approximate (Redis samples a few keys rather than tracking every access). Separate cache and durable data into **different instances** with different policies, rather than relying on `volatile-*` discipline.
+
+---
+
+## Persistence
+
+|                           | RDB                                                          | AOF                                                 |
+| :------------------------ | :----------------------------------------------------------- | :-------------------------------------------------- |
+| What                      | Periodic snapshot (fork + write file)                        | Log of every write, replayed on start               |
+| Data loss on crash        | Since last snapshot (minutes)                                | With `appendfsync everysec`, about one second       |
+| File size / restart speed | Compact, fast restart                                        | Larger, slower replay (rewritten in the background) |
+| Cost                      | Fork can pause large instances briefly; memory copy-on-write | Constant disk writes                                |
+
+```text
+# redis.conf
+save 3600 1 300 100 60 10000     # RDB: snapshot if N changes in M seconds
+appendonly yes
+appendfsync everysec             # always | everysec | no
+aof-use-rdb-preamble yes         # hybrid: RDB base + AOF tail
+```
+
+| Use case                          | Settings                                               |
+| :-------------------------------- | :----------------------------------------------------- |
+| Pure cache                        | Persistence off or RDB only                            |
+| Sessions, rate limits             | RDB + AOF `everysec`                                   |
+| Queues and data that must survive | AOF `everysec` + replicas; or a real database / broker |
+
+<Callout type="warn">
+  Redis is not a primary database for data that cannot be lost. Even with AOF, asynchronous
+  replication means a failover can drop recently acknowledged writes. Keep the source of truth in a
+  database and treat Redis data as rebuildable where possible.
+</Callout>

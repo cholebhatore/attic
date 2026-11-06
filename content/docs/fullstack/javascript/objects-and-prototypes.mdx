@@ -1,0 +1,352 @@
+---
+title: Objects and Prototypes
+description: The JavaScript object model - properties and descriptors, property order, getters and setters, the prototype chain and property lookup, constructor functions and what new does, classes as syntax over prototypes (fields, private members, static blocks, inheritance, super), composition vs inheritance, freezing and immutability, iterators and generators, Proxy and Reflect, and Map, Set, WeakMap, and WeakRef.
+---
+
+`Object.keys(user)` lists `role` but `JSON.stringify(user)` omits a getter-based `fullName`. A library adds a method to `Array.prototype` and every `for...in` loop over arrays starts iterating it. `instanceof` returns false for an array created in an iframe. A "frozen" config object still lets nested settings change. Every one of these follows from JavaScript's object model, which is based on prototypes rather than classes, even when `class` syntax is used.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after [Scope, Closures, and this](/fullstack/javascript/scope-closures-this), before the execution pages.
+
+An object is a collection of properties, each with a key and some metadata. Every object also has a hidden link to another object, its **prototype**. When a property is not found on an object, JavaScript looks it up on the prototype, then the prototype's prototype, and so on. That chain of fallbacks is how methods are shared and how inheritance works; `class` is a cleaner way to write it, not a different mechanism.
+
+Topics, in order:
+
+1. Properties and descriptors
+2. Property order and enumeration
+3. The prototype chain
+4. Constructors and new
+5. Classes
+6. Composition vs inheritance
+7. Immutability
+8. Iterators and generators
+9. Proxy and Reflect
+10. Map, Set, and weak collections
+
+| Word                    | Plain meaning                                                                     |
+| :---------------------- | :-------------------------------------------------------------------------------- |
+| **own property**        | Defined directly on the object, not inherited.                                    |
+| **property descriptor** | Metadata: value, writable, enumerable, configurable (or get/set).                 |
+| **prototype**           | The object another object falls back to for missing properties (`[[Prototype]]`). |
+| **prototype chain**     | The linked list of prototypes searched during lookup.                             |
+| **iterable**            | An object with a `Symbol.iterator` method; works with `for...of` and spread.      |
+| **generator**           | A function that can pause (`yield`) and resume, producing an iterator.            |
+| **Proxy**               | An object that intercepts fundamental operations on another object.               |
+
+---
+
+## Properties and descriptors
+
+Every property has attributes:
+
+| Attribute      | Data property | Accessor property | Default via `defineProperty` | Default via assignment |
+| :------------- | :------------ | :---------------- | :--------------------------- | :--------------------- |
+| `value`        | ✓             |                   | `undefined`                  | assigned value         |
+| `writable`     | ✓             |                   | `false`                      | `true`                 |
+| `get` / `set`  |               | ✓                 | `undefined`                  |                        |
+| `enumerable`   | ✓             | ✓                 | `false`                      | `true`                 |
+| `configurable` | ✓             | ✓                 | `false`                      | `true`                 |
+
+```js
+const user = { first: 'Ada', last: 'Lovelace' };
+Object.defineProperty(user, 'fullName', {
+  get() {
+    return `${this.first} ${this.last}`;
+  },
+  enumerable: false,
+});
+user.fullName; // 'Ada Lovelace'
+Object.keys(user); // ['first', 'last']
+JSON.stringify(user); // '{"first":"Ada","last":"Lovelace"}'
+Object.getOwnPropertyDescriptor(user, 'first');
+// { value: 'Ada', writable: true, enumerable: true, configurable: true }
+```
+
+Getters run on every access: a getter doing expensive work inside a loop runs that work every iteration.
+
+---
+
+## Property order and enumeration
+
+Own property keys are ordered: **integer-like keys in ascending numeric order first**, then string keys in insertion order, then symbols in insertion order.
+
+```js
+Object.keys({ b: 1, 2: 'x', a: 2, 1: 'y' }); // ['1', '2', 'b', 'a']
+```
+
+| Mechanism                            | Own            | Inherited      | Non-enumerable | Symbols |
+| :----------------------------------- | :------------- | :------------- | :------------- | :------ |
+| `for...in`                           | ✓              | ✓ (enumerable) |                |         |
+| `Object.keys` / `values` / `entries` | ✓              |                |                |         |
+| `JSON.stringify`                     | ✓              |                |                |         |
+| `Object.getOwnPropertyNames`         | ✓              |                | ✓              |         |
+| `Reflect.ownKeys`                    | ✓              |                | ✓              | ✓       |
+| Spread `{ ...o }`                    | ✓ (enumerable) |                |                | ✓       |
+
+`for...in` walks inherited enumerable properties too, which is why extending built-in prototypes breaks loops in other code. Use `for...of` with `Object.entries`, or `Object.hasOwn(obj, key)` checks.
+
+---
+
+## The prototype chain
+
+Every object has an internal `[[Prototype]]` link (readable with `Object.getPrototypeOf`; `__proto__` is a legacy accessor).
+
+```js
+const animal = {
+  eats: true,
+  describe() {
+    return `eats: ${this.eats}`;
+  },
+};
+const rabbit = Object.create(animal); // rabbit's prototype is animal
+rabbit.jumps = true;
+
+rabbit.jumps; // true: own property
+rabbit.eats; // true: found on animal
+rabbit.describe(); // 'eats: true': method from animal, this = rabbit
+rabbit.toString; // found on Object.prototype
+rabbit.missing; // undefined after reaching null at the end of the chain
+```
+
+<Mermaid
+  chart={`
+flowchart LR
+    R["rabbit { jumps }"] -- "[[Prototype]]" --> A["animal { eats, describe }"] -- "[[Prototype]]" --> O["Object.prototype { toString, hasOwnProperty, ... }"] -- "[[Prototype]]" --> N["null"]
+`}
+/>
+
+Rules:
+
+- **Reads** walk the chain. **Writes** create or update an own property on the target object (shadowing the inherited one), unless the inherited property is a setter or non-writable.
+- Methods on a prototype are shared by all objects linked to it: one function in memory, many users.
+- `this` inside an inherited method is the object the method was called on, not the prototype.
+- Long chains slightly slow lookups; engines cache them with inline caches ([Browser Architecture](/fullstack/web-fundamentals/browser-architecture)).
+- Built-ins: arrays → `Array.prototype` → `Object.prototype`; functions → `Function.prototype` → `Object.prototype`.
+
+**Prototype pollution**: if code merges user-controlled JSON into objects without filtering, a key like `__proto__` can add properties to `Object.prototype`, affecting every object in the process (a real vulnerability class in Node.js libraries). Mitigations: validate input with schemas, use `Object.create(null)` or `Map` for dictionaries, reject `__proto__`, `constructor`, and `prototype` keys.
+
+---
+
+## Constructors and new
+
+Before classes, constructors were ordinary functions called with `new`:
+
+```js
+function User(name) {
+  this.name = name;
+}
+User.prototype.greet = function () {
+  return `Hi ${this.name}`;
+};
+
+const u = new User('Ada');
+```
+
+What `new User('Ada')` does:
+
+1. Creates a new empty object.
+2. Sets its `[[Prototype]]` to `User.prototype`.
+3. Calls `User` with `this` bound to the new object.
+4. Returns the new object (unless the function explicitly returns another object).
+
+`u instanceof User` checks whether `User.prototype` appears anywhere in `u`'s prototype chain. Across realms (iframes, Node `vm` contexts, some test runners), each realm has its own `Array.prototype`, so `instanceof Array` fails for arrays from elsewhere; `Array.isArray` works across realms.
+
+---
+
+## Classes
+
+```js
+class Account {
+  static #count = 0; // private static field
+  #balance = 0; // private instance field (truly private)
+  currency = 'INR'; // public instance field
+
+  constructor(owner) {
+    this.owner = owner;
+    Account.#count++;
+  }
+
+  deposit(amount) {
+    // on Account.prototype, shared
+    if (amount <= 0) throw new RangeError('amount must be positive');
+    this.#balance += amount;
+    return this;
+  }
+
+  get balance() {
+    return this.#balance;
+  }
+
+  static get count() {
+    return Account.#count;
+  }
+
+  static {
+    // static initialisation block
+    // runs once when the class is evaluated
+  }
+}
+
+class SavingsAccount extends Account {
+  constructor(owner, rate) {
+    super(owner); // must call before using this
+    this.rate = rate;
+  }
+  addInterest() {
+    return this.deposit(this.balance * this.rate);
+  }
+}
+```
+
+What classes add over constructor functions:
+
+- Clearer syntax for the same prototype mechanism (`typeof Account` is `'function'`; methods live on `Account.prototype`).
+- Class bodies are always strict mode; classes cannot be called without `new`; class declarations are in the TDZ until evaluated.
+- **Private members** (`#field`, `#method()`) are enforced by the language (not a naming convention); access from outside is a syntax error. `#field in obj` checks for them (brand check).
+- Fields are initialised per instance before the constructor body runs (after `super()` in subclasses).
+- `extends` sets up two chains: `SavingsAccount.prototype` → `Account.prototype` (instance methods) and `SavingsAccount` → `Account` (static methods).
+
+---
+
+## Composition vs inheritance
+
+Deep inheritance hierarchies couple subclasses to every detail of their ancestors (the fragile base class problem): a change in `Account` can break `SavingsAccount` in ways neither author anticipated, and hierarchies rarely match how requirements evolve.
+
+```js
+// Inheritance: a SavingsAccount IS an Account
+// Composition: a service HAS collaborators
+function createOrderService({ repo, payments, clock }) {
+  return {
+    async place(input) {
+      const order = { ...input, createdAt: clock() };
+      await payments.charge(order.total);
+      return repo.save(order);
+    },
+  };
+}
+```
+
+Prefer composition (objects holding other objects, functions taking dependencies) for application code; use inheritance for genuine "is-a" relationships with stable base classes, such as custom errors (`class NotFoundError extends Error`) or framework base classes.
+
+---
+
+## Immutability
+
+| Mechanism                        | Prevents                                        | Depth                                     |
+| :------------------------------- | :---------------------------------------------- | :---------------------------------------- |
+| `const`                          | Rebinding the variable                          | n/a: object still mutable                 |
+| `Object.preventExtensions`       | Adding properties                               | Shallow                                   |
+| `Object.seal`                    | Adding and deleting properties                  | Shallow                                   |
+| `Object.freeze`                  | Adding, deleting, and changing properties       | **Shallow**: nested objects still mutable |
+| Deep freeze (recursive)          | All levels                                      | Cost proportional to size                 |
+| Immutable update patterns, Immer | Mutation by convention, with structural sharing | Any                                       |
+
+```js
+const config = Object.freeze({ db: { host: 'localhost' } });
+config.db = {}; // ignored (TypeError in strict mode)
+config.db.host = 'prod'; // works: nested object not frozen
+```
+
+Non-mutating array methods (`toSorted`, `toReversed`, `toSpliced`, `with`) return copies, avoiding the classic bug of `sort()` mutating props or state.
+
+---
+
+## Iterators and generators
+
+The **iteration protocol**: an object is iterable if it has a `[Symbol.iterator]()` method returning an iterator, an object with `next()` that returns `{ value, done }`. `for...of`, spread, destructuring, `Array.from`, `Promise.all`, and `new Map(iterable)` all use it.
+
+```js
+class Range {
+  constructor(start, end) {
+    this.start = start;
+    this.end = end;
+  }
+  *[Symbol.iterator]() {
+    // generator method
+    for (let i = this.start; i < this.end; i++) yield i;
+  }
+}
+[...new Range(1, 4)]; // [1, 2, 3]
+```
+
+**Generators** (`function*`) pause at each `yield` and resume when `next()` is called, keeping their local state. They make lazy, possibly infinite sequences cheap:
+
+```js
+function* ids() {
+  let n = 0;
+  while (true) yield `id_${n++}`;
+}
+const gen = ids();
+gen.next().value; // 'id_0'
+```
+
+**Async generators** (`async function*`) with `for await...of` consume streams of asynchronous values: paginated API results, lines of a file, messages from a queue, chunks of a `ReadableStream`. Iterator helpers (`.map`, `.filter`, `.take` on iterators) allow lazy pipelines without building intermediate arrays.
+
+---
+
+## Proxy and Reflect
+
+A `Proxy` wraps an object and intercepts operations through **traps**: `get`, `set`, `has`, `deleteProperty`, `apply`, `construct`, and more. `Reflect` provides the default behaviour for each trap.
+
+```js
+const audited = new Proxy(
+  {},
+  {
+    set(target, key, value, receiver) {
+      console.log(`set ${String(key)} =`, value);
+      return Reflect.set(target, key, value, receiver);
+    },
+  },
+);
+audited.role = 'admin'; // logs, then sets
+```
+
+Used by reactivity systems (Vue 3, MobX, Valtio), Immer drafts, ORMs and mocking libraries, validation layers, and the Server Functions machinery of some frameworks. Proxies add overhead to every intercepted operation; avoid them on hot paths.
+
+---
+
+## Map, Set, and weak collections
+
+| Collection                         | Keys                    | Ordered          | Size         | Garbage collection                  | Use                                                        |
+| :--------------------------------- | :---------------------- | :--------------- | :----------- | :---------------------------------- | :--------------------------------------------------------- |
+| Plain object                       | Strings, symbols        | Mostly insertion | Manual count | Strong                              | Records with known keys, JSON data                         |
+| `Map`                              | Any value (objects too) | Insertion        | `.size`      | Strong                              | Dictionaries, caches, frequent add/remove                  |
+| `Set`                              | Any value               | Insertion        | `.size`      | Strong                              | Unique collections, membership tests                       |
+| `WeakMap`                          | Objects only            | Not iterable     | None         | Entry removed when key is collected | Per-object metadata, private data, caches keyed by objects |
+| `WeakSet`                          | Objects only            | Not iterable     | None         | Same                                | Marking objects (visited, processed)                       |
+| `WeakRef` / `FinalizationRegistry` | n/a                     |                  |              | Observe collection                  | Advanced caches; non-deterministic timing                  |
+
+Using plain objects as dictionaries for user-supplied keys invites prototype-pollution and collisions with inherited names like `constructor`; `Map` avoids both. Set operations (`union`, `intersection`, `difference`, `isSubsetOf`) are built into `Set` in current engines.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="How does property lookup work in JavaScript?">
+    The engine checks the object's own properties, then follows the [[Prototype]] link to its
+    prototype, and so on until the property is found or the chain ends at null, returning undefined.
+    Writes create own properties instead of modifying the prototype.
+  </Accordion>
+  <Accordion title="What does the new keyword do?">
+    Creates an empty object, links its prototype to the constructor's prototype property, calls the
+    constructor with this bound to the new object, and returns it unless the constructor returns
+    another object.
+  </Accordion>
+  <Accordion title="Are JavaScript classes real classes?">
+    They are syntax over prototypes and constructor functions, adding strict mode, mandatory new,
+    fields, true private members, and static blocks. Methods still live on the prototype object.
+  </Accordion>
+  <Accordion title="What is prototype pollution?">
+    An attacker-controlled key such as __proto__ in merged input modifies Object.prototype, adding
+    properties to every object in the process. Prevent it with schema validation, Map or
+    null-prototype objects, and rejecting dangerous keys.
+  </Accordion>
+  <Accordion title="When is a WeakMap the right tool?">
+    To associate data with objects without preventing those objects from being garbage collected,
+    such as caching computed values per DOM node or storing private per-instance data.
+  </Accordion>
+</Accordions>

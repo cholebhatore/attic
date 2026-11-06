@@ -1,0 +1,60 @@
+---
+title: System Architecture
+description: Monoliths, modular monoliths, microservices and their real costs, service communication, API gateways and BFFs, serverless architecture, and multi-tenancy models (shared schema, schema per tenant, database per tenant).
+---
+
+A five-person startup splits its product into twelve microservices. Each feature now touches four repositories, local development needs Docker Compose with fifteen containers, and a request fails in ways nobody can trace. Microservices solve organisational scaling problems; a small team does not have those problems yet.
+
+---
+
+## Monolith to microservices
+
+|                   | Monolith                    | Modular monolith                                       | Microservices                                        |
+| :---------------- | :-------------------------- | :----------------------------------------------------- | :--------------------------------------------------- |
+| Deploy unit       | One                         | One                                                    | Many                                                 |
+| Module boundaries | Often blurry                | Enforced (separate modules, own tables, internal APIs) | Network boundaries                                   |
+| Transactions      | Local, simple               | Local                                                  | Distributed: sagas, eventual consistency             |
+| Operational cost  | Low                         | Low                                                    | High: CI/CD per service, tracing, service discovery  |
+| Team scaling      | Contention past a few teams | Teams own modules                                      | Teams deploy independently                           |
+| Failure modes     | One process                 | One process                                            | Network failures, partial outages, cascading latency |
+
+The usual path: start with a **modular monolith** with clear boundaries (bounded contexts, no cross-module table access, module APIs), then extract a service when there is a concrete reason: independent scaling, a different technology need, or a team that must deploy independently. The strangler fig pattern extracts functionality gradually behind a routing layer.
+
+---
+
+## Service communication
+
+| Style                 | Use                                      | Watch out for                                                                                                              |
+| :-------------------- | :--------------------------------------- | :------------------------------------------------------------------------------------------------------------------------- |
+| Synchronous HTTP/gRPC | Queries needing an immediate answer      | Latency chains, cascading failures: add [timeouts and circuit breakers](/fullstack/building-for-scale/resilience-patterns) |
+| Asynchronous events   | Notifying others that something happened | Eventual consistency, duplicates; see [Event-driven](/fullstack/architecture/event-driven)                                 |
+| Shared database       | Avoid between services                   | Couples schemas and deploys                                                                                                |
+
+---
+
+## Gateways and BFFs
+
+- **API gateway**: single entry point handling routing, auth, rate limiting, and TLS (Kong, AWS API Gateway, Envoy, Traefik).
+- **Backend-for-frontend (BFF)**: a backend per client type (web, mobile) that aggregates services and shapes responses for that client. Next.js server code often plays this role for a web app, and it is also the recommended way to keep [auth tokens out of the browser](/fullstack/auth/client-storage).
+- **Service mesh** (Istio, Linkerd): sidecar proxies providing mTLS, retries, and telemetry between services. Worth it with many services; overhead otherwise.
+
+---
+
+## Serverless architecture
+
+Functions triggered by HTTP, queues, schedules, and storage events, plus managed services (DynamoDB, S3, SQS). Strengths: no idle cost, automatic scaling, little ops. Weaknesses: cold starts, execution time limits, connection limits to relational databases (use poolers or HTTP-based drivers), vendor lock-in, harder local testing. Cloud specifics: [Lambda](/cloud/aws/compute/lambda), [Cloud Run](/cloud/gcp/deploy-cloud-run).
+
+---
+
+## Multi-tenancy
+
+A SaaS serves many customers (tenants) from one system.
+
+| Model                          | Isolation                                                                          | Cost and ops                                                    | Fits                               |
+| :----------------------------- | :--------------------------------------------------------------------------------- | :-------------------------------------------------------------- | :--------------------------------- |
+| Shared tables with `tenant_id` | Logical (app filters + [row-level security](/fullstack/auth/authorization-models)) | Cheapest, simplest migrations                                   | Most B2B SaaS, many small tenants  |
+| Schema per tenant              | Stronger                                                                           | Migrations run per schema; thousands of schemas strain catalogs | Moderate tenant counts             |
+| Database per tenant            | Strongest; per-tenant backup, region, encryption keys                              | Most expensive, fleet management                                | Enterprise and regulated customers |
+| Hybrid                         | Shared for small tenants, dedicated for large ones                                 | Two code paths                                                  | Mature SaaS                        |
+
+Also tenant-aware rate limits and quotas (one noisy tenant must not slow others), per-tenant configuration and feature flags, tenant ID in every log line and trace, and data export and deletion per tenant.

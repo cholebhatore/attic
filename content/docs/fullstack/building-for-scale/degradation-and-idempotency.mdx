@@ -1,0 +1,92 @@
+---
+title: Degradation and Idempotency
+description: Graceful degradation and degradation tiers, feature flags, kill switches, progressive delivery (canary, percentage rollouts), flag hygiene, and idempotency keys for safe retries with a server-side implementation.
+---
+
+On a sale day the database is at capacity. One option is the whole site slowing to a crawl. Another is turning off personalised recommendations, review counts, and "recently viewed" with a flag, keeping browse and checkout fast. Graceful degradation is choosing in advance what to give up.
+
+---
+
+## Graceful degradation
+
+Rank features by importance and decide what each falls back to:
+
+| Tier         | Example features                                    | Under pressure                                                                   |
+| :----------- | :-------------------------------------------------- | :------------------------------------------------------------------------------- |
+| Critical     | Login, cart, checkout, payments                     | Protected: reserved capacity, last to shed                                       |
+| Important    | Search, product pages                               | Serve cached or simplified versions                                              |
+| Nice to have | Recommendations, reviews, live counters, animations | Disable or serve static fallbacks                                                |
+| Background   | Analytics, emails, reindexing                       | Queue and delay ([load shifting](/fullstack/building-for-scale/traffic-control)) |
+
+Patterns: serve stale cache on origin errors (`stale-if-error`), static pages from the CDN when the app is down, read-only mode during database incidents, and frontends that render partial pages when one API fails (React error boundaries around non-critical widgets).
+
+---
+
+## Feature flags
+
+A **feature flag** is a runtime switch that changes behaviour without a deploy.
+
+| Flag type                    | Purpose                                                 | Lifetime      |
+| :--------------------------- | :------------------------------------------------------ | :------------ |
+| Release toggle               | Ship code dark, turn on later (trunk-based development) | Days to weeks |
+| Experiment                   | A/B test variants                                       | Weeks         |
+| Ops toggle / **kill switch** | Turn off an expensive or failing feature instantly      | Long-lived    |
+| Permission / entitlement     | Enable for a plan or tenant                             | Long-lived    |
+
+```ts
+if (await flags.isEnabled('recommendations', { userId: user.id, plan: user.plan })) {
+  widgets.push(await recommendations.forUser(user.id));
+}
+```
+
+**Progressive delivery**: release to internal users, then 1 percent, 10 percent, 50 percent, 100 percent, watching error rates and SLOs at each step, with instant rollback by flag. Canary deploys do the same at the infrastructure level.
+
+Tools: LaunchDarkly, Unleash, Flagsmith, GrowthBook, PostHog, Statsig, ConfigCat; OpenFeature is a vendor-neutral SDK standard. Evaluate flags locally from a cached ruleset so the flag service is not on the request path.
+
+Hygiene: owner and expiry date per flag, remove release flags after full rollout, test both paths, and audit-log flag changes, since a flag flip is a production change.
+
+---
+
+## Idempotency keys
+
+A mobile client sends `POST /payments`, the connection drops before the response arrives, and the client retries. Without protection, the customer pays twice. An **idempotency key** makes the retry return the original result instead of repeating the action.
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    participant K as Key store
+    C->>S: POST /payments, Idempotency-Key: 4f1c...
+    S->>K: insert key (status: processing) if absent
+    S->>S: charge card
+    S->>K: store response (201, body)
+    S--xC: response lost in network
+    C->>S: retry, same Idempotency-Key
+    S->>K: key exists, completed
+    S-->>C: stored 201 response (no second charge)
+`}
+/>
+
+```sql
+CREATE TABLE idempotency_keys (
+  key           text NOT NULL,
+  user_id       bigint NOT NULL,
+  request_hash  text NOT NULL,           -- reject the same key with a different body
+  status        text NOT NULL,           -- processing | completed
+  response_code int,
+  response_body jsonb,
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, key)
+);
+```
+
+Rules:
+
+- The client generates a unique key (UUID) per logical operation and reuses it on retries.
+- Insert the key atomically before doing work; a concurrent duplicate sees `processing` and gets `409` (or waits).
+- Store the final response and return it for repeats; reject a reused key with a different request body (`422`).
+- Expire keys after a period (24 hours is common).
+- Ideally perform the business write and the key update in the same database transaction; pass the key through to downstream providers that support it (Stripe does).
+
+Idempotency also underpins safe [retries](/fullstack/building-for-scale/resilience-patterns), [message consumers](/fullstack/message-brokers/delivery-semantics), and [offline sync](/fullstack/pwas/offline-and-push).

@@ -1,0 +1,300 @@
+---
+title: DOM, Events, and Fetch
+description: The DOM as a live tree (nodes vs elements, querying, live vs static collections, safe vs unsafe content insertion), efficient DOM updates, the event model (dispatch phases, target vs currentTarget, propagation and default actions, delegation, passive and once listeners, custom events, composed events), fetch in depth (request and response lifecycle, errors, bodies and streams, credentials and CORS modes, timeouts, retries), and browser storage options.
+---
+
+A comment rendered with `innerHTML` runs an attacker's script for every visitor. A list of 2,000 items with a click listener on each slows the page and leaks memory when items are removed. A `fetch` to a failing API "succeeds" because a 500 response does not reject. Frameworks hide much of the DOM, but every one of them compiles down to these APIs, and their rules still apply in event handlers, refs, and integrations.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the last JavaScript page, connecting the language to the browser. Rendering costs of DOM changes are in the [Rendering Pipeline](/fullstack/web-fundamentals/rendering-pipeline); storage scoping in [Browser Architecture](/fullstack/web-fundamentals/browser-architecture).
+
+The **DOM** is the live object tree the browser builds from HTML; changing it changes the page. **Events** are notifications (a click, a key press, a network message) that travel through that tree, so one listener on a parent can handle events from all its children. **fetch** is the API for HTTP requests; it resolves when headers arrive and leaves interpreting the status code to the caller.
+
+Topics, in order:
+
+1. The DOM tree
+2. Querying and collections
+3. Changing content safely
+4. Efficient updates
+5. The event model
+6. Delegation and listener options
+7. Custom events and composed events
+8. fetch in depth
+9. Browser storage
+
+| Word                  | Plain meaning                                                       |
+| :-------------------- | :------------------------------------------------------------------ |
+| **node**              | Any item in the DOM tree: element, text, comment, document.         |
+| **element**           | A node representing a tag (`div`, `input`).                         |
+| **live collection**   | A list that updates automatically as the DOM changes.               |
+| **event propagation** | The path an event takes: capture down, target, bubble up.           |
+| **default action**    | What the browser does unless prevented (follow link, submit form).  |
+| **delegation**        | Handling events for many children with one listener on an ancestor. |
+| **opaque response**   | A `no-cors` response whose body and headers are hidden from script. |
+
+---
+
+## The DOM tree
+
+```html
+<ul id="todos">
+  <li class="done">Buy milk</li>
+  <li>Call bank</li>
+</ul>
+```
+
+```text
+Document
+└── html
+    └── body
+        └── ul#todos                 (Element)
+            ├── li.done              (Element)
+            │   └── "Buy milk"       (Text node)
+            └── li                   (Element)
+                └── "Call bank"      (Text node)
+```
+
+- `childNodes` includes text and comment nodes (including whitespace between tags); `children` includes only elements.
+- Element **attributes** (in HTML) and DOM **properties** (on the object) differ: `input.getAttribute('value')` is the initial value from HTML, `input.value` is the current value typed by the user. `class` attribute vs `className`/`classList` property.
+- `dataset` maps `data-*` attributes: `el.dataset.userId` for `data-user-id`.
+
+---
+
+## Querying and collections
+
+| API                                              | Returns                             | Live?           |
+| :----------------------------------------------- | :---------------------------------- | :-------------- |
+| `querySelector(css)`                             | First match or `null`               | n/a             |
+| `querySelectorAll(css)`                          | `NodeList`                          | Static snapshot |
+| `getElementById(id)`                             | Element or `null`                   | n/a             |
+| `getElementsByClassName`, `getElementsByTagName` | `HTMLCollection`                    | **Live**        |
+| `children`                                       | `HTMLCollection`                    | Live            |
+| `closest(css)`                                   | Nearest ancestor (or self) matching | n/a             |
+| `matches(css)`                                   | Boolean                             | n/a             |
+
+Live collections change while being iterated: removing elements from a live `getElementsByClassName('item')` collection inside a loop over it skips elements. Copy to an array first (`[...collection]`) or use `querySelectorAll`.
+
+---
+
+## Changing content safely
+
+| API                                                 | Parses HTML    | XSS risk with untrusted input                      |
+| :-------------------------------------------------- | :------------- | :------------------------------------------------- |
+| `textContent = s`                                   | No             | Safe                                               |
+| `createElement` + `append` + attributes             | No             | Safe (except `href`/`src` with `javascript:` URLs) |
+| `innerHTML = s`                                     | Yes            | **Dangerous**                                      |
+| `insertAdjacentHTML`, `outerHTML`, `document.write` | Yes            | Dangerous                                          |
+| `setHTML(s)` (Sanitizer API)                        | Yes, sanitised | Safer where supported                              |
+
+```js
+// XSS: a comment containing <img src=x onerror="stealCookies()"> executes
+list.innerHTML += `<li>${comment}</li>`;
+
+// Safe
+const li = document.createElement('li');
+li.textContent = comment;
+list.append(li);
+```
+
+When HTML must be rendered (rich text from a CMS), sanitise it with DOMPurify on output, and back it up with a Content-Security-Policy. URL attributes need validation too: `a.href = userUrl` with `javascript:alert(1)` executes on click; allow only `http:` and `https:`. Frameworks escape text by default; `dangerouslySetInnerHTML` and `v-html` opt out of that protection ([OWASP Top 10](/fullstack/security/owasp-top-10)).
+
+---
+
+## Efficient updates
+
+- Batch insertions with a `DocumentFragment` or a single `append(...nodes)`: one insertion triggers one style/layout pass instead of many.
+- `replaceChildren(...nodes)` swaps all children at once.
+- Avoid reading layout properties (`offsetHeight`, `getBoundingClientRect`) between writes ([layout thrashing](/fullstack/optimization/runtime-and-rendering)).
+- `<template>` elements hold inert markup to clone efficiently (`template.content.cloneNode(true)`).
+- Removing an element removes its listeners from the tree, but references held in JavaScript (closures, arrays, maps) keep detached nodes in memory.
+- `MutationObserver` watches DOM changes asynchronously (microtasks) instead of polling.
+
+---
+
+## The event model
+
+<Mermaid
+  chart={`
+flowchart TD
+    W["window"] --> D["document"] --> H["html"] --> B["body"] --> U["ul#todos"] --> L["li (target)"]
+    L -. "bubble" .-> U2["ul#todos"] -.-> B2["body"] -.-> D2["document"] -.-> W2["window"]
+`}
+/>
+
+Dispatching an event has three phases:
+
+1. **Capture**: from `window` down to the target's parent, running listeners registered with `{ capture: true }`.
+2. **Target**: listeners on the target itself.
+3. **Bubble**: back up to `window`, running ordinary listeners (for events that bubble; `focus`, `blur`, `mouseenter`, and some others do not, while `focusin`/`focusout` do).
+
+```js
+list.addEventListener('click', (event) => {
+  event.target; // the innermost element clicked (maybe a span inside the li)
+  event.currentTarget; // the element this listener is attached to (list)
+});
+```
+
+| Method                             | Effect                                                                                                               |
+| :--------------------------------- | :------------------------------------------------------------------------------------------------------------------- |
+| `event.stopPropagation()`          | Stops further propagation to other elements (listeners on the current element still run)                             |
+| `event.stopImmediatePropagation()` | Also stops remaining listeners on the current element                                                                |
+| `event.preventDefault()`           | Cancels the default action (link navigation, form submission, checkbox toggle, scrolling) if the event is cancelable |
+
+`stopPropagation` is rarely the right tool: it breaks analytics, delegated handlers, and "click outside to close" logic elsewhere on the page. Prefer checking `event.target` in the outer handler.
+
+---
+
+## Delegation and listener options
+
+```js
+// One listener for any number of items, including items added later
+list.addEventListener('click', (event) => {
+  const button = event.target.closest('button[data-action]');
+  if (!button || !list.contains(button)) return;
+  const id = button.closest('li').dataset.id;
+  if (button.dataset.action === 'delete') removeTodo(id);
+});
+```
+
+Delegation saves memory (one listener instead of thousands), handles dynamically added elements automatically, and simplifies cleanup. React uses it internally: one listener per event type on the root container.
+
+| Option              | Effect                                                                                                                                                                     |
+| :------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `{ passive: true }` | Promises not to call `preventDefault`; scrolling and touch never wait for the listener (default true for `touchstart`/`wheel` on `window`, `document`, `body` in Chromium) |
+| `{ once: true }`    | Listener removes itself after first call                                                                                                                                   |
+| `{ capture: true }` | Runs in the capture phase                                                                                                                                                  |
+| `{ signal }`        | Removes the listener when an `AbortSignal` aborts: clean removal of many listeners at once                                                                                 |
+
+```js
+const controller = new AbortController();
+window.addEventListener('resize', onResize, { signal: controller.signal });
+document.addEventListener('keydown', onKey, { signal: controller.signal });
+// later: controller.abort() removes both
+```
+
+`removeEventListener` requires the same function reference and capture flag used when adding; inline arrow functions cannot be removed later without a signal.
+
+---
+
+## Custom events and composed events
+
+```js
+el.dispatchEvent(
+  new CustomEvent('cart:updated', {
+    detail: { count: 3 },
+    bubbles: true, // propagate to ancestors
+    composed: true, // cross Shadow DOM boundaries (web components)
+    cancelable: true,
+  }),
+);
+```
+
+Custom events let independent components communicate through the DOM without shared state ([Web Components](/fullstack/web-components/building-web-components)). `dispatchEvent` runs listeners **synchronously**, unlike browser-generated events, which arrive as tasks.
+
+`event.isTrusted` is false for script-dispatched events; some browser features (opening popups, fullscreen, clipboard) require a trusted **user activation**.
+
+---
+
+## fetch in depth
+
+### Lifecycle
+
+```js
+const res = await fetch('/api/orders', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+  body: JSON.stringify({ productId: 42, qty: 1 }),
+  credentials: 'same-origin', // send cookies: 'omit' | 'same-origin' (default) | 'include'
+  signal: AbortSignal.timeout(8000), // timeout
+});
+// fetch resolves as soon as response HEADERS arrive; the body may still be downloading
+
+if (!res.ok) {
+  // status 200–299
+  const problem = await res.json().catch(() => null);
+  throw new ApiError(res.status, problem);
+}
+const order = await res.json(); // reads and parses the rest of the body
+```
+
+### When fetch rejects vs resolves
+
+| Situation                                                    | Result                                                                                           |
+| :----------------------------------------------------------- | :----------------------------------------------------------------------------------------------- |
+| Network failure, DNS error, connection refused, CORS failure | **Rejects** with `TypeError` (CORS details are deliberately hidden from script)                  |
+| Aborted or timed out                                         | Rejects with `AbortError` / `TimeoutError`                                                       |
+| Any HTTP status, including 404 and 500                       | **Resolves**; check `res.ok` / `res.status`                                                      |
+| Redirects                                                    | Followed automatically (`redirect: 'follow'`); `res.redirected` and `res.url` show the final URL |
+
+### Bodies
+
+- A body can be read **once** (`json()`, `text()`, `blob()`, `arrayBuffer()`, `formData()`); `res.clone()` before reading to read twice.
+- `res.body` is a `ReadableStream` for streaming downloads and progress ([Streamed Responses](/fullstack/performance/streamed-responses)).
+- Request bodies: string, `FormData` (sets multipart boundary automatically: do not set `Content-Type` manually), `URLSearchParams`, `Blob`, `ArrayBuffer`, or a `ReadableStream` (with `duplex: 'half'`).
+- Upload progress is not available from `fetch`; use `XMLHttpRequest` or upload directly to storage with presigned URLs.
+
+### Modes and credentials
+
+| Option        | Values                                                     | Notes                                                                                                                                                        |
+| :------------ | :--------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`        | `cors` (default), `same-origin`, `no-cors`                 | `no-cors` yields an **opaque** response: status 0, unreadable body; only useful for caching or fire-and-forget                                               |
+| `credentials` | `omit`, `same-origin`, `include`                           | `include` sends cookies cross-origin; server must reply with exact origin + `Allow-Credentials` ([CORS](/fullstack/web-fundamentals/browser-security-model)) |
+| `cache`       | `default`, `no-store`, `reload`, `no-cache`, `force-cache` | Interacts with the HTTP cache                                                                                                                                |
+| `keepalive`   | `true`                                                     | Request can outlive the page (analytics on unload); prefer `navigator.sendBeacon`                                                                            |
+| `priority`    | `high`, `low`, `auto`                                      | Hint for request prioritisation                                                                                                                              |
+
+### Retries
+
+Retry only idempotent requests, only on retryable failures (network errors, 429, 502, 503, 504), with exponential backoff and jitter, honouring `Retry-After` ([Resilience Patterns](/fullstack/building-for-scale/resilience-patterns)). Retrying a `POST` that may have succeeded needs an idempotency key.
+
+---
+
+## Browser storage
+
+| Storage          | Capacity                   | API                                           | Lifetime                 | Accessible from                                   | Use                          |
+| :--------------- | :------------------------- | :-------------------------------------------- | :----------------------- | :------------------------------------------------ | :--------------------------- |
+| Cookies          | ~4 KB each                 | `document.cookie` / `Set-Cookie`              | Expiry or session        | JS (unless `HttpOnly`) and every matching request | Sessions (HttpOnly)          |
+| `localStorage`   | ~5 MB per origin           | Synchronous strings                           | Until cleared            | Main thread only                                  | Small preferences            |
+| `sessionStorage` | ~5 MB                      | Synchronous strings                           | Per tab                  | Main thread                                       | Per-tab UI state             |
+| IndexedDB        | Large (percentage of disk) | Async, structured data, transactions, indexes | Until cleared or evicted | Main thread, workers                              | Offline data, caches, drafts |
+| Cache Storage    | Large                      | Async `Request`/`Response` pairs              | Until cleared or evicted | Main thread, service workers                      | Offline responses            |
+| OPFS             | Large                      | Async (sync handles in workers)               | Until cleared            | Workers                                           | Files, SQLite in WASM        |
+
+- `localStorage` is synchronous: reading or writing large values blocks the main thread. Values are strings; `JSON.stringify` everything.
+- Storage is per origin and, in third-party contexts, partitioned by top-level site.
+- Browsers may evict non-persistent storage under disk pressure; `navigator.storage.persist()` requests persistence, `navigator.storage.estimate()` reports usage.
+- The `storage` event notifies other tabs of `localStorage` changes; `BroadcastChannel` sends messages between same-origin tabs.
+- Where to keep auth tokens is a security decision: [Client-side Storage](/fullstack/auth/client-storage).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between event.target and event.currentTarget?">
+    target is the element where the event originated (the innermost element clicked). currentTarget
+    is the element whose listener is currently running, which differs when the event bubbles to an
+    ancestor.
+  </Accordion>
+  <Accordion title="What is event delegation and why use it?">
+    Attaching one listener to a common ancestor and using event.target (with closest) to handle
+    events from many children. It reduces listeners and memory, and automatically covers elements
+    added later.
+  </Accordion>
+  <Accordion title="Why is innerHTML dangerous?">
+    It parses its input as HTML, so untrusted strings can inject elements with event-handler
+    attributes or scripts that execute in the page (XSS). Use textContent or DOM creation APIs, or
+    sanitise.
+  </Accordion>
+  <Accordion title="Does fetch reject on HTTP 500?">
+    No. fetch resolves for any HTTP response and rejects only on network failures, CORS failures, or
+    aborts. Check res.ok or res.status.
+  </Accordion>
+  <Accordion title="Why are passive event listeners faster?">
+    The browser knows the listener will not call preventDefault, so it can scroll immediately on the
+    compositor thread instead of waiting for the main thread to run the listener.
+  </Accordion>
+</Accordions>

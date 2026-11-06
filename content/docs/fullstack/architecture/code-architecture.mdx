@@ -1,0 +1,86 @@
+---
+title: Code Architecture
+description: Layered architecture, hexagonal architecture with ports and adapters, clean architecture and the dependency rule, vertical slice architecture, and domain-driven design basics (bounded contexts, aggregates, value objects, ubiquitous language).
+---
+
+Replacing the ORM in a codebase where SQL queries are written inside React Server Components, route handlers, and cron jobs means touching hundreds of files. In a codebase where all data access goes through repositories, it means rewriting the repositories. Code architecture is mostly about which way dependencies point.
+
+---
+
+## Layered architecture
+
+```text
+Presentation (routes, controllers, UI)
+        ↓
+Application / service layer (use cases)
+        ↓
+Domain (entities, rules)
+        ↓
+Infrastructure (DB, HTTP clients, queues)
+```
+
+Simple and familiar. The weakness: the domain depends on infrastructure (the bottom layer), so business rules end up shaped by the database.
+
+---
+
+## Hexagonal (ports and adapters)
+
+<Mermaid
+  chart={`
+flowchart LR
+    subgraph Adapters_in["Driving adapters"]
+        H["HTTP routes"]
+        CLI["CLI / jobs"]
+        T["Tests"]
+    end
+    subgraph Core["Application core"]
+        UC["Use cases"] --> D["Domain model"]
+        UC --> P1["Port: OrderRepo"]
+        UC --> P2["Port: PaymentGateway"]
+    end
+    subgraph Adapters_out["Driven adapters"]
+        PG["Postgres repo"]
+        ST["Stripe adapter"]
+        MEM["In-memory fakes"]
+    end
+    H --> UC
+    CLI --> UC
+    T --> UC
+    PG -. implements .-> P1
+    MEM -. implements .-> P1
+    ST -. implements .-> P2
+`}
+/>
+
+The core defines **ports** (interfaces it needs). **Adapters** implement them for real technologies. The core imports nothing from Express, FastAPI, Prisma, or Stripe, so it can be tested with in-memory fakes and the technologies can be swapped.
+
+**Clean architecture** (Robert C. Martin) and **onion architecture** are variations with the same **dependency rule**: source code dependencies point inward, toward business rules.
+
+---
+
+## Vertical slices
+
+Organise by feature (`orders/place-order`, `orders/cancel-order`), each slice holding its handler, validation, and data access. Less abstraction, high cohesion per feature, easy to delete. Works well with the [feature-folder layout](/fullstack/nodejs/express). Many teams combine slices for organisation with ports and adapters for external services.
+
+---
+
+## Domain-driven design basics
+
+DDD is for complex business domains. Its strategic ideas help even without its tactical patterns.
+
+| Concept             | Meaning                                                                        | Example                                                                          |
+| :------------------ | :----------------------------------------------------------------------------- | :------------------------------------------------------------------------------- |
+| Ubiquitous language | Same terms in code, conversations, and docs                                    | `Shipment`, not `OrderDeliveryRecord` in code and "shipment" in meetings         |
+| Bounded context     | A boundary within which a model and its terms are consistent                   | "Customer" in Billing (payment details) vs Support (tickets) are separate models |
+| Entity              | Object with identity over time                                                 | `Order`                                                                          |
+| Value object        | Defined by its values, immutable                                               | `Money(1180, 'INR')`, `Address`                                                  |
+| Aggregate           | Cluster of objects changed together through one root, one transaction boundary | `Order` with its `OrderLines`                                                    |
+| Domain event        | Something that happened that others care about                                 | `OrderPlaced`                                                                    |
+| Context map         | How bounded contexts relate and translate                                      | Anti-corruption layer around a legacy ERP                                        |
+
+Bounded contexts are the natural seams for modules in a [modular monolith](/fullstack/architecture/system-architecture) and, later, for services.
+
+<Callout type="warn">
+  Layers and interfaces have a cost. A CRUD app with little business logic gains nothing from
+  hexagonal architecture and DDD aggregates; apply them where the domain is genuinely complex.
+</Callout>

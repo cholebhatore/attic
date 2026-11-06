@@ -1,0 +1,332 @@
+---
+title: Scope, Closures, and this
+description: How JavaScript resolves names - execution contexts and the call stack, lexical environments and the scope chain, var, let, const, hoisting and the temporal dead zone, function vs block scope, closures and what they retain in memory, classic closure bugs (loops, stale values), module and factory patterns, and the four rules of this binding plus arrow functions, bind, and lost-this bugs.
+---
+
+Five click handlers registered in a `for (var i ...)` loop all log `5`. A method passed to `setTimeout` throws "cannot read properties of undefined". A React interval keeps showing the value from the first render. A cache inside a closure keeps 300 MB alive long after the component is gone. All four are consequences of two mechanisms: **lexical scope with closures**, and **dynamic `this` binding**.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after [Types and Values](/fullstack/javascript/types-and-values), before [Objects and Prototypes](/fullstack/javascript/objects-and-prototypes).
+
+**Scope** answers "which variable does this name refer to?". JavaScript decides by where code is **written** (lexical scope): a function can see variables of the blocks and functions that textually surround it. A **closure** is a function together with the variables it can see from where it was created; it keeps them alive even after the outer function returns, like a backpack the function carries. **`this`** is different: it is decided by **how a function is called**, not where it is written (except for arrow functions).
+
+Topics, in order:
+
+1. Execution contexts and the call stack
+2. Lexical environments and the scope chain
+3. var, let, const, and hoisting
+4. Closures
+5. Closure bugs and patterns
+6. Closures and memory
+7. The four rules of this
+8. Arrow functions and bind
+9. Common this bugs
+
+| Word                    | Plain meaning                                                                  |
+| :---------------------- | :----------------------------------------------------------------------------- |
+| **execution context**   | The record of a running piece of code: its variables, `this`, and outer scope. |
+| **call stack**          | Stack of execution contexts for functions currently running.                   |
+| **lexical environment** | Map of names to values for one scope, plus a link to the outer scope.          |
+| **scope chain**         | The chain of outer environments searched to resolve a name.                    |
+| **hoisting**            | Declarations are registered before code in their scope runs.                   |
+| **TDZ**                 | Temporal dead zone: a `let`/`const` binding exists but is not yet initialised. |
+| **closure**             | A function plus references to the environments it was created in.              |
+| **receiver**            | The object a method is called on: the value of `this`.                         |
+
+---
+
+## Execution contexts and the call stack
+
+When a script starts, the engine creates a **global execution context**. Each function call pushes a new execution context onto the **call stack**; returning pops it.
+
+```js
+function a() {
+  b();
+}
+function b() {
+  c();
+}
+function c() {
+  throw new Error('boom');
+}
+a();
+// Error: boom
+//   at c, at b, at a, at <global>   ← the stack trace is the call stack at the throw
+```
+
+Each context holds: its lexical environment (local variables), a reference to the outer environment, and the `this` value. Deep recursion overflows the stack (`RangeError: Maximum call stack size exceeded`), typically at around ten thousand frames depending on the engine and frame size.
+
+---
+
+## Lexical environments and the scope chain
+
+Each function call, block (`{ }` with `let`/`const`), and module creates an environment. Each environment points to the environment where its code was **written**:
+
+```js
+const tax = 0.18; // module scope
+function priceWithTax(price) {
+  // function scope
+  const total = price * (1 + tax); // tax found by walking up the chain
+  if (total > 1000) {
+    const discount = 50; // block scope
+    return total - discount;
+  }
+  return total;
+}
+```
+
+<Mermaid
+  chart={`
+flowchart BT
+    B["Block env: discount"] --> F["Function env: price, total"] --> M["Module env: tax, priceWithTax"] --> G["Global env: globalThis, console, ..."]
+`}
+/>
+
+Name resolution walks up this chain until it finds the name, or throws a `ReferenceError`. Assigning to an undeclared name in sloppy mode creates a global variable; **strict mode** (on by default in ES modules and classes) throws instead.
+
+The chain is fixed when the function is **defined**, not when it is called. That is **lexical** (static) scoping.
+
+---
+
+## var, let, const, and hoisting
+
+|                                                         | `var`                           | `let`                    | `const`                  | `function` declaration                |
+| :------------------------------------------------------ | :------------------------------ | :----------------------- | :----------------------- | :------------------------------------ |
+| Scope                                                   | Function                        | Block                    | Block                    | Function (block in strict mode)       |
+| Hoisted                                                 | Yes, initialised to `undefined` | Yes, uninitialised (TDZ) | Yes, uninitialised (TDZ) | Yes, fully (callable before its line) |
+| Redeclare in same scope                                 | Allowed                         | Error                    | Error                    | Allowed (sloppy)                      |
+| Reassign                                                | Yes                             | Yes                      | No                       | Yes                                   |
+| Creates global object property at top level of a script | Yes                             | No                       | No                       | Yes                                   |
+
+```js
+console.log(a); // undefined (var hoisted and initialised)
+var a = 1;
+
+console.log(b); // ReferenceError: Cannot access 'b' before initialization (TDZ)
+let b = 2;
+
+greet(); // works: function declarations are hoisted with their body
+function greet() {}
+
+sayHi(); // TypeError: sayHi is not a function (var hoisted as undefined)
+var sayHi = function () {};
+```
+
+Before code in a scope runs, the engine creates bindings for every declaration in it; `let`/`const`/`class` bindings stay uninitialised until their declaration line runs. The TDZ catches use-before-definition bugs that `var` silently turns into `undefined`.
+
+Default to `const`, use `let` when reassignment is needed, avoid `var`.
+
+---
+
+## Closures
+
+A function keeps a reference to the environment it was created in, for as long as the function itself exists:
+
+```js
+function makeCounter() {
+  let count = 0; // lives on after makeCounter returns
+  return {
+    increment: () => ++count,
+    get: () => count,
+  };
+}
+const c1 = makeCounter();
+const c2 = makeCounter(); // separate environment, separate count
+c1.increment();
+c1.increment();
+c1.get(); // 2
+c2.get(); // 0
+```
+
+Closures capture **variables (bindings), not values**. If the variable later changes, the closure sees the new value:
+
+```js
+let message = 'hello';
+const say = () => console.log(message);
+message = 'goodbye';
+say(); // 'goodbye'
+```
+
+Uses: private state (counters, caches), function factories, partial application, event handlers that remember context, callbacks, memoisation, and module patterns.
+
+---
+
+## Closure bugs and patterns
+
+### The loop bug
+
+```js
+for (var i = 0; i < 3; i++) {
+  setTimeout(() => console.log(i)); // 3, 3, 3: one shared i (function-scoped)
+}
+for (let i = 0; i < 3; i++) {
+  setTimeout(() => console.log(i)); // 0, 1, 2: a fresh binding per iteration
+}
+```
+
+`let` in a `for` loop header creates a new binding for each iteration, copying the previous value forward.
+
+### Stale closures
+
+A closure created at one time keeps seeing the bindings of that time's environment. In React, each render is a new function call with new bindings, so a callback created in render 1 sees render 1's state forever ([Effects and Refs](/fullstack/react/effects-and-refs)):
+
+```js
+function setup() {
+  let count = 0;
+  const log = () => console.log(count); // sees this call's count
+  count++;
+  return log;
+}
+```
+
+### Patterns
+
+```js
+// Factory with private state
+function createRateLimiter(max) {
+  const hits = new Map();
+  return function allow(key) {
+    const n = (hits.get(key) ?? 0) + 1;
+    hits.set(key, n);
+    return n <= max;
+  };
+}
+
+// Partial application
+const multiply = (a) => (b) => a * b;
+const double = multiply(2);
+double(21); // 42
+
+// Memoisation
+function memoize(fn) {
+  const cache = new Map();
+  return (arg) => (cache.has(arg) ? cache.get(arg) : (cache.set(arg, fn(arg)), cache.get(arg)));
+}
+```
+
+Before ES modules, the **IIFE module pattern** (`(function () { ... })()`) used closures to create private scope; modules now give every file its own scope.
+
+---
+
+## Closures and memory
+
+A closure keeps its whole captured environment reachable, as long as the closure is reachable. Engines retain only variables that some inner function actually references (V8 allocates a shared "context" object for those), but all closures created in the same scope share that context.
+
+```js
+function attach(element) {
+  const hugeData = new Array(1e6).fill('x'); // 1 million entries
+  const summary = hugeData.length;
+  element.addEventListener('click', () => console.log(summary));
+  // If any closure in this scope referenced hugeData, it would stay alive as long as the listener does
+}
+```
+
+Leaks happen when long-lived things (global maps, event listeners on `window`, intervals, caches, subscriptions) hold closures that capture large objects or DOM nodes. Remove listeners and clear intervals when done; use `WeakMap` for caches keyed by objects.
+
+---
+
+## The four rules of this
+
+`this` is set per call, according to how the function is invoked. In priority order:
+
+| Rule                | Call form                                       | `this`                                                                        | Example                     |
+| :------------------ | :---------------------------------------------- | :---------------------------------------------------------------------------- | :-------------------------- |
+| 1. `new` binding    | `new Fn()`                                      | The newly created object                                                      | `new User('Ada')`           |
+| 2. Explicit binding | `fn.call(obj)`, `fn.apply(obj)`, `fn.bind(obj)` | `obj`                                                                         | `greet.call(user)`          |
+| 3. Implicit binding | `obj.fn()`                                      | The object before the dot                                                     | `user.greet()`              |
+| 4. Default binding  | `fn()`                                          | `undefined` in strict mode (modules, classes); `globalThis` in sloppy scripts | `const g = user.greet; g()` |
+
+```js
+'use strict';
+const user = {
+  name: 'Ada',
+  greet() {
+    return `Hi ${this.name}`;
+  },
+};
+
+user.greet(); // 'Hi Ada'          (implicit)
+const g = user.greet;
+g(); // TypeError: this is undefined (default)
+g.call({ name: 'Lin' }); // 'Hi Lin'          (explicit)
+const bound = user.greet.bind(user);
+setTimeout(bound); // 'Hi Ada'
+```
+
+Implicit binding only applies at the call site: `obj.fn` evaluated alone produces a plain function; the receiver is lost the moment the method is detached.
+
+---
+
+## Arrow functions and bind
+
+Arrow functions have **no own `this`** (nor `arguments`, `super`, or `new.target`). They use `this` from the enclosing scope, lexically, like any other variable, and `call`/`bind` cannot change it.
+
+```js
+class Timer {
+  seconds = 0;
+  start() {
+    setInterval(function () {
+      this.seconds++;
+    }, 1000); // this is undefined: default binding
+    setInterval(() => {
+      this.seconds++;
+    }, 1000); // this is the Timer: lexical
+  }
+}
+```
+
+|                       | Regular function                  | Arrow function                       |
+| :-------------------- | :-------------------------------- | :----------------------------------- |
+| `this`                | Set by call site                  | Inherited lexically                  |
+| Usable as constructor | Yes                               | No                                   |
+| `arguments`           | Yes                               | No (use rest parameters)             |
+| Good for              | Methods on objects and prototypes | Callbacks, especially inside methods |
+
+Avoid arrow functions as object-literal methods that need `this` to be the object: `{ name: 'x', greet: () => this.name }` takes `this` from the surrounding module scope (`undefined`).
+
+`bind` returns a new function permanently bound to a `this` (and optionally leading arguments). Class fields with arrow functions (`handleClick = () => { ... }`) create one bound function per instance, convenient for passing as callbacks but using more memory than a shared prototype method.
+
+---
+
+## Common this bugs
+
+| Bug                                     | Cause                                                                                                              | Fix                                                                |
+| :-------------------------------------- | :----------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------- |
+| Method passed as callback loses `this`  | `setTimeout(obj.method)`, `arr.map(obj.method)`, `addEventListener('click', obj.method)`                           | `() => obj.method()`, `obj.method.bind(obj)`, or arrow class field |
+| `this` inside a nested regular function | Inner function call uses default binding                                                                           | Arrow function for the inner callback                              |
+| Destructured method                     | `const { log } = console` works only because console methods do not need `this` in modern engines; many methods do | Call through the object                                            |
+| Event listener `this`                   | Regular-function listeners get `this` = the element (`currentTarget`)                                              | Use `event.currentTarget` explicitly                               |
+| `this` at module top level              | `undefined` in ES modules                                                                                          | Use `globalThis` if the global object is needed                    |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is a closure? Give a practical use.">
+    A function together with references to the variables in scope where it was created, which stay
+    alive as long as the function does. Uses: private state, factories, memoisation, callbacks that
+    remember context, partial application.
+  </Accordion>
+  <Accordion title="Why does var in a loop with setTimeout log the same number?">
+    var is function-scoped, so every callback closes over the same binding, which holds its final
+    value when the timers fire. let creates a new binding per iteration.
+  </Accordion>
+  <Accordion title="What is the temporal dead zone?">
+    The period between entering a scope and executing a let, const, or class declaration, during
+    which the binding exists but accessing it throws a ReferenceError.
+  </Accordion>
+  <Accordion title="How is this determined?">
+    By the call: new binds the new object; call, apply, and bind set it explicitly; obj.fn() uses
+    obj; a plain call gets undefined in strict mode. Arrow functions ignore these rules and use the
+    this of their enclosing scope.
+  </Accordion>
+  <Accordion title="How can closures cause memory leaks?">
+    A closure keeps its captured environment reachable. If a long-lived reference (global map,
+    window listener, interval) holds the closure, any large objects or DOM nodes it captures cannot
+    be garbage collected.
+  </Accordion>
+</Accordions>

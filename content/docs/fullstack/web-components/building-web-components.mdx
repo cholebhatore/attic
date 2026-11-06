@@ -1,0 +1,96 @@
+---
+title: Building Web Components
+description: A vanilla custom element with Shadow DOM, attributes vs properties, custom events, styling with parts and custom properties, Lit, and using web components in React.
+---
+
+A copy-to-clipboard button built once as a custom element works in plain HTML, React, Vue, and a CMS template. This page builds one with no library, then shows how Lit shortens the same work.
+
+---
+
+## A vanilla element
+
+```js title="copy-button.js"
+class CopyButton extends HTMLElement {
+  static observedAttributes = ['text'];
+
+  constructor() {
+    super();
+    const root = this.attachShadow({ mode: 'open' });
+    root.innerHTML = `
+      <style>
+        button { font: inherit; padding: 0.25rem 0.75rem; border-radius: var(--radius, 6px); }
+      </style>
+      <button part="button"><slot>Copy</slot></button>`;
+    root.querySelector('button').addEventListener('click', () => this.copy());
+  }
+
+  async copy() {
+    await navigator.clipboard.writeText(this.getAttribute('text') ?? '');
+    this.dispatchEvent(new CustomEvent('copied', { bubbles: true, composed: true }));
+  }
+
+  attributeChangedCallback(name, oldValue, newValue) {
+    /* react to text changes */
+  }
+}
+customElements.define('copy-button', CopyButton);
+```
+
+```html
+<copy-button text="npm i attic">Copy install command</copy-button>
+```
+
+Tag names must contain a hyphen. `composed: true` lets the event cross the shadow boundary.
+
+---
+
+## Attributes vs properties
+
+**Attributes** are strings in HTML; **properties** are JS values on the object. Complex data (arrays, objects) goes through properties. Good elements reflect simple properties to attributes so CSS selectors and HTML usage both work.
+
+---
+
+## Styling from outside
+
+Shadow DOM blocks outside CSS, by design. Ways in:
+
+- **CSS custom properties** inherit through the boundary (`--radius` above).
+- **`::part(button)`** styles elements exposed with `part`.
+- **`::slotted()`** styles slotted children from inside.
+
+---
+
+## Lit
+
+```ts
+import { LitElement, html, css } from 'lit';
+import { customElement, property } from 'lit/decorators.js';
+
+@customElement('user-badge')
+export class UserBadge extends LitElement {
+  static styles = css`
+    :host {
+      display: inline-flex;
+      gap: 0.5rem;
+    }
+  `;
+  @property() name = '';
+  render() {
+    return html`<strong>${this.name}</strong>`;
+  }
+}
+```
+
+Lit adds reactive properties and efficient template updates on top of the standards in about 5 KB.
+
+---
+
+## Using them in React
+
+React 19 supports custom elements fully: it passes props as properties when the element defines them, and `onCopied` style props attach listeners for custom events. Earlier React versions needed refs and manual `addEventListener`.
+
+```tsx
+<copy-button text={cmd} onCopied={() => toast('Copied')} />
+```
+
+TypeScript needs a declaration in `JSX.IntrinsicElements` for the new tag.

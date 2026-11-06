@@ -1,0 +1,284 @@
+---
+title: Cascade and Specificity
+description: How CSS decides which declaration wins - origins and importance, cascade layers, specificity calculation with worked examples, :is, :where, :not, and :has, source order, inheritance and the inherit, initial, unset, revert keywords, the value pipeline (declared, cascaded, specified, computed, used, actual), custom property resolution, and strategies for keeping specificity manageable.
+---
+
+A button style refuses to apply, so a developer adds `!important`. A month later another developer needs to override that, and adds `!important` to a more specific selector. Within a year the stylesheet is a specificity arms race that nobody dares touch. CSS is not unpredictable: the cascade is a deterministic algorithm, and knowing its steps is what keeps stylesheets maintainable.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first CSS page. The browser's style calculation step ([Rendering Pipeline](/fullstack/web-fundamentals/rendering-pipeline)) runs this algorithm for every element.
+
+Many rules can target the same element and property. The **cascade** is a tie-breaking procedure applied in a fixed order, like a tournament bracket: first by where the style came from and whether it is `!important`, then by which **layer** it is in, then by **specificity** (how targeted the selector is), and finally by **source order** (last one wins). Properties that no rule sets may be **inherited** from the parent or fall back to an initial value.
+
+Topics, in order:
+
+1. The cascade algorithm
+2. Origins and importance
+3. Cascade layers
+4. Specificity
+5. Modern selectors and specificity
+6. Source order and scope
+7. Inheritance and the global keywords
+8. The value pipeline
+9. Custom properties
+10. Keeping specificity under control
+
+| Word               | Plain meaning                                                           |
+| :----------------- | :---------------------------------------------------------------------- |
+| **declaration**    | A property-value pair: `color: red`.                                    |
+| **rule**           | A selector plus a block of declarations.                                |
+| **origin**         | Who wrote the style: browser (user agent), user, or author (the site).  |
+| **cascade layer**  | A named group of styles with an explicit priority (`@layer`).           |
+| **specificity**    | A score for how precisely a selector targets an element.                |
+| **inheritance**    | A child taking a property's value from its parent when nothing sets it. |
+| **computed value** | The value after resolving relative units and keywords, before layout.   |
+
+---
+
+## The cascade algorithm
+
+For each element and property, collect every declaration that applies, then sort by these criteria in order, stopping at the first that distinguishes them:
+
+1. **Origin and importance**
+2. **Context** (Shadow DOM: outer page styles vs component styles)
+3. **Element-attached styles** (`style` attribute)
+4. **Cascade layers**
+5. **Specificity**
+6. **Scope proximity** (`@scope`)
+7. **Order of appearance**
+
+The highest-priority declaration is the **cascaded value**. If none exists, inheritance or the initial value applies.
+
+---
+
+## Origins and importance
+
+| Precedence (highest first) | Origin                                                         |
+| :------------------------- | :------------------------------------------------------------- |
+| 1                          | Transitions (while running)                                    |
+| 2                          | User-agent `!important`                                        |
+| 3                          | User `!important` (accessibility settings, user stylesheets)   |
+| 4                          | Author `!important`                                            |
+| 5                          | Animations (while running)                                     |
+| 6                          | Author normal (the site's CSS)                                 |
+| 7                          | User normal                                                    |
+| 8                          | User-agent normal (browser defaults: `h1` sizes, link colours) |
+
+`!important` reverses the order of origins: user `!important` beats author `!important`, which preserves users' ability to enforce accessibility needs (minimum font sizes, high contrast). Within the author origin, `!important` lifts a declaration above all normal declarations regardless of specificity.
+
+Legitimate uses of `!important`: utility classes that must always win (`.hidden { display: none !important; }`), and overriding third-party inline styles. Everywhere else it is a symptom of a specificity problem.
+
+---
+
+## Cascade layers
+
+```css
+@layer reset, base, components, utilities; /* declare order once: later wins */
+
+@layer reset {
+  * {
+    margin: 0;
+  }
+}
+@layer components {
+  .card .title {
+    font-size: 1.25rem;
+  } /* specificity (0,2,0) */
+}
+@layer utilities {
+  .text-sm {
+    font-size: 0.875rem;
+  } /* specificity (0,1,0), but later layer: wins */
+}
+```
+
+- Layer order is compared **before** specificity: a simple selector in a later layer beats a complex one in an earlier layer.
+- **Unlayered styles beat all layered styles** (for normal declarations), so legacy CSS without layers overrides layered code; for `!important`, the order reverses (earlier layers win).
+- Third-party CSS can be imported into a low layer: `@import url('vendor.css') layer(vendor);` so app styles always override it without specificity hacks.
+- Tailwind v4 emits its styles into `theme`, `base`, `components`, and `utilities` layers.
+
+---
+
+## Specificity
+
+Specificity is a triple **(A, B, C)**, compared left to right:
+
+| Column        | Counts                                                                                                                 |
+| :------------ | :--------------------------------------------------------------------------------------------------------------------- |
+| A             | ID selectors `#nav`                                                                                                    |
+| B             | Class selectors `.btn`, attribute selectors `[type="text"]`, pseudo-classes `:hover`, `:focus-visible`, `:nth-child()` |
+| C             | Type selectors `button`, pseudo-elements `::before`                                                                    |
+| (not counted) | Universal `*`, combinators (`>`, `+`, `~`, space), `:where()`                                                          |
+
+Worked examples:
+
+| Selector                    | A   | B   | C   | Specificity                                        |
+| :-------------------------- | :-- | :-- | :-- | :------------------------------------------------- |
+| `button`                    | 0   | 0   | 1   | (0,0,1)                                            |
+| `.btn`                      | 0   | 1   | 0   | (0,1,0)                                            |
+| `.btn.btn-primary`          | 0   | 2   | 0   | (0,2,0)                                            |
+| `nav ul li a`               | 0   | 0   | 4   | (0,0,4)                                            |
+| `.nav a:hover`              | 0   | 2   | 1   | (0,2,1)                                            |
+| `#header .nav a`            | 1   | 1   | 1   | (1,1,1)                                            |
+| `input[type="email"]:focus` | 0   | 2   | 1   | (0,2,1)                                            |
+| `ul > li::before`           | 0   | 0   | 3   | (0,0,3)                                            |
+| `style="..."` attribute     |     |     |     | beats all selectors (in the same origin and layer) |
+
+Comparison is column by column, not a decimal number: (0,1,0) beats (0,0,15), and (1,0,0) beats (0,99,99).
+
+---
+
+## Modern selectors and specificity
+
+| Selector                 | Specificity rule                     | Example                                    |
+| :----------------------- | :----------------------------------- | :----------------------------------------- |
+| `:is(a, b)`              | Takes the **most specific** argument | `:is(#main, .content) p` counts as (1,0,1) |
+| `:not(a, b)`             | Most specific argument               | `button:not(.primary)` = (0,1,1)           |
+| `:has(a)`                | Most specific argument               | `.card:has(img)` = (0,1,1)                 |
+| `:where(a, b)`           | **Always zero**                      | `:where(.card) p` = (0,0,1)                |
+| `:nth-child(2 of .item)` | Pseudo-class plus argument           | (0,2,0)                                    |
+
+`:where()` is the key tool for writing overridable defaults: library and reset styles wrapped in `:where()` have zero specificity, so any app style overrides them.
+
+```css
+:where(.prose) h2 {
+  margin-top: 2rem;
+} /* (0,0,1): easy to override */
+form:has(:invalid) .submit {
+  opacity: 0.5;
+} /* parent selection */
+```
+
+---
+
+## Source order and scope
+
+When everything else ties, the declaration that appears **later** wins: later in the same stylesheet, or in a stylesheet loaded later. That makes stylesheet order significant; code-split CSS loaded in a different order on different routes can produce styles that differ by navigation path, a common bug with CSS-in-JS and lazy-loaded component CSS.
+
+**`@scope`** limits styles to a subtree, with an optional lower boundary, and resolves ties by proximity (the nearer scope root wins):
+
+```css
+@scope (.card) to (.card-footer) {
+  img {
+    border-radius: 8px;
+  } /* images in a card, but not inside its footer */
+}
+```
+
+CSS Modules, Vue scoped styles, and Shadow DOM solve scoping by generating unique class names or isolating style trees.
+
+---
+
+## Inheritance and the global keywords
+
+Some properties inherit by default, mostly text-related ones; most box-related ones do not.
+
+| Inherited by default                                                                                                     | Not inherited                                                                                                |
+| :----------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------- |
+| `color`, `font-*`, `line-height`, `letter-spacing`, `text-align`, `visibility`, `cursor`, `direction`, custom properties | `margin`, `padding`, `border`, `width`, `height`, `background`, `display`, `position`, `overflow`, `opacity` |
+
+Global keywords, valid for every property:
+
+| Keyword        | Effect                                                                                                           |
+| :------------- | :--------------------------------------------------------------------------------------------------------------- |
+| `inherit`      | Take the parent's computed value                                                                                 |
+| `initial`      | The property's initial value from the spec (`display: initial` is `inline`, not the browser's `block` for `div`) |
+| `unset`        | `inherit` if the property inherits, otherwise `initial`                                                          |
+| `revert`       | Roll back to the previous origin's value (usually the browser default)                                           |
+| `revert-layer` | Roll back to the previous cascade layer                                                                          |
+
+`all: unset` or `all: revert` reset every property, useful for isolating embedded widgets. Form controls do not inherit fonts by default in most browsers; resets add `font: inherit` to `button`, `input`, `select`, `textarea`.
+
+---
+
+## The value pipeline
+
+| Stage     | Meaning                                                                           | Example (`width: 50%` in a 600px container, `font-size: 2em` with parent 16px) |
+| :-------- | :-------------------------------------------------------------------------------- | :----------------------------------------------------------------------------- |
+| Declared  | All declarations that match                                                       | `50%`, `2em` and others                                                        |
+| Cascaded  | The winner of the cascade                                                         | `50%`, `2em`                                                                   |
+| Specified | Cascaded, or inherited/initial if none                                            | `50%`, `2em`                                                                   |
+| Computed  | Relative values resolved as far as possible without layout; this is what inherits | `50%` (percent widths resolve at layout), `32px`                               |
+| Used      | After layout                                                                      | `300px`, `32px`                                                                |
+| Actual    | After device constraints (rounding to device pixels, available fonts)             | `300px`, `32px`                                                                |
+
+`getComputedStyle()` returns the **resolved** value, which is the used value for layout properties like `width` (`'300px'`) and the computed value for others.
+
+Inheritance passes **computed** values: a child of an element with `font-size: 2em` (computed `32px`) inherits `32px`, not `2em`. Unitless `line-height: 1.5` inherits as the factor `1.5`, while `line-height: 1.5em` inherits as a fixed length computed from the parent's font size, a classic source of cramped text in children with larger fonts; prefer unitless line heights.
+
+---
+
+## Custom properties
+
+```css
+:root {
+  --space: 1rem;
+  --brand: oklch(62% 0.17 160);
+}
+.card {
+  padding: var(--space);
+  border-color: var(--brand, gray); /* fallback if undefined */
+}
+.compact {
+  --space: 0.5rem;
+} /* override for a subtree */
+```
+
+- Custom properties **cascade and inherit** like normal properties and are resolved at computed-value time, per element. That makes them runtime theming tools (change one variable on a container, the whole subtree updates), unlike preprocessor variables, which are replaced at build time.
+- A `var()` with an invalid value makes the declaration "invalid at computed-value time": the property becomes `unset`, not "ignored", so earlier declarations do not apply.
+- `@property` registers a custom property with a type, initial value, and inheritance, which enables animating it and type checking:
+
+```css
+@property --angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+```
+
+---
+
+## Keeping specificity under control
+
+| Strategy                         | How                                                                                |
+| :------------------------------- | :--------------------------------------------------------------------------------- |
+| Single-class selectors           | Style elements with one class each (BEM, utility classes); avoid IDs for styling   |
+| Cascade layers                   | Explicit priority between resets, vendor CSS, components, and utilities            |
+| `:where()` for defaults          | Zero-specificity base styles that are trivially overridable                        |
+| Scoping                          | CSS Modules, `@scope`, Shadow DOM, or utility-first CSS to avoid global collisions |
+| No `!important` except utilities | Treat new `!important` as a review flag                                            |
+| Avoid deep descendant selectors  | `.page .sidebar .nav ul li a` couples CSS to markup structure                      |
+| Lint                             | Stylelint rules for max specificity and no IDs                                     |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="How does the browser decide which CSS rule applies?">
+    It runs the cascade: compare origin and importance, then cascade layers, then specificity, then
+    order of appearance. If no declaration applies, inherited properties take the parent's value and
+    others use their initial value.
+  </Accordion>
+  <Accordion title="What is the specificity of #nav .item a:hover?">
+    One ID, two class-level selectors (.item and :hover), and one type selector: (1,2,1).
+  </Accordion>
+  <Accordion title="What is the difference between :is() and :where()?">
+    Both match any element matching one of their arguments. :is() takes the specificity of its most
+    specific argument; :where() always has zero specificity, which makes it ideal for overridable
+    defaults.
+  </Accordion>
+  <Accordion title="Do cascade layers override specificity?">
+    Yes. Layer order is compared before specificity, so a simple selector in a later layer beats a
+    complex selector in an earlier one, and unlayered styles beat layered ones for normal
+    declarations.
+  </Accordion>
+  <Accordion title="Why prefer unitless line-height?">
+    A unitless value is inherited as a factor and recalculated for each element's font size. A
+    length like 1.5em is computed once on the parent and inherited as a fixed length, which is too
+    small for children with larger text.
+  </Accordion>
+</Accordions>

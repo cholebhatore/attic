@@ -1,0 +1,279 @@
+---
+title: Runtime and Rendering
+description: Making pages responsive after load - the main-thread budget, long tasks and how they hurt INP, breaking up work and yielding (scheduler.yield, postTask), event handler patterns, debouncing and throttling, rendering costs and layout thrashing, compositor-only animations, will-change and layers, large DOMs, content-visibility and virtualisation, layout shift prevention, Web Workers and OffscreenCanvas, and memory leaks.
+---
+
+Clicking "Add to cart" takes 450 ms to show any feedback. A profile shows the click handler updating state, the framework re-rendering a product grid, an analytics library serialising the whole cart, and a synchronous `localStorage` write, all in one 430 ms task. Nothing was slow to load; the page was slow to **respond**. Since INP became a Core Web Vital in 2024, responsiveness after load is measured as directly as loading speed.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after the loading pages. This page covers what happens once code is running. The mechanics of the main thread, event loop, and rendering are in [Browser Architecture](/fullstack/web-fundamentals/browser-architecture) and the [Rendering Pipeline](/fullstack/web-fundamentals/rendering-pipeline).
+
+The browser's main thread is a single checkout counter: JavaScript, style, layout, and painting all queue there. If one customer (a task) takes 400 ms, everyone waits, including the user's click. Runtime optimization keeps each task short, does less work per interaction, makes rendering cheap, and moves heavy work elsewhere.
+
+Topics, in order:
+
+1. The main-thread budget
+2. Long tasks and INP
+3. Breaking up work and yielding
+4. Event handler patterns
+5. Debouncing and throttling
+6. Rendering costs and layout thrashing
+7. Animations
+8. Large DOMs and lists
+9. Layout shift
+10. Moving work off the main thread
+11. Memory
+
+| Word                    | Plain meaning                                                              |
+| :---------------------- | :------------------------------------------------------------------------- |
+| **long task**           | Main-thread work longer than 50 ms.                                        |
+| **INP**                 | Interaction to Next Paint: delay from input to the next visual update.     |
+| **input delay**         | Time an interaction waits because the main thread is busy.                 |
+| **processing time**     | Time spent running event handlers.                                         |
+| **presentation delay**  | Time from handlers finishing to the next frame being painted.              |
+| **yielding**            | Ending a task early so the browser can handle other work, then continuing. |
+| **debounce / throttle** | Run after activity stops / at most once per interval.                      |
+| **jank**                | Visible stutter from missed frames.                                        |
+
+---
+
+## The main-thread budget
+
+| Target                                     | Budget                             | Source of the number |
+| :----------------------------------------- | :--------------------------------- | :------------------- |
+| Respond to input with visible feedback     | ~100 ms feels instant              | RAIL model guidance  |
+| INP "good" threshold (p75 of interactions) | ≤ 200 ms                           | Core Web Vitals      |
+| Long task threshold                        | 50 ms                              | Long Tasks API       |
+| Animation frame at 60 Hz                   | 16.7 ms total; ~10 ms for app work | Display refresh      |
+| Animation frame at 120 Hz                  | 8.3 ms                             |                      |
+
+On mid-range phones, JavaScript runs several times slower than on developer laptops; budgets must be checked with CPU throttling (4x to 6x in DevTools) or real devices.
+
+---
+
+## Long tasks and INP
+
+INP for one interaction has three parts:
+
+<Mermaid
+  chart={`
+gantt
+    dateFormat X
+    axisFormat %L ms
+    section Interaction
+    Input delay: main thread busy with another task :0, 120
+    Processing: event handlers run                  :120, 330
+    Presentation delay: style, layout, paint        :330, 420
+`}
+/>
+
+| Part               | Typical causes                                                                     | Fixes                                                              |
+| :----------------- | :--------------------------------------------------------------------------------- | :----------------------------------------------------------------- |
+| Input delay        | Long tasks already running: hydration, third-party scripts, timers, heavy effects  | Break up long tasks, defer non-critical work, reduce JS            |
+| Processing time    | Heavy handlers: large state updates and re-renders, synchronous storage, analytics | Do the minimum before the next paint; defer the rest               |
+| Presentation delay | Large DOM updates, expensive styles and layout, big re-renders                     | Smaller updates, virtualisation, cheaper CSS, `content-visibility` |
+
+Diagnose with the Performance panel (interaction track, long tasks), the `web-vitals` library's attribution build (reports the element, event type, and phase breakdown), and the Long Animation Frames API (`PerformanceObserver` with `long-animation-frame`), which attributes slow frames to specific scripts.
+
+---
+
+## Breaking up work and yielding
+
+A task cannot be interrupted, so long work must be split into chunks that give the browser a chance to handle input and paint between them.
+
+```ts
+async function processAll(items: Item[]) {
+  let lastYield = performance.now();
+  for (const item of items) {
+    process(item);
+    if (performance.now() - lastYield > 40) {
+      // stay under the 50 ms long-task threshold
+      await yieldToMain();
+      lastYield = performance.now();
+    }
+  }
+}
+
+function yieldToMain(): Promise<void> {
+  if ('scheduler' in globalThis && 'yield' in (globalThis as any).scheduler) {
+    return (globalThis as any).scheduler.yield(); // continuation keeps priority over other queued tasks
+  }
+  return new Promise((resolve) => setTimeout(resolve, 0)); // fallback: back of the task queue
+}
+```
+
+| API                                    | Behaviour                                                                                                     |
+| :------------------------------------- | :------------------------------------------------------------------------------------------------------------ |
+| `scheduler.yield()`                    | Yields to the browser; the continuation runs before other pending tasks of the same priority                  |
+| `scheduler.postTask(fn, { priority })` | Queue work as `user-blocking`, `user-visible`, or `background`                                                |
+| `setTimeout(fn, 0)`                    | Yields, but the continuation goes to the back of the queue (and is clamped after nesting)                     |
+| `requestIdleCallback(fn)`              | Runs when the browser is idle; for truly optional work (may be delayed indefinitely)                          |
+| `requestAnimationFrame(fn)`            | Runs before the next paint; for visual updates, not for yielding                                              |
+| React transitions                      | React yields between components during interruptible renders ([Fiber](/fullstack/react/fiber-and-scheduling)) |
+
+---
+
+## Event handler patterns
+
+Do the visible part first, then yield, then do the rest:
+
+```ts
+button.addEventListener('click', async () => {
+  button.classList.add('is-loading'); // 1. immediate visual feedback
+  updateCartBadge(); // 2. the minimal DOM change the user expects
+  await yieldToMain(); // 3. let the browser paint
+  saveCartToStorage(); // 4. deferred work
+  sendAnalytics('add_to_cart');
+});
+```
+
+- Avoid synchronous `localStorage` writes of large objects in handlers (they block); batch or move to IndexedDB.
+- Avoid layout reads right after writes in handlers (forced synchronous layout, below).
+- In React, mark large non-urgent updates as transitions so the urgent part commits first.
+
+---
+
+## Debouncing and throttling
+
+| Technique                        | Behaviour                                                   | Use                                                          |
+| :------------------------------- | :---------------------------------------------------------- | :----------------------------------------------------------- |
+| Debounce                         | Run once, after input pauses for N ms                       | Search-as-you-type requests, autosave, validation            |
+| Throttle                         | Run at most once per N ms during continuous input           | Scroll and resize handlers, analytics sampling               |
+| `requestAnimationFrame` throttle | Run at most once per frame                                  | Visual updates driven by pointer or scroll                   |
+| Passive listeners                | Promise not to call `preventDefault`; scrolling never waits | `touchstart`, `wheel`, `scroll`                              |
+| Observers                        | Browser-computed notifications without polling              | `IntersectionObserver` (visibility), `ResizeObserver` (size) |
+
+Debouncing reduces work, not latency: the user's input field must still update immediately; only the expensive follow-up is debounced.
+
+---
+
+## Rendering costs and layout thrashing
+
+Style and layout cost grows with the number of affected elements:
+
+- **Style recalculation** is triggered by class or attribute changes; changing a class on `body` can restyle every element. Toggle classes on the smallest relevant subtree.
+- **Layout** after geometry changes; one element's size change can relayout its ancestors and following siblings.
+- **Forced synchronous layout**: reading `offsetHeight`, `getBoundingClientRect()`, `scrollTop`, and similar after writing styles forces layout immediately. In a loop, this becomes **layout thrashing**:
+
+```ts
+// 500 forced layouts
+items.forEach((el) => {
+  el.style.height = el.scrollHeight + 'px';
+});
+
+// Read all, then write all: one layout
+const heights = items.map((el) => el.scrollHeight);
+items.forEach((el, i) => {
+  el.style.height = heights[i] + 'px';
+});
+```
+
+- `contain: layout paint` (or `contain: content`) tells the browser a subtree's layout does not affect the outside, limiting the scope of relayout.
+
+---
+
+## Animations
+
+| Animate                                    | Cost                        | Notes                                                         |
+| :----------------------------------------- | :-------------------------- | :------------------------------------------------------------ |
+| `transform`, `opacity`                     | Composite only              | Can run on the compositor thread even while JS is busy        |
+| `filter`, `clip-path`                      | Paint (sometimes composite) | Varies by engine                                              |
+| `background-color`, `box-shadow`           | Paint                       | Expensive shadows with large blur                             |
+| `width`, `height`, `top`, `left`, `margin` | Layout + paint              | Avoid for animation; use `transform: scale/translate` instead |
+
+- Prefer CSS transitions and animations, or the Web Animations API, over JavaScript-driven frame loops; the browser can run them off the main thread.
+- `will-change: transform` promotes an element to its own layer ahead of time; use it on elements about to animate, not globally (each layer costs GPU memory).
+- Honour `prefers-reduced-motion`.
+- View transitions animate between DOM states with snapshots ([Modern CSS](/fullstack/css/responsive-and-modern-css)).
+
+---
+
+## Large DOMs and lists
+
+Every element costs memory, style, and layout time. Lighthouse warns above about 1,400 DOM nodes; pages with tens of thousands of nodes have slow interactions everywhere.
+
+| Technique                                                           | Effect                                                                                |
+| :------------------------------------------------------------------ | :------------------------------------------------------------------------------------ |
+| Virtualise long lists and tables                                    | Only visible rows exist in the DOM                                                    |
+| Paginate or load incrementally                                      | Bounded DOM size                                                                      |
+| `content-visibility: auto` + `contain-intrinsic-size`               | Browser skips style, layout, and paint for offscreen sections until near the viewport |
+| Remove hidden content instead of `display: none` for large subtrees | Less to style                                                                         |
+| Flatten deeply nested wrappers                                      | Fewer boxes                                                                           |
+
+```css
+.article-section {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 800px; /* placeholder size to keep the scrollbar stable */
+}
+```
+
+---
+
+## Layout shift
+
+CLS measures unexpected movement of visible content. Causes and fixes:
+
+| Cause                                                             | Fix                                                                 |
+| :---------------------------------------------------------------- | :------------------------------------------------------------------ |
+| Images, videos, iframes without dimensions                        | `width`/`height` attributes or `aspect-ratio`                       |
+| Ads and embeds injected late                                      | Reserve space with min-height containers                            |
+| Web fonts swapping                                                | Metric-matched fallbacks, `font-display: optional`                  |
+| Content inserted above existing content (banners, cookie notices) | Reserve space, overlay instead of pushing, or insert below the fold |
+| Animations of layout properties                                   | Animate `transform`                                                 |
+| Client-rendered content replacing skeletons of a different size   | Skeletons with the final size                                       |
+
+Shifts within 500 ms of a user interaction are excluded from CLS (expected movement), which is why expanding an accordion on click is fine.
+
+---
+
+## Moving work off the main thread
+
+| Tool                                 | For                                                                                          |
+| :----------------------------------- | :------------------------------------------------------------------------------------------- |
+| Web Workers                          | CPU-heavy work: parsing large files, search indexing, image processing, diffing, compression |
+| Comlink                              | RPC-style API over `postMessage` to workers                                                  |
+| Transferable objects (`ArrayBuffer`) | Pass large binary data without copying                                                       |
+| `OffscreenCanvas`                    | Canvas rendering in a worker                                                                 |
+| WebAssembly                          | Fast, predictable compute (often inside a worker)                                            |
+| Service workers                      | Network and caching logic (not for CPU work on behalf of the page)                           |
+| Server                               | Anything that need not run on the device at all                                              |
+
+Workers have no DOM access and communication has a serialisation cost (`structuredClone`), so they suit chunky work rather than many tiny calls.
+
+---
+
+## Memory
+
+Memory leaks make long-lived pages (dashboards, SPAs open all day) progressively slower as garbage collection runs more often and pauses longer.
+
+Common leaks: event listeners and intervals never removed, detached DOM nodes still referenced, growing caches without limits, closures capturing large objects, observers never disconnected, subscriptions in components without cleanup ([Effects and Refs](/fullstack/react/effects-and-refs)).
+
+Finding them: DevTools Memory panel, take a heap snapshot, perform an action several times, take another, and compare; filter for "Detached" elements; the Performance monitor shows JS heap and DOM node counts over time. `WeakMap`, `WeakRef`, and `FinalizationRegistry` help associate data with objects without preventing their collection.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What are the three parts of INP, and how is each improved?">
+    Input delay (main thread busy when input arrives: break up long tasks, reduce JS), processing
+    time (handlers too heavy: do minimal work, defer the rest), and presentation delay (expensive
+    rendering after handlers: smaller DOM updates, cheaper styles and layout).
+  </Accordion>
+  <Accordion title="How is a long task broken up?">
+    Split work into chunks and yield between them with scheduler.yield (or setTimeout as a
+    fallback), prioritise urgent work with scheduler.postTask, use React transitions for large
+    renders, or move CPU work to a Web Worker.
+  </Accordion>
+  <Accordion title="Why animate transform instead of top or left?">
+    transform affects only compositing, which can run on the compositor thread and GPU without
+    style, layout, or paint. top and left trigger layout and paint each frame on the main thread.
+  </Accordion>
+  <Accordion title="What does content-visibility: auto do?">
+    It lets the browser skip rendering work (style, layout, paint) for offscreen content until it
+    approaches the viewport, with contain-intrinsic-size providing a placeholder size.
+  </Accordion>
+</Accordions>

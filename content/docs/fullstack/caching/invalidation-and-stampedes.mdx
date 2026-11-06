@@ -1,0 +1,73 @@
+---
+title: Invalidation and Stampedes
+description: TTL-based vs event-based invalidation, versioned keys, tag-based invalidation, cross-instance invalidation, the read-modify race, cache stampedes and fixes (locking, request coalescing, early probabilistic refresh, stale-while-revalidate, jitter).
+---
+
+A homepage query takes 2 seconds and is cached for 60. At second 60 the entry expires, 3,000 requests arrive in the next 2 seconds, all miss, and all run the 2-second query. The database falls over, and the outage is caused by the cache. Invalidation decides correctness; stampede protection decides survival.
+
+---
+
+## Invalidation strategies
+
+| Strategy        | How                                                              | Staleness                       | Complexity                                                 |
+| :-------------- | :--------------------------------------------------------------- | :------------------------------ | :--------------------------------------------------------- |
+| TTL only        | Entries expire after N seconds                                   | Up to N seconds                 | Lowest                                                     |
+| Delete on write | Writer deletes affected keys                                     | Near zero (race windows exist)  | Must know every affected key                               |
+| Versioned keys  | Key includes a version: `product:42:v17`; bump version on change | None for readers of new version | Old versions expire by TTL                                 |
+| Tag-based       | Entries tagged (`products`, `category:7`); invalidate by tag     | Near zero                       | Needs tag tracking (framework support: Next.js `cacheTag`) |
+| Event-driven    | DB change events (CDC, outbox) trigger invalidation              | Seconds                         | Infrastructure                                             |
+
+Use TTL as a safety net even with explicit invalidation, so a missed delete heals itself.
+
+### Multiple instances
+
+In-process caches on many app instances need a broadcast to invalidate: Redis Pub/Sub (`PUBLISH invalidate product:42`) or keep in-process TTLs very short.
+
+### The classic race
+
+1. Reader misses, loads value v1 from the DB (slowly).
+2. Writer updates DB to v2 and deletes the key.
+3. Reader writes v1 into the cache. Stale until TTL.
+
+Mitigations: short TTLs, delete again after a short delay ("delayed double delete"), or version checks on write (`SET` only if the stored version is older).
+
+---
+
+## Stampede (thundering herd)
+
+<Mermaid
+  chart={`
+flowchart LR
+    E["Hot key expires"] --> M["1000 concurrent misses"] --> DB["1000 identical DB queries"] --> X["DB overload"]
+`}
+/>
+
+| Fix                                    | How                                                                                          |
+| :------------------------------------- | :------------------------------------------------------------------------------------------- |
+| **Request coalescing** (single flight) | Within a process, concurrent misses for one key share one in-flight promise                  |
+| **Lock on miss**                       | `SET lock:key NX PX 5000`; winner recomputes, others wait briefly or serve stale             |
+| **Stale-while-revalidate**             | Store value with a soft expiry; past it, serve the stale value and refresh in the background |
+| **Probabilistic early refresh**        | Each request refreshes early with a probability that rises as expiry nears (XFetch)          |
+| **TTL jitter**                         | Randomise TTLs so keys created together do not expire together                               |
+| **Pre-warming**                        | Fill caches before traffic arrives (after deploys, before sales)                             |
+
+```ts
+const inflight = new Map<string, Promise<unknown>>();
+function singleFlight<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  if (!inflight.has(key))
+    inflight.set(
+      key,
+      fn().finally(() => inflight.delete(key)),
+    );
+  return inflight.get(key) as Promise<T>;
+}
+```
+
+---
+
+## Other failure modes
+
+- **Cache penetration**: requests for keys that never exist bypass the cache every time. Negative caching or a Bloom filter.
+- **Cache avalanche**: many keys expire together or the cache node dies, sending all traffic to the DB. Jitter, replicas, circuit breakers, and capacity on the DB for a cold start.
+- **Hot key**: one key on one Redis node takes most traffic. Replicate it under several keys or add an in-process L1.
+- **Inconsistent serialisation**: deploys that change the cached shape need versioned keys, or old entries crash new code.

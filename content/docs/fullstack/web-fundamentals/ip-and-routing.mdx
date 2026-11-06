@@ -1,0 +1,235 @@
+---
+title: IP and Routing
+description: The IPv4 header, addressing and CIDR with subnet arithmetic, private ranges, NAT and its consequences, IPv6, ARP and DHCP on the local network, longest-prefix-match forwarding, BGP and anycast, TTL and traceroute, ICMP, MTU, fragmentation, and path MTU discovery.
+---
+
+A deploy moves an API behind a new load balancer, and some users on a corporate VPN can load the homepage but every large API response hangs forever. Small packets get through; large ones are silently dropped because a tunnel shrank the path MTU and a firewall blocks the ICMP message that would have said so. IP-layer details rarely matter, until they are the only explanation.
+
+---
+
+## The plain-language version
+
+**Where this sits:** below TCP and UDP, above the physical link. IP gets a packet from one host to another across many networks, with **no guarantees**: packets can be lost, duplicated, delayed, or reordered. Everything reliable is built on top.
+
+An IP address works like a postal address with a hierarchy: the first part names the network (like a city and street), the rest names a host on it (the house number). Routers only look at the network part to decide which way to send a packet.
+
+Topics, in order:
+
+1. The IPv4 packet header
+2. Addresses, CIDR, and subnet arithmetic
+3. Private ranges and NAT
+4. IPv6
+5. The local network: ARP and DHCP
+6. Forwarding: routing tables and longest-prefix match
+7. Between networks: BGP and anycast
+8. TTL, ICMP, and traceroute
+9. MTU, fragmentation, and path MTU discovery
+
+| Word                | Plain meaning                                                                                      |
+| :------------------ | :------------------------------------------------------------------------------------------------- |
+| **CIDR**            | Classless inter-domain routing: writing a network as address/prefix length, such as `10.0.0.0/16`. |
+| **prefix**          | The leading bits that identify the network.                                                        |
+| **subnet**          | A block of addresses sharing a prefix.                                                             |
+| **NAT**             | Network address translation: rewriting addresses at a boundary.                                    |
+| **MAC address**     | Hardware address used on the local link.                                                           |
+| **default gateway** | The router a host sends packets to when the destination is not local.                              |
+| **BGP**             | Border Gateway Protocol: how autonomous systems exchange routes.                                   |
+| **anycast**         | The same IP announced from many locations; routing delivers to the nearest.                        |
+| **MTU**             | Maximum transmission unit: largest packet a link carries.                                          |
+| **ICMP**            | Internet Control Message Protocol: errors and diagnostics (ping, "unreachable").                   |
+
+---
+
+## The IPv4 header
+
+```text
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-------+-------+---------------+-------------------------------+
+|Version|  IHL  |  DSCP / ECN   |         Total Length          |
++-------+-------+---------------+-----+-------------------------+
+|        Identification         |Flags|    Fragment Offset      |
++---------------+---------------+-----+-------------------------+
+|  Time to Live |    Protocol   |        Header Checksum        |
++---------------+---------------+-------------------------------+
+|                       Source Address                          |
++---------------------------------------------------------------+
+|                    Destination Address                        |
++---------------------------------------------------------------+
+```
+
+| Field                                  | Purpose                                                          |
+| :------------------------------------- | :--------------------------------------------------------------- |
+| Version                                | 4 or 6                                                           |
+| Total length                           | Header + payload in bytes (max 65,535)                           |
+| Identification, flags, fragment offset | Fragmentation and reassembly; the "don't fragment" (DF) flag     |
+| TTL                                    | Hop limit, decremented by each router; packet dropped at 0       |
+| Protocol                               | What the payload is: 6 = TCP, 17 = UDP, 1 = ICMP                 |
+| Checksum                               | Header integrity only (recomputed every hop because TTL changes) |
+| DSCP / ECN                             | Traffic class and explicit congestion notification               |
+| Source, destination                    | 32-bit addresses                                                 |
+
+IP does not check the payload, retransmit, or order packets. Those are transport-layer jobs.
+
+---
+
+## Addresses and CIDR
+
+An IPv4 address is 32 bits, written as four decimal bytes: `192.168.10.37`. CIDR notation `192.168.10.0/24` means the first 24 bits are the network prefix and the remaining 8 bits identify hosts.
+
+### Worked subnet example
+
+Network `10.20.0.0/22`:
+
+| Quantity                   | Calculation           | Result          |
+| :------------------------- | :-------------------- | :-------------- |
+| Host bits                  | 32 − 22               | 10              |
+| Total addresses            | 2^10                  | 1,024           |
+| Netmask                    | 22 ones then 10 zeros | `255.255.252.0` |
+| First address (network)    |                       | `10.20.0.0`     |
+| Last address (broadcast)   | network + 1,023       | `10.20.3.255`   |
+| Usable hosts (traditional) | 1,024 − 2             | 1,022           |
+
+Is `10.20.2.200` inside it? AND it with the mask: the third byte 2 AND 252 = 0, so the network part is `10.20.0.0`, which matches. Yes. Is `10.20.4.1`? 4 AND 252 = 4, giving `10.20.4.0`. No.
+
+Cloud VPC design is this arithmetic: a `/16` VPC (65,536 addresses) split into `/20` subnets (4,096 each) per availability zone, for example. Cloud providers reserve a few addresses per subnet (AWS reserves five).
+
+### Special ranges
+
+| Range                                           | Use                                                                            |
+| :---------------------------------------------- | :----------------------------------------------------------------------------- |
+| `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` | Private (RFC 1918), not routed on the public internet                          |
+| `100.64.0.0/10`                                 | Carrier-grade NAT shared space                                                 |
+| `127.0.0.0/8`                                   | Loopback (`127.0.0.1` = this host)                                             |
+| `169.254.0.0/16`                                | Link-local; also cloud instance metadata at `169.254.169.254` (an SSRF target) |
+| `0.0.0.0`                                       | "This host" / all interfaces when binding a server                             |
+| `224.0.0.0/4`                                   | Multicast                                                                      |
+
+A server bound to `127.0.0.1` accepts only local connections; bound to `0.0.0.0` it accepts on every interface. Inside a container, binding to `127.0.0.1` makes the app unreachable from outside the container, a common Docker mistake.
+
+---
+
+## NAT
+
+IPv4's 4.3 billion addresses ran out (IANA's free pool was exhausted in 2011). **NAT** lets many devices share one public address. A home router rewrites outgoing packets' source address and port and keeps a translation table:
+
+| Inside (private)     | Outside (public)    | Remote              |
+| :------------------- | :------------------ | :------------------ |
+| `192.168.1.10:51000` | `203.0.113.5:40001` | `93.184.216.34:443` |
+| `192.168.1.11:51000` | `203.0.113.5:40002` | `93.184.216.34:443` |
+
+Replies to `203.0.113.5:40001` are rewritten back to `192.168.1.10:51000`.
+
+Consequences engineers meet:
+
+- **Inbound connections fail** by default: there is no table entry for unsolicited packets. This is why peer-to-peer apps need STUN/TURN and **hole punching** ([WebRTC](/fullstack/realtime/transports)), and why home servers need port forwarding.
+- **Carrier-grade NAT (CGNAT)**: mobile carriers put thousands of customers behind one public IP. Rate limiting by IP then punishes many unrelated users at once.
+- **NAT table timeouts**: idle TCP connections can be silently dropped by middleboxes after minutes. Long-lived connections (WebSockets, database pools) need keep-alive pings.
+- Servers see the NAT's address, not the client's. Behind load balancers, the real client IP arrives in `X-Forwarded-For` or the PROXY protocol, and must only be trusted from known proxies.
+
+---
+
+## IPv6
+
+128-bit addresses written as eight groups of hex: `2001:0db8:0000:0000:0000:ff00:0042:8329`, shortened to `2001:db8::ff00:42:8329` (leading zeros dropped, one run of zero groups replaced by `::`).
+
+|                    | IPv4                 | IPv6                                                            |
+| :----------------- | :------------------- | :-------------------------------------------------------------- |
+| Address size       | 32 bits              | 128 bits (about 3.4 × 10^38 addresses)                          |
+| Header             | Variable, checksum   | Fixed 40 bytes, no checksum, extension headers                  |
+| NAT                | Ubiquitous           | Not needed; every device can have a global address              |
+| Fragmentation      | Routers may fragment | Only the sender fragments; relies on path MTU discovery         |
+| Address config     | DHCP                 | SLAAC (self-configuration from router advertisements) or DHCPv6 |
+| Typical allocation | One address per home | A `/56` or `/64` per home (billions of addresses)               |
+
+Most networks are **dual stack**. Clients use **Happy Eyeballs** (RFC 8305): start the IPv6 connection, start IPv4 shortly after, and use whichever connects first, so broken IPv6 does not stall users. A server reachable over IPv6 needs an `AAAA` DNS record and must listen on `::`. Rate limiting by IPv6 address should key on the `/64` prefix, since one user controls a whole `/64`.
+
+---
+
+## The local network: ARP and DHCP
+
+Before a packet leaves a host, the host decides: is the destination on my subnet?
+
+- **Yes**: deliver directly on the link. It needs the destination's **MAC address**, found with **ARP** ("who has 192.168.1.20? tell 192.168.1.10"), cached in the ARP table. IPv6 uses Neighbor Discovery instead.
+- **No**: send the frame to the **default gateway's** MAC address, with the final IP still in the IP header. The router takes it from there.
+
+**DHCP** hands out an IP address, subnet mask, default gateway, and DNS servers when a device joins a network (discover, offer, request, acknowledge).
+
+---
+
+## Forwarding: longest-prefix match
+
+Each router has a forwarding table of prefixes and next hops. For each packet, it picks the **most specific** (longest) prefix that matches the destination.
+
+| Prefix         | Next hop                   |
+| :------------- | :------------------------- |
+| `0.0.0.0/0`    | ISP uplink (default route) |
+| `10.0.0.0/8`   | Core switch                |
+| `10.20.0.0/16` | Data centre A              |
+| `10.20.5.0/24` | Rack 5                     |
+
+Destination `10.20.5.9` matches all four; the `/24` wins, so it goes to Rack 5. Destination `10.30.1.1` matches `/8` and `/0`; it goes to the core switch. Destination `8.8.8.8` matches only `/0`.
+
+Inside an organisation, routes are learned through interior protocols (OSPF, IS-IS) or configured statically; cloud VPC route tables are the same concept.
+
+---
+
+## BGP and anycast
+
+Between autonomous systems, **BGP** announces "AS 13335 can reach `104.16.0.0/13`". Each AS chooses among announced paths using its own policy (commercial relationships first, then path length and other attributes), not purely the shortest physical route.
+
+- BGP is trust-based. Misconfigurations and hijacks have taken down large parts of the internet: Pakistan Telecom accidentally hijacked YouTube's prefix in 2008, and Facebook withdrew its own routes in October 2021, disappearing for about six hours. **RPKI** cryptographically validates which AS may announce a prefix.
+- **Anycast**: the same prefix is announced from many locations. BGP routes each user to a topologically nearby site. Public DNS resolvers (`1.1.1.1`, `8.8.8.8`), root DNS servers, and CDNs use anycast for low latency and DDoS absorption: attack traffic is split across all sites.
+
+---
+
+## TTL, ICMP, and traceroute
+
+Every router decrements TTL; at zero it drops the packet and sends back an ICMP "time exceeded" message. This prevents packets looping forever when routing is wrong.
+
+`traceroute` exploits it: send packets with TTL 1, 2, 3, ... and record which router replies at each step.
+
+```bash
+traceroute example.com      # macOS/Linux (UDP or ICMP probes)
+tracert example.com         # Windows
+mtr example.com             # continuous traceroute with loss per hop
+```
+
+Reading the output: a sudden jump in latency between two hops often marks an ocean crossing; `* * *` at one hop usually means that router does not answer probes, not that traffic is lost (if later hops respond, the path works).
+
+**ICMP** also carries "destination unreachable", "fragmentation needed", and echo (`ping`). Blocking all ICMP at firewalls breaks path MTU discovery.
+
+---
+
+## MTU, fragmentation, and path MTU discovery
+
+Ethernet's MTU is 1,500 bytes. Tunnels and overlays add headers and reduce the effective MTU: a VPN or IPsec tunnel can take 50 to 80 bytes, VXLAN 50, PPPoE 8.
+
+- **IPv4 fragmentation**: a router can split an oversized packet into fragments that the receiver reassembles. Fragmentation hurts performance and security (losing one fragment loses the whole packet), so TCP sets the **DF** (don't fragment) bit.
+- **Path MTU discovery (PMTUD)**: with DF set, a router that cannot forward a large packet drops it and returns ICMP "fragmentation needed" with its MTU. The sender then uses smaller packets.
+- **PMTUD black holes**: if a firewall blocks that ICMP message, large packets vanish silently. The TCP handshake and small requests succeed (small packets fit); large responses hang. This is the scenario at the top of this page. Fixes: allow ICMP type 3 code 4 (and ICMPv6 "packet too big"), clamp TCP MSS on the tunnel, or rely on packetization-layer PMTUD.
+
+QUIC avoids IP fragmentation entirely: it starts with packets of at most 1,200 bytes and probes upward.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="How many usable hosts in a /27?">
+    32 − 27 = 5 host bits, 2^5 = 32 addresses, 30 usable after excluding network and broadcast
+    addresses (cloud providers reserve more).
+  </Accordion>
+  <Accordion title="Why can't a server on a home network accept connections from the internet by default?">
+    NAT keeps translation entries only for connections initiated from inside. Unsolicited inbound
+    packets match no entry and are dropped unless a port forward is configured.
+  </Accordion>
+  <Accordion title="How does anycast route users to the nearest server?">
+    Many sites announce the same IP prefix via BGP. Each network's routers pick the best path by
+    their policy, which usually leads to a topologically close site.
+  </Accordion>
+  <Accordion title="Small requests work but large responses hang over a VPN. Why?">
+    Likely a path MTU black hole: the tunnel reduced MTU, large DF packets are dropped, and the ICMP
+    "fragmentation needed" messages are blocked, so the sender never learns to shrink packets.
+  </Accordion>
+</Accordions>

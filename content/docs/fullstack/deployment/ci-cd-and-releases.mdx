@@ -1,0 +1,76 @@
+---
+title: CI/CD and Releases
+description: Continuous integration vs delivery vs deployment, a pipeline from commit to production, environments and promotion, database migrations during deploys, rolling, blue-green, and canary releases, rollbacks, and release hygiene.
+---
+
+A team deploys every two weeks in a four-hour window, and each release breaks something because it contains 80 changes. Another team deploys 20 times a day, each change small, tested, and reversible in a minute. Frequent, small, automated releases are safer, not riskier.
+
+---
+
+## The plain-language version
+
+| Term                       | Meaning                                                                    |
+| :------------------------- | :------------------------------------------------------------------------- |
+| **Continuous integration** | Every push is merged often and verified automatically (lint, tests, build) |
+| **Continuous delivery**    | Every passing build is deployable; release is a button                     |
+| **Continuous deployment**  | Every passing build goes to production automatically                       |
+| **Artifact**               | The built output deployed unchanged across environments (a Docker image)   |
+| **Promotion**              | Moving the same artifact from staging to production                        |
+
+---
+
+## A pipeline
+
+```yaml title=".github/workflows/deploy.yml (outline)"
+on:
+  push:
+    branches: [main]
+jobs:
+  test: # lint, typecheck, unit + integration tests (see CI page)
+  build:
+    needs: test # docker build, tag with ${{ github.sha }}, push to registry, scan image
+  deploy-staging:
+    needs: build # deploy image, run migrations, smoke tests (Playwright against staging)
+  deploy-prod:
+    needs: deploy-staging
+    environment: production # required reviewers / protection rules
+```
+
+Details of workflows, caching, and secrets: [GitHub Actions](/fullstack/git-and-github/github-actions). The image built once is promoted through environments; rebuilding per environment risks deploying something different from what was tested.
+
+---
+
+## Migrations during deploys
+
+Old and new versions run side by side during a rollout, so schema changes must be backward compatible:
+
+1. Deploy migration that **expands** (add nullable column, new table).
+2. Deploy code that uses it (writing both old and new where needed).
+3. Backfill.
+4. Later deploy a migration that **contracts** (drop the old column).
+
+Run migrations as a separate pipeline step or a one-off job before the new code goes live, with lock timeouts. Details: [Migrations and ORMs](/fullstack/databases/migrations-and-orms).
+
+---
+
+## Release strategies
+
+| Strategy      | How                                                                            | Rollback               | Cost                                                                                            |
+| :------------ | :----------------------------------------------------------------------------- | :--------------------- | :---------------------------------------------------------------------------------------------- |
+| Recreate      | Stop old, start new                                                            | Redeploy old           | Downtime                                                                                        |
+| Rolling       | Replace instances gradually; health checks gate each step                      | Roll back gradually    | Default on most platforms                                                                       |
+| Blue-green    | Run new version beside old; switch traffic at once                             | Switch back instantly  | Double capacity briefly                                                                         |
+| Canary        | Send a small percentage of traffic to the new version, watch metrics, increase | Route away from canary | Needs traffic splitting + good metrics                                                          |
+| Feature flags | Deploy dark, enable per user or percentage                                     | Flip the flag          | Flag management; see [feature flags](/fullstack/building-for-scale/degradation-and-idempotency) |
+
+Separating **deploy** (code is running) from **release** (users see it) through flags makes most rollbacks a flag flip instead of a redeploy.
+
+---
+
+## Rollbacks and hygiene
+
+- Keep the previous image tag ready; rollback = redeploy it (or the platform's "rollback" button).
+- Database migrations are the hard part of rollbacks; expand/contract keeps old code compatible so code can roll back without reversing schema.
+- Automated rollback on SLO regression in canaries (Argo Rollouts, Flagger, platform features).
+- Tag releases, generate changelogs from [conventional commits](/fullstack/git-and-github/github-and-gh), and annotate dashboards with deploy markers so regressions line up with the change that caused them.
+- DORA metrics track delivery health: deployment frequency, lead time for changes, change failure rate, and time to restore service.

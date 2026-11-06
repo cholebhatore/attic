@@ -1,0 +1,276 @@
+---
+title: Backend Optimization
+description: Making servers fast and efficient - latency budgets and request anatomy, removing round trips, database access patterns, N+1, caching, connection reuse and pooling, payload size and serialisation, concurrency and parallel I/O, CPU work off the request path, CPU and memory profiling in Node.js and Python, garbage collection and its pauses, tail latency sources, and load testing methodology.
+---
+
+An endpoint takes 900 ms. A trace shows 840 ms spent in 61 database queries, each about 14 ms: the ORM loads a list of orders, then each order's customer, then each customer's address. The fix is one query with joins, not faster hardware or a rewrite in another language. Backend latency is usually dominated by I/O and round trips, and the profile, not intuition, says which.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the backend half of Optimization. The models used here (Amdahl, Little's law, queueing, tail latency) are on [Performance Theory](/fullstack/optimization/performance-theory).
+
+A request's time is the sum of its steps: waiting in queues, network round trips to databases and services, and CPU work. Make the request do fewer round trips, make each necessary one cheaper, run independent ones at the same time, move work that does not affect the response off the request path, and keep CPU-heavy work from blocking other requests.
+
+Topics, in order:
+
+1. Request anatomy and latency budgets
+2. Removing round trips
+3. Database access
+4. Caching
+5. Connections and pooling
+6. Payloads and serialisation
+7. Concurrency and parallel I/O
+8. Work off the request path
+9. CPU profiling
+10. Memory and garbage collection
+11. Sources of tail latency
+12. Load testing
+
+| Word                 | Plain meaning                                                   |
+| :------------------- | :-------------------------------------------------------------- |
+| **span**             | One timed operation in a trace (a query, an HTTP call).         |
+| **flame graph**      | Visualisation of where CPU time is spent by call stack.         |
+| **event loop lag**   | Delay before a ready callback can run because the loop is busy. |
+| **GC pause**         | Time the runtime stops or slows the program to reclaim memory.  |
+| **throughput**       | Requests per second the system sustains.                        |
+| **saturation point** | Load at which latency starts climbing steeply.                  |
+
+---
+
+## Request anatomy and latency budgets
+
+Instrument with distributed tracing ([Observability](/fullstack/building-for-scale/observability)) and read a slow request's trace before changing anything. A typical breakdown:
+
+```text
+POST /checkout                                   420 ms
+├─ auth middleware (session lookup, Redis)          2 ms
+├─ validate body                                    1 ms
+├─ SELECT cart + items (3 queries, sequential)     45 ms
+├─ POST pricing-service                            120 ms   ← slowest dependency
+├─ POST payment-provider                           210 ms   ← external, unavoidable
+├─ INSERT order (transaction)                       25 ms
+├─ send confirmation email (inline!)               ...      ← should be async
+└─ serialise response                               3 ms
+```
+
+Set a **latency budget** per endpoint from the user-facing goal (for example, p99 ≤ 500 ms) and allocate it across dependencies; every dependency call then gets a timeout consistent with the budget ([Resilience Patterns](/fullstack/building-for-scale/resilience-patterns)).
+
+---
+
+## Removing round trips
+
+| Pattern                             | Round trips | Better                                                   |
+| :---------------------------------- | :---------- | :------------------------------------------------------- |
+| N+1 queries                         | 1 + N       | Join, or batch with `WHERE id IN (...)`                  |
+| Sequential independent queries      | N           | `Promise.all` / `asyncio.gather`                         |
+| Read-then-write in application code | 2+          | Single atomic statement (`UPDATE ... RETURNING`, upsert) |
+| Many small cache gets               | N           | `MGET` or a pipeline                                     |
+| Chatty service-to-service calls     | N           | Batch endpoint, or aggregate data in one call            |
+| Auth lookup on every internal call  | 1 per hop   | Propagate verified identity (signed token)               |
+
+At 1 to 5 ms per round trip inside a region, round-trip reduction is usually the largest single win.
+
+---
+
+## Database access
+
+The database is the most common bottleneck and the hardest to scale, so the application should ask it for as little as possible, as efficiently as possible:
+
+| Practice                                                                  | Why                                                                                       |
+| :------------------------------------------------------------------------ | :---------------------------------------------------------------------------------------- |
+| Index for actual query patterns ([Indexes](/fullstack/databases/indexes)) | Turns scans of millions of rows into lookups of a few                                     |
+| Select only needed columns                                                | Less I/O, enables index-only scans, smaller payloads                                      |
+| Keyset pagination                                                         | Constant cost per page instead of growing `OFFSET` scans                                  |
+| Aggregate in SQL, not in application code                                 | Avoids transferring rows to sum them                                                      |
+| Short transactions                                                        | Fewer lock waits and connection holds ([Transactions](/fullstack/databases/transactions)) |
+| Avoid `SELECT *` + ORM hydration of large graphs                          | Object creation and memory cost                                                           |
+| Read replicas for heavy reads                                             | Offload primary ([Scaling Databases](/fullstack/scaling-databases))                       |
+| Precompute expensive aggregates                                           | Materialised views, counters, summary tables                                              |
+| Find the worst queries by total time (`pg_stat_statements`)               | Optimises what actually costs the most ([Profiling](/fullstack/databases/profiling))      |
+
+Detect N+1 automatically: count queries per request in development and tests, and alert on traces with many identical spans.
+
+---
+
+## Caching
+
+Caching trades freshness for speed and capacity ([Caching](/fullstack/caching)):
+
+| Layer                | Latency                      | Use                                                                        |
+| :------------------- | :--------------------------- | :------------------------------------------------------------------------- |
+| In-process (LRU map) | ~nanoseconds to microseconds | Hot, small, rarely changing data (config, feature flags, reference tables) |
+| Redis / Memcached    | ~0.2–1 ms                    | Shared results across instances: computed objects, sessions, rate limits   |
+| HTTP / CDN           | 0 ms to the origin           | Public GET responses                                                       |
+
+Measure the hit ratio: a cache with a low hit ratio adds a network hop to most requests. Protect against stampedes when hot keys expire.
+
+---
+
+## Connections and pooling
+
+- **Database pools**: opening a PostgreSQL connection costs a TCP + TLS handshake, authentication, and a backend process; reuse via a pool. Size pools with Little's law: concurrent queries needed ≈ query rate × query time. Oversized pools across many instances overload the database ([Pooling and Failure Modes](/fullstack/databases/pooling-and-failure-modes)).
+- **HTTP keep-alive for outbound calls**: create one HTTP client per process and reuse it. A new TLS connection per outbound call adds tens of milliseconds and burns CPU.
+
+```ts
+// Node: undici (behind fetch) pools connections per origin automatically; tune for heavy upstream use
+import { Agent, setGlobalDispatcher } from 'undici';
+setGlobalDispatcher(new Agent({ keepAliveTimeout: 30_000, connections: 128 }));
+```
+
+```python
+# Python: reuse one AsyncClient for the app's lifetime (created in the FastAPI lifespan)
+client = httpx.AsyncClient(timeout=httpx.Timeout(2.0), limits=httpx.Limits(max_connections=100))
+```
+
+---
+
+## Payloads and serialisation
+
+- Return only what clients need; pagination and field selection keep payloads bounded.
+- Compress responses (Brotli or gzip) above a size threshold; small responses are not worth the CPU.
+- JSON serialisation of large objects is CPU work on the request thread; in Node it blocks the event loop. Faster serialisers: `fast-json-stringify` with schemas (Fastify uses it), `orjson` / `msgspec` in Python (often several times faster than the standard library).
+- Stream large responses instead of building them in memory ([Streamed Responses](/fullstack/performance/streamed-responses)).
+- Binary formats (Protobuf, MessagePack) for high-volume service-to-service traffic.
+
+---
+
+## Concurrency and parallel I/O
+
+```ts
+// Sequential: ~150 ms
+const user = await getUser(id);
+const orders = await getOrders(id);
+const recs = await getRecommendations(id);
+
+// Parallel: ~max(50, 60, 40) = 60 ms
+const [user2, orders2, recs2] = await Promise.all([
+  getUser(id),
+  getOrders(id),
+  getRecommendations(id),
+]);
+```
+
+```python
+user, orders, recs = await asyncio.gather(get_user(id), get_orders(id), get_recs(id))
+```
+
+Limit concurrency for fan-out to avoid overwhelming dependencies (`p-limit` in Node, `asyncio.Semaphore` in Python). In Python async servers, any blocking library call (sync DB driver, `requests`, CPU loops) stalls every request on that event loop ([Async Python](/fullstack/python-backend/async-python)).
+
+---
+
+## Work off the request path
+
+Anything the response does not depend on can run later:
+
+| Work                                             | Move to                                                                    |
+| :----------------------------------------------- | :------------------------------------------------------------------------- |
+| Emails, notifications, webhooks to partners      | Job queue ([Job Queues](/fullstack/message-brokers/job-queues-and-outbox)) |
+| Image and video processing                       | Queue + workers, or object storage events                                  |
+| Analytics and audit logging                      | Async buffered writes, log pipeline                                        |
+| Search index and cache updates                   | Events / outbox consumers                                                  |
+| Report generation                                | Background job; return `202 Accepted` with a status URL                    |
+| CPU-heavy computation (PDFs, hashing many items) | Worker threads / process pools / separate service                          |
+
+This shortens latency and isolates failures: a slow email provider no longer slows checkout.
+
+---
+
+## CPU profiling
+
+Profile under realistic load, in production-like builds.
+
+| Need                            | Node.js                                                                 | Python                                                                                |
+| :------------------------------ | :---------------------------------------------------------------------- | :------------------------------------------------------------------------------------ |
+| Sampling CPU profile            | `node --cpu-prof`, `--inspect` + Chrome DevTools, Clinic.js Flame, `0x` | `py-spy record` (no code changes, attaches to running processes), Scalene, `cProfile` |
+| Event loop blocking             | `perf_hooks.monitorEventLoopDelay`, Clinic Doctor                       | asyncio debug mode (logs slow callbacks)                                              |
+| Production continuous profiling | Pyroscope, Datadog, Grafana Profiles                                    | Same                                                                                  |
+
+Reading a **flame graph**: the x-axis is the share of samples (not time order); wide boxes are where time goes; look for wide plateaus at the top (functions doing work themselves) and unexpected frames (JSON parsing, regex, logging, encryption, ORM hydration).
+
+Common CPU hotspots in web backends: serialisation, validation of large payloads, synchronous crypto (password hashing belongs on a thread pool), logging with string formatting at high volume, regular expressions with catastrophic backtracking, template rendering, ORM object creation.
+
+---
+
+## Memory and garbage collection
+
+| Runtime          | GC model                                                                                              | Tuning and pitfalls                                                                                                                                                                |
+| :--------------- | :---------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Node.js (V8)     | Generational: fast young-generation scavenges, incremental and concurrent old-generation mark-compact | Heap limit defaults may not match container memory: set `--max-old-space-size` below the container limit; large heaps mean longer major GCs                                        |
+| Python (CPython) | Reference counting + cyclic garbage collector                                                         | Memory freed immediately when references drop; cycles collected periodically; fragmentation can keep RSS high; `gc.freeze()` before forking workers improves copy-on-write sharing |
+| JVM, Go          | Concurrent collectors with tunable pause goals                                                        | Pause-time vs throughput trade-offs                                                                                                                                                |
+
+GC pauses appear as latency spikes across all requests on a process. Reduce allocation rate (reuse buffers, avoid building large intermediate arrays, stream data), cap in-process caches, and find leaks with heap snapshots (Node: Chrome DevTools via `--inspect`, `heapdump`; Python: `tracemalloc`, memray).
+
+---
+
+## Sources of tail latency
+
+| Source                                  | Mitigation                                                 |
+| :-------------------------------------- | :--------------------------------------------------------- |
+| GC pauses                               | Lower allocation, right-size heaps, more smaller instances |
+| Cold caches after deploy or restart     | Warm-up, gradual traffic shifting                          |
+| Lock contention (DB row locks, mutexes) | Shorter transactions, avoid hot rows                       |
+| Noisy neighbours on shared hosts        | Dedicated instances for critical paths                     |
+| Retries of slow requests                | Retry budgets, hedging for idempotent reads                |
+| Queueing at high utilisation            | Headroom, autoscaling before saturation                    |
+| Fan-out to many backends                | Batch, cache, hedged requests                              |
+| Large payload outliers                  | Pagination limits, size caps                               |
+| Cold starts (serverless)                | Provisioned capacity, smaller bundles                      |
+
+Track p99 and p99.9 per endpoint, not just averages.
+
+---
+
+## Load testing
+
+A load test answers: what throughput can the system sustain within its latency SLO, where does it break, and what breaks first?
+
+| Test   | Shape                    | Answers                                        |
+| :----- | :----------------------- | :--------------------------------------------- |
+| Load   | Expected peak, sustained | Meets SLO at expected traffic?                 |
+| Stress | Ramp until failure       | Saturation point and failure mode              |
+| Spike  | Sudden jump              | Autoscaling and queueing behaviour             |
+| Soak   | Moderate load for hours  | Leaks, connection exhaustion, slow degradation |
+
+Methodology:
+
+- Production-like data volumes (a query fast on 1,000 rows can be slow on 10 million) and realistic request mixes.
+- **Open-model** load (constant arrival rate) rather than closed loops that slow down when the server does, which hides latency (coordinated omission).
+- Watch latency percentiles, error rate, and resource saturation (CPU, connection pools, DB, event loop lag) together; the first resource to saturate is the bottleneck.
+- Change one variable per run.
+
+Tools: k6, Gatling, Locust (Python), Artillery, autocannon and wrk2 for raw HTTP throughput.
+
+<Callout type="warn">
+  Load testing a shared staging database, or production without coordination, can cause real
+  outages. Isolate the environment or schedule and monitor carefully.
+</Callout>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="An endpoint is slow. What is the approach?">
+    Get a trace of a slow request, find the largest contributors, and address them in order: remove
+    round trips (N+1, sequential independent calls), fix slow queries with indexes, cache repeated
+    reads, move non-essential work off the request path, then profile CPU if compute dominates.
+    Verify with the same measurement.
+  </Accordion>
+  <Accordion title="How is a database connection pool sized?">
+    With Little's law: concurrent connections needed equals query rate times average query time,
+    plus headroom, and the total across all instances must stay within the database's capacity. More
+    connections than the database can serve in parallel only add contention.
+  </Accordion>
+  <Accordion title="What causes high p99 latency while p50 looks fine?">
+    GC pauses, lock contention, cache misses, queueing near saturation, retries, slow dependencies,
+    fan-out amplification, cold starts, and occasional large payloads.
+  </Accordion>
+  <Accordion title="Why are open-model load tests preferred?">
+    Closed-loop generators wait for responses before sending more, so they send less traffic exactly
+    when the server is slow, hiding latency spikes (coordinated omission). Constant arrival rates
+    reveal true latency under load.
+  </Accordion>
+</Accordions>

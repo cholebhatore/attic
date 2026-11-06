@@ -1,0 +1,86 @@
+---
+title: Docker Compose
+description: Defining a local stack (app, PostgreSQL, Redis, worker) in compose.yaml, service networking by name, health checks and depends_on, volumes, environment files, watch mode for development, profiles, and common commands.
+---
+
+A new developer joins and needs Postgres 17, Redis, a mail catcher, and the API running. With Compose, that is one command instead of a page of setup instructions that drift out of date.
+
+---
+
+## A full local stack
+
+```yaml title="compose.yaml"
+services:
+  api:
+    build: .
+    ports: ['3000:3000']
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/shop
+      REDIS_URL: redis://cache:6379
+    depends_on:
+      db: { condition: service_healthy }
+      cache: { condition: service_started }
+    develop:
+      watch:
+        - action: sync
+          path: ./src
+          target: /app/src
+        - action: rebuild
+          path: package.json
+
+  worker:
+    build: .
+    command: ['node', 'dist/worker.js']
+    env_file: .env
+    depends_on: [db, cache]
+
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: shop
+    ports: ['5432:5432']
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 5s
+      retries: 10
+
+  cache:
+    image: valkey/valkey:8
+    ports: ['6379:6379']
+
+  mail:
+    image: axllent/mailpit
+    ports: ['8025:8025']
+    profiles: [tools]
+
+volumes:
+  pgdata:
+```
+
+- Services reach each other by **service name** (`db:5432`) on the Compose network; `localhost` inside a container is the container itself.
+- `depends_on` with `service_healthy` waits for the health check, not just container start.
+- Named volumes keep data across restarts; `docker compose down -v` deletes them.
+- `profiles` keep optional services off unless requested.
+
+---
+
+## Commands
+
+```bash
+docker compose up -d                 # start in background
+docker compose up --watch            # sync code changes into containers
+docker compose logs -f api
+docker compose exec db psql -U postgres shop
+docker compose run --rm api pnpm migrate
+docker compose --profile tools up -d
+docker compose down                  # stop (add -v to delete volumes)
+```
+
+<Callout type="info">
+  Many teams run only dependencies (Postgres, Redis) in Compose and the app itself natively for the
+  fastest reload and debugging. Compose is also enough to run small production deployments on a
+  single VPS, as in [Deployment on a VPS](/fullstack/deployment/vps).
+</Callout>

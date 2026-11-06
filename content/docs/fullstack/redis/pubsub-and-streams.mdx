@@ -1,0 +1,88 @@
+---
+title: Pub/Sub and Streams
+description: Redis Pub/Sub channels and patterns, at-most-once delivery and its uses, sharded pub/sub, Redis Streams with XADD and XREAD, consumer groups, acknowledgements, pending entries, claiming stuck messages, and trimming.
+---
+
+A chat server runs on four instances. A message posted to instance A must reach users connected to instances B, C, and D. Redis Pub/Sub broadcasts it in a line of code. But if instance C restarts at that moment, it never sees the message. When messages must not be lost, Streams are the tool.
+
+---
+
+## The plain-language version
+
+**Pub/Sub** is a radio broadcast: whoever is listening right now hears it; nobody else ever will. **Streams** are a logbook: messages are appended and kept, readers track their position, and a **consumer group** shares the work among several readers with acknowledgements.
+
+| Word               | Plain meaning                                                      |
+| :----------------- | :----------------------------------------------------------------- |
+| **channel**        | Named topic for Pub/Sub.                                           |
+| **at-most-once**   | Delivered zero or one time; may be lost.                           |
+| **stream entry**   | Message with an ID like `1762425000123-0` (milliseconds-sequence). |
+| **consumer group** | Readers sharing a stream; each entry goes to one of them.          |
+| **PEL**            | Pending entries list: delivered but not yet acknowledged.          |
+
+---
+
+## Pub/Sub
+
+```text
+SUBSCRIBE room:42
+PSUBSCRIBE room:*          # pattern subscription
+PUBLISH room:42 '{"from":"ada","text":"hi"}'
+```
+
+```ts
+const sub = redis.duplicate(); // a subscribed connection cannot run other commands
+await sub.connect();
+await sub.subscribe('room:42', (message) => broadcastToLocalSockets('room:42', message));
+await redis.publish('room:42', JSON.stringify({ from: 'ada', text: 'hi' }));
+```
+
+Properties: no persistence, no acknowledgement, slow subscribers get disconnected if their output buffer fills. Good for: cache invalidation broadcasts, fanning out WebSocket messages across instances (the Socket.IO Redis adapter uses it), live notifications where a missed message is tolerable. In Cluster, **sharded pub/sub** (`SPUBLISH`, `SSUBSCRIBE`) keeps a channel's traffic on one shard.
+
+---
+
+## Streams
+
+```text
+XADD orders * type created order_id 981           # * = auto ID
+XADD orders MAXLEN ~ 100000 * type paid order_id 981   # cap length (approximate trim)
+XRANGE orders - + COUNT 10
+XREAD BLOCK 5000 STREAMS orders $                 # wait for new entries
+```
+
+### Consumer groups
+
+```text
+XGROUP CREATE orders billing $ MKSTREAM
+XREADGROUP GROUP billing worker-1 COUNT 10 BLOCK 5000 STREAMS orders >
+# process...
+XACK orders billing 1762425000123-0
+XPENDING orders billing                          # unacknowledged entries
+XAUTOCLAIM orders billing worker-2 60000 0-0     # take over entries idle > 60 s (crashed worker)
+```
+
+<Mermaid
+  chart={`
+flowchart LR
+    P["Producers: XADD"] --> S["Stream: orders"]
+    S --> G1["Group: billing"]
+    S --> G2["Group: email"]
+    G1 --> W1["worker-1"]
+    G1 --> W2["worker-2"]
+    G2 --> W3["worker-a"]
+`}
+/>
+
+Each group receives every entry; within a group, each entry goes to one consumer. Delivery is **at least once**: a worker that crashes before `XACK` leaves the entry pending, and another worker claims it, so processing must be idempotent.
+
+---
+
+## Pub/Sub vs Streams vs a broker
+
+|                 | Pub/Sub           | Streams               | Kafka / RabbitMQ            |
+| :-------------- | :---------------- | :-------------------- | :-------------------------- |
+| Persistence     | None              | In memory (+ AOF/RDB) | Disk, replicated            |
+| Replay          | No                | Yes, by ID            | Yes (Kafka)                 |
+| Consumer groups | No                | Yes                   | Yes                         |
+| Scale           | Very high fan-out | Bounded by memory     | Very large retained volumes |
+
+Streams suit moderate, short-retention event flows when Redis is already in the stack. For large, long-retention, or business-critical event logs, see [Message Brokers](/fullstack/message-brokers).

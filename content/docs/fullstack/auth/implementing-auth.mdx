@@ -1,0 +1,319 @@
+---
+title: Implementing Auth
+description: A complete token-based auth implementation in Express and FastAPI - registration, login, short-lived access tokens, rotating refresh tokens in httpOnly cookies with reuse detection, protected routes, role checks, and logout.
+---
+
+This page puts the previous pages together: Argon2id password hashes, 15-minute JWT access tokens kept in memory by the client, opaque refresh tokens in an `HttpOnly` cookie, stored hashed, rotated on every use, with reuse detection. The same design is shown in Express and FastAPI.
+
+---
+
+## The design
+
+| Piece           | Choice                                                                                |
+| :-------------- | :------------------------------------------------------------------------------------ |
+| Password hash   | Argon2id                                                                              |
+| Access token    | EdDSA-signed JWT, 15 min, returned in the JSON body, held in memory by the client     |
+| Refresh token   | 32 random bytes, `HttpOnly; Secure; SameSite=Strict; Path=/auth`, 30 days             |
+| Refresh storage | `refresh_tokens(id, user_id, family_id, token_hash, expires_at, used_at, revoked_at)` |
+| Revocation      | Revoke family on reuse; revoke all on password change                                 |
+
+```sql
+CREATE TABLE refresh_tokens (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     bigint NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  family_id   uuid NOT NULL,
+  token_hash  bytea NOT NULL UNIQUE,
+  expires_at  timestamptz NOT NULL,
+  used_at     timestamptz,
+  revoked_at  timestamptz,
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ON refresh_tokens (family_id);
+```
+
+The raw refresh token is high-entropy, so a fast SHA-256 hash is enough to store it safely.
+
+---
+
+## Endpoints
+
+| Endpoint              | Does                                                                  |
+| :-------------------- | :-------------------------------------------------------------------- |
+| `POST /auth/register` | Validate, hash password, create user                                  |
+| `POST /auth/login`    | Verify password, issue access token + new refresh family              |
+| `POST /auth/refresh`  | Rotate refresh token, issue new access token; on reuse, revoke family |
+| `POST /auth/logout`   | Revoke current family, clear cookie                                   |
+| `GET /me`             | Protected by access token                                             |
+
+---
+
+## Implementation
+
+<Tabs items={['Express', 'FastAPI']}>
+<Tab value="Express">
+
+```ts title="src/auth/tokens.ts"
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { SignJWT, jwtVerify } from 'jose';
+import { db } from '../db';
+import { keys } from './keys'; // EdDSA key pair loaded at startup
+
+const ACCESS_TTL = '15m';
+const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const sha256 = (s: string) => createHash('sha256').update(s).digest();
+
+export async function signAccess(user: { id: number; role: string }) {
+  return new SignJWT({ role: user.role })
+    .setProtectedHeader({ alg: 'EdDSA', kid: keys.kid })
+    .setSubject(String(user.id))
+    .setIssuer('shop')
+    .setAudience('shop-api')
+    .setIssuedAt()
+    .setExpirationTime(ACCESS_TTL)
+    .sign(keys.privateKey);
+}
+
+export async function verifyAccess(token: string) {
+  const { payload } = await jwtVerify(token, keys.publicKey, {
+    algorithms: ['EdDSA'],
+    issuer: 'shop',
+    audience: 'shop-api',
+  });
+  return payload;
+}
+
+export async function issueRefresh(userId: number, familyId: string = randomUUID()) {
+  const raw = randomBytes(32).toString('base64url');
+  await db.query(
+    `INSERT INTO refresh_tokens (user_id, family_id, token_hash, expires_at) VALUES ($1, $2, $3, $4)`,
+    [userId, familyId, sha256(raw), new Date(Date.now() + REFRESH_TTL_MS)],
+  );
+  return raw;
+}
+
+export async function rotateRefresh(raw: string) {
+  return db.transaction(async (tx) => {
+    const {
+      rows: [rt],
+    } = await tx.query(`SELECT * FROM refresh_tokens WHERE token_hash = $1 FOR UPDATE`, [
+      sha256(raw),
+    ]);
+    if (!rt || rt.revoked_at || rt.expires_at < new Date()) return null;
+    if (rt.used_at) {
+      // reuse: likely theft
+      await tx.query(`UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = $1`, [
+        rt.family_id,
+      ]);
+      return null;
+    }
+    await tx.query(`UPDATE refresh_tokens SET used_at = now() WHERE id = $1`, [rt.id]);
+    const next = await issueRefresh(rt.user_id, rt.family_id);
+    return { userId: rt.user_id as number, refresh: next };
+  });
+}
+```
+
+```ts title="src/auth/auth.routes.ts"
+import { Router } from 'express';
+import argon2 from 'argon2';
+import { z } from 'zod';
+import { signAccess, issueRefresh, rotateRefresh, verifyAccess } from './tokens';
+
+const cookieOpts = {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'strict' as const,
+  path: '/auth',
+  maxAge: 30 * 864e5,
+};
+const Login = z.object({ email: z.email(), password: z.string().min(1) });
+
+export const authRouter = Router();
+
+authRouter.post('/login', loginLimiter, async (req, res) => {
+  const { email, password } = Login.parse(req.body);
+  const user = await users.findByEmail(email);
+  const ok = user
+    ? await argon2.verify(user.passwordHash, password)
+    : await argon2.verify(DUMMY_HASH, password);
+  if (!user || !ok) return res.status(401).json({ title: 'Invalid email or password' }); // same message, similar timing
+
+  res.cookie('rt', await issueRefresh(user.id), cookieOpts);
+  res.json({ accessToken: await signAccess(user) });
+});
+
+authRouter.post('/refresh', async (req, res) => {
+  const result = req.cookies.rt && (await rotateRefresh(req.cookies.rt));
+  if (!result)
+    return res.clearCookie('rt', { path: '/auth' }).status(401).json({ title: 'Session expired' });
+  const user = await users.get(result.userId);
+  if (user.banned) return res.status(403).json({ title: 'Account disabled' });
+  res.cookie('rt', result.refresh, cookieOpts);
+  res.json({ accessToken: await signAccess(user) });
+});
+
+authRouter.post('/logout', async (req, res) => {
+  if (req.cookies.rt) await revokeFamilyByToken(req.cookies.rt);
+  res.clearCookie('rt', { path: '/auth' }).sendStatus(204);
+});
+
+// Middleware for protected routes
+export async function requireUser(req, res, next) {
+  const token = req.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
+  if (!token) return res.status(401).set('WWW-Authenticate', 'Bearer').end();
+  try {
+    const claims = await verifyAccess(token);
+    req.user = { id: Number(claims.sub), role: claims.role as string };
+    next();
+  } catch {
+    res.status(401).set('WWW-Authenticate', 'Bearer error="invalid_token"').end();
+  }
+}
+
+export const requireRole = (role: string) => (req, res, next) =>
+  req.user?.role === role ? next() : res.status(403).json({ title: 'Forbidden' });
+```
+
+`cookie-parser` provides `req.cookies`; `loginLimiter` is an `express-rate-limit` instance with a Redis store.
+
+</Tab>
+<Tab value="FastAPI">
+
+```python title="app/auth/tokens.py"
+import hashlib, secrets, uuid
+from datetime import datetime, timedelta, timezone
+import jwt
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from .models import RefreshToken
+from .keys import PRIVATE_KEY, PUBLIC_KEY, KID
+
+ACCESS_TTL = timedelta(minutes=15)
+REFRESH_TTL = timedelta(days=30)
+sha256 = lambda s: hashlib.sha256(s.encode()).digest()
+
+def sign_access(user) -> str:
+    now = datetime.now(timezone.utc)
+    return jwt.encode({"sub": str(user.id), "role": user.role, "iss": "shop", "aud": "shop-api",
+                       "iat": now, "exp": now + ACCESS_TTL}, PRIVATE_KEY, algorithm="EdDSA",
+                      headers={"kid": KID})
+
+def verify_access(token: str) -> dict:
+    return jwt.decode(token, PUBLIC_KEY, algorithms=["EdDSA"], audience="shop-api", issuer="shop")
+
+async def issue_refresh(s: AsyncSession, user_id: int, family_id: uuid.UUID | None = None) -> str:
+    raw = secrets.token_urlsafe(32)
+    s.add(RefreshToken(user_id=user_id, family_id=family_id or uuid.uuid4(), token_hash=sha256(raw),
+                       expires_at=datetime.now(timezone.utc) + REFRESH_TTL))
+    await s.flush()
+    return raw
+
+async def rotate_refresh(s: AsyncSession, raw: str) -> tuple[int, str] | None:
+    rt = await s.scalar(select(RefreshToken).where(RefreshToken.token_hash == sha256(raw)).with_for_update())
+    if not rt or rt.revoked_at or rt.expires_at < datetime.now(timezone.utc):
+        return None
+    if rt.used_at:                                                   # reuse: revoke the family
+        await s.execute(update(RefreshToken).where(RefreshToken.family_id == rt.family_id)
+                        .values(revoked_at=datetime.now(timezone.utc)))
+        await s.commit()
+        return None
+    rt.used_at = datetime.now(timezone.utc)
+    new_raw = await issue_refresh(s, rt.user_id, rt.family_id)
+    await s.commit()
+    return rt.user_id, new_raw
+```
+
+```python title="app/auth/router.py"
+from typing import Annotated
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pwdlib import PasswordHash
+from pydantic import BaseModel, EmailStr
+
+router = APIRouter(prefix="/auth", tags=["auth"])
+hasher = PasswordHash.recommended()
+COOKIE = dict(httponly=True, secure=True, samesite="strict", path="/auth", max_age=30 * 86400)
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+@router.post("/login")
+async def login(body: LoginIn, response: Response, s: DbSession):
+    user = await users.by_email(s, body.email)
+    ok = hasher.verify(body.password, user.password_hash if user else DUMMY_HASH)
+    if not user or not ok:
+        raise HTTPException(401, "Invalid email or password")
+    response.set_cookie("rt", await issue_refresh(s, user.id), **COOKIE)
+    await s.commit()
+    return {"access_token": sign_access(user)}
+
+@router.post("/refresh")
+async def refresh(response: Response, s: DbSession, rt: str | None = Cookie(None)):
+    result = rt and await rotate_refresh(s, rt)
+    if not result:
+        response.delete_cookie("rt", path="/auth")
+        raise HTTPException(401, "Session expired")
+    user_id, new_rt = result
+    user = await users.get(s, user_id)
+    response.set_cookie("rt", new_rt, **COOKIE)
+    return {"access_token": sign_access(user)}
+
+bearer = HTTPBearer(auto_error=False)
+
+async def current_user(creds: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)]):
+    if not creds:
+        raise HTTPException(401, headers={"WWW-Authenticate": "Bearer"})
+    try:
+        claims = verify_access(creds.credentials)
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
+    return {"id": int(claims["sub"]), "role": claims["role"]}
+
+def require_role(role: str):
+    async def check(user=Depends(current_user)):
+        if user["role"] != role:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Forbidden")
+        return user
+    return check
+```
+
+</Tab>
+</Tabs>
+
+---
+
+## Client side
+
+```ts
+let accessToken: string | null = null;
+
+async function api(path: string, init: RequestInit = {}) {
+  const send = () =>
+    fetch(path, { ...init, headers: { ...init.headers, Authorization: `Bearer ${accessToken}` } });
+  let res = await send();
+  if (res.status === 401) {
+    const r = await fetch('/auth/refresh', { method: 'POST', credentials: 'include' });
+    if (!r.ok) {
+      location.href = '/login';
+      throw new Error('logged out');
+    }
+    accessToken = (await r.json()).accessToken;
+    res = await send();
+  }
+  return res;
+}
+```
+
+Deduplicate concurrent refreshes (share one in-flight promise) so ten parallel 401s do not trigger ten rotations, which would look like reuse.
+
+---
+
+## Checklist before production
+
+- Rate limits on login, register, refresh, and password reset.
+- CSRF: the refresh cookie is `SameSite=Strict` and scoped to `/auth`; also check `Origin` on `/auth/*`.
+- Logs redact `Authorization`, cookies, and passwords.
+- Password change and admin ban revoke all families.
+- Tests for reuse detection, expired tokens, wrong `aud`, and `alg` confusion.
+- Consider a library or provider instead (next page): this code is the minimum, not the whole job (email verification, MFA, account recovery, audit logs).

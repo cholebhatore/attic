@@ -1,0 +1,78 @@
+---
+title: Estimation and Building Blocks
+description: Back-of-the-envelope estimation (QPS, storage, bandwidth), latency numbers, availability nines, and the standard building blocks - DNS, CDN, load balancers, app servers, caches, databases, object storage, queues, search, and ID generation.
+---
+
+"Should this use Kafka?" cannot be answered without knowing whether the system handles 50 events per second or 500,000. Rough estimates turn design debates into arithmetic.
+
+---
+
+## Estimation
+
+```text
+10 M daily active users × 20 requests/day = 200 M requests/day
+200 M / 86,400 s ≈ 2,300 requests/s average
+peak ≈ 2–3 × average ≈ 5,000–7,000 requests/s
+
+Storage: 1 M new posts/day × 2 KB = 2 GB/day ≈ 730 GB/year (text only)
+Images: 200 K/day × 500 KB = 100 GB/day ≈ 36 TB/year → object storage + CDN
+```
+
+Useful shortcuts: a day is about 86,400 ≈ 10⁵ seconds; 1 million requests per day is about 12 per second.
+
+### Latency orders of magnitude
+
+| Operation                             | Roughly          |
+| :------------------------------------ | :--------------- |
+| L1 cache / main memory reference      | ~1 ns / ~100 ns  |
+| Read 1 MB sequentially from memory    | ~10 µs (or less) |
+| SSD random read                       | ~16–100 µs       |
+| Round trip within a data centre       | ~0.5 ms          |
+| Redis GET over the network            | ~0.2–1 ms        |
+| Indexed DB query                      | ~1–10 ms         |
+| Round trip across a continent / ocean | ~40–150 ms       |
+
+Approximations in the spirit of the widely circulated "latency numbers every programmer should know"; exact values vary by hardware.
+
+### Availability
+
+| Availability | Downtime per year |
+| :----------- | :---------------- |
+| 99%          | ~3.65 days        |
+| 99.9%        | ~8.8 hours        |
+| 99.99%       | ~53 minutes       |
+| 99.999%      | ~5.3 minutes      |
+
+Components in series multiply: two 99.9 percent dependencies give about 99.8 percent. Redundancy in parallel raises it.
+
+---
+
+## Building blocks
+
+| Block                 | Role                                          | Examples                                     |
+| :-------------------- | :-------------------------------------------- | :------------------------------------------- |
+| DNS                   | Name to address, geo-routing, failover        | Route 53, Cloudflare                         |
+| CDN                   | Cache static and cacheable content near users | Cloudflare, CloudFront, Fastly               |
+| Load balancer         | Spread traffic, health checks, TLS            | L4 (TCP) vs L7 (HTTP: path routing, headers) |
+| Stateless app servers | Business logic, horizontally scaled           | Containers, functions                        |
+| Cache                 | Hot reads                                     | Redis, Memcached                             |
+| Relational DB         | Source of truth, transactions                 | PostgreSQL, MySQL                            |
+| NoSQL                 | Scale-out key-value or wide-column            | DynamoDB, Cassandra                          |
+| Object storage        | Files, media, backups                         | S3, R2, GCS                                  |
+| Queue / log           | Async work, decoupling, buffering spikes      | SQS, RabbitMQ, Kafka                         |
+| Search                | Full-text and relevance                       | Elasticsearch, OpenSearch                    |
+| Rate limiter          | Protect services                              | Gateway or Redis-based                       |
+
+Load balancing algorithms: round robin, least connections, weighted, and consistent hashing (for cache affinity).
+
+---
+
+## Unique IDs at scale
+
+| Option                                           | Properties                                      |
+| :----------------------------------------------- | :---------------------------------------------- |
+| DB auto-increment                                | Simple; single point of coordination; guessable |
+| UUIDv4                                           | No coordination; random, poor index locality    |
+| UUIDv7 / ULID                                    | Time-ordered, no coordination, index-friendly   |
+| Snowflake-style (timestamp + machine + sequence) | 64-bit, ordered, needs machine IDs              |
+| Ticket server / range allocation                 | Short sequential IDs, each server takes a block |

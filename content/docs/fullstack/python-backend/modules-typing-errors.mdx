@@ -1,0 +1,115 @@
+---
+title: Modules, Typing, Errors
+description: Modules and packages, absolute and relative imports, __name__ == "__main__", project layout, type hints, generics, TypedDict and Protocol, mypy and pyright, exceptions, custom exceptions, and logging.
+---
+
+A Python app grows from one file to dozens, needs type checking to stay maintainable, and must turn failures into useful errors. This page covers the structure that holds a backend together.
+
+---
+
+## Modules and packages
+
+A **module** is a `.py` file. A **package** is a folder of modules (with `__init__.py`, optional in modern Python for namespace packages, but recommended for apps).
+
+```python
+import json
+from pathlib import Path
+from app.orders.service import create_order     # absolute import (preferred)
+from .repo import OrderRepo                     # relative import within a package
+```
+
+```python
+if __name__ == "__main__":     # true only when run directly, not when imported
+    main()
+```
+
+### Project layout
+
+<Files>
+  <Folder name="shop-api" defaultOpen>
+    <File name="pyproject.toml" />
+    <File name="uv.lock" />
+    <Folder name="src" defaultOpen>
+      <Folder name="app" defaultOpen>
+        <File name="__init__.py" />
+        <File name="main.py" />
+        <File name="settings.py" />
+        <File name="db.py" />
+        <Folder name="orders" defaultOpen>
+          <File name="router.py" />
+          <File name="schemas.py" />
+          <File name="models.py" />
+          <File name="service.py" />
+        </Folder>
+      </Folder>
+    </Folder>
+    <Folder name="tests" />
+    <Folder name="migrations" />
+  </Folder>
+</Files>
+
+The `src/` layout stops tests from accidentally importing the working directory instead of the installed package. Circular imports (`a` imports `b` imports `a`) usually mean a module should be split.
+
+---
+
+## Type hints
+
+```python
+from typing import Protocol, TypedDict, Literal
+
+def find(users: list[dict[str, str]], email: str) -> dict[str, str] | None: ...
+
+Status = Literal["pending", "paid", "shipped"]
+
+class OrderDict(TypedDict):
+    id: int
+    status: Status
+
+class Notifier(Protocol):          # structural type, like a TS interface
+    def send(self, to: str, body: str) -> None: ...
+
+def first[T](items: list[T]) -> T | None:   # generic function (3.12+ syntax)
+    return items[0] if items else None
+```
+
+Hints are not enforced at runtime. **mypy** or **pyright** (strict mode) check them; **Pydantic** enforces them at runtime for incoming data.
+
+---
+
+## Exceptions
+
+```python
+class AppError(Exception):
+    status = 500
+
+class NotFound(AppError):
+    status = 404
+    def __init__(self, what: str):
+        super().__init__(f"{what} not found")
+
+try:
+    order = repo.get(order_id)
+except NotFound:
+    raise                          # re-raise as-is
+except (TimeoutError, ConnectionError) as e:
+    raise AppError("upstream unavailable") from e   # keep the cause chain
+else:
+    print("ran only if no exception")
+finally:
+    print("always runs")
+```
+
+Catch specific exceptions. A bare `except:` also catches `KeyboardInterrupt` and hides bugs. Python style is **EAFP** ("easier to ask forgiveness than permission"): try the operation and handle the exception, instead of checking first.
+
+---
+
+## Logging
+
+```python
+import logging
+logger = logging.getLogger(__name__)
+logger.info("order created", extra={"order_id": order.id})
+logger.exception("payment failed")    # inside except: includes the stack trace
+```
+
+Configure once at startup (JSON output in production with `structlog` or `python-json-logger`). See [structured logging](/fullstack/backend-fundamentals/config-logging-errors).

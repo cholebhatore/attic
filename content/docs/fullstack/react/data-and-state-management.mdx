@@ -1,0 +1,234 @@
+---
+title: Data and State Management
+description: Categories of state and where each belongs, why server state is a cache problem, fetch-on-render vs fetch-then-render vs render-as-you-fetch and request waterfalls, TanStack Query internals (query keys, staleness, garbage collection, deduplication, invalidation, optimistic updates), client stores and selector subscriptions (Zustand, Redux Toolkit, Jotai), URL state, and forms.
+---
+
+Teams once put every API response into Redux, then wrote loading flags, error flags, cache invalidation, retries, and refetch-on-focus logic by hand for every endpoint. Most of that "global state" was a cache of data owned by the server, and caches need different tools from UI state: expiry, deduplication, background refresh, and invalidation after writes. Choosing a tool starts with classifying the state.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after the core hooks pages. This page is about application-level state architecture.
+
+There are different kinds of state, owned by different parties. **Server state** is owned by the backend; the client holds a possibly outdated copy, like a printed timetable. **Client state** is owned by the browser session: whether a modal is open, what is typed in a draft. **URL state** is owned by the address bar, shareable and bookmarkable. Mixing them in one store makes every one of them harder.
+
+Topics, in order:
+
+1. Categories of state
+2. Server state is a cache
+3. Fetching strategies and waterfalls
+4. TanStack Query in depth
+5. Mutations and optimistic updates
+6. Client stores and subscriptions
+7. URL state
+8. Forms
+
+| Word                  | Plain meaning                                                                           |
+| :-------------------- | :-------------------------------------------------------------------------------------- |
+| **server state**      | Data persisted remotely, shared, and changeable by others.                              |
+| **stale**             | Cached data that may be outdated and should be refetched when convenient.               |
+| **query key**         | Serializable identifier of a piece of cached server data.                               |
+| **invalidation**      | Marking cached data stale so it refetches.                                              |
+| **deduplication**     | Multiple components requesting the same data share one request.                         |
+| **waterfall**         | Requests that start only after earlier ones finish, adding round trips.                 |
+| **selector**          | Function picking a slice of a store; components re-render only when that slice changes. |
+| **optimistic update** | Updating the UI before the server confirms, rolling back on failure.                    |
+
+---
+
+## Categories of state
+
+| Category                | Example                                                           | Owner           | Best home                                                       |
+| :---------------------- | :---------------------------------------------------------------- | :-------------- | :-------------------------------------------------------------- |
+| Server state            | Orders, profile, product list                                     | Backend         | Server Components, route loaders, TanStack Query, SWR           |
+| URL state               | Search query, filters, page, selected tab                         | Address bar     | Search params / route params                                    |
+| Local UI state          | Modal open, hover, input text                                     | One component   | `useState`                                                      |
+| Shared client state     | Shopping cart before checkout, editor document, multi-step wizard | Browser session | Zustand, Jotai, Redux Toolkit, context for slow-changing values |
+| Form state              | Field values, touched, errors                                     | Form            | Native forms + actions, React Hook Form                         |
+| Persistent client state | Preferences, drafts                                               | Browser storage | `localStorage` or IndexedDB synced to state                     |
+
+A useful test: if the page were reloaded, where should this value come from? From the server: server state. From the URL: URL state. Nowhere (reset is fine): local state.
+
+---
+
+## Server state is a cache
+
+A client copy of server data is a cache with all the usual problems ([Caching](/fullstack/caching)):
+
+- It can be **stale**: someone else changed the data.
+- Multiple components need the same data: requests should be **deduplicated**.
+- After a mutation, related data must be **invalidated**.
+- Data unused for a while should be **garbage collected**.
+- Requests fail and need **retries**; slow ones need **race handling**.
+- When the user returns to the tab or reconnects, data may need **refreshing**.
+
+Hand-written `useEffect` + `useState` fetching handles none of these.
+
+---
+
+## Fetching strategies and waterfalls
+
+| Strategy                | How                                                                                                                        | Problem                                                                        |
+| :---------------------- | :------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------- |
+| **Fetch-on-render**     | Each component fetches in an effect after it renders                                                                       | Waterfalls: child fetches only after parent's data arrives and it renders      |
+| **Fetch-then-render**   | Fetch everything at the route level, then render                                                                           | No waterfall, but nothing shows until the slowest request ends                 |
+| **Render-as-you-fetch** | Start all requests as early as possible (on navigation, in a loader, on the server), render as each resolves with Suspense | Best of both; requires a router, framework, or cache that starts fetches early |
+
+A waterfall in numbers, at 150 ms per request:
+
+```text
+fetch-on-render:   User ──150──▶ render ▶ Orders ──150──▶ render ▶ OrderItems ──150──▶  = 450 ms + render time
+parallel/loader:   User, Orders, OrderItems in parallel ──150──▶                        = 150 ms
+```
+
+Waterfalls are the most common cause of slow React pages on real networks. Fixes: route loaders (React Router, TanStack Router), Server Components fetching in parallel on the server (where round trips to the database are short), `Promise.all` for independent requests, prefetching on link hover, and including related data in one API response.
+
+---
+
+## TanStack Query in depth
+
+```tsx
+const { data, error, isPending, isFetching } = useQuery({
+  queryKey: ['orders', { userId, status }],
+  queryFn: ({ signal }) => api.getOrders({ userId, status }, { signal }),
+  staleTime: 30_000, // data is fresh for 30 s: no refetch on mount within that window
+  gcTime: 5 * 60_000, // unused cache entries are removed after 5 min
+});
+```
+
+| Concept                     | Behaviour                                                                                                    |
+| :-------------------------- | :----------------------------------------------------------------------------------------------------------- |
+| Query key                   | Array hashed deterministically; same key = same cache entry, shared by all components                        |
+| `staleTime` (default 0)     | How long data counts as fresh. Stale data is still shown, but refetched on triggers                          |
+| Refetch triggers            | Component mount, window refocus, network reconnect, interval (all configurable), only if stale               |
+| `gcTime` (default 5 min)    | How long inactive (unobserved) data stays in memory                                                          |
+| Deduplication               | Concurrent requests for one key share a single promise                                                       |
+| Retries                     | Failed queries retry 3 times with exponential backoff by default                                             |
+| Cancellation                | The `signal` aborts requests when the key changes or the query is unmounted                                  |
+| `isPending` vs `isFetching` | No data yet vs any request in flight (including background refresh)                                          |
+| Structural sharing          | New results reuse unchanged parts of the old object, so identities stay stable and components re-render less |
+
+This is **stale-while-revalidate** applied in the client: show cached data immediately, refresh in the background, update when new data arrives. SWR (by Vercel) implements the same model with a smaller API. With SSR, queries can be prefetched on the server and **dehydrated** into the HTML so the client cache starts warm.
+
+---
+
+## Mutations and optimistic updates
+
+```tsx
+const queryClient = useQueryClient();
+
+const toggleTodo = useMutation({
+  mutationFn: (todo: Todo) => api.updateTodo(todo.id, { done: !todo.done }),
+  onMutate: async (todo) => {
+    await queryClient.cancelQueries({ queryKey: ['todos'] }); // avoid overwrites by in-flight fetches
+    const previous = queryClient.getQueryData<Todo[]>(['todos']);
+    queryClient.setQueryData<Todo[]>(['todos'], (old = []) =>
+      old.map((t) => (t.id === todo.id ? { ...t, done: !t.done } : t)),
+    );
+    return { previous }; // context for rollback
+  },
+  onError: (_err, _todo, context) => queryClient.setQueryData(['todos'], context?.previous),
+  onSettled: () => queryClient.invalidateQueries({ queryKey: ['todos'] }), // reconcile with server truth
+});
+```
+
+Invalidation by key prefix (`['orders']` invalidates `['orders', { userId: 1 }]` too) is why key design matters: put the entity first, then parameters. Optimistic updates suit actions that rarely fail and must feel instant (likes, toggles, reordering); payments and other consequential actions should show a pending state instead. React 19's `useOptimistic` provides the same idea for actions ([React 19 and Patterns](/fullstack/react/react-19-and-patterns)).
+
+---
+
+## Client stores and subscriptions
+
+Context re-renders every consumer on any change. Stores avoid this with **selector subscriptions**: each component subscribes to the slice it needs and re-renders only when that slice changes (compared by `Object.is` or a custom equality function). Internally they use `useSyncExternalStore`.
+
+```tsx
+import { create } from 'zustand';
+
+type CartState = {
+  items: CartItem[];
+  add: (item: CartItem) => void;
+  remove: (id: string) => void;
+};
+
+export const useCart = create<CartState>()((set) => ({
+  items: [],
+  add: (item) => set((s) => ({ items: [...s.items, item] })),
+  remove: (id) => set((s) => ({ items: s.items.filter((i) => i.id !== id) })),
+}));
+
+const count = useCart((s) => s.items.length); // re-renders only when the count changes
+const add = useCart((s) => s.add); // stable function
+```
+
+A selector that returns a new object each time (`(s) => ({ a: s.a, b: s.b })`) re-renders on every store change; use separate selectors or a shallow-equality helper.
+
+| Library                 | Model                                                                                                  | Fits                                                             |
+| :---------------------- | :----------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------- |
+| Zustand                 | Single store, hooks with selectors, minimal API                                                        | Most apps needing shared client state                            |
+| Redux Toolkit           | Single store, reducers and actions, strong conventions, excellent devtools; RTK Query for server state | Large teams wanting enforced patterns, complex state transitions |
+| Jotai                   | Atoms composed bottom-up; components subscribe to atoms                                                | Fine-grained, interdependent state (editors, canvases)           |
+| XState / state machines | Explicit states and transitions                                                                        | Complex flows: checkout, wizards, media players                  |
+| MobX, signals libraries | Observable, fine-grained reactivity                                                                    | Teams preferring mutable reactive models                         |
+
+---
+
+## URL state
+
+Anything that should survive a reload, be shareable, or work with back and forward belongs in the URL: search queries, filters, sort order, pagination, selected tabs, open detail panels.
+
+```tsx
+const [searchParams, setSearchParams] = useSearchParams();
+const page = Number(searchParams.get('page') ?? 1);
+setSearchParams((p) => {
+  p.set('page', String(page + 1));
+  return p;
+});
+```
+
+Considerations: parse and validate URL params like any user input (a schema), decide between `push` (creates history entries) and `replace` (for every keystroke in a search box), and debounce writes. Libraries such as `nuqs` give typed, hook-based URL state in Next.js and React Router.
+
+---
+
+## Forms
+
+| Approach                         | Model                                                                                                      | When                                         |
+| :------------------------------- | :--------------------------------------------------------------------------------------------------------- | :------------------------------------------- |
+| Native `form` + React 19 actions | Uncontrolled inputs, `FormData` on submit, server validation, progressive enhancement                      | Most forms, especially with Server Functions |
+| React Hook Form                  | Uncontrolled inputs registered by ref; re-renders only fields with errors; schema validation via resolvers | Large, dynamic, client-validated forms       |
+| TanStack Form, Conform           | Typed, framework-agnostic / server-action-first                                                            | Type-heavy or server-validated forms         |
+| Controlled inputs in state       | Every keystroke is a render                                                                                | Small forms, inputs that drive other UI      |
+
+```tsx
+const form = useForm<SignUp>({ resolver: zodResolver(SignUpSchema), mode: 'onBlur' });
+<form onSubmit={form.handleSubmit(onSubmit)}>
+  <input {...form.register('email')} aria-invalid={!!form.formState.errors.email} />
+  {form.formState.errors.email && <p role="alert">{form.formState.errors.email.message}</p>}
+</form>;
+```
+
+The same schema should validate on the server: client validation is a convenience, not a security control ([Runtime Validation](/fullstack/typescript/runtime-validation)).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why is server state different from client state?">
+    It is owned remotely, can change without the client knowing, and is shared across components and
+    users. Managing it needs caching, staleness, deduplication, invalidation, retries, and
+    background refresh, which client-state tools do not provide.
+  </Accordion>
+  <Accordion title="What is a request waterfall and how is it avoided?">
+    Requests that start only after earlier ones complete, usually because each component fetches
+    after it renders. Start requests earlier and in parallel: route loaders, server-side fetching,
+    Promise.all, prefetching, or aggregated endpoints.
+  </Accordion>
+  <Accordion title="What does staleTime control in TanStack Query?">
+    How long cached data counts as fresh. Fresh data is served without refetching; stale data is
+    still shown but refetched on triggers like mount, focus, and reconnect.
+  </Accordion>
+  <Accordion title="Why do stores use selectors instead of context?">
+    Context re-renders every consumer when its value changes. Selector subscriptions let each
+    component re-render only when the specific slice it reads changes.
+  </Accordion>
+</Accordions>

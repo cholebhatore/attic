@@ -1,0 +1,72 @@
+---
+title: End-to-End Tests
+description: Playwright vs Cypress, locators and auto-waiting, reusing logged-in state, test data, flakiness causes, traces, visual and accessibility checks, and running in CI.
+---
+
+Unit tests all pass, and checkout is broken in production because a CSP header blocks the payment script. Only a test that drives a real browser through the real app catches problems that live between the pieces.
+
+---
+
+## The plain-language version
+
+An E2E test opens a browser, visits the app, and acts like a user: click, type, assert on what appears. They are slow and the most realistic. Keep a small set covering critical journeys: sign up, log in, checkout, the main workflow.
+
+| Word              | Plain meaning                                                |
+| :---------------- | :----------------------------------------------------------- |
+| **locator**       | A way to find an element, re-evaluated on each use.          |
+| **auto-waiting**  | The tool waits for elements to be actionable before acting.  |
+| **storage state** | Saved cookies and storage, to skip logging in for each test. |
+| **trace**         | Recording of a run: DOM snapshots, network, console.         |
+
+---
+
+## Playwright vs Cypress
+
+|                         | Playwright                               | Cypress                                         |
+| :---------------------- | :--------------------------------------- | :---------------------------------------------- |
+| Browsers                | Chromium, Firefox, WebKit                | Chromium-family, Firefox, WebKit (experimental) |
+| Architecture            | Drives browsers over protocols from Node | Runs inside the browser alongside the app       |
+| Multiple tabs / origins | Yes                                      | Limited                                         |
+| Parallelism             | Built in, free                           | Via paid cloud or plugins                       |
+| Debugging               | Trace viewer, UI mode, codegen           | Time-travel UI, very approachable               |
+| Languages               | TS/JS, Python, Java, .NET                | JS/TS                                           |
+
+Playwright is the common default for new projects; Cypress remains popular and has good component testing.
+
+---
+
+## A Playwright test
+
+```ts title="e2e/checkout.spec.ts"
+import { test, expect } from '@playwright/test';
+
+test.use({ storageState: 'e2e/.auth/user.json' }); // logged in already
+
+test('user can buy a product', async ({ page }) => {
+  await page.goto('/products/42');
+  await page.getByRole('button', { name: 'Add to cart' }).click();
+  await page.getByRole('link', { name: /cart/i }).click();
+  await page.getByRole('button', { name: 'Checkout' }).click();
+  await expect(page.getByRole('heading', { name: 'Order confirmed' })).toBeVisible();
+});
+```
+
+A setup project logs in once and saves `storageState`. `npx playwright codegen` records actions into code.
+
+---
+
+## Flakiness
+
+| Cause                                   | Fix                                             |
+| :-------------------------------------- | :---------------------------------------------- |
+| Fixed sleeps (`waitForTimeout`)         | Web-first assertions that retry (`toBeVisible`) |
+| Shared test data between parallel tests | Unique data per test, or API-seeded fixtures    |
+| Depending on third-party services       | Route and mock them (`page.route`)              |
+| Animations, time                        | Disable animations, fix the clock               |
+| Order-dependent tests                   | Each test sets up its own state                 |
+
+---
+
+## In CI
+
+Run against a preview deployment or a locally started server (`webServer` in `playwright.config.ts`), shard across machines, upload traces on failure. Add `@axe-core/playwright` for accessibility and `toHaveScreenshot()` for visual checks on key pages.

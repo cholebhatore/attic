@@ -1,0 +1,88 @@
+---
+title: gRPC, tRPC, Webhooks
+description: gRPC with Protobuf, streaming modes and deadlines, gRPC-Web and Connect; tRPC procedures with end-to-end types; webhooks with signatures, retries, idempotency, and replay protection.
+---
+
+Three API styles for three different relationships: gRPC between internal services that need speed and strict contracts, tRPC between a TypeScript frontend and its own backend, and webhooks for telling another system that something happened.
+
+---
+
+## gRPC
+
+Services and messages are defined in **Protocol Buffers**; code generators produce typed clients and servers in many languages. Messages are compact binary over HTTP/2.
+
+```protobuf
+syntax = "proto3";
+service Inventory {
+  rpc Reserve(ReserveRequest) returns (ReserveReply);
+  rpc WatchStock(StockQuery) returns (stream StockUpdate);   // server streaming
+}
+message ReserveRequest { string sku = 1; int32 qty = 2; }
+message ReserveReply { bool ok = 1; string reservation_id = 2; }
+```
+
+| Mode             | Use                     |
+| :--------------- | :---------------------- |
+| Unary            | Normal request/response |
+| Server streaming | Feeds, progress         |
+| Client streaming | Uploads, telemetry      |
+| Bidirectional    | Chat-like protocols     |
+
+- **Deadlines** propagate across calls, so a downstream service knows how long the caller will wait.
+- Field numbers are the contract: never reuse or renumber them; add new optional fields for compatibility.
+- Browsers cannot speak raw gRPC; use **gRPC-Web** via a proxy or **Connect** (Buf), which serves gRPC, gRPC-Web, and plain JSON over HTTP from one definition.
+
+---
+
+## tRPC
+
+```ts title="server"
+import { initTRPC } from '@trpc/server';
+import { z } from 'zod';
+const t = initTRPC.create();
+
+export const appRouter = t.router({
+  orderById: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(({ input }) => db.order.find(input.id)),
+  cancelOrder: t.procedure
+    .input(z.object({ id: z.string() }))
+    .mutation(({ input }) => cancel(input.id)),
+});
+export type AppRouter = typeof appRouter;
+```
+
+```ts title="client"
+const order = await trpc.orderById.query({ id: 'ord_981' }); // fully typed, no codegen
+```
+
+Types flow from server to client through TypeScript inference. It works only when both sides are TypeScript in the same repository, and the API is not meant for third parties.
+
+---
+
+## Webhooks
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant P as Provider (Stripe)
+    participant A as App webhook endpoint
+    participant Q as Job queue
+    P->>A: POST /webhooks/stripe (event, signature header)
+    A->>A: verify signature on raw body, check timestamp
+    A->>A: store event id (dedupe)
+    A->>Q: enqueue processing
+    A-->>P: 200 quickly
+    Note over P: Retries with backoff on non-2xx or timeout
+`}
+/>
+
+Receiving:
+
+- **Verify the signature** (HMAC of the raw body with a shared secret) before parsing. Use a constant-time comparison.
+- **Reject old timestamps** (for example over 5 minutes) to stop replays.
+- **Deduplicate by event ID**: providers deliver at least once.
+- **Respond 2xx fast** and process asynchronously.
+- Events can arrive out of order; fetch current state from the provider's API when order matters.
+
+Sending: sign payloads, retry with exponential backoff, record delivery attempts, let customers see and replay deliveries, and never let a slow customer endpoint block other deliveries. Standard Webhooks (standardwebhooks.com) defines a common signature format.

@@ -1,0 +1,317 @@
+---
+title: Server Components
+description: React Server Components in depth - the problem they solve, the two module graphs, 'use client' as a boundary, how the RSC payload (Flight) encodes the tree and client references, how initial loads and navigations use it, what can cross the boundary, composition patterns, Server Functions and their security model, preventing secret leaks, and performance trade-offs vs SSR alone.
+---
+
+A product page imports a markdown parser and a syntax highlighter, together 200 KB of JavaScript, only to render a description that never changes in the browser. With classic SSR, that code still ships to every visitor so the page can hydrate. A dashboard component fetches from an API route, which queries the database: two network hops to show data the server already had. Server Components remove both costs by letting some components exist **only** on the server.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after [Hydration and Streaming](/fullstack/rendering/hydration-and-streaming). SSR renders all components to HTML on the server and then hydrates **all** of them on the client. Server Components split the tree: **Server Components** run only on the server (at build time or per request) and are never sent to the browser as code; **Client Components** are classic React components that render on the server for the first HTML and then hydrate.
+
+Think of a restaurant menu with photos. The photos (Server Components) are printed in the kitchen and delivered as finished pictures; the diner cannot and does not need to re-cook them. Only the interactive parts, such as the order buttons (Client Components), come with instructions to operate them.
+
+Topics, in order:
+
+1. The problem
+2. Two module graphs and the boundary
+3. What each kind of component can do
+4. The RSC payload
+5. Initial load and navigation
+6. What can cross the boundary
+7. Composition patterns
+8. Server Functions
+9. Keeping secrets on the server
+10. Trade-offs
+
+| Word                     | Plain meaning                                                                                                  |
+| :----------------------- | :------------------------------------------------------------------------------------------------------------- |
+| **RSC**                  | React Server Component.                                                                                        |
+| **Client Component**     | Component in a module marked with `'use client'` (or imported from one); hydrates in the browser.              |
+| **RSC payload / Flight** | Serialised description of the rendered server tree plus references to client components.                       |
+| **client reference**     | Pointer to a client component's module and export, resolved by the bundler.                                    |
+| **Server Function**      | Async server function callable from the client, marked `'use server'`.                                         |
+| **serialisable**         | Can be encoded as data and reconstructed: primitives, plain objects, arrays, Dates, Maps, Sets, promises, JSX. |
+
+---
+
+## The problem
+
+| Problem with SSR-only React                    | Cause                                                    | Server Components answer                                    |
+| :--------------------------------------------- | :------------------------------------------------------- | :---------------------------------------------------------- |
+| Every component ships to the client            | Hydration needs the code of every component              | Server Components never ship                                |
+| Data is sent twice (HTML + JSON for hydration) | Client must re-render with the same data                 | Server output is sent once, as rendered result              |
+| Client-server waterfalls                       | Components fetch via APIs after rendering                | Server Components read data directly, close to the database |
+| Large dependencies for rendering-only work     | Markdown, syntax highlighting, date formatting libraries | Run them on the server only                                 |
+| API routes written just to feed components     | No direct data access in components                      | `async` components query directly                           |
+
+---
+
+## Two module graphs and the boundary
+
+```tsx title="app/products/[id]/page.tsx (Server Component, the default)"
+import { db } from '@/lib/db';
+import { marked } from 'marked'; // never sent to the browser
+import { AddToCart } from './add-to-cart';
+
+export default async function ProductPage({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const product = await db.product.findUnique({ where: { id } });
+  if (!product) notFound();
+  return (
+    <article>
+      <h1>{product.name}</h1>
+      <div dangerouslySetInnerHTML={{ __html: marked(product.descriptionMd) }} />
+      <AddToCart productId={product.id} price={product.priceCents} />
+    </article>
+  );
+}
+```
+
+```tsx title="app/products/[id]/add-to-cart.tsx"
+'use client';
+import { useState } from 'react';
+
+export function AddToCart({ productId, price }: { productId: string; price: number }) {
+  const [qty, setQty] = useState(1);
+  return (/* quantity picker and button */);
+}
+```
+
+`'use client'` marks a **boundary in the module graph**, not a single component: the marked module and everything it imports become client code. The bundler builds two graphs:
+
+<Mermaid
+  chart={`
+flowchart LR
+    subgraph Server["Server graph (runs on server only)"]
+        P["page.tsx"] --> DB["lib/db"]
+        P --> M["marked"]
+        P -. "client reference" .-> AC
+    end
+    subgraph Client["Client graph (bundled for browser)"]
+        AC["add-to-cart.tsx ('use client')"] --> R["react, UI libs"]
+    end
+`}
+/>
+
+The server graph references client components only by **reference** (module ID + export name), never by importing their behaviour into server rendering logic beyond producing a placeholder.
+
+---
+
+## What each kind of component can do
+
+| Capability                                        | Server Component            | Client Component                          |
+| :------------------------------------------------ | :-------------------------- | :---------------------------------------- |
+| `async` component, `await` data                   | Yes                         | No (use `use(promise)` or a data library) |
+| Direct DB, filesystem, secrets, internal services | Yes                         | No                                        |
+| `useState`, `useReducer`, `useEffect`, refs       | No                          | Yes                                       |
+| Event handlers (`onClick`)                        | No                          | Yes                                       |
+| Browser APIs                                      | No                          | Yes (in effects and handlers)             |
+| Context                                           | Cannot provide or read      | Yes                                       |
+| Code shipped to browser                           | No                          | Yes                                       |
+| Re-renders on the client                          | No (re-fetched from server) | Yes                                       |
+| Renders during SSR                                | Yes                         | Yes (then hydrates)                       |
+
+Client Components still render on the server for the initial HTML. "Client" means "also runs in the browser", not "only runs in the browser".
+
+---
+
+## The RSC payload
+
+The server renders the Server Component tree into a streaming text format (internally called **Flight**). It contains:
+
+- Rendered host elements (`div`, `h1`) with their props.
+- **Client references** where Client Components appear, with the props passed to them.
+- Serialised data for those props.
+- Placeholders for pending Suspense boundaries and promises, filled in by later lines in the stream.
+
+A simplified, illustrative version (the exact format is an internal React detail):
+
+```text
+1:I["./add-to-cart.tsx",["chunk-a1b2.js"],"AddToCart"]
+0:["$","article",null,{"children":[
+    ["$","h1",null,{"children":"Desk Lamp"}],
+    ["$","div",null,{"dangerouslySetInnerHTML":{"__html":"<p>Warm light…</p>"}}],
+    ["$","$L1",null,{"productId":"p_42","price":2999}]
+]}]
+```
+
+- Line `1` declares a client module reference: which file, which chunks to load, which export.
+- Line `0` is the tree; `$L1` says "render the client component from reference 1 here with these props".
+- The markdown library's output appears as data; the library itself is absent.
+
+The client-side React runtime reads this stream and reconstructs the tree, loading only the chunks for referenced Client Components.
+
+---
+
+## Initial load and navigation
+
+**Initial page load** (with SSR):
+
+1. Server renders Server Components → RSC payload.
+2. Server renders that payload plus Client Components to **HTML** (classic SSR) and streams it.
+3. The RSC payload is also inlined into the HTML (in script tags) so the client can hydrate without refetching.
+4. The browser shows the HTML, loads client chunks, and **hydrates only the Client Components**.
+
+**Client-side navigation**:
+
+1. The router requests the RSC payload (not HTML) for the new route, often prefetched.
+2. React merges the new server tree into the existing UI, **preserving the state of Client Components** that remain at the same position (an open sidebar, a playing video, scroll position in shared layouts).
+3. Only newly referenced client chunks load.
+
+**Refreshing server data** (after a mutation): the framework re-requests the RSC payload for the route and React reconciles it, so the UI shows fresh server data without losing client state.
+
+---
+
+## What can cross the boundary
+
+Props passed from a Server Component to a Client Component are serialised into the payload.
+
+| Allowed                                                   | Not allowed                                              |
+| :-------------------------------------------------------- | :------------------------------------------------------- |
+| Strings, numbers, booleans, `null`, `undefined`, `bigint` | Functions (except Server Functions)                      |
+| Plain objects and arrays of allowed values                | Class instances (a Prisma model with methods, `Decimal`) |
+| `Date`, `Map`, `Set`, typed arrays, `FormData`            | Symbols (except global ones)                             |
+| Promises (resolved on the client with `use`)              | DOM nodes, React context                                 |
+| JSX elements (including Server Component output)          | Circular references in some cases                        |
+| Server Function references                                |                                                          |
+
+Two practical consequences:
+
+- **Pass only what the client needs.** Passing a whole user record to a client avatar component sends every field, including ones that should never reach the browser (password hashes, internal flags), visibly in the page source. Select fields explicitly.
+- Payload size is a performance cost: large lists passed as props bloat both the HTML and the inlined payload.
+
+---
+
+## Composition patterns
+
+### Push the client boundary down
+
+Mark the smallest interactive leaf as a Client Component, not the page. A page with one interactive button should not make its whole tree client code.
+
+### Server Components as children of Client Components
+
+A Client Component cannot **import** a Server Component (that import would pull it into the client graph), but it can **receive** one as `children` or any JSX prop:
+
+```tsx
+// Server Component
+<Tabs>
+  {' '}
+  {/* client: holds active tab state */}
+  <ServerRenderedReport /> {/* server: rendered on the server, passed as JSX */}
+</Tabs>
+```
+
+The server renders `ServerRenderedReport` and passes the result as a serialised element; `Tabs` decides where to put it.
+
+### Providers
+
+Context only works in Client Components. Wrap providers in a client module and render it high in the server layout with the rest of the app as `children`; Server Components under it still render on the server.
+
+### Fetch in parallel, stream with Suspense
+
+```tsx
+export default async function Dashboard() {
+  const userP = getUser(); // start, do not await yet
+  const statsP = getStats();
+  const user = await userP; // needed for the header
+  return (
+    <>
+      <Header user={user} />
+      <Suspense fallback={<StatsSkeleton />}>
+        <Stats statsPromise={statsP} /> {/* awaited inside, streams when ready */}
+      </Suspense>
+    </>
+  );
+}
+```
+
+Sequential `await`s in nested Server Components recreate waterfalls on the server; fewer round trips each, but still serial. Patterns for avoiding them are in [Data Fetching and Caching](/fullstack/rendering/data-fetching-and-caching).
+
+---
+
+## Server Functions
+
+```ts title="app/cart/actions.ts"
+'use server';
+import { z } from 'zod';
+import { updateTag } from 'next/cache';
+
+const AddItem = z.object({ productId: z.string(), qty: z.number().int().min(1).max(10) });
+
+export async function addToCart(input: unknown) {
+  const user = await requireUser(); // authenticate on every call
+  const { productId, qty } = AddItem.parse(input); // validate: input is untrusted
+  await db.cartItem.upsert({/* ... */});
+  updateTag(`cart:${user.id}`); // refresh cached data for this user
+}
+```
+
+How they work: the bundler replaces the function in client code with a reference containing a server-generated ID. Calling it sends a `POST` to the app with the ID and serialised arguments; the server runs the function and returns the result (and, in frameworks, an updated RSC payload for the route).
+
+Security model:
+
+- **Every Server Function is a public HTTP endpoint.** Anyone can call it with any arguments, not just the UI that renders the button.
+- Authenticate and **authorise** inside the function, every time; do not rely on the page that rendered the form having checked.
+- Validate arguments with a schema.
+- Closures over server values (Server Functions defined inline in Server Components) have their captured values encrypted by frameworks, but avoid capturing sensitive data anyway.
+- Frameworks include CSRF protection by comparing `Origin` with `Host` for Server Function requests; custom deployments behind proxies must preserve these headers.
+
+---
+
+## Keeping secrets on the server
+
+```ts title="lib/db.ts"
+import 'server-only'; // build fails if a client module ever imports this file
+```
+
+- `server-only` turns an accidental import of server code into a build error instead of a leaked secret or a crash.
+- Environment variables without the public prefix (`NEXT_PUBLIC_`) are not bundled into client code, but values passed as props to Client Components are sent to the browser.
+- React's taint APIs (`experimental_taintObjectReference`, `experimental_taintUniqueValue`) can mark objects or values that must never be passed to the client.
+- A Data Access Layer (one module that fetches data, checks authorization, and returns minimal DTOs) keeps these rules in one place.
+
+---
+
+## Trade-offs
+
+| Benefit                                               | Cost                                                                                             |
+| :---------------------------------------------------- | :----------------------------------------------------------------------------------------------- |
+| Less client JavaScript; no hydration for server parts | Two environments to reason about; boundary rules                                                 |
+| Data access without API layers or client waterfalls   | Each navigation needs a server round trip for the payload (mitigated by prefetching and caching) |
+| Large rendering dependencies stay on the server       | Server load for dynamic routes                                                                   |
+| Client state preserved across server data refreshes   | Tooling and library compatibility (libraries using context or hooks must be client components)   |
+| Secrets and business logic stay server-side           | Easy to leak data through props if careless                                                      |
+
+Server Components are not a replacement for client interactivity; they move non-interactive work off the client.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Are Server Components the same as SSR?">
+    No. SSR turns components into HTML for the first load, then hydrates all of them. Server
+    Components run only on the server and produce a serialised tree; their code never ships and they
+    never hydrate. They are used together: Server Components plus SSR of Client Components for the
+    initial HTML.
+  </Accordion>
+  <Accordion title="What does 'use client' actually mark?">
+    A boundary in the module graph. The file and everything it imports become part of the client
+    bundle. It does not mean the component only renders in the browser: Client Components still
+    render on the server for the initial HTML.
+  </Accordion>
+  <Accordion title="Why can't a Server Component pass a function prop to a Client Component?">
+    Props cross the network as serialised data, and functions cannot be serialised. Server Functions
+    are the exception: they are passed as references that the client calls over HTTP.
+  </Accordion>
+  <Accordion title="How does a Client Component render a Server Component?">
+    It cannot import one, but it can receive one as children or another JSX prop from a Server
+    Component parent. The server renders it and passes the result as serialised elements.
+  </Accordion>
+  <Accordion title="Why must Server Functions authenticate and validate internally?">
+    They are exposed as HTTP endpoints that anyone can call with arbitrary arguments, regardless of
+    which page rendered the form or button.
+  </Accordion>
+</Accordions>

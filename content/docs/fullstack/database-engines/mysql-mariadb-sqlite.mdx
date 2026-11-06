@@ -1,0 +1,54 @@
+---
+title: MySQL, MariaDB, SQLite
+description: MySQL with InnoDB, clustered primary keys, practical differences from PostgreSQL, MariaDB's divergence from MySQL, and SQLite's embedded model, WAL mode, limits, and its growing use in production.
+---
+
+MySQL and PostgreSQL look interchangeable from an ORM, yet the same schema can behave differently: primary key choice affects MySQL far more, default isolation levels differ, and some SQL features do not exist in both. SQLite is a different kind of database entirely: a library, not a server.
+
+---
+
+## MySQL
+
+- **InnoDB** is the storage engine for almost everything: transactions, row locks, foreign keys, crash recovery.
+- **Clustered primary key**: rows are stored inside the primary key B-tree. Secondary indexes point to the primary key, not to a row location. Random UUIDv4 primary keys therefore scatter inserts across the tree and bloat every secondary index; use auto-increment or time-ordered IDs.
+- Default isolation is **repeatable read** with gap locks, which prevents some anomalies but causes more locking surprises.
+- Replication: binlog-based asynchronous replication, semi-sync, Group Replication / InnoDB Cluster.
+- Ecosystem: Vitess (sharding, used by PlanetScale), ProxySQL, Percona tools (`pt-online-schema-change`, `gh-ost` for online migrations).
+
+### Differences from PostgreSQL that bite
+
+| Topic                  | MySQL                                                         | PostgreSQL                    |
+| :--------------------- | :------------------------------------------------------------ | :---------------------------- |
+| Upsert                 | `ON DUPLICATE KEY UPDATE`                                     | `ON CONFLICT ... DO UPDATE`   |
+| `RETURNING`            | No (MariaDB has it for some statements)                       | Yes                           |
+| Transactional DDL      | No: `ALTER TABLE` commits implicitly                          | Yes: migrations can roll back |
+| Text collation default | Case-insensitive (`utf8mb4_0900_ai_ci`)                       | Case-sensitive                |
+| UTF-8                  | Use `utf8mb4`; legacy `utf8` is 3-byte and cannot store emoji | `UTF8`                        |
+| Strictness             | Historically permissive (now strict mode by default)          | Strict                        |
+
+---
+
+## MariaDB
+
+A fork of MySQL created in 2009 after Oracle acquired MySQL. Largely compatible at first, now diverging: different optimiser, Galera Cluster for multi-primary replication, system-versioned (temporal) tables, `RETURNING` on some statements, and its own JSON implementation. Many Linux distributions ship MariaDB as "mysql". Test before swapping one for the other.
+
+---
+
+## SQLite
+
+A full SQL database in a single file, linked into the application as a library. No server, no network, no users.
+
+| Strength                                   | Limit                                                       |
+| :----------------------------------------- | :---------------------------------------------------------- |
+| Zero setup, one file to back up            | One writer at a time (readers run concurrently in WAL mode) |
+| Very fast reads (no network hop)           | No built-in replication or network access                   |
+| Ideal for mobile, desktop, embedded, tests | Fewer types (dynamic typing unless `STRICT` tables)         |
+| Runs in browsers (WASM) and at the edge    | Limited `ALTER TABLE`                                       |
+
+```sql
+PRAGMA journal_mode = WAL;      -- concurrent readers with one writer
+PRAGMA busy_timeout = 5000;     -- wait instead of failing on lock
+PRAGMA foreign_keys = ON;       -- off by default
+```
+
+SQLite in production web apps has grown with tools that add replication and distribution: **Litestream** (continuous backup to S3), **LiteFS**, **Turso / libSQL** (replicated SQLite at the edge), and **Cloudflare D1**. For a single-server app with modest write volume, SQLite can be simpler and faster than a separate database server. Node 22+ ships `node:sqlite`; Python ships `sqlite3`.

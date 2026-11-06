@@ -1,0 +1,270 @@
+---
+title: Loading and Network
+description: Optimising how resources reach the browser - the critical path and its length, request priorities and fetchpriority, resource hints (preconnect, dns-prefetch, preload, modulepreload, prefetch), 103 Early Hints, compression, image formats, responsive images, lazy loading, LCP image strategy, font loading and layout shift, CSS delivery, caching strategy, CDNs, and fewer origins.
+---
+
+A homepage's LCP image is a 1.8 MB PNG hero, referenced from CSS, lazy-loaded, served from a third origin, and requested only after a web font and two stylesheets. Each of those choices adds latency; together they push LCP past four seconds on mobile. Converting to AVIF at the right size, putting it in HTML with high priority, and serving it from the main origin brings it under two seconds without touching any application code.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after [JavaScript and Bundles](/fullstack/optimization/javascript-and-bundles). The theory behind round trips is in [How the Internet Works](/fullstack/web-fundamentals/how-the-internet-works) and the browser's loading behaviour in the [Rendering Pipeline](/fullstack/web-fundamentals/rendering-pipeline).
+
+Loading optimization answers four questions for every resource: Does it need to load at all? Can it load **sooner** (discovered earlier, higher priority, fewer round trips)? Can it be **smaller** (compression, format, size)? Can it be **reused** (caching)?
+
+Topics, in order:
+
+1. The critical path
+2. Priorities and fetchpriority
+3. Resource hints
+4. 103 Early Hints
+5. Compression
+6. Images
+7. Fonts
+8. CSS delivery
+9. Caching strategy
+10. CDNs and origins
+
+| Word                  | Plain meaning                                                             |
+| :-------------------- | :------------------------------------------------------------------------ |
+| **critical path**     | The chain of resources that must load before the first meaningful render. |
+| **resource hint**     | Markup telling the browser about future needs early.                      |
+| **LCP element**       | The largest image or text block in the viewport.                          |
+| **FOUT / FOIT**       | Flash of unstyled text / flash of invisible text while web fonts load.    |
+| **responsive images** | Serving different image sizes for different screens via `srcset`.         |
+
+---
+
+## The critical path
+
+The length of the critical path, in round trips, matters more than total bytes. Each level of discovery adds at least one RTT:
+
+```text
+HTML  →  CSS (in head)  →  @import CSS  →  web font in that CSS  →  text renders
+1 RTT       +1 RTT            +1 RTT              +1 RTT
+```
+
+On a 150 ms RTT mobile connection, that chain costs 600 ms of pure latency before text shows. Shortening it:
+
+| Technique                                              | Removes                                                             |
+| :----------------------------------------------------- | :------------------------------------------------------------------ |
+| Inline critical CSS (above-the-fold rules) in the HTML | The CSS round trip for first render                                 |
+| Avoid `@import` in CSS                                 | A sequential level                                                  |
+| Preload fonts and the LCP image                        | Late discovery                                                      |
+| Serve from the same origin                             | Extra DNS + TCP + TLS per origin                                    |
+| Stream HTML early (send `head` first)                  | Server time from the start of the chain                             |
+| 103 Early Hints                                        | The wait for the server to finish rendering before discovery begins |
+
+---
+
+## Priorities and fetchpriority
+
+Browsers assign each request a priority. Chromium's approximate defaults:
+
+| Resource                                       | Priority                                                            |
+| :--------------------------------------------- | :------------------------------------------------------------------ |
+| HTML document                                  | Highest                                                             |
+| CSS in `head`, fonts (preloaded or discovered) | Highest / High                                                      |
+| Scripts in `head` (blocking)                   | High                                                                |
+| `async`/`defer` scripts                        | Low                                                                 |
+| Images                                         | Low, raised to High once known to be in the viewport (after layout) |
+| `prefetch`                                     | Lowest                                                              |
+
+The hero image is "low" until layout proves it is visible, which happens late. Fix:
+
+```html
+<img src="/hero.avif" fetchpriority="high" width="1200" height="600" alt="..." />
+<img src="/carousel-2.avif" fetchpriority="low" loading="lazy" alt="..." />
+```
+
+`fetchpriority="high"` on the LCP image commonly improves LCP noticeably; `low` on non-critical images and scripts frees bandwidth for what matters. Over-prioritising everything prioritises nothing.
+
+---
+
+## Resource hints
+
+| Hint                                                                              | Does                                              | Use for                                                                                 | Caution                                                                                                |
+| :-------------------------------------------------------------------------------- | :------------------------------------------------ | :-------------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------- |
+| `<link rel="dns-prefetch" href="//cdn.example">`                                  | DNS lookup only                                   | Origins likely used later                                                               | Cheap                                                                                                  |
+| `<link rel="preconnect" href="https://cdn.example" crossorigin>`                  | DNS + TCP + TLS                                   | 1–3 critical third-party origins used soon                                              | Unused preconnects waste sockets; `crossorigin` must match how the resource is fetched (fonts need it) |
+| `<link rel="preload" href="/font.woff2" as="font" type="font/woff2" crossorigin>` | Fetch now at the right priority, for this page    | Late-discovered critical resources: fonts, LCP image in CSS, critical background images | Preloading too much competes with critical resources; unused preloads warn in the console              |
+| `<link rel="modulepreload" href="/chunk.js">`                                     | Fetch and parse an ES module and its dependencies | Known module chunks needed soon                                                         |                                                                                                        |
+| `<link rel="prefetch" href="/next-page.js">`                                      | Low-priority fetch for a future navigation        | Likely next pages                                                                       | Wasted if unused                                                                                       |
+| Speculation Rules (`<script type="speculationrules">`)                            | Prefetch or fully prerender likely next pages     | Instant navigations in multi-page sites                                                 | Prerender runs the page's JS and analytics                                                             |
+
+---
+
+## 103 Early Hints
+
+While the server is still generating the HTML (querying databases, rendering), it can send an interim response:
+
+```http
+HTTP/1.1 103 Early Hints
+Link: </styles/main.css>; rel=preload; as=style
+Link: <https://cdn.example.com>; rel=preconnect
+
+HTTP/1.1 200 OK
+Content-Type: text/html
+...
+```
+
+The browser starts fetching CSS and opening connections during server think time. Most valuable when TTFB is long. Supported by Chromium browsers and major CDNs (which can generate hints from previous responses' `Link` headers).
+
+---
+
+## Compression
+
+| Format    | Use                                                                   | Notes                                                                                                          |
+| :-------- | :-------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------- |
+| gzip      | Universal fallback                                                    | Fast                                                                                                           |
+| Brotli    | Text assets: HTML, CSS, JS, JSON, SVG                                 | Better ratio; precompress static files at high levels at build time; use moderate levels for dynamic responses |
+| Zstandard | Text, increasingly supported                                          | Fast compression at high ratios                                                                                |
+| None      | Already-compressed formats (JPEG, PNG, WebP, AVIF, WOFF2, video, zip) | Recompressing wastes CPU                                                                                       |
+
+Verify with the Network panel's `Content-Encoding` column and compare transfer size to resource size.
+
+---
+
+## Images
+
+Images are usually the largest bytes on a page and often the LCP element.
+
+### Formats
+
+| Format                      | Best for                                            | Typical savings vs JPEG                                             |
+| :-------------------------- | :-------------------------------------------------- | :------------------------------------------------------------------ |
+| AVIF                        | Photos, illustrations                               | Often 30–50 percent smaller at similar quality                      |
+| WebP                        | Photos, transparency                                | Often 25–35 percent smaller                                         |
+| JPEG (progressive, mozjpeg) | Fallback photos                                     |                                                                     |
+| PNG                         | Lossless graphics, screenshots needing exact pixels | Large for photos                                                    |
+| SVG                         | Icons, logos, simple illustrations                  | Tiny, scalable; sanitise user-supplied SVG (it can contain scripts) |
+
+Savings depend on content and encoder settings; measure on real images.
+
+### Responsive images
+
+```html
+<img
+  src="/products/lamp-800.avif"
+  srcset="
+    /products/lamp-400.avif   400w,
+    /products/lamp-800.avif   800w,
+    /products/lamp-1600.avif 1600w
+  "
+  sizes="(min-width: 1024px) 33vw, 100vw"
+  width="800"
+  height="800"
+  alt="Brass desk lamp"
+  loading="lazy"
+  decoding="async"
+/>
+```
+
+- `srcset` lists available widths; `sizes` tells the browser how wide the image will display, so it picks the smallest sufficient file for the device's width and pixel density.
+- A 400-pixel slot on a 2x screen needs an 800-pixel image, not a 3,000-pixel original.
+- `<picture>` with `<source type="image/avif">` provides format fallbacks.
+- **Always set `width` and `height`** (or CSS `aspect-ratio`) so the browser reserves space and avoids layout shift (CLS).
+- Image CDNs (Cloudinary, imgix, Cloudflare Images) and framework components (`next/image`) generate sizes and formats on demand.
+
+### Lazy loading and the LCP image
+
+- `loading="lazy"` defers offscreen images until near the viewport: good for below-the-fold content.
+- **Never lazy-load the LCP image** or other above-the-fold images: it delays them until layout, which is a common regression when lazy loading is applied globally.
+- The LCP image should be in the HTML (not injected by JS, not a CSS background), prioritised, correctly sized, and served from the main origin or a preconnected CDN.
+
+---
+
+## Fonts
+
+Web fonts block text rendering or swap it, both visible to users.
+
+| Practice                                                     | Effect                                                                                 |
+| :----------------------------------------------------------- | :------------------------------------------------------------------------------------- |
+| WOFF2 only                                                   | Smallest, universally supported                                                        |
+| Subset to needed characters (`unicode-range`)                | Latin-only subset of a font can be a fraction of the full file                         |
+| Variable fonts                                               | One file for all weights instead of several                                            |
+| Self-host on the main origin                                 | No extra connection; partitioned caches removed the "shared CDN" benefit anyway        |
+| `font-display: swap`                                         | Text visible immediately in a fallback, then swaps (FOUT)                              |
+| `font-display: optional`                                     | Use the web font only if it loads very quickly; otherwise keep the fallback (no shift) |
+| Preload the one or two fonts used above the fold             | Earlier discovery                                                                      |
+| Fallback metric overrides (`size-adjust`, `ascent-override`) | Fallback occupies the same space, minimising layout shift when the font swaps          |
+| System font stack                                            | No font download at all                                                                |
+
+```css
+@font-face {
+  font-family: 'Inter';
+  src: url('/fonts/inter-var-latin.woff2') format('woff2');
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153;
+}
+@font-face {
+  font-family: 'Inter Fallback';
+  src: local('Arial');
+  size-adjust: 107%;
+  ascent-override: 90%;
+}
+body {
+  font-family: 'Inter', 'Inter Fallback', sans-serif;
+}
+```
+
+`next/font` and Fontaine-style tools generate these overrides automatically.
+
+---
+
+## CSS delivery
+
+- CSS in the `head` is render-blocking: keep the initial CSS small and route-specific.
+- Inline critical CSS for the first viewport; load the rest without blocking (`media` trick or framework support).
+- Remove unused CSS (utility-first frameworks like Tailwind generate only used classes; Coverage shows unused rules).
+- Avoid CSS-in-JS that generates styles at runtime on the client, which adds JavaScript work and blocks rendering; prefer build-time extraction.
+
+---
+
+## Caching strategy
+
+| Asset                         | Strategy                                                                                                |
+| :---------------------------- | :------------------------------------------------------------------------------------------------------ |
+| Hashed JS, CSS, fonts, images | `public, max-age=31536000, immutable`                                                                   |
+| HTML                          | `no-cache` with ETag, or short CDN `s-maxage` + `stale-while-revalidate`                                |
+| API GET responses (public)    | Short `s-maxage` + `stale-while-revalidate` at the CDN                                                  |
+| Personalised responses        | `private` or `no-store`                                                                                 |
+| Service worker                | Precache app shell for instant repeat loads ([Service Workers](/fullstack/performance/service-workers)) |
+
+Full semantics: [HTTP Caching](/fullstack/performance/http-caching).
+
+---
+
+## CDNs and origins
+
+- A CDN puts responses within tens of milliseconds of users and terminates TLS close to them, removing hundreds of milliseconds of handshake latency for distant users.
+- Cache HTML at the edge where possible (static and ISR pages); even uncached dynamic requests benefit from the CDN's warm, optimised connections to the origin.
+- **Fewer origins**: every additional origin costs DNS + TCP + TLS (and cannot share HTTP/2 multiplexing). Consolidate assets on the main domain or one CDN domain.
+- Enable HTTP/3 and TLS 1.3 at the edge ([HTTP Versions](/fullstack/web-fundamentals/http-versions)).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="How can a slow LCP caused by a hero image be improved?">
+    Put the image in the HTML (not CSS or JS), do not lazy-load it, add fetchpriority high, serve a
+    correctly sized AVIF or WebP via srcset and sizes, set dimensions, serve it from the main origin
+    or a preconnected CDN, and reduce render-blocking CSS ahead of it.
+  </Accordion>
+  <Accordion title="preload vs prefetch vs preconnect?">
+    preconnect opens a connection (DNS, TCP, TLS) to an origin early. preload fetches a resource
+    needed for the current page at its proper priority. prefetch fetches something likely needed for
+    a future navigation at the lowest priority.
+  </Accordion>
+  <Accordion title="How do web fonts cause layout shift and how is it prevented?">
+    Text first renders in a fallback font with different metrics, then reflows when the web font
+    arrives. Use font-display optional or swap with metric-matched fallbacks (size-adjust and
+    overrides), preload critical fonts, and subset them.
+  </Accordion>
+  <Accordion title="What is 103 Early Hints for?">
+    Sending Link preload and preconnect headers before the final response, so the browser fetches
+    critical resources during the server's processing time.
+  </Accordion>
+</Accordions>

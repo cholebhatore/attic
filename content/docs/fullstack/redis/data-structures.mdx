@@ -1,0 +1,112 @@
+---
+title: Data Structures
+description: Redis strings and counters, hashes, lists, sets, sorted sets, bitmaps, HyperLogLog, geospatial indexes, streams, and JSON, with commands, complexity, and typical uses.
+---
+
+Storing a user profile as one JSON string means reading and rewriting the whole string to change one field, and racing other writers. Storing it as a hash lets Redis update one field atomically. Picking the right structure is most of Redis design.
+
+---
+
+## Overview
+
+| Type                              | Shape                                                | Typical use                                                   |
+| :-------------------------------- | :--------------------------------------------------- | :------------------------------------------------------------ |
+| String                            | Bytes (text, numbers, serialised JSON), up to 512 MB | Cache entries, counters, flags, locks                         |
+| Hash                              | Field → value map                                    | Objects, per-user settings                                    |
+| List                              | Ordered sequence, push/pop both ends                 | Simple queues, recent items                                   |
+| Set                               | Unique unordered members                             | Tags, online users, deduplication                             |
+| Sorted set                        | Unique members ordered by score                      | Leaderboards, rate limit windows, scheduling, priority queues |
+| Bitmap                            | Bits in a string                                     | Daily active flags per user ID                                |
+| HyperLogLog                       | Probabilistic cardinality                            | Unique visitor counts (about 0.81 percent error, 12 KB)       |
+| Geo                               | Sorted set of coordinates                            | "Stores within 5 km"                                          |
+| Stream                            | Append-only log with IDs                             | Event logs, durable queues                                    |
+| JSON (module, built into Redis 8) | Nested documents                                     | Document storage with path updates                            |
+
+---
+
+## Strings and counters
+
+```text
+SET product:42 '{"name":"Lamp","price":2999}' EX 300
+GET product:42
+INCR orders:today              # atomic +1
+INCRBY stock:A1 -2
+SET lock:report "worker-7" NX PX 30000   # set only if absent, 30 s expiry
+MGET product:1 product:2 product:3        # one round trip
+```
+
+---
+
+## Hashes
+
+```text
+HSET user:19 name "Ada" plan "pro" logins 0
+HGET user:19 plan
+HINCRBY user:19 logins 1
+HGETALL user:19
+HEXPIRE user:19 3600 FIELDS 1 plan      # per-field TTL (Redis 7.4+, Valkey 9)
+```
+
+Small hashes use a compact encoding, so many small hashes are memory-efficient.
+
+---
+
+## Lists
+
+```text
+LPUSH notifications:19 "order shipped"
+LTRIM notifications:19 0 49              # keep the latest 50
+LRANGE notifications:19 0 9
+BLMOVE jobs:pending jobs:processing RIGHT LEFT 5   # blocking pop + move (reliable queue)
+```
+
+Access by index is O(N); lists suit ends, not the middle.
+
+---
+
+## Sets
+
+```text
+SADD post:7:likes 19 23 41
+SISMEMBER post:7:likes 19
+SCARD post:7:likes
+SINTER user:19:follows user:23:follows    # mutual follows
+```
+
+---
+
+## Sorted sets
+
+```text
+ZADD leaderboard 4200 "ada" 3900 "lin"
+ZINCRBY leaderboard 150 "lin"
+ZREVRANGE leaderboard 0 9 WITHSCORES      # top 10
+ZRANK leaderboard "ada"
+ZRANGEBYSCORE delayed:jobs -inf 1762425000   # jobs due now (score = run-at timestamp)
+```
+
+Implemented as a skip list plus hash: O(log N) inserts and rank queries.
+
+---
+
+## Specialised types
+
+```text
+SETBIT active:2026-11-06 19 1             # user 19 active today
+BITCOUNT active:2026-11-06
+PFADD visitors:2026-11-06 "ip1" "ip2"
+PFCOUNT visitors:2026-11-06
+GEOADD stores 72.8777 19.0760 "mumbai-1"
+GEOSEARCH stores FROMLONLAT 72.88 19.07 BYRADIUS 5 km
+XADD events * type order_created id 981   # see Pub/Sub and Streams
+```
+
+---
+
+## Key design
+
+- Namespaced names: `app:entity:id:field` (`shop:cart:19`).
+- Every cache key gets a TTL.
+- Avoid **big keys** (a set with millions of members) and **hot keys** (one key taking most traffic); both hurt latency and Cluster balance.
+- Use `SCAN` (cursor-based) instead of `KEYS *` in production; `KEYS` blocks the server.
+- Check with `MEMORY USAGE key`, `redis-cli --bigkeys`, `--hotkeys`.

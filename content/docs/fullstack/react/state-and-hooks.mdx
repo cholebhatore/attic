@@ -1,0 +1,327 @@
+---
+title: State and Hooks
+description: How hooks work internally (the per-fiber hook list and why call order matters), state as a snapshot, the update queue and functional updates, bail-outs with Object.is, immutable updates, structuring state (minimal, derived, normalised, colocated), lifting state, controlled vs uncontrolled inputs, useReducer, context propagation and its costs, useId, and custom hooks.
+---
+
+```tsx
+setCount(count + 1);
+setCount(count + 1);
+setCount(count + 1);
+```
+
+This increments by one, not three. A form with `firstName`, `lastName`, and `fullName` in three state variables shows a stale full name after one edit. A context holding the logged-in user, theme, and a live cursor position re-renders the entire app on every mouse move. Each comes from misunderstanding what state is in React and how updates flow.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after the [Rendering Model](/fullstack/react/rendering-model) and [Fiber](/fullstack/react/fiber-and-scheduling). State is the data a component instance remembers between renders; hooks are the functions that connect a component to React features.
+
+State behaves like a **photograph**, not a live variable. During one render, `count` is a fixed value. Calling `setCount` does not change that photo; it queues a request for React to take a new photo (render again) with the new value. Hooks are matched to their stored state purely by **order of calls**, like numbered lockers: the first `useState` call gets locker 1 every time.
+
+Topics, in order:
+
+1. How hooks are stored
+2. State is a snapshot
+3. The update queue and functional updates
+4. Bail-outs
+5. Immutable updates
+6. Structuring state
+7. Lifting state and colocation
+8. Controlled and uncontrolled inputs
+9. useReducer
+10. Context: propagation and cost
+11. useId and custom hooks
+
+| Word                  | Plain meaning                                                                                  |
+| :-------------------- | :--------------------------------------------------------------------------------------------- |
+| **hook**              | A function starting with `use` that reads or registers React state, context, effects, or refs. |
+| **snapshot**          | The fixed state values a render sees.                                                          |
+| **update queue**      | Pending state changes on a hook, processed at the next render.                                 |
+| **functional update** | `setX(prev => next)`, computed from the latest queued value.                                   |
+| **bail-out**          | React skipping a render because nothing changed.                                               |
+| **derived state**     | Data computable from other state or props, which should not be stored.                         |
+| **normalised state**  | Entities stored once by ID, referenced elsewhere by ID.                                        |
+| **colocation**        | Keeping state as close as possible to where it is used.                                        |
+| **context**           | A value provided by an ancestor and read by any descendant.                                    |
+
+---
+
+## How hooks are stored
+
+Each function component's fiber holds a **linked list of hook objects** in `memoizedState`. During render, React keeps a cursor; each hook call reads the next node in the list.
+
+```tsx
+function Profile({ userId }: { userId: string }) {
+  const [name, setName] = useState(''); // hook 1
+  const [age, setAge] = useState(0); // hook 2
+  const ref = useRef(null); // hook 3
+  useEffect(() => {
+    /* ... */
+  }, [userId]); // hook 4
+}
+```
+
+```text
+fiber.memoizedState → { state: '' } → { state: 0 } → { ref } → { effect, deps: ['u1'] } → null
+```
+
+There are no names; only positions. If a hook call is skipped on one render:
+
+```tsx
+if (isEditing) {
+  const [draft, setDraft] = useState(''); // sometimes hook 2, sometimes absent
+}
+const [age, setAge] = useState(0); // reads hook 2's node when not editing
+```
+
+When `isEditing` flips, `age` reads the node that belonged to `draft`, getting a string instead of a number. This is why the **rules of hooks** exist:
+
+1. Call hooks only at the top level of a component or custom hook: never in conditions, loops, nested functions, or after an early `return`.
+2. Call them only from React function components or custom hooks.
+
+`eslint-plugin-react-hooks` enforces both; the React Compiler also relies on them. (The `use` API is the exception: it can be called conditionally because it does not store state in the list.)
+
+---
+
+## State is a snapshot
+
+```tsx
+function Counter() {
+  const [count, setCount] = useState(0);
+
+  function handleClick() {
+    setCount(count + 1); // queue: replace with 0 + 1
+    setCount(count + 1); // queue: replace with 0 + 1
+    setCount(count + 1); // queue: replace with 0 + 1
+    console.log(count); // 0: this render's snapshot
+    setTimeout(() => alert(count), 3000); // 0, even after the re-render
+  }
+  return <button onClick={handleClick}>{count}</button>;
+}
+```
+
+Every render is a separate function call with its own `count` constant. Event handlers and timers created in that render close over that render's values. That is the source of **stale closures** in effects and intervals ([Effects and Refs](/fullstack/react/effects-and-refs)), and the reason state must be read from the next render, not right after setting it.
+
+---
+
+## The update queue and functional updates
+
+Setters do not modify state immediately; they append an update to the hook's queue and schedule a render. During the next render, React processes the queue in order:
+
+| Queued update          | Processing                | Result |
+| :--------------------- | :------------------------ | :----- |
+| `setCount(5)`          | Replace with 5            | 5      |
+| `setCount(c => c + 1)` | Call with previous result | 6      |
+| `setCount(c => c * 2)` | Call with previous result | 12     |
+
+```tsx
+setCount((c) => c + 1);
+setCount((c) => c + 1);
+setCount((c) => c + 1); // 3: each updater receives the result of the previous one
+```
+
+Use a functional update whenever the next value depends on the previous one, especially in callbacks that may run with stale closures (intervals, async code, effects). Updater functions must be pure; StrictMode calls them twice.
+
+**Lazy initial state**: `useState(expensive())` calls `expensive()` on every render and ignores the result after the first. `useState(() => expensive())` calls it only once.
+
+---
+
+## Bail-outs
+
+React compares the new state with the current one using `Object.is`. If they are equal, it may skip rendering the component and its children.
+
+```tsx
+setUser(user); // same reference: bail out, no render
+user.name = 'Ada';
+setUser(user); // mutated, same reference: bail out, UI does not update (bug)
+setUser({ ...user, name: 'Ada' }); // new reference: render
+```
+
+`Object.is` differs from `===` only for `NaN` (equal to itself) and `+0`/`-0` (not equal).
+
+---
+
+## Immutable updates
+
+State is treated as immutable: create new objects and arrays instead of changing existing ones.
+
+| Operation     | Mutating (avoid)            | Immutable                                                  |
+| :------------ | :-------------------------- | :--------------------------------------------------------- |
+| Add to array  | `arr.push(x)`               | `[...arr, x]`                                              |
+| Remove        | `arr.splice(i, 1)`          | `arr.filter((_, j) => j !== i)` or `arr.toSpliced(i, 1)`   |
+| Replace item  | `arr[i] = x`                | `arr.map((v, j) => (j === i ? x : v))` or `arr.with(i, x)` |
+| Sort          | `arr.sort()`                | `arr.toSorted()`                                           |
+| Update field  | `obj.a = 1`                 | `{ ...obj, a: 1 }`                                         |
+| Nested update | `obj.address.city = 'Pune'` | `{ ...obj, address: { ...obj.address, city: 'Pune' } }`    |
+
+Spreads are shallow: nested objects are shared between old and new state, which is fine as long as nothing mutates them. For deeply nested updates, **Immer** lets code "mutate" a draft and produces an immutable result:
+
+```tsx
+import { produce } from 'immer';
+setOrder((o) =>
+  produce(o, (draft) => {
+    draft.items[2].qty += 1;
+  }),
+);
+```
+
+Why immutability: equality checks by reference are O(1) and power bail-outs, `memo`, and dependency arrays; old states remain intact for undo, time-travel debugging, and concurrent rendering, where React may render with an older state while a newer one is pending.
+
+---
+
+## Structuring state
+
+Principles, in order of how often they prevent bugs:
+
+1. **Do not store what can be derived.**
+
+   ```tsx
+   // Wrong: fullName drifts
+   const [fullName, setFullName] = useState('');
+   // Right
+   const fullName = `${firstName} ${lastName}`;
+   const total = useMemo(() => items.reduce((s, i) => s + i.price * i.qty, 0), [items]); // only if expensive
+   ```
+
+2. **Avoid contradictions.** Two booleans `isSending` and `isSent` allow the impossible state "both true". Use one status: `'typing' | 'sending' | 'sent'` (a discriminated union, see [TypeScript](/fullstack/typescript/type-system)).
+3. **Avoid duplication.** Storing the selected item object duplicates data already in the list, and goes stale when the list updates. Store `selectedId` and look the item up.
+4. **Normalise nested, relational data.** `{ byId: { [id]: post }, allIds: [...] }` makes updates O(1) and avoids deep spreads.
+5. **Do not mirror props in state** (`useState(props.value)` uses the prop only for initialisation and ignores later changes). Either use the prop directly, name it `initialValue` to make the intent explicit, or reset with a `key`.
+
+---
+
+## Lifting state and colocation
+
+When two siblings need the same data, **lift** the state to their closest common parent and pass it down with callbacks. Conversely, **colocate** state as low as possible: state in the root re-renders the root's whole subtree on each change, while state in a leaf re-renders only the leaf.
+
+<Mermaid
+  chart={`
+flowchart TD
+    P["SearchPage: query state lives here"] --> I["SearchInput: value={query} onChange={setQuery}"]
+    P --> R["Results: query={query}"]
+    P --> F["Footer: does not use query, but re-renders with SearchPage"]
+`}
+/>
+
+Moving state down, or passing static parts of the tree as `children` (which are created by the parent's parent and therefore unchanged), often removes the need for memoisation entirely. See [Performance](/fullstack/react/performance).
+
+---
+
+## Controlled and uncontrolled inputs
+
+|                                   | Controlled                         | Uncontrolled                                                 |
+| :-------------------------------- | :--------------------------------- | :----------------------------------------------------------- |
+| Source of truth                   | React state (`value` + `onChange`) | The DOM (`defaultValue`, read with a ref or `FormData`)      |
+| Re-render per keystroke           | Yes                                | No                                                           |
+| Instant validation and formatting | Easy                               | Harder                                                       |
+| Typical use                       | Inputs that drive other UI         | Large forms, form actions, file inputs (always uncontrolled) |
+
+Switching an input between controlled and uncontrolled (`value` going from `undefined` to a string) triggers a warning and resets behaviour: initialise with `''`, not `undefined`. React 19 form actions and libraries like React Hook Form lean on uncontrolled inputs for performance ([Data and State Management](/fullstack/react/data-and-state-management)).
+
+---
+
+## useReducer
+
+```tsx
+type State = { status: 'idle' | 'loading' | 'error' | 'success'; items: Item[]; error?: string };
+type Action =
+  { type: 'fetch' } | { type: 'success'; items: Item[] } | { type: 'failure'; error: string };
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case 'fetch':
+      return { ...state, status: 'loading', error: undefined };
+    case 'success':
+      return { status: 'success', items: action.items };
+    case 'failure':
+      return { ...state, status: 'error', error: action.error };
+  }
+}
+
+const [state, dispatch] = useReducer(reducer, { status: 'idle', items: [] });
+```
+
+Prefer a reducer when several values change together, when the next state depends on the previous one in non-trivial ways, or when many event types update the same state. Reducers are pure and testable without React, and `dispatch` has a stable identity, so it can be passed down or used in effects without listing dependencies.
+
+---
+
+## Context: propagation and cost
+
+```tsx
+const ThemeContext = createContext<Theme>('light');
+
+function App() {
+  const [theme, setTheme] = useState<Theme>('light');
+  return (
+    <ThemeContext value={theme}>
+      {' '}
+      {/* React 19; <ThemeContext.Provider> before */}
+      <Page />
+    </ThemeContext>
+  );
+}
+
+function Button() {
+  const theme = use(ThemeContext); // or useContext(ThemeContext)
+}
+```
+
+How it works: when a provider's `value` changes (by `Object.is`), React walks the subtree and schedules a render for every fiber that reads that context, **bypassing `memo`**. Consequences:
+
+- An object literal as value (`value={{ user, setUser }}`) creates a new reference every render of the provider, re-rendering all consumers every time. Memoise the value or pass stable pieces.
+- One context with many fields re-renders every consumer when any field changes. **Split contexts** by update frequency (user, theme, and live data separately), and separate state from setters (`StateContext` and `DispatchContext`).
+- Context is a dependency-injection mechanism, not a state manager: it suits values that change rarely (theme, locale, current user, feature flags, services). Frequently changing shared state belongs in a store with selector-based subscriptions ([Data and State Management](/fullstack/react/data-and-state-management)).
+- A consumer with no provider above it receives the default value passed to `createContext`, a common source of "undefined" bugs in tests.
+
+---
+
+## useId and custom hooks
+
+`useId()` generates a stable ID that matches between server and client render, for linking labels and inputs (`htmlFor`, `aria-describedby`) without hydration mismatches. It is not for list keys.
+
+**Custom hooks** extract reusable stateful logic:
+
+```tsx
+function useDebouncedValue<T>(value: T, delayMs: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(value), delayMs);
+    return () => clearTimeout(id);
+  }, [value, delayMs]);
+  return debounced;
+}
+```
+
+- A custom hook shares **logic, not state**: two components calling `useDebouncedValue` each get their own state, because each call adds hooks to the calling component's own list.
+- Name them `useX` so lint rules apply.
+- Return stable identities (wrap returned functions in `useCallback` if consumers will put them in dependency arrays), or rely on the React Compiler.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why can't hooks be called conditionally?">
+    React identifies each hook only by its call order within the component, storing them as a linked
+    list on the fiber. Skipping a call shifts every later hook onto the wrong stored state.
+  </Accordion>
+  <Accordion title="Why does calling setCount(count + 1) three times increment by one?">
+    count is a constant snapshot for the current render, so all three calls queue "set to count + 1"
+    with the same value. Functional updates receive the latest queued value and accumulate.
+  </Accordion>
+  <Accordion title="Why must state be updated immutably?">
+    React detects changes by reference with Object.is. Mutating an object and setting the same
+    reference is seen as no change. Immutability also keeps previous states intact for concurrent
+    rendering and enables cheap equality checks for memoisation.
+  </Accordion>
+  <Accordion title="Why can context cause performance problems?">
+    Every component reading a context re-renders when its value changes, even through memo. Unstable
+    object values or contexts mixing fast-changing and slow-changing data cause wide, frequent
+    re-renders.
+  </Accordion>
+  <Accordion title="When should state be derived instead of stored?">
+    Whenever it can be computed from existing props or state. Storing it creates two sources of
+    truth that drift apart and requires effects to keep them in sync.
+  </Accordion>
+</Accordions>

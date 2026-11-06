@@ -1,0 +1,311 @@
+---
+title: Fiber and Scheduling
+description: How React executes work - the stack reconciler's limits, the Fiber data structure, the current and work-in-progress trees, the work loop with beginWork and completeWork, the commit sub-phases, lanes and update priorities, automatic batching, time slicing and yielding, transitions and deferred values, how Suspense works, and tearing with external stores.
+---
+
+Typing into a search box that filters 5,000 rows feels laggy: each keystroke waits for the whole list to re-render before the character appears. Wrapping the list update in `startTransition` makes typing instant while the list catches up a moment later. The component code barely changes; what changes is **when** React does the work. That capability comes from Fiber, the architecture React has used since version 16.
+
+---
+
+## The plain-language version
+
+**Where this sits:** under the [Rendering Model](/fullstack/react/rendering-model). That page described what React computes; this page describes how and when it computes it.
+
+Before Fiber, React rendered recursively: once it started, it had to finish the whole tree, like reading a book aloud without being allowed to pause mid-chapter. A large update blocked the main thread, and the browser could not respond to typing. Fiber turned rendering into a list of small units of work that React can pause, give the browser a turn, and resume, or throw away if something more urgent arrives. Updates carry **priorities**: a keystroke is urgent; updating a large results list is not.
+
+Topics, in order:
+
+1. Why the stack reconciler had to go
+2. The Fiber data structure
+3. Two trees: current and work-in-progress
+4. The work loop: beginWork and completeWork
+5. The commit phase in detail
+6. Lanes: update priorities
+7. Batching
+8. Time slicing and yielding
+9. Transitions and deferred values
+10. How Suspense works
+11. Tearing and external stores
+
+| Word                      | Plain meaning                                                                       |
+| :------------------------ | :---------------------------------------------------------------------------------- |
+| **fiber**                 | A JavaScript object representing one component or DOM element and its pending work. |
+| **current tree**          | The fiber tree that matches what is on screen.                                      |
+| **work-in-progress tree** | The tree being built for the next render.                                           |
+| **lane**                  | A priority bit attached to an update.                                               |
+| **time slicing**          | Splitting render work into chunks and yielding to the browser between them.         |
+| **transition**            | An update marked non-urgent, which can be interrupted.                              |
+| **Suspense**              | A boundary that shows a fallback while something below it waits for data or code.   |
+| **tearing**               | Different parts of the UI showing different versions of the same data in one frame. |
+
+---
+
+## Why the stack reconciler had to go
+
+React 15's reconciler walked the tree with recursive function calls. The JavaScript call stack held the state of the traversal, so the traversal could not be paused midway: returning would lose the stack. Rendering 10,000 nodes was one long, uninterruptible task. At 0.01 ms per component that is 100 ms with no input handling and no frames, so animations stuttered and typing lagged. The [browser event loop](/fullstack/web-fundamentals/browser-architecture) cannot interrupt a running task.
+
+Fiber reimplements the traversal with an explicit linked data structure held in the heap, so React controls its own "stack" and can stop after any unit of work and continue later.
+
+---
+
+## The Fiber data structure
+
+Each fiber is an object roughly like this (simplified from React's source):
+
+```ts
+type Fiber = {
+  tag: number; // FunctionComponent, HostComponent ('div'), SuspenseComponent, ...
+  type: any; // the component function or the tag name
+  key: string | null;
+  stateNode: any; // DOM node for host components
+  child: Fiber | null; // first child
+  sibling: Fiber | null; // next sibling
+  return: Fiber | null; // parent (where to "return" after finishing)
+  pendingProps: any;
+  memoizedProps: any; // props used in the last committed render
+  memoizedState: any; // for function components: the linked list of hooks
+  updateQueue: any; // pending state updates, effects
+  lanes: number; // pending work priorities on this fiber
+  childLanes: number; // pending work somewhere in the subtree
+  flags: number; // side effects to apply in commit (Placement, Update, Deletion, ...)
+  alternate: Fiber | null; // the corresponding fiber in the other tree
+};
+```
+
+The `child`, `sibling`, and `return` pointers make the tree walkable without recursion:
+
+<Mermaid
+  chart={`
+flowchart TD
+    App["App"] -- child --> Header["Header"]
+    Header -- sibling --> List["List"]
+    List -- child --> Row1["Row (key=a)"]
+    Row1 -- sibling --> Row2["Row (key=b)"]
+    Row2 -. return .-> List
+    List -. return .-> App
+`}
+/>
+
+`memoizedState` is where hook state lives: a linked list with one node per hook call, in call order. This is why [hooks must be called in the same order on every render](/fullstack/react/state-and-hooks).
+
+---
+
+## Two trees: current and work-in-progress
+
+React keeps two fiber trees, linked through `alternate`:
+
+- **Current**: corresponds to what is on screen.
+- **Work-in-progress**: built during a render, reusing (cloning) current fibers where possible.
+
+When the render finishes and commits, React swaps a single pointer so the work-in-progress tree becomes current. This **double buffering** (the same technique graphics systems use to avoid showing half-drawn frames) is why the user never sees a partially updated UI, and why a render can be discarded cheaply: React simply never swaps.
+
+---
+
+## The work loop
+
+```js
+// Conceptual
+function workLoopConcurrent() {
+  while (workInProgress !== null && !shouldYield()) {
+    performUnitOfWork(workInProgress);
+  }
+}
+
+function performUnitOfWork(fiber) {
+  const next = beginWork(fiber); // render this component, reconcile its children
+  if (next !== null) {
+    workInProgress = next; // go down to the first child
+  } else {
+    completeUnitOfWork(fiber); // no children: complete, then move to sibling or parent
+  }
+}
+```
+
+- **beginWork** (going down): for a function component, call it with its props and hooks, then reconcile the returned elements against the old children, creating or reusing child fibers and marking flags. If neither props, state, nor context changed (and `childLanes` shows no pending work below), React **bails out** and skips the subtree entirely.
+- **completeWork** (coming back up): for host components, create DOM nodes (on mount) or compute the attribute changes (on update), but do not insert them into the document yet. Effect flags bubble up so commit can find them without walking the whole tree.
+
+The traversal is depth-first: down via `child`, across via `sibling`, up via `return`. After each fiber, `shouldYield()` checks whether the time slice (about 5 ms) has expired.
+
+---
+
+## The commit phase in detail
+
+Commit runs synchronously, without yielding, so the DOM never shows a half-applied update:
+
+| Sub-phase        | Work                                                                                                                                                                       |
+| :--------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Before mutation  | Read DOM state that is about to change (`getSnapshotBeforeUpdate` in class components)                                                                                     |
+| Mutation         | Insert, update, and remove DOM nodes; detach old refs; run cleanup of layout effects for updated components; `useInsertionEffect` runs here (for CSS-in-JS libraries)      |
+| Swap             | `root.current = finishedWork`: the work-in-progress tree becomes current                                                                                                   |
+| Layout           | Attach refs, run `useLayoutEffect` setups and `componentDidMount/Update`: the DOM is updated but not yet painted, so measuring and synchronously adjusting is flicker-free |
+| (Browser paints) |                                                                                                                                                                            |
+| Passive          | `useEffect` cleanups and setups, scheduled after paint                                                                                                                     |
+
+State updates made inside layout effects are processed synchronously before paint (useful for measuring a tooltip's size and repositioning it), but they block painting, so heavy work there hurts responsiveness.
+
+---
+
+## Lanes: update priorities
+
+Every update is assigned a **lane**, a bit in a 31-bit mask. Lanes let React track multiple pending priorities at once and batch updates of the same priority together.
+
+| Lane (simplified) | Typical source                                         | Interruptible                               |
+| :---------------- | :----------------------------------------------------- | :------------------------------------------ |
+| Sync              | Discrete user input: click, keydown, `flushSync`       | No                                          |
+| Continuous input  | Drag, scroll, pointer move                             | No                                          |
+| Default           | Updates outside events (network responses, timers)     | Rendered without time slicing in most cases |
+| Transition        | `startTransition`, `useTransition`, `useDeferredValue` | Yes                                         |
+| Retry             | Suspense retrying after data arrives                   | Yes                                         |
+| Idle / Offscreen  | Pre-rendering hidden content (`Activity` component)    | Yes                                         |
+
+When a higher-priority update arrives while a lower-priority render is in progress, React **abandons** the in-progress work-in-progress tree, renders the urgent update on top of the current tree, commits it, and then **restarts** the low-priority render from scratch with the new state. Render-phase code may therefore run several times for one visible update, another reason it must be pure.
+
+---
+
+## Batching
+
+Several state updates in the same synchronous event are combined into one render:
+
+```tsx
+function handleClick() {
+  setCount((c) => c + 1);
+  setFlag(true);
+  setText('saved');
+  // one render, one commit
+}
+```
+
+Since React 18, **automatic batching** also applies inside promises, `setTimeout`, and native event handlers (before 18, only React event handlers were batched). To force an immediate render, for example to measure the DOM right after an update, use `flushSync`, sparingly.
+
+---
+
+## Time slicing and yielding
+
+In concurrent renders, React's scheduler works in roughly 5 ms slices, then yields to the browser via a `MessageChannel` macrotask, letting the browser handle input and paint before continuing.
+
+<Mermaid
+  chart={`
+gantt
+    dateFormat X
+    axisFormat %L ms
+    section Blocking render (legacy)
+    Render 10,000 rows             :0, 120
+    Input handled                  :120, 125
+    section Concurrent transition
+    Render slice                   :0, 5
+    Input + paint                  :5, 10
+    Render slice                   :10, 15
+    Input + paint                  :15, 20
+    Render slices continue         :20, 140
+`}
+/>
+
+Time slicing does not make the total work smaller; it keeps the page responsive while work proceeds. A single component that takes 50 ms to render still blocks for 50 ms, since React can only yield **between** fibers.
+
+---
+
+## Transitions and deferred values
+
+```tsx
+const [query, setQuery] = useState('');
+const [results, setResults] = useState(allRows);
+const [isPending, startTransition] = useTransition();
+
+function onChange(e: React.ChangeEvent<HTMLInputElement>) {
+  setQuery(e.target.value); // urgent: input shows the character now
+  startTransition(() => {
+    setResults(filterRows(allRows, e.target.value)); // non-urgent: interruptible
+  });
+}
+```
+
+```tsx
+// Alternative when the slow part is rendering a value, not computing it
+const deferredQuery = useDeferredValue(query);
+const stale = query !== deferredQuery;
+return <Results query={deferredQuery} style={{ opacity: stale ? 0.6 : 1 }} />;
+```
+
+Semantics:
+
+- Transition updates render in the background; a newer transition interrupts and replaces an older one, so intermediate states are skipped.
+- During a transition, React keeps showing the current UI instead of falling back to Suspense spinners for already-visible content, avoiding the "flash of loading state".
+- Transitions cannot be used for controlled input values themselves: the input's own state must update urgently or typing lags.
+- `isPending` lets the UI indicate that newer content is coming.
+- Async functions passed to `startTransition` (React 19 **Actions**) keep `isPending` true until they finish.
+
+---
+
+## How Suspense works
+
+A component that needs data or code that is not ready **suspends**: it throws a promise (or, with the `use` API, React tracks the promise for it). React catches it at the nearest `<Suspense>` boundary:
+
+1. The boundary renders its `fallback` instead of the suspended subtree.
+2. React attaches a listener to the promise.
+3. When the promise resolves, React retries rendering the subtree (a Retry lane render).
+
+Important behaviours:
+
+- **Data must be cached outside the component.** If a component creates a new promise on every render, each retry creates another promise and suspends forever. Frameworks and data libraries (Server Components, TanStack Query's suspense mode, Relay, `cache()`) own this cache.
+- **Already-visible content is not replaced with a fallback during a transition**; React keeps the old UI until the new one is ready.
+- **Sibling pre-warming**: React 19 commits the fallback immediately when a component suspends, then renders the suspended siblings in the background to start their data requests early.
+- On the server, Suspense boundaries define **streaming** chunks ([Hydration and Streaming](/fullstack/rendering/hydration-and-streaming)).
+- Error boundaries handle rejected promises the same way Suspense handles pending ones.
+
+---
+
+## Tearing and external stores
+
+Concurrent rendering pauses between fibers. If a component reads a **mutable external store** (a global variable, a Redux store, `window.location`) directly during render, and the store changes during a pause, components rendered before the pause show the old value while those after show the new one. That inconsistency in a single committed frame is **tearing**.
+
+`useSyncExternalStore` prevents it: React reads a snapshot, and if the snapshot changes during a concurrent render, it re-renders synchronously so the whole UI is consistent.
+
+```tsx
+function useOnlineStatus() {
+  return useSyncExternalStore(
+    (callback) => {
+      window.addEventListener('online', callback);
+      window.addEventListener('offline', callback);
+      return () => {
+        window.removeEventListener('online', callback);
+        window.removeEventListener('offline', callback);
+      };
+    },
+    () => navigator.onLine, // client snapshot
+    () => true, // server snapshot
+  );
+}
+```
+
+State libraries (Redux, Zustand, Jotai) use it internally; application code uses it when subscribing to browser APIs or non-React stores.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What problem did Fiber solve?">
+    The old recursive reconciler could not pause, so large renders blocked the main thread. Fiber
+    represents work as a linked tree of units processed in a loop, so React can yield to the
+    browser, prioritise urgent updates, abandon or restart low-priority work, and support Suspense
+    and transitions.
+  </Accordion>
+  <Accordion title="Can a commit be interrupted?">
+    No. Only the render phase is interruptible. The commit phase runs synchronously so the DOM is
+    never left in a partially updated state.
+  </Accordion>
+  <Accordion title="What is the difference between useTransition and useDeferredValue?">
+    useTransition wraps the state update that causes slow work and exposes isPending.
+    useDeferredValue takes a value and returns a lagging copy for the slow part of the tree, useful
+    when the update source is outside the component's control.
+  </Accordion>
+  <Accordion title="Why must Suspense data be cached outside the component?">
+    When the promise resolves React re-renders the component. If the component creates a new promise
+    on each render, it suspends again on every retry and never shows content.
+  </Accordion>
+  <Accordion title="What is tearing and how is it prevented?">
+    Different components showing different values of the same external data in one frame because the
+    data changed during a paused concurrent render. useSyncExternalStore detects snapshot changes
+    and forces a consistent synchronous re-render.
+  </Accordion>
+</Accordions>

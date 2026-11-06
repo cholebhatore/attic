@@ -1,0 +1,113 @@
+---
+title: Patterns
+description: Application patterns with Redis - cache-aside, sessions, fixed-window and sliding-window rate limiting, token bucket, distributed locks and their limits, leaderboards, job queues, idempotency and deduplication, counters, and feature flags.
+---
+
+Most Redis usage in web apps falls into a handful of patterns. Each has a simple version and a correct version, and the difference usually shows up only under concurrency or failure.
+
+---
+
+## Cache-aside
+
+```ts
+async function getProduct(id: string) {
+  const key = `product:${id}`;
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+  const product = await db.product.findUnique({ where: { id } });
+  await redis.set(key, JSON.stringify(product), { EX: 300 + Math.floor(Math.random() * 60) }); // TTL + jitter
+  return product;
+}
+// on update: write DB, then DEL product:<id>
+```
+
+Invalidation and stampede protection: [Caching](/fullstack/caching).
+
+---
+
+## Sessions
+
+`SET sess:<random-id> <json> EX 604800`, with `sess:*` IDs also tracked in a per-user set for "log out everywhere". See [Sessions](/fullstack/auth/sessions).
+
+---
+
+## Rate limiting
+
+**Fixed window** (simple, allows bursts at window edges):
+
+```text
+INCR rl:ip:1.2.3.4:202611061022    # key per minute
+EXPIRE rl:ip:1.2.3.4:202611061022 60 NX
+# reject if the count > 100
+```
+
+**Sliding window log** with a sorted set (accurate):
+
+```lua
+-- KEYS[1] = rl key, ARGV = now_ms, window_ms, limit, request_id
+redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1] - ARGV[2])
+local count = redis.call('ZCARD', KEYS[1])
+if count >= tonumber(ARGV[3]) then return 0 end
+redis.call('ZADD', KEYS[1], ARGV[1], ARGV[4])
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+return 1
+```
+
+**Token bucket / GCRA** allow controlled bursts with a steady refill rate; libraries implement them in Lua (`rate-limiter-flexible` for Node, `limits` for Python). Algorithms compared in [traffic control](/fullstack/building-for-scale/traffic-control).
+
+---
+
+## Distributed locks
+
+```text
+SET lock:invoice:981 <unique-token> NX PX 30000
+-- release only if still the owner (Lua):
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) else return 0 end
+```
+
+- Always set an expiry (a crashed holder must not lock forever) and a unique token (do not delete someone else's lock).
+- A lock can expire while the holder is still working (GC pause, slow I/O). For correctness-critical work, use a **fencing token**: an increasing number checked by the resource being protected, or rely on database constraints and transactions instead.
+- Redlock (locking across several independent Redis nodes) is debated; for efficiency locks (avoid duplicate work) a single-node lock is fine; for correctness, prefer the database.
+
+---
+
+## Leaderboards
+
+```text
+ZINCRBY game:leaderboard 50 "player:19"
+ZREVRANGE game:leaderboard 0 9 WITHSCORES
+ZREVRANK game:leaderboard "player:19"
+```
+
+---
+
+## Queues
+
+Lists with `BLMOVE` into a processing list, or Streams with consumer groups. In practice, use a library: **BullMQ** (Node) or **RQ / arq / Celery with Redis** (Python), which add retries, delays, priorities, and dashboards. See [Job Queues](/fullstack/message-brokers/job-queues-and-outbox).
+
+---
+
+## Idempotency and deduplication
+
+```text
+SET idem:<idempotency-key> "processing" NX EX 86400
+# if set: process, then SET idem:<key> <response-json> EX 86400
+# if not set: return the stored response (or 409 while still processing)
+```
+
+Webhook event IDs and message IDs use the same `SET NX` pattern.
+
+---
+
+## More patterns
+
+| Need                 | Structure                                                    |
+| :------------------- | :----------------------------------------------------------- |
+| Page view counters   | `INCR`, flushed to the DB periodically                       |
+| Unique visitors      | HyperLogLog                                                  |
+| "Who is online"      | Sorted set with last-seen timestamps, trimmed by score       |
+| Feature flags        | Hash of flag → value, cached in-process with short TTL       |
+| Recent activity feed | Capped list with `LPUSH` + `LTRIM`                           |
+| Delayed jobs         | Sorted set scored by run-at time                             |
+| Geo search           | `GEOADD` / `GEOSEARCH`                                       |
+| Vector similarity    | Redis Query Engine vector indexes (Redis 8) or valkey-search |

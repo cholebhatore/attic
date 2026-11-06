@@ -1,0 +1,130 @@
+---
+title: Observability
+description: Logs, metrics, and traces and what each answers, cardinality, distributed tracing and context propagation, OpenTelemetry instrumentation in Node.js and Python, the collector, correlation between signals, profiling, and sampling.
+---
+
+Checkout latency doubles. Dashboards show CPU and memory are fine. Logs show no errors. Only a trace reveals that each checkout now calls the tax service three times, sequentially, because of a refactor. Monitoring answers known questions; observability makes it possible to answer new ones.
+
+---
+
+## The plain-language version
+
+Three kinds of **telemetry**, each answering a different question:
+
+| Signal      | Shape                                               | Answers                                 | Example                                           |
+| :---------- | :-------------------------------------------------- | :-------------------------------------- | :------------------------------------------------ |
+| **Logs**    | Timestamped events with context                     | What happened in this case?             | `payment failed orderId=981 reason=card_declined` |
+| **Metrics** | Numbers aggregated over time                        | How much, how often, how fast, overall? | `http_requests_total`, p99 latency                |
+| **Traces**  | Tree of timed spans across services for one request | Where did the time go for this request? | Checkout → tax ×3 → payment                       |
+| Profiles    | CPU and memory by function over time                | Which code is expensive?                | Continuous profiling                              |
+
+**Instrumentation** is the code that emits them; **telemetry** is the data; **observability** is the property of being able to understand the system from it.
+
+| Word                    | Plain meaning                                                   |
+| :---------------------- | :-------------------------------------------------------------- |
+| **span**                | One timed operation with attributes (an HTTP call, a DB query). |
+| **trace ID**            | ID shared by every span in one request, across services.        |
+| **context propagation** | Passing trace IDs between services (the `traceparent` header).  |
+| **cardinality**         | Number of unique label combinations in a metric.                |
+| **sampling**            | Keeping only some traces to control cost.                       |
+
+---
+
+## Metrics and cardinality
+
+Metric types: **counter** (only goes up: requests), **gauge** (goes up and down: queue depth), **histogram** (distribution: latency buckets, for percentiles).
+
+Labels (`route`, `status`, `method`) multiply series. A `user_id` label on a metric with a million users creates a million time series and a large bill. High-cardinality details belong in logs and trace attributes, not metric labels.
+
+---
+
+## Distributed tracing
+
+<Mermaid
+  chart={`
+gantt
+    dateFormat X
+    axisFormat %L ms
+    section Trace 4bf9...
+    POST /checkout          :0, 480
+    auth middleware         :5, 20
+    SELECT cart             :25, 60
+    POST tax-service (1)    :60, 160
+    POST tax-service (2)    :160, 260
+    POST tax-service (3)    :260, 360
+    POST payment-service    :360, 470
+`}
+/>
+
+The W3C `traceparent` header carries the trace ID between services; OpenTelemetry libraries add and read it automatically for HTTP, gRPC, and many queue clients.
+
+---
+
+## OpenTelemetry
+
+**OpenTelemetry** (OTel) is the vendor-neutral standard: APIs and SDKs for instrumentation, automatic instrumentation for common libraries, a wire protocol (OTLP), and the **Collector**, which receives, processes (sampling, redaction), and exports telemetry to any backend.
+
+<Tabs items={['Node.js', 'Python']}>
+<Tab value="Node.js">
+
+```ts title="instrumentation.ts (loaded first: node --import ./instrumentation.js server.js)"
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { getNodeAutoInstrumentations } from '@opentelemetry/auto-instrumentations-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+
+new NodeSDK({
+  serviceName: 'checkout-api',
+  traceExporter: new OTLPTraceExporter({ url: 'http://otel-collector:4318/v1/traces' }),
+  instrumentations: [getNodeAutoInstrumentations()], // http, express, pg, redis, ...
+}).start();
+```
+
+```ts
+import { trace } from '@opentelemetry/api';
+const tracer = trace.getTracer('checkout');
+await tracer.startActiveSpan('calculate-tax', async (span) => {
+  span.setAttribute('cart.items', cart.items.length);
+  try {
+    return await tax.calculate(cart);
+  } finally {
+    span.end();
+  }
+});
+```
+
+</Tab>
+<Tab value="Python">
+
+```bash
+uv add opentelemetry-distro opentelemetry-exporter-otlp
+uv run opentelemetry-bootstrap -a install       # installs instrumentations for detected libraries
+OTEL_SERVICE_NAME=checkout-api OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
+  uv run opentelemetry-instrument uvicorn app.main:app
+```
+
+```python
+from opentelemetry import trace
+tracer = trace.get_tracer("checkout")
+with tracer.start_as_current_span("calculate-tax") as span:
+    span.set_attribute("cart.items", len(cart.items))
+    total = await tax.calculate(cart)
+```
+
+</Tab>
+</Tabs>
+
+Next.js has built-in OpenTelemetry support through `instrumentation.ts` and `@vercel/otel`.
+
+---
+
+## Correlation
+
+The value multiplies when signals link: every log line carries `trace_id` and `span_id`; metrics carry **exemplars** pointing to example traces; a latency spike on a dashboard leads to a slow trace, which leads to its logs. Use structured JSON logs ([Config, Logging, Errors](/fullstack/backend-fundamentals/config-logging-errors)).
+
+---
+
+## Sampling and cost
+
+Tracing every request at high volume is expensive. **Head sampling** keeps a fixed percentage decided at the start. **Tail sampling** (in the Collector) decides after the trace completes, keeping all errors and slow requests plus a sample of the rest. Set log retention and levels deliberately; telemetry bills grow faster than traffic.
+
+Backends: Grafana stack (Loki, Tempo, Mimir, Pyroscope), Jaeger, Honeycomb, Datadog, New Relic, Sentry, SigNoz, Elastic, and cloud-native options.

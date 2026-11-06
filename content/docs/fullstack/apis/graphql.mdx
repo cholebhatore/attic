@@ -1,0 +1,99 @@
+---
+title: GraphQL
+description: Schema and types, queries, mutations and subscriptions, resolvers, the N+1 problem and DataLoader, query depth and cost limits, caching, persisted queries, federation, and when GraphQL fits.
+---
+
+A mobile home screen needs data from user, orders, recommendations, and notifications. With REST that is four round trips, each returning far more fields than the screen shows. GraphQL lets the client ask for exactly that shape in one request, at the cost of moving complexity to the server.
+
+---
+
+## The plain-language version
+
+The server publishes a typed **schema**. Clients send **queries** naming exactly the fields they want; the server runs a **resolver** function for each field and returns JSON matching the query's shape.
+
+| Word                                | Plain meaning                                      |
+| :---------------------------------- | :------------------------------------------------- |
+| **schema**                          | Types and fields the API offers, written in SDL.   |
+| **query / mutation / subscription** | Read / write / real-time stream.                   |
+| **resolver**                        | Function that produces one field's value.          |
+| **DataLoader**                      | Batches and caches loads within one request.       |
+| **persisted query**                 | A query registered ahead of time and called by ID. |
+| **federation**                      | Composing one graph from many services' subgraphs. |
+
+---
+
+## Schema and query
+
+```graphql
+type User {
+  id: ID!
+  name: String!
+  orders(first: Int = 10): [Order!]!
+}
+type Order {
+  id: ID!
+  total: Int!
+  status: OrderStatus!
+}
+enum OrderStatus {
+  PENDING
+  PAID
+  SHIPPED
+}
+
+type Query {
+  me: User
+}
+type Mutation {
+  cancelOrder(id: ID!): Order!
+}
+```
+
+```graphql
+query Home {
+  me {
+    name
+    orders(first: 3) {
+      id
+      total
+      status
+    }
+  }
+}
+```
+
+---
+
+## The N+1 problem
+
+The `orders` resolver runs once per user. Listing 50 users means 1 query for users plus 50 for orders. **DataLoader** collects all keys requested in one tick and issues one batched query:
+
+```ts
+const ordersByUser = new DataLoader(async (userIds: readonly string[]) => {
+  const rows = await db.order.findMany({ where: { userId: { in: [...userIds] } } });
+  return userIds.map((id) => rows.filter((r) => r.userId === id));
+});
+// resolver: orders: (user) => ordersByUser.load(user.id)
+```
+
+Create loaders per request so caches do not leak between users.
+
+---
+
+## Production concerns
+
+| Concern                               | Mitigation                                                                                               |
+| :------------------------------------ | :------------------------------------------------------------------------------------------------------- |
+| Expensive or malicious nested queries | Depth limits, query cost analysis, timeouts                                                              |
+| HTTP caching (one POST endpoint)      | Persisted queries over GET, CDN caching by query ID, client-side normalised caches (Apollo, urql, Relay) |
+| Authorization per field               | Check in resolvers or a directive layer, not only at the endpoint                                        |
+| Introspection exposing internals      | Disable in production for private APIs                                                                   |
+| Errors                                | `200` with an `errors` array; monitor them separately                                                    |
+
+Servers: Apollo Server, GraphQL Yoga, Pothos (code-first TS), Strawberry (Python). Federation: Apollo Federation, GraphQL Mesh, WunderGraph Cosmo.
+
+---
+
+## When it fits
+
+Good: many client types with different data needs, rapidly evolving frontends, aggregating several backends. Poor: simple CRUD, public APIs that benefit from HTTP caching, file uploads, small teams without the capacity to run it well.

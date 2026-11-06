@@ -1,0 +1,226 @@
+---
+title: How the Internet Works
+description: The physical internet (links, routers, ISPs, IXPs, autonomous systems), packet switching, the layered model and encapsulation, the four components of latency, bandwidth-delay product, throughput, jitter, and packet loss.
+---
+
+A user in Mumbai loads a site hosted in Virginia. The server answers in 5 ms, yet nothing appears for over a second. The server is not the bottleneck; physics and protocol round trips are. Every performance decision on the web, from CDNs to HTTP/3 to bundling, is a response to the constraints on this page.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first page of the network layer. The next two pages zoom into addressing and routing ([IP and Routing](/fullstack/web-fundamentals/ip-and-routing)) and reliable delivery ([TCP, UDP, QUIC](/fullstack/web-fundamentals/tcp-udp-quic)).
+
+The internet is a network of networks. No single entity runs it. Thousands of independently operated networks (ISPs, cloud providers, universities, companies) agree on a few protocols and connect to each other. Data travels as small, independent **packets**, each carrying its destination address, like postcards sorted at every post office along the route without anyone planning the whole journey in advance.
+
+Topics, in order:
+
+1. The physical internet: links, routers, ISPs, IXPs, autonomous systems
+2. Packet switching vs circuit switching
+3. Layers and encapsulation
+4. Latency: propagation, transmission, queuing, processing
+5. Bandwidth, throughput, and the bandwidth-delay product
+6. Jitter and packet loss
+7. What this means for web applications
+
+| Word                       | Plain meaning                                                                                       |
+| :------------------------- | :-------------------------------------------------------------------------------------------------- |
+| **packet**                 | A unit of data, typically up to 1,500 bytes on Ethernet, with headers describing where it goes.     |
+| **link**                   | A physical connection between two devices: fibre, copper, radio.                                    |
+| **router**                 | A device that forwards packets between networks, one hop at a time.                                 |
+| **autonomous system (AS)** | A network under one administrative control with its own routing policy, identified by an AS number. |
+| **ISP**                    | Internet service provider: a network that sells connectivity.                                       |
+| **IXP**                    | Internet exchange point: a facility where many networks connect to exchange traffic directly.       |
+| **latency**                | Time for one bit (or one message) to get from A to B.                                               |
+| **bandwidth**              | Maximum data rate a link can carry, in bits per second.                                             |
+| **throughput**             | Data rate actually achieved end to end.                                                             |
+| **RTT**                    | Round-trip time: there and back.                                                                    |
+
+---
+
+## The physical internet
+
+<Mermaid
+  chart={`
+flowchart LR
+    H["Home device"] -- "Wi-Fi" --> R["Home router (NAT)"] -- "fibre / DSL / 5G" --> ISP["Access ISP"]
+    ISP --> T2["Regional ISP (tier 2)"]
+    T2 -- "peering at IXP" --> CDN["CDN / cloud network"]
+    T2 -- "paid transit" --> T1["Tier 1 backbone"]
+    T1 -- "submarine cable" --> T1B["Tier 1 backbone (other continent)"]
+    T1B --> DC["Data centre: load balancer, servers"]
+`}
+/>
+
+- **Access networks** connect homes and phones: fibre (FTTH), cable (DOCSIS), DSL, cellular (4G/5G), satellite. This "last mile" is often the slowest and lossiest part of the path.
+- **Backbones** are high-capacity fibre networks run by large carriers. About 99 percent of intercontinental traffic crosses **submarine cables**, not satellites.
+- **Autonomous systems** are the unit of internet routing. Each AS (an ISP, Google, Cloudflare, a university) decides which routes to accept and announce, using **BGP** (covered in [IP and Routing](/fullstack/web-fundamentals/ip-and-routing)).
+- Networks connect in two economic modes:
+  - **Transit**: a smaller network pays a larger one to carry its traffic to the whole internet.
+  - **Peering**: two networks exchange traffic between their own customers, usually without payment, often at an **IXP** (DE-CIX Frankfurt, AMS-IX, LINX, Mumbai IX).
+- **Tier 1** networks reach every destination through peering alone, without buying transit.
+- Large content companies and CDNs place servers inside or next to ISPs and peer directly at IXPs, which is why a request to a CDN often never touches a backbone.
+
+---
+
+## Packet switching
+
+The telephone network used **circuit switching**: a call reserved a fixed path and capacity for its whole duration, idle or not. The internet uses **packet switching**: each packet is forwarded independently, and links are shared by everyone's packets.
+
+|           | Circuit switching       | Packet switching                  |
+| :-------- | :---------------------- | :-------------------------------- |
+| Capacity  | Reserved per connection | Shared, statistically multiplexed |
+| Idle cost | Wasted reservation      | None                              |
+| Delay     | Constant after setup    | Variable (queues)                 |
+| Failure   | Call drops              | Packets reroute around failures   |
+| Ordering  | Guaranteed              | Not guaranteed                    |
+
+Packet switching is far more efficient for bursty data such as web traffic, at the cost of variable delay, loss when queues overflow, and possible reordering. TCP and QUIC exist to hide those effects from applications.
+
+Routers are **store-and-forward**: they receive a whole packet, check it, look up the next hop, and place it in an output queue. Each hop adds a small delay; a typical intercontinental path has 10 to 20 hops (`traceroute` shows them).
+
+---
+
+## Layers and encapsulation
+
+Networking is split into layers so each solves one problem and depends only on the service of the layer below.
+
+| TCP/IP layer | OSI layers | Job                                                                   | Unit               | Examples                        | Address       |
+| :----------- | :--------- | :-------------------------------------------------------------------- | :----------------- | :------------------------------ | :------------ |
+| Application  | 7, 6, 5    | Meaning of the data                                                   | message            | HTTP, DNS, TLS, SMTP, WebSocket | URL, hostname |
+| Transport    | 4          | Process-to-process delivery, reliability, flow and congestion control | segment / datagram | TCP, UDP, QUIC                  | port          |
+| Internet     | 3          | Host-to-host delivery across networks                                 | packet             | IPv4, IPv6, ICMP                | IP address    |
+| Link         | 2, 1       | One hop on one physical medium                                        | frame              | Ethernet, Wi-Fi, 5G             | MAC address   |
+
+On the way out, each layer wraps the data from the layer above with its own header (**encapsulation**). On the way in, each layer strips its header and hands the payload up.
+
+```text
+Ethernet header | IP header | TCP header | TLS record header | HTTP request bytes | Ethernet trailer
+   14 bytes        20 bytes     20 bytes        5 bytes               ...                  4 bytes
+```
+
+A worked overhead example: Ethernet allows 1,500 bytes per frame payload (the **MTU**). With 20 bytes of IPv4 header and 20 to 32 bytes of TCP header (32 with the common timestamp option), about 1,448 to 1,460 bytes of application data fit in one packet (the **MSS**, maximum segment size). A 100 KB response therefore needs about 70 packets.
+
+Routers in the middle look only at the link and internet layers; they do not need to understand TCP or HTTP. That separation is why new applications (and new transports like QUIC, which runs over UDP) can be deployed without changing the core of the internet: the **end-to-end principle**.
+
+---
+
+## Latency: where the time goes
+
+The delay for one packet across one hop has four components:
+
+| Component                        | Cause                                           | Depends on                   | Typical size                                   |
+| :------------------------------- | :---------------------------------------------- | :--------------------------- | :--------------------------------------------- |
+| **Propagation**                  | Signal travelling through the medium            | Distance ÷ speed in medium   | 5 µs per km in fibre                           |
+| **Transmission (serialisation)** | Pushing the packet's bits onto the link         | Packet size ÷ link bandwidth | 1,500 B at 1 Gbps = 12 µs; at 10 Mbps = 1.2 ms |
+| **Queuing**                      | Waiting behind other packets in a router buffer | Load on the link             | 0 to hundreds of ms                            |
+| **Processing**                   | Router examining headers, looking up routes     | Router hardware              | Microseconds                                   |
+
+### Propagation is a hard floor
+
+Light in fibre travels at about two-thirds of its speed in vacuum, roughly 200,000 km/s, or 200 km per millisecond. Real cable routes are longer than great-circle distances.
+
+| Route                       | Great-circle distance | Minimum RTT in fibre (straight line) | Typical real RTT |
+| :-------------------------- | :-------------------- | :----------------------------------- | :--------------- |
+| Within a city               | 20 km                 | 0.2 ms                               | 1–5 ms           |
+| Mumbai → Singapore          | ~3,900 km             | ~39 ms                               | ~60 ms           |
+| London → New York           | ~5,600 km             | ~56 ms                               | ~70–80 ms        |
+| Mumbai → Virginia (US East) | ~13,000 km            | ~130 ms                              | ~200–230 ms      |
+| Sydney → London             | ~17,000 km            | ~170 ms                              | ~250–280 ms      |
+
+Minimum RTT = 2 × distance ÷ 200 km/ms. Real figures are rough, from public latency maps, and vary by provider and route.
+
+No server optimisation removes propagation delay; only moving the server (or a cache of its content) closer to the user does. That is the entire reason CDNs and edge computing exist.
+
+### Why round trips dominate
+
+A fresh HTTPS request over TCP from Mumbai to Virginia with an RTT of about 220 ms:
+
+| Step                                    | Round trips | Time                               |
+| :-------------------------------------- | :---------- | :--------------------------------- |
+| DNS lookup (uncached)                   | 1 or more   | ~0–220 ms (resolver may be nearby) |
+| TCP handshake                           | 1           | 220 ms                             |
+| TLS 1.3 handshake                       | 1           | 220 ms                             |
+| HTTP request and first byte of response | 1           | 220 ms + server time               |
+| **Total before the first byte**         | **3–4**     | **~660–880 ms**                    |
+
+The same request to a CDN node 10 ms away costs about 30 to 40 ms. Halving server processing time from 10 ms to 5 ms saves 5 ms; moving the content closer saves over 600 ms. Most web pages are **latency-bound, not bandwidth-bound**.
+
+---
+
+## Bandwidth, throughput, and the bandwidth-delay product
+
+**Bandwidth** is the capacity of the narrowest link (the bottleneck). **Throughput** is what a transfer actually achieves, limited by the bottleneck, competing traffic, packet loss, and the transport protocol's windows.
+
+The **bandwidth-delay product** (BDP) is how much data is "in flight" on a path when it is fully used:
+
+$$
+\text{BDP} = \text{bandwidth} \times \text{RTT}
+$$
+
+Worked example: a 100 Mbps path with 200 ms RTT has BDP = 100,000,000 bits/s × 0.2 s = 20,000,000 bits = 2.5 MB. To keep that path full, a sender must have 2.5 MB of unacknowledged data in flight. A sender limited to 64 KB in flight (the old TCP window maximum without window scaling) reaches only:
+
+$$
+\text{throughput} = \frac{\text{window}}{\text{RTT}} = \frac{64 \times 1024 \times 8 \text{ bits}}{0.2 \text{ s}} \approx 2.6 \text{ Mbps}
+$$
+
+That is about 2.6 percent of the link. Long-distance transfers are slow not because the link is slow but because windows are small relative to the RTT. TCP window scaling and congestion control (next pages) govern this.
+
+### Why bigger bandwidth barely helps page loads
+
+Measurements from Google (Mike Belshe, "More Bandwidth Doesn't Matter (Much)", 2010) showed page load time improving sharply as bandwidth rose to about 5 Mbps, then flattening, while every reduction in RTT kept improving load time roughly linearly. Typical pages are many small requests, each dominated by round trips rather than transfer time.
+
+---
+
+## Jitter and packet loss
+
+- **Jitter** is variation in latency between packets, mostly from changing queue lengths. It matters for real-time media (calls, games), which use jitter buffers, and for latency percentiles in APIs.
+- **Packet loss** happens when a queue overflows, a radio link corrupts a frame, or a device fails. Loss rates of 1 to 2 percent are common on mobile and congested Wi-Fi.
+  - TCP treats loss as a congestion signal and slows down, so even small loss rates cut throughput sharply on long paths. The Mathis approximation for loss-limited TCP Reno throughput is roughly MSS ÷ (RTT × √loss). At MSS 1,460 bytes, RTT 100 ms, and 1 percent loss, that gives about 1,460 × 8 ÷ (0.1 × 0.1) ≈ 1.2 Mbps regardless of link speed.
+  - Loss also causes **head-of-line blocking** in TCP: later data waits for the retransmission of an earlier packet.
+- **Bufferbloat**: oversized router buffers absorb bursts instead of dropping, so queues grow and latency rises by hundreds of milliseconds under load (a video call stutters when someone starts a download). Modern queue management (CoDel, FQ-CoDel) and congestion controllers like BBR target this.
+
+---
+
+## What this means for web applications
+
+| Constraint                                          | Consequence                                         | Response                                                                      |
+| :-------------------------------------------------- | :-------------------------------------------------- | :---------------------------------------------------------------------------- |
+| Propagation delay is fixed by distance              | Every round trip to a far server costs 100+ ms      | CDNs, edge caching, multi-region deployment                                   |
+| Connection setup costs several RTTs                 | New connections are expensive                       | Keep-alive, connection reuse, HTTP/2 multiplexing, HTTP/3 0-RTT, `preconnect` |
+| Small windows on new connections                    | First bytes arrive slowly (slow start)              | Small critical resources, early hints, fewer origins                          |
+| Sequential dependencies multiply RTTs               | A request chain HTML → CSS → font costs three trips | Preload, inline critical CSS, avoid waterfalls in data fetching               |
+| Mobile networks have high and variable RTT and loss | p75 users see far worse latency than developers     | Test with throttling, measure field data, send less                           |
+| Chatty APIs                                         | 20 sequential API calls = 20 RTTs                   | Batch, aggregate on the server (BFF), parallelise                             |
+
+<Callout type="warn">
+  Developers usually test on fast networks a few milliseconds from their servers. Real users are
+  often 50 to 300 ms away on lossy mobile links. Throttling in DevTools and field data from real
+  users close that gap; see [Core Web Vitals](/fullstack/performance/core-web-vitals).
+</Callout>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What are the four components of network delay?">
+    Propagation (distance over signal speed), transmission (packet size over bandwidth), queuing
+    (waiting in router buffers), and processing (header inspection and lookup). Propagation
+    dominates long paths; queuing dominates congested ones.
+  </Accordion>
+  <Accordion title="Why does upgrading from 100 Mbps to 1 Gbps barely speed up web browsing?">
+    Page loads consist of many small requests whose cost is dominated by round trips (DNS, TCP, TLS,
+    request/response, slow start), not by transfer time. Bandwidth helps large downloads; latency
+    governs page loads.
+  </Accordion>
+  <Accordion title="What is the bandwidth-delay product and why does it matter?">
+    Bandwidth multiplied by RTT: the amount of data that must be in flight to fill a path. If the
+    sender's window is smaller than the BDP, throughput is capped at window divided by RTT,
+    regardless of link speed.
+  </Accordion>
+  <Accordion title="What is the difference between peering and transit?">
+    Transit is paid access to the whole internet through a larger network. Peering is a direct
+    exchange of traffic between two networks' own customers, typically settlement-free at an IXP.
+  </Accordion>
+</Accordions>

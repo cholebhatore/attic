@@ -1,0 +1,277 @@
+---
+title: Box Model and Positioning
+description: How CSS sizes and places boxes - the box model and box-sizing, display types and the outer/inner display model, normal flow and block formatting contexts, margin collapsing, intrinsic vs extrinsic sizing (min-content, max-content, fit-content), percentages and what they resolve against, overflow, positioning schemes and containing blocks, sticky positioning, stacking contexts and z-index, and the top layer.
+---
+
+A modal with `z-index: 9999` renders behind a header with `z-index: 10`. A `position: fixed` toolbar scrolls away with its parent. Two paragraphs end up 20px apart instead of the expected 40px. A `width: 100%` input overflows its container by exactly its padding. Each of these follows from a precise rule about how CSS creates boxes, sizes them, and stacks them.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after [Cascade and Specificity](/fullstack/css/cascade-and-specificity), which decides property values; this page covers how those values become boxes on the page. [Flexbox and Grid](/fullstack/css/flexbox-and-grid) covers the two main layout algorithms.
+
+Every element generates a rectangular **box**. The browser lays boxes out in **normal flow** (blocks stacked vertically, inline content flowing in lines) unless a property removes them from it (`position: absolute`, `float`) or switches their children to another layout algorithm (`display: flex` or `grid`). Boxes then stack in layers, grouped into **stacking contexts**, which is what `z-index` actually orders.
+
+Topics, in order:
+
+1. The box model and box-sizing
+2. Display types
+3. Normal flow and formatting contexts
+4. Margin collapsing
+5. Sizing: intrinsic, extrinsic, percentages
+6. Overflow
+7. Positioning and containing blocks
+8. Sticky positioning
+9. Stacking contexts and z-index
+10. The top layer
+
+| Word                   | Plain meaning                                                                     |
+| :--------------------- | :-------------------------------------------------------------------------------- |
+| **content box**        | The area holding content; `width` applies here by default.                        |
+| **border box**         | Content + padding + border.                                                       |
+| **normal flow**        | Default layout: blocks top to bottom, inline content left to right in lines.      |
+| **formatting context** | An independent layout region with its own rules (block, inline, flex, grid).      |
+| **BFC**                | Block formatting context: contains floats, prevents margin collapse with outside. |
+| **containing block**   | The rectangle that positions and percentages resolve against.                     |
+| **stacking context**   | A group of boxes painted together; `z-index` orders siblings within it.           |
+| **intrinsic size**     | Size determined by content (`min-content`, `max-content`).                        |
+
+---
+
+## The box model and box-sizing
+
+<Mermaid
+  chart={`
+flowchart TB
+    subgraph M["margin (transparent, outside the border)"]
+        subgraph B["border"]
+            subgraph P["padding (has background)"]
+                C["content (width x height by default)"]
+            end
+        end
+    end
+`}
+/>
+
+| `box-sizing`            | `width: 200px; padding: 20px; border: 2px` gives a rendered width of |
+| :---------------------- | :------------------------------------------------------------------- |
+| `content-box` (default) | 200 + 2×20 + 2×2 = **244px**                                         |
+| `border-box`            | **200px** (content shrinks to 156px)                                 |
+
+```css
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+```
+
+Almost every modern reset sets `border-box`, because "this box is 200px wide" is far easier to reason about. The overflowing `width: 100%` input in the opening example is `content-box` arithmetic.
+
+---
+
+## Display types
+
+`display` sets two things: the **outer** display type (how the box participates in its parent's layout) and the **inner** display type (how it lays out its children).
+
+| `display`              | Outer          | Inner     | Behaviour                                                                                                                       |
+| :--------------------- | :------------- | :-------- | :------------------------------------------------------------------------------------------------------------------------------ |
+| `block`                | block          | flow      | Takes full available width, starts on a new line, width/height apply                                                            |
+| `inline`               | inline         | flow      | Flows in a line; `width`/`height` ignored; vertical margins and padding do not push lines apart                                 |
+| `inline-block`         | inline         | flow-root | Flows in a line but sizes like a block                                                                                          |
+| `flex` / `inline-flex` | block / inline | flex      | Children laid out by flexbox                                                                                                    |
+| `grid` / `inline-grid` | block / inline | grid      | Children laid out by grid                                                                                                       |
+| `flow-root`            | block          | flow-root | Block that establishes a new BFC                                                                                                |
+| `contents`             | (none)         |           | Box disappears; children are laid out as if they were the parent's children (can drop accessibility semantics in some browsers) |
+| `none`                 |                |           | No box; removed from layout and accessibility tree                                                                              |
+
+Replaced elements (`img`, `video`, `input`) are inline by default and sit on the text baseline, which is why images in a `div` leave a few pixels of gap below them; `display: block` or `vertical-align: middle` removes it.
+
+---
+
+## Normal flow and formatting contexts
+
+In a **block formatting context**, block boxes stack vertically, each as wide as its container by default. In an **inline formatting context**, inline boxes and text flow horizontally into **line boxes**, wrapping at the container's edge; `line-height`, `vertical-align`, and fonts determine line height.
+
+A new BFC is established by: the root element, floats, absolutely positioned elements, `display: flow-root`, `inline-block`, flex and grid items, `overflow` other than `visible`/`clip`, and `contain: layout`/`content`. A BFC:
+
+- Contains its floats (the parent's height includes them; the old "clearfix" problem).
+- Does not let its children's margins collapse with outside margins.
+- Does not overlap floats beside it.
+
+`display: flow-root` is the modern, side-effect-free way to create a BFC.
+
+---
+
+## Margin collapsing
+
+Vertical margins of adjacent blocks in normal flow **collapse** into one margin equal to the largest (or, with negative margins, the largest positive plus the most negative).
+
+| Situation                                                                    | Result                                                        |
+| :--------------------------------------------------------------------------- | :------------------------------------------------------------ |
+| Paragraph with `margin-bottom: 20px` followed by one with `margin-top: 40px` | 40px gap, not 60px                                            |
+| First child's top margin with a parent that has no border, padding, or BFC   | The margin "leaks" out of the parent, pushing the parent down |
+| Empty block with top and bottom margins                                      | Its own margins collapse together                             |
+
+Margins **do not** collapse: horizontally, in flex or grid containers, for floated or absolutely positioned elements, for `inline-block`, or across a BFC boundary or padding/border. Using `gap` in flex/grid layouts or margin in one direction only (`margin-block-end`) avoids collapse surprises.
+
+---
+
+## Sizing: intrinsic, extrinsic, percentages
+
+| Keyword                      | Meaning                                                                                      |
+| :--------------------------- | :------------------------------------------------------------------------------------------- |
+| `auto`                       | Depends on context: blocks fill available width; heights fit content                         |
+| `min-content`                | Smallest size without overflow (longest word or widest unbreakable item)                     |
+| `max-content`                | Size if content never wrapped                                                                |
+| `fit-content`                | `min(max-content, max(min-content, available space))`: shrink-wrap up to the available width |
+| `clamp(min, preferred, max)` | Preferred value bounded on both sides                                                        |
+
+Percentages resolve against the **containing block**, and against different dimensions per property:
+
+| Property                                                     | Percentage of                                                                                  |
+| :----------------------------------------------------------- | :--------------------------------------------------------------------------------------------- |
+| `width`, `max-width`, `left`/`right`                         | Containing block's width                                                                       |
+| `height`, `top`/`bottom`                                     | Containing block's height (if the height is definite; otherwise `height: %` behaves as `auto`) |
+| `margin` and `padding` (all sides, including top and bottom) | Containing block's **width** (in horizontal writing modes)                                     |
+| `transform: translate(50%)`                                  | The element's **own** size                                                                     |
+
+Vertical padding being a percentage of width is the old "aspect ratio box" trick; `aspect-ratio` replaces it. `height: 100%` failing usually means the parent's height is not definite; flex, grid, or explicit heights up the chain fix it.
+
+`min-width` and `max-width` beat `width`; `min-width` beats `max-width` when they conflict. Flex and grid items default to `min-width: auto` (their content's minimum size), the root cause of many overflow bugs ([Flexbox and Grid](/fullstack/css/flexbox-and-grid)).
+
+Viewport units: `vh` on mobile equals the largest viewport (browser toolbars hidden), so `100vh` content hides behind toolbars; `svh` (small), `lvh` (large), and `dvh` (dynamic) units address this.
+
+---
+
+## Overflow
+
+| Value               | Effect                                     | Creates BFC / scroll container |
+| :------------------ | :----------------------------------------- | :----------------------------- |
+| `visible` (default) | Content spills outside                     | No                             |
+| `hidden`            | Clipped; still programmatically scrollable | Yes                            |
+| `clip`              | Clipped; not scrollable                    | No scroll container            |
+| `scroll`            | Always shows scrollbars                    | Yes                            |
+| `auto`              | Scrollbars when needed                     | Yes                            |
+
+Side effects: `overflow: hidden` on an ancestor breaks `position: sticky` (the sticky element sticks within that ancestor instead of the viewport) and clips absolutely positioned children such as dropdowns. `scrollbar-gutter: stable` reserves scrollbar space to avoid layout shifts when content becomes scrollable. `overscroll-behavior: contain` prevents scroll chaining from modals to the page behind.
+
+Text overflow: `text-overflow: ellipsis` needs `overflow: hidden` and `white-space: nowrap`; multi-line truncation uses `line-clamp` (`-webkit-line-clamp`); `overflow-wrap: anywhere` breaks long URLs.
+
+---
+
+## Positioning and containing blocks
+
+| `position` | In flow?         | Positioned relative to (containing block)                                                                                    | Typical use                                           |
+| :--------- | :--------------- | :--------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------------- |
+| `static`   | Yes              | n/a (`top`/`left` ignored)                                                                                                   | Default                                               |
+| `relative` | Yes (space kept) | Its own normal position                                                                                                      | Nudging; establishing a containing block for children |
+| `absolute` | No               | Padding box of the nearest **positioned** ancestor (any value except `static`), or the initial containing block              | Badges, dropdowns, overlays                           |
+| `fixed`    | No               | The viewport, **unless** an ancestor has `transform`, `filter`, `perspective`, `contain: paint`, or `will-change: transform` | Headers, toasts                                       |
+| `sticky`   | Yes              | Behaves as relative until a scroll threshold, then sticks within its nearest scrolling ancestor and its parent               | Sticky headers, table headers                         |
+
+The "fixed toolbar scrolls away" bug: an ancestor with `transform` (often from an animation library) becomes the containing block for fixed descendants. Render overlays at the end of `body` (a portal) or in the top layer to avoid it.
+
+`inset: 0` is shorthand for `top: 0; right: 0; bottom: 0; left: 0`. Absolutely positioned elements with both `left` and `right` (or `inset`) set and `width: auto` stretch between them; with `margin: auto` and fixed dimensions they centre.
+
+**Anchor positioning** (`anchor-name`, `position-anchor`, `position-area`, `position-try`) positions tooltips and popovers relative to another element with automatic flipping when there is no space, replacing JavaScript positioning libraries where supported.
+
+---
+
+## Sticky positioning
+
+```css
+.table-header {
+  position: sticky;
+  top: 0;
+}
+```
+
+Sticky requires:
+
+1. A threshold (`top`, `bottom`, `left`, or `right`).
+2. Room to move: it sticks only while its **parent** is in view; when the parent scrolls out, the element goes with it.
+3. No ancestor between it and the intended scroller with `overflow: hidden`, `auto`, or `scroll` (that ancestor becomes the sticky scroller).
+
+When `position: sticky` "does nothing", one of those three is almost always the cause.
+
+---
+
+## Stacking contexts and z-index
+
+Painting order within a stacking context (back to front):
+
+1. Background and borders of the context's root element
+2. Positioned descendants with negative `z-index`
+3. Non-positioned block boxes in flow order
+4. Floats
+5. Inline content
+6. Positioned descendants with `z-index: auto` or `0`, in order
+7. Positioned descendants with positive `z-index`
+
+A **stacking context** is created by (among others): the root element, positioned elements (`relative`/`absolute`) with a `z-index` other than `auto`, `fixed` and `sticky` elements, flex and grid items with a `z-index`, `opacity` below 1, `transform`, `filter`, `backdrop-filter`, `perspective`, `clip-path`, `mask`, `mix-blend-mode`, `isolation: isolate`, `contain: paint`, and `will-change` naming any of these.
+
+The crucial rule: **`z-index` only compares elements within the same stacking context.** A stacking context is painted as one unit at its own position in its parent context.
+
+```html
+<header style="position: relative; z-index: 10">...</header>
+<main style="position: relative; z-index: 1">
+  <!-- stacking context at level 1 -->
+  <div class="modal" style="position: fixed; z-index: 9999">...</div>
+  <!-- 9999 only inside main -->
+</main>
+```
+
+The modal's 9999 is compared only with other children of `main`; `main` as a whole (level 1) paints below `header` (level 10). Fixes: render the modal outside `main` (portal to `body`), use the top layer (`dialog`, popover), or restructure contexts. `isolation: isolate` deliberately creates a context to contain a component's z-indexes without affecting the page.
+
+A z-index scale (tokens such as `--z-dropdown: 100; --z-modal: 1000; --z-toast: 1100`) prevents ad-hoc escalation.
+
+---
+
+## The top layer
+
+Elements shown with `dialog.showModal()`, the Popover API (`popover` attribute), and fullscreen elements are rendered in the **top layer**, above every stacking context in the document, regardless of `z-index`, `transform` ancestors, or `overflow`.
+
+```html
+<button popovertarget="menu">Menu</button>
+<div id="menu" popover>...</div>
+<!-- top layer, light-dismiss, no JS -->
+
+<dialog id="confirm">...</dialog>
+<script>
+  document.getElementById('confirm').showModal();
+</script>
+```
+
+Modal dialogs also make the rest of the page inert (no focus or clicks behind them) and provide `::backdrop`. These replace most custom modal and dropdown z-index engineering ([Semantic HTML](/fullstack/html/semantic-html-and-forms)).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why does a z-index of 9999 not bring an element to the front?">
+    z-index only orders elements within the same stacking context. If an ancestor creates a stacking
+    context (positioned with z-index, opacity, transform, filter, and others) that sits below
+    another context, nothing inside it can rise above that other context.
+  </Accordion>
+  <Accordion title="What is margin collapsing and when does it not happen?">
+    Adjacent vertical margins of blocks in normal flow merge into the larger one. It does not happen
+    horizontally, in flex or grid layouts, for floats, absolutely positioned or inline-block
+    elements, or across padding, borders, or a new BFC.
+  </Accordion>
+  <Accordion title="What is a containing block for an absolutely positioned element?">
+    The padding box of the nearest ancestor with a position other than static, or the initial
+    containing block if none. For fixed elements it is the viewport, unless an ancestor has
+    transform, filter, perspective, or similar properties.
+  </Accordion>
+  <Accordion title="Why might position: sticky not work?">
+    No threshold is set, the parent is no taller than the sticky element so it has no room to move,
+    or an ancestor with overflow hidden, auto, or scroll becomes the scroll container.
+  </Accordion>
+  <Accordion title="What does box-sizing: border-box change?">
+    width and height include padding and border, so the rendered size equals the declared size and
+    content shrinks instead of the box growing.
+  </Accordion>
+</Accordions>

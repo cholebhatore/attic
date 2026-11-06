@@ -1,0 +1,272 @@
+---
+title: Hydration and Streaming
+description: What hydration does step by step and what it costs, the hydration gap and event replay, mismatches and their causes, renderToString vs streaming renderers, how out-of-order streaming works with Suspense boundaries and inline scripts, selective and prioritised hydration, progressive hydration, islands, resumability, and what breaks streaming in production.
+---
+
+A server-rendered product page paints in 0.8 seconds, but tapping "Add to cart" does nothing until 3 seconds. The HTML arrived quickly; the JavaScript that makes the button work had to download, run every component again, and attach handlers. Meanwhile, the page's TTFB is 1.2 seconds because the server waits for a slow reviews query before sending a single byte. Hydration and streaming are the two mechanisms that decide how quickly server-rendered pages become visible and usable.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after [Rendering Strategies](/fullstack/rendering/rendering-strategies). Any server-rendered React page (SSR, SSG, ISR) goes through hydration; streaming decides how the HTML is delivered.
+
+Server HTML is a photograph of the app. **Hydration** brings the photograph to life: React runs the components again in the browser, checks that what it produced matches the HTML on the page, and attaches event handlers and state, without rebuilding the DOM. **Streaming** sends the HTML in pieces as each part is ready, instead of waiting for the slowest part, like a restaurant bringing each dish as it is cooked rather than holding the whole order until dessert is ready.
+
+Topics, in order:
+
+1. What hydration does
+2. The cost of hydration
+3. The hydration gap
+4. Mismatches
+5. Renderers: buffered vs streaming
+6. How out-of-order streaming works
+7. Selective and prioritised hydration
+8. Reducing hydration: islands, Server Components, resumability
+9. What breaks streaming
+
+| Word                       | Plain meaning                                                                                              |
+| :------------------------- | :--------------------------------------------------------------------------------------------------------- |
+| **hydration**              | Making server-rendered HTML interactive by running components on the client and attaching to existing DOM. |
+| **hydration mismatch**     | Client render produced different output than the server HTML.                                              |
+| **flush**                  | Sending buffered bytes to the network.                                                                     |
+| **shell**                  | The HTML outside any pending Suspense boundary, sent first.                                                |
+| **out-of-order streaming** | Sending later parts of the page before earlier slow parts resolve, then placing them correctly.            |
+| **selective hydration**    | Hydrating Suspense boundaries independently, prioritising those the user interacts with.                   |
+| **resumability**           | Continuing on the client from serialised server state without re-running components.                       |
+
+---
+
+## What hydration does
+
+```tsx
+// Server
+const html = renderToString(<App />); // or a streaming renderer
+// Client
+import { hydrateRoot } from 'react-dom/client';
+hydrateRoot(document.getElementById('root')!, <App />);
+```
+
+Step by step on the client:
+
+1. The JavaScript for every client component on the page downloads and executes.
+2. React renders the component tree **again**, from the top, with the same props and data the server used.
+3. Instead of creating DOM nodes, React walks the existing DOM in parallel with its fiber tree and **claims** each node.
+4. It attaches event listeners (React uses one delegated listener per event type at the root), sets up refs, and runs effects.
+5. From now on, updates work normally.
+
+For step 2 to produce the same tree, the client needs the **same data** the server used. Frameworks serialise it into the page (a JSON script tag, or the RSC payload), which means data is sent twice: once as HTML, once as JSON.
+
+---
+
+## The cost of hydration
+
+| Cost                                 | Scales with                                  |
+| :----------------------------------- | :------------------------------------------- |
+| Download and parse of component code | JavaScript size of all hydrated components   |
+| Re-rendering every component         | Size of the tree, complexity of render logic |
+| Serialised data in the page          | Amount of data used for rendering            |
+| Effects running                      | Number and cost of effects                   |
+
+A large page can spend hundreds of milliseconds of main-thread time hydrating on a mid-range phone, during which input is delayed: a common cause of poor [INP](/fullstack/performance/core-web-vitals) on content sites.
+
+---
+
+## The hydration gap
+
+Between first paint and hydration completing, the page **looks** interactive but is not: buttons do nothing, forms submit with a full page reload (if they have an action) or not at all, client-side navigation is unavailable.
+
+Mitigations:
+
+- **Event replay**: React 18+ records discrete events (clicks, key presses) that happen on not-yet-hydrated parts, hydrates that part with priority, then replays the event.
+- **Progressive enhancement**: real links and forms with `action` attributes work before JavaScript ([React 19 form actions](/fullstack/react/react-19-and-patterns)).
+- Smaller hydration cost: less JavaScript, fewer client components.
+
+---
+
+## Mismatches
+
+The client's first render must produce exactly the markup the server sent. When it does not, React logs a mismatch and, for the affected part (or the whole root in severe cases), discards the server HTML and renders on the client, losing the benefit of SSR and possibly flickering.
+
+| Cause                               | Example                                                           | Fix                                                                                 |
+| :---------------------------------- | :---------------------------------------------------------------- | :---------------------------------------------------------------------------------- |
+| Time and randomness                 | `new Date().toLocaleTimeString()`, `Math.random()`, generated IDs | Pass values from the server; `useId` for IDs; render client-only values after mount |
+| Browser-only APIs in render         | `window.innerWidth`, `localStorage`, `navigator.language`         | Read in an effect, or `useSyncExternalStore` with a server snapshot                 |
+| Locale and time zone differences    | Server in UTC, client in IST formatting dates                     | Format with an explicit time zone, or on the client after mount                     |
+| Invalid HTML nesting                | `div` inside `p`, `a` inside `a`, missing `tbody`                 | Fix markup; the browser parser rearranges invalid nesting before React sees it      |
+| Browser extensions                  | Password managers or translators injecting nodes                  | `suppressHydrationWarning` on the affected element if unavoidable                   |
+| Different data on client and server | Client fetches fresher data before hydrating                      | Use the serialised server data for the first render                                 |
+
+```tsx
+// Client-only value without a mismatch
+function LocalTime({ iso }: { iso: string }) {
+  const [text, setText] = useState<string | null>(null);
+  useEffect(() => setText(new Date(iso).toLocaleTimeString()), [iso]);
+  return <time dateTime={iso}>{text ?? iso}</time>;
+}
+```
+
+---
+
+## Renderers: buffered vs streaming
+
+| API                                    | Behaviour                                                                                                |
+| :------------------------------------- | :------------------------------------------------------------------------------------------------------- |
+| `renderToString`                       | Renders the whole tree synchronously to one string. Does not support Suspense data waiting (falls back). |
+| `renderToPipeableStream` (Node)        | Streams HTML into a Node writable; supports Suspense; callbacks `onShellReady` and `onAllReady`          |
+| `renderToReadableStream` (Web Streams) | Same for edge runtimes, Deno, Bun                                                                        |
+| `prerender` / `prerenderToNodeStream`  | Static generation that waits for all data (for SSG)                                                      |
+
+```ts
+const { pipe } = renderToPipeableStream(<App />, {
+  bootstrapScripts: ['/client.js'],
+  onShellReady() {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/html');
+    pipe(res);                        // send the shell now; boundaries stream later
+  },
+  onShellError() { res.statusCode = 500; res.end('<h1>Something went wrong</h1>'); },
+  onAllReady() { /* use instead of onShellReady for crawlers, to send complete HTML at once */ },
+});
+```
+
+Because headers and the status code are sent with the shell, errors inside a Suspense boundary after the shell cannot change the status to 500. React renders that boundary's fallback in the HTML and retries it on the client. Status-critical checks (not found, redirects, auth) must happen **before** the shell is sent.
+
+---
+
+## How out-of-order streaming works
+
+```tsx
+export default function ProductPage() {
+  return (
+    <Layout>
+      <ProductDetails /> {/* fast */}
+      <Suspense fallback={<ReviewsSkeleton />}>
+        <Reviews /> {/* slow query */}
+      </Suspense>
+      <Footer /> {/* after the slow part in source order */}
+    </Layout>
+  );
+}
+```
+
+What goes over the single HTTP response:
+
+```html
+<!-- Chunk 1: shell, sent immediately -->
+<html>
+  <head>
+    ...
+  </head>
+  <body>
+    <main>
+      <section>...product details...</section>
+      <!--$?--><template id="B:0"></template>
+      <div class="skeleton">Loading reviews…</div>
+      <!--/$-->
+      <footer>...</footer>
+    </main>
+    <script src="/client.js" async></script>
+
+    <!-- Chunk 2: seconds later, when Reviews resolves (connection still open) -->
+    <div hidden id="S:0">
+      <ul>
+        ...12 reviews...
+      </ul>
+    </div>
+    <script>
+      $RC('B:0', 'S:0');
+    </script>
+    <!-- tiny inline script: swap the fallback for the content -->
+  </body>
+</html>
+```
+
+The real markers and function names are internal to React and change between versions; the structure is the point:
+
+- The shell includes the fallback, wrapped in markers.
+- Resolved content arrives later, **anywhere in the stream**, as hidden HTML followed by a small inline script that moves it into place.
+- `Footer` appears in the first chunk even though it comes after `Reviews` in source order: that is what "out of order" means.
+- The page is usable progressively; the browser renders the shell while the server keeps working.
+
+Streaming pairs naturally with parallel data fetching: start all queries when the request begins, and each boundary resolves as soon as its own data does.
+
+---
+
+## Selective and prioritised hydration
+
+With Suspense boundaries, hydration is not all-or-nothing:
+
+1. Each boundary hydrates **independently**, as soon as its HTML and code are available. A slow `Reviews` boundary does not block hydrating `ProductDetails`.
+2. If the user interacts with a part that is not hydrated yet, React **raises its priority**, hydrates it first, and replays the event.
+3. Hydration work is done in interruptible chunks, so the main thread stays responsive.
+
+<Mermaid
+  chart={`
+flowchart LR
+    A["HTML for shell + details arrives"] --> B["Details boundary hydrates"]
+    A --> C["Reviews still streaming"]
+    U["User clicks a review filter before hydration"] --> D["Reviews boundary hydrated with high priority"] --> E["Click replayed"]
+    C --> D
+`}
+/>
+
+Placing Suspense boundaries well is therefore both a streaming decision and a hydration decision: boundaries around independent, slow, or heavy regions.
+
+---
+
+## Reducing hydration
+
+Every approach below is a way of shipping or running less JavaScript on the client:
+
+| Approach                         | Idea                                                                                                                                  | Example                                                                          |
+| :------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------- |
+| Server Components                | Components that never ship to the client and never hydrate; only interactive leaves do                                                | Next.js App Router ([Server Components](/fullstack/rendering/server-components)) |
+| Islands                          | Static HTML page with independently hydrated interactive islands, hydrated on load, idle, or visibility                               | Astro, Fresh                                                                     |
+| Progressive / lazy hydration     | Defer hydrating below-the-fold or rarely used parts until visible or idle                                                             | Astro directives, `React.lazy` boundaries                                        |
+| Resumability                     | Serialise listeners and state into HTML; the client resumes without re-executing components, loading handler code only on interaction | Qwik                                                                             |
+| Fine-grained reactive frameworks | Smaller runtime and cheaper hydration                                                                                                 | Solid, Svelte                                                                    |
+
+---
+
+## What breaks streaming
+
+| Cause                                               | Symptom                                           | Fix                                                                              |
+| :-------------------------------------------------- | :------------------------------------------------ | :------------------------------------------------------------------------------- |
+| Reverse proxy buffering (Nginx default)             | Whole page arrives at once after the slowest part | `proxy_buffering off` for HTML routes, or `X-Accel-Buffering: no`                |
+| Compression middleware buffering the whole body     | Same                                              | Use streaming-aware compression, flush per chunk                                 |
+| CDN or platform without streaming support           | Same                                              | Check platform support; most modern ones stream                                  |
+| No Suspense boundaries                              | Shell waits for everything                        | Add boundaries around slow parts                                                 |
+| Awaiting slow data in a layout above the boundaries | Shell itself is slow                              | Move slow fetches down into the bounded components; start them early, await late |
+| Crawlers                                            | Prefer complete HTML                              | `onAllReady` for bots, or frameworks detect bots automatically                   |
+
+Measure with the Network panel's waterfall (the document request shows a long "content download" while chunks arrive) or `curl -N` to watch chunks appear. The HTTP mechanics are covered in [Streamed Responses](/fullstack/performance/streamed-responses).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What exactly happens during hydration?">
+    The client downloads component code, re-renders the tree with the same data the server used,
+    matches the result against existing DOM nodes instead of creating new ones, attaches event
+    listeners and refs, and runs effects.
+  </Accordion>
+  <Accordion title="What causes hydration mismatches?">
+    Rendering different output on client and server: time, randomness, browser-only APIs, locale or
+    time zone differences, invalid HTML nesting the browser rearranges, extensions modifying the
+    DOM, or different data.
+  </Accordion>
+  <Accordion title="How does React stream content out of order in one HTTP response?">
+    It sends the shell with fallbacks and markers, keeps the connection open, and later sends each
+    resolved boundary as hidden HTML plus a small inline script that swaps it into the right place.
+  </Accordion>
+  <Accordion title="Why can't a streamed page return a 500 for an error inside a Suspense boundary?">
+    The status code and headers were sent with the shell. React renders the boundary's fallback and
+    retries on the client, so status-critical logic must run before the shell is flushed.
+  </Accordion>
+  <Accordion title="What is selective hydration?">
+    Hydrating Suspense boundaries independently and out of order, prioritising whichever region the
+    user interacts with first, and replaying the event once it is hydrated.
+  </Accordion>
+</Accordions>

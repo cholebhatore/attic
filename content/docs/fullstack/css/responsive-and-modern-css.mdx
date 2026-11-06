@@ -1,0 +1,363 @@
+---
+title: Responsive and Modern CSS
+description: Responsive design principles (the viewport meta tag, mobile-first, content-driven breakpoints), media queries and user preference queries, container queries and container units, fluid typography and spacing with clamp and the math behind it, logical properties and writing modes, modern colour (oklch, color-mix), nesting, :has, scroll-driven animations, @starting-style, anchor positioning, view transitions, and feature detection.
+---
+
+A card component looks right in the main column and broken in the sidebar, because media queries respond to the viewport, not to the space the component has. Headings are either tiny on desktops or overflowing on phones because font sizes jump at two breakpoints. Many of the CSS features added in recent years remove exactly these kinds of workarounds.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the last CSS page, after the layout algorithms.
+
+Responsive design means layouts adapt to the space available, the device's capabilities, and the user's preferences. Modern CSS lets components respond to their own container, lets sizes scale smoothly instead of jumping, and replaces several JavaScript tasks (parent selection, scroll animations, tooltip positioning, page transitions) with declarative rules.
+
+Topics, in order:
+
+1. Responsive foundations
+2. Media queries and preferences
+3. Container queries
+4. Fluid typography and spacing
+5. Logical properties
+6. Modern colour
+7. Nesting and :has
+8. Motion: transitions, scroll-driven animations, @starting-style
+9. Anchor positioning and popovers
+10. View transitions
+11. Feature detection and support
+
+| Word                 | Plain meaning                                                                         |
+| :------------------- | :------------------------------------------------------------------------------------ |
+| **viewport**         | The visible area of the page in the browser window.                                   |
+| **breakpoint**       | A width at which the layout changes.                                                  |
+| **container query**  | Styles that depend on an ancestor container's size or style.                          |
+| **fluid value**      | A size that scales continuously with the viewport or container.                       |
+| **logical property** | A property described by flow direction (`inline`, `block`) instead of physical sides. |
+| **Baseline**         | Label for web features available across all major browsers.                           |
+
+---
+
+## Responsive foundations
+
+```html
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+```
+
+Without it, mobile browsers render the page at a virtual width of about 980px and zoom out, so media queries never match phone widths.
+
+Principles:
+
+- **Mobile first**: base styles for the smallest screens, then `min-width` queries add complexity. Small screens get less CSS to override.
+- **Content-driven breakpoints**: add a breakpoint where the content breaks (lines too long, columns too cramped), not at specific device widths, which change every year.
+- **Intrinsic layouts first**: Flexbox wrapping, `auto-fill` grids, `clamp()`, and container queries often remove the need for breakpoints entirely.
+- **Readable line length**: about 45 to 75 characters per line (`max-width: 65ch`).
+- **Touch targets**: at least 24×24 CSS pixels (WCAG 2.2 minimum), 44×44 recommended.
+
+---
+
+## Media queries and preferences
+
+```css
+@media (width >= 48rem) {
+  .nav {
+    display: flex;
+  }
+} /* range syntax */
+@media (hover: hover) and (pointer: fine) {
+  .row:hover {
+    background: var(--hover);
+  }
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+  }
+}
+@media (prefers-contrast: more) {
+  :root {
+    --border: black;
+  }
+}
+@media print {
+  nav,
+  .ads {
+    display: none;
+  }
+}
+```
+
+| Query                                            | Responds to                                                |
+| :----------------------------------------------- | :--------------------------------------------------------- |
+| `width`, `height`, `aspect-ratio`, `orientation` | Viewport dimensions                                        |
+| `hover`, `pointer`, `any-hover`                  | Input capabilities: touch vs mouse                         |
+| `prefers-color-scheme`                           | Light or dark theme setting                                |
+| `prefers-reduced-motion`                         | Vestibular sensitivity setting; reduce or remove animation |
+| `prefers-contrast`, `forced-colors`              | High contrast modes                                        |
+| `resolution`                                     | Pixel density                                              |
+| `scripting`                                      | Whether JavaScript is enabled                              |
+
+Use `rem` or `em` for breakpoints so they scale with the user's font-size setting.
+
+---
+
+## Container queries
+
+```css
+.card-list {
+  container-type: inline-size;
+  container-name: cards;
+}
+
+.card {
+  display: grid;
+  gap: 0.5rem;
+}
+@container cards (inline-size >= 32rem) {
+  .card {
+    grid-template-columns: 10rem 1fr;
+  }
+}
+
+.card h3 {
+  font-size: clamp(1rem, 4cqi, 1.5rem);
+} /* 4% of the container's inline size */
+```
+
+- `container-type: inline-size` makes an element a query container for its width; it applies size containment on that axis, so the container's width cannot depend on its children's width (fine for most block layouts).
+- Container units: `cqi`/`cqb` (1 percent of the container's inline/block size), `cqw`, `cqh`, `cqmin`, `cqmax`.
+- **Style queries** (`@container style(--variant: compact)`) apply styles based on a container's custom property values.
+- Components become portable: the same card adapts in a sidebar, a modal, or the main column without knowing about page breakpoints. Media queries remain right for page-level layout and user preferences.
+
+---
+
+## Fluid typography and spacing
+
+Rather than jumping between sizes at breakpoints, values can scale linearly between a minimum and a maximum:
+
+```css
+h1 {
+  font-size: clamp(1.75rem, 1.2rem + 2.5vw, 3rem);
+}
+```
+
+How to derive the middle term: a font that should be 28px (1.75rem) at a 360px viewport and 48px (3rem) at 1,200px:
+
+| Step                                      | Calculation                                   |
+| :---------------------------------------- | :-------------------------------------------- |
+| Slope (px of font per px of viewport)     | (48 − 28) / (1,200 − 360) = 20 / 840 ≈ 0.0238 |
+| As vw (1vw = 1 percent of viewport width) | 0.0238 × 100 ≈ 2.38vw                         |
+| Intercept                                 | 28 − 0.0238 × 360 ≈ 19.4px ≈ 1.21rem          |
+| Result                                    | `clamp(1.75rem, 1.21rem + 2.38vw, 3rem)`      |
+
+Including a `rem` term keeps text responsive to the user's browser font size (pure `vw` font sizes ignore zoom preferences, an accessibility failure). Tools like Utopia generate full fluid type and space scales.
+
+---
+
+## Logical properties
+
+Physical properties (`margin-left`, `padding-top`, `width`) are tied to screen directions. **Logical** properties follow the writing mode, so layouts work for right-to-left languages (Arabic, Hebrew, Urdu) and vertical scripts:
+
+| Physical                         | Logical (horizontal LTR)                    |
+| :------------------------------- | :------------------------------------------ |
+| `margin-left` / `margin-right`   | `margin-inline-start` / `margin-inline-end` |
+| `padding-top` / `padding-bottom` | `padding-block-start` / `padding-block-end` |
+| `width` / `height`               | `inline-size` / `block-size`                |
+| `left: 0; right: 0`              | `inset-inline: 0`                           |
+| `text-align: left`               | `text-align: start`                         |
+| `border-top-left-radius`         | `border-start-start-radius`                 |
+
+With `dir="rtl"` on the document, logical properties flip automatically; physical ones do not.
+
+---
+
+## Modern colour
+
+```css
+:root {
+  --brand: oklch(62% 0.17 160); /* lightness, chroma, hue */
+  --brand-hover: oklch(from var(--brand) calc(l - 0.08) c h); /* relative colour syntax */
+  --brand-soft: color-mix(in oklch, var(--brand), white 80%);
+  color-scheme: light dark;
+  --bg: light-dark(white, oklch(18% 0 0));
+}
+```
+
+- **OKLCH** is perceptually uniform: equal lightness values look equally light across hues, which makes generating palettes and accessible contrast predictable (HSL's "50 percent lightness" yellow and blue look very different).
+- It reaches wide-gamut (Display P3) colours on capable screens.
+- `color-mix()` and relative colour syntax derive hover, disabled, and tinted variants from one token.
+- `light-dark()` with `color-scheme` switches values for light and dark themes without media queries.
+
+---
+
+## Nesting and :has
+
+```css
+.card {
+  padding: 1rem;
+  & .title {
+    font-weight: 600;
+  }
+  &:hover {
+    border-color: var(--brand);
+  }
+  &.is-active {
+    outline: 2px solid var(--brand);
+  }
+  @media (width >= 48rem) {
+    padding: 2rem;
+  }
+}
+
+form:has(:user-invalid) .submit {
+  opacity: 0.5;
+}
+.field:has(input:focus-visible) {
+  outline: 2px solid var(--focus);
+}
+li:has(+ li.active) {
+  /* the item before the active one */
+}
+```
+
+Native nesting compiles nothing: the browser parses it. Nested selectors have the specificity of `:is()` applied to the parent. `:has()` is a parent and previous-sibling selector; it enables state-driven styling that previously required JavaScript class toggling, at some style-recalculation cost for broad selectors on large DOMs.
+
+---
+
+## Motion: transitions, scroll-driven animations, @starting-style
+
+```css
+/* Animate elements from display: none on entry */
+.toast {
+  transition:
+    opacity 0.2s,
+    translate 0.2s,
+    display 0.2s allow-discrete;
+  @starting-style {
+    opacity: 0;
+    translate: 0 1rem;
+  }
+}
+.toast[hidden] {
+  display: none;
+  opacity: 0;
+}
+
+/* Scroll-driven: progress bar tied to page scroll, no JS */
+.progress {
+  animation: grow linear;
+  animation-timeline: scroll(root);
+}
+@keyframes grow {
+  from {
+    scale: 0 1;
+  }
+  to {
+    scale: 1 1;
+  }
+}
+
+/* Reveal as elements enter the viewport */
+.reveal {
+  animation: fade-in linear both;
+  animation-timeline: view();
+  animation-range: entry 0% cover 30%;
+}
+```
+
+- `@starting-style` defines the styles an element transitions **from** when first rendered, enabling enter animations without JavaScript; `transition-behavior: allow-discrete` lets `display` and `overlay` participate.
+- Scroll-driven animations run on the compositor where possible, replacing scroll listeners.
+- Individual transform properties (`translate`, `rotate`, `scale`) animate independently.
+- Wrap non-essential motion in `@media (prefers-reduced-motion: no-preference)`.
+
+---
+
+## Anchor positioning and popovers
+
+```css
+.trigger {
+  anchor-name: --menu-trigger;
+}
+.menu {
+  position: fixed;
+  position-anchor: --menu-trigger;
+  position-area: block-end span-inline-end; /* below, aligned to start */
+  position-try-fallbacks: flip-block; /* flip above if no room below */
+}
+```
+
+Combined with the `popover` attribute (top layer, light dismiss, accessible toggling), tooltips and menus no longer need a JavaScript positioning library in supporting browsers ([Box Model and Positioning](/fullstack/css/box-model-and-positioning)).
+
+---
+
+## View transitions
+
+```js
+// Same-document (SPA): animate between two DOM states
+document.startViewTransition(() => updateTheDom());
+```
+
+```css
+/* Cross-document (MPA): opt in on both pages */
+@view-transition {
+  navigation: auto;
+}
+.product-image {
+  view-transition-name: product-hero;
+} /* morph between pages */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.25s;
+}
+```
+
+The browser snapshots the old state, applies the update, snapshots the new state, and animates between them with pseudo-elements that CSS can style. Elements with the same `view-transition-name` on both sides animate position and size between their old and new boxes.
+
+---
+
+## Feature detection and support
+
+```css
+@supports (container-type: inline-size) {
+  /* container query layout */
+}
+@supports not (anchor-name: --a) {
+  /* fallback positioning */
+}
+@supports selector(:has(a)) {
+  /* :has-based styles */
+}
+```
+
+- Use **Baseline** status on MDN and web.dev to judge whether a feature is safe ("widely available" means supported across major browsers for 30 months).
+- Progressive enhancement: base styles work everywhere; enhancements apply where supported.
+- Many features here (container queries, nesting, `:has`, `oklch`, `color-mix`, `@layer`, logical properties, view transitions for same-document use) are Baseline; anchor positioning, scroll-driven animations, and cross-document view transitions arrived later in some engines. Check before relying on them without fallbacks.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="When should container queries be used instead of media queries?">
+    For components whose layout depends on the space they are placed in (cards, widgets, sidebars),
+    so they adapt wherever they are used. Media queries remain right for page-level layout and user
+    preferences like dark mode or reduced motion.
+  </Accordion>
+  <Accordion title="Why combine rem and vw in clamp for font sizes?">
+    A pure vw size ignores the user's font-size setting and zoom, an accessibility problem. Adding a
+    rem term keeps text responsive to user preferences while still scaling with the viewport.
+  </Accordion>
+  <Accordion title="Why use logical properties?">
+    They follow the writing direction, so layouts adapt automatically to right-to-left languages and
+    vertical writing modes without separate stylesheets.
+  </Accordion>
+  <Accordion title="What does :has() enable?">
+    Selecting an element based on its descendants or following siblings, such as styling a form that
+    contains invalid fields or a card containing an image, without JavaScript toggling classes.
+  </Accordion>
+</Accordions>

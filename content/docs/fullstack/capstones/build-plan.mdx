@@ -1,0 +1,127 @@
+---
+title: Build Plan
+description: Milestone-by-milestone plan for the capstone - repository layout, the shared OpenAPI contract, data model, and a definition of done for each milestone in both the Node.js and Python backends.
+---
+
+Each milestone ends with something that runs and is tested. The Node.js and Python backends implement the same OpenAPI contract, so the frontend and the Playwright suite run unchanged against either.
+
+---
+
+## Repository layout
+
+<Files>
+  <Folder name="shop" defaultOpen>
+    <Folder name="apps" defaultOpen>
+      <Folder name="web" />
+      <Folder name="api-node" />
+      <Folder name="api-python" />
+    </Folder>
+    <Folder name="packages" defaultOpen>
+      <Folder name="contract" />
+      <Folder name="ui" />
+    </Folder>
+    <Folder name="e2e" />
+    <Folder name="infra" />
+    <File name="compose.yaml" />
+    <File name="pnpm-workspace.yaml" />
+  </Folder>
+</Files>
+
+`packages/contract` holds `openapi.yaml`, generated TypeScript types for the frontend, and the shared Playwright fixtures. See [Monorepos](/fullstack/tooling/monorepos).
+
+---
+
+## Data model
+
+<Mermaid
+  chart={`
+erDiagram
+    USER ||--o{ ORDER : places
+    USER ||--o{ REFRESH_TOKEN : has
+    ORDER ||--|{ ORDER_ITEM : contains
+    PRODUCT ||--o{ ORDER_ITEM : "sold as"
+    ORDER ||--o{ ORDER_EVENT : "status history"
+    OUTBOX }o--|| ORDER : "events for"
+    HELP_ARTICLE ||--o{ ARTICLE_CHUNK : "embedded as"
+`}
+/>
+
+---
+
+## Milestones
+
+<Steps>
+<Step>
+
+### Skeleton and CI
+
+Monorepo, Compose with Postgres and Redis, both APIs serving `/healthz`, Next.js app shell, lint + typecheck + test in GitHub Actions.
+
+**Done when**: `docker compose up` runs everything and CI is green on a PR.
+
+</Step>
+<Step>
+
+### Catalogue
+
+Products table and migrations, `GET /products` with cursor pagination and filters, product pages statically generated, search with full-text and trigram indexes.
+
+**Done when**: integration tests cover pagination edges; `EXPLAIN ANALYZE` shows index scans.
+
+</Step>
+<Step>
+
+### Auth
+
+Register, login, refresh rotation with reuse detection, logout, Google OIDC sign-in, admin role checks.
+
+**Done when**: tests cover reuse detection, expired tokens, and IDOR attempts on orders.
+
+</Step>
+<Step>
+
+### Orders
+
+Cart, `POST /orders` with an idempotency key, stock decrement in a transaction, order events, outbox row in the same transaction.
+
+**Done when**: a concurrency test placing 50 parallel orders for 10 units never oversells.
+
+</Step>
+<Step>
+
+### Async and real-time
+
+Outbox relay, job queue (BullMQ / Celery or arq) for emails and a webhook to a fake warehouse, SSE endpoint for order status.
+
+**Done when**: killing a worker mid-job causes a retry without duplicate emails.
+
+</Step>
+<Step>
+
+### Support assistant
+
+Help articles chunked and embedded into pgvector, streaming chat endpoint, `get_order_status` tool scoped to the user, citations in answers.
+
+**Done when**: an eval set of 30 questions passes at the chosen threshold, and a prompt-injection article cannot trigger tool calls for other users.
+
+</Step>
+<Step>
+
+### Production
+
+Multi-stage images, deploy to a VPS with Caddy or to a PaaS, OpenTelemetry traces end to end, error tracking, an SLO with a burn-rate alert, Lighthouse CI budget, backups with a tested restore.
+
+**Done when**: a deliberately slow dependency trips the circuit breaker and the storefront degrades instead of failing.
+
+</Step>
+</Steps>
+
+---
+
+## Stretch goals
+
+- Swap the frontend's data layer to Server Components and Server Functions.
+- Add a React Native app using the same API and auth.
+- Package the shop's order-status tool as an MCP server.
+- Replace polling-based outbox relay with Debezium CDC into Kafka.
+- Split notifications into a separate service and trace requests across it.

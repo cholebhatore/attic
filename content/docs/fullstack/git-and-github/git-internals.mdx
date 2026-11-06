@@ -1,0 +1,95 @@
+---
+title: Git Internals
+description: Content-addressed objects (blobs, trees, commits), refs and HEAD, the working tree, index, and repository, and why commits are snapshots.
+---
+
+A developer runs `git reset --hard` and thinks a day's work is gone. It is almost certainly still in the repository, because Git never edits or deletes commits in normal use; it only moves labels. That fact comes straight from how Git stores data.
+
+---
+
+## The plain-language version
+
+Git is a database of **snapshots**. Every commit records the whole project tree at that moment plus a pointer to its parent commit. **Branches** are sticky notes pointing at a commit. Moving a sticky note does not destroy the photo it was on.
+
+Topics: objects, refs and HEAD, the three areas, what common commands do to them.
+
+| Word       | Plain meaning                                                    |
+| :--------- | :--------------------------------------------------------------- |
+| **blob**   | The contents of one file.                                        |
+| **tree**   | A directory listing: names pointing at blobs and other trees.    |
+| **commit** | A snapshot (one root tree) + parent(s) + author + message.       |
+| **SHA**    | The hash that names each object, computed from its contents.     |
+| **ref**    | A name pointing at a commit: branch, tag, remote branch.         |
+| **HEAD**   | The ref for "where I am now", usually pointing at a branch.      |
+| **index**  | The staging area: the snapshot that the next commit will record. |
+
+---
+
+## Objects
+
+Every object is stored under the hash of its content (SHA-1, with SHA-256 repositories supported). Same content, same hash, stored once.
+
+```bash
+git cat-file -p HEAD          # show the commit object
+git cat-file -p HEAD^{tree}   # show its tree
+git log --oneline --graph --all
+```
+
+Because a commit's hash includes its parent's hash, changing any old commit changes every hash after it. That is why rewriting shared history causes trouble.
+
+---
+
+## Refs and HEAD
+
+- `refs/heads/main` is a file containing a commit hash. Committing on `main` writes a new commit and moves that file to it.
+- `HEAD` normally contains `ref: refs/heads/main`. **Detached HEAD** means it holds a commit hash directly; new commits there have no branch pointing at them.
+- `refs/remotes/origin/main` is the last known position of `main` on the remote, updated by `git fetch`.
+- Tags are refs that do not move.
+
+---
+
+## The three areas
+
+<Mermaid
+  chart={`
+flowchart LR
+    W["Working tree (files on disk)"] -- "git add" --> I["Index (staging)"]
+    I -- "git commit" --> R["Repository (commits)"]
+    R -- "git restore / checkout" --> W
+`}
+/>
+
+| Command                         | Working tree          | Index                | Branch ref |
+| :------------------------------ | :-------------------- | :------------------- | :--------- |
+| `git reset --soft X`            | Unchanged             | Unchanged            | Moves to X |
+| `git reset --mixed X` (default) | Unchanged             | Reset to X           | Moves to X |
+| `git reset --hard X`            | Reset to X            | Reset to X           | Moves to X |
+| `git restore file`              | Reset file from index | Unchanged            | Unchanged  |
+| `git restore --staged file`     | Unchanged             | Reset file from HEAD | Unchanged  |
+
+---
+
+## Recovering "lost" work
+
+`git reflog` lists every position HEAD has been at. A commit lost to a bad reset or rebase is in there:
+
+```bash
+git reflog                 # find the hash before the mistake
+git branch rescue abc1234  # put a ref on it
+```
+
+Only uncommitted, unstaged changes wiped by `reset --hard` or `checkout -- .` are truly gone. Unreachable commits are garbage-collected after a grace period (default about 30 days for reflog-reachable entries).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Does Git store diffs or snapshots?">
+    Snapshots, logically. Each commit points to a full tree. Packfiles compress similar objects with
+    deltas on disk, but that is a storage optimisation.
+  </Accordion>
+  <Accordion title="What is a branch in Git?">
+    A movable pointer (a ref file) to a commit. Creating one is writing a 41-byte file.
+  </Accordion>
+</Accordions>

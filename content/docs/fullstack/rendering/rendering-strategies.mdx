@@ -1,0 +1,268 @@
+---
+title: Rendering Strategies
+description: Where and when HTML is produced - client-side rendering, server-side rendering, static site generation, incremental static regeneration, partial prerendering, and islands - with request timelines, effects on TTFB, FCP, LCP, and interactivity, caching and freshness, personalisation, SEO and crawler behaviour, server cost, failure modes, and a decision framework.
+---
+
+A marketing site built as a client-rendered single-page app shows a blank screen until 400 KB of JavaScript downloads, parses, runs, and fetches data: on a mid-range phone over 4G, that is three to five seconds. Search engines may index an empty `div`. Rebuilt with static generation, the same pages arrive as complete HTML from a CDN in a few hundred milliseconds. Not a line of component code changed; only **where** and **when** the HTML was produced.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first page of the rendering section. It assumes the [React rendering model](/fullstack/react/rendering-model) and the [browser rendering pipeline](/fullstack/web-fundamentals/rendering-pipeline).
+
+Two questions define every strategy:
+
+- **Where** is HTML produced: in the browser, or on a server?
+- **When**: once at build time, periodically, or on every request?
+
+Think of a restaurant. **CSR** hands the customer raw ingredients and a recipe (JavaScript) to cook at the table. **SSR** cooks each dish to order in the kitchen. **SSG** cooks everything before opening and keeps it warm. **ISR** pre-cooks but refreshes dishes on a schedule or when the menu changes. **Partial prerendering** serves a pre-plated base immediately and adds the made-to-order parts as they finish.
+
+Topics, in order:
+
+1. The strategies and their timelines
+2. Client-side rendering
+3. Server-side rendering
+4. Static site generation
+5. Incremental static regeneration
+6. Partial prerendering and islands
+7. Comparison across metrics
+8. SEO and crawlers
+9. Cost and failure modes
+10. Choosing per route
+
+| Word             | Plain meaning                                                       |
+| :--------------- | :------------------------------------------------------------------ |
+| **TTFB**         | Time to first byte of the HTML response.                            |
+| **FCP**          | First contentful paint: first text or image visible.                |
+| **LCP**          | Largest contentful paint: main content visible.                     |
+| **TTI / INP**    | When the page responds reliably / how quickly it responds to input. |
+| **hydration**    | Attaching JavaScript behaviour to server-rendered HTML.             |
+| **revalidation** | Regenerating cached HTML or data.                                   |
+| **static shell** | The part of a page that is identical for every request.             |
+| **dynamic hole** | A part that depends on the request (cookies, user, query).          |
+
+---
+
+## The strategies and their timelines
+
+<Mermaid
+  chart={`
+gantt
+    dateFormat X
+    axisFormat %L ms
+    section CSR
+    HTML shell (tiny)                :0, 200
+    Download + parse JS bundle       :200, 900
+    Fetch data from API              :900, 1300
+    Render, FCP and LCP              :1300, 1400
+    section SSR
+    Server fetches data and renders  :0, 600
+    HTML arrives, FCP and LCP        :600, 750
+    JS loads and hydrates            :750, 1400
+    section SSG via CDN
+    HTML from CDN, FCP and LCP       :0, 250
+    JS loads and hydrates            :250, 900
+    section Streaming SSR / PPR
+    Static shell from cache, FCP     :0, 250
+    Dynamic parts stream in, LCP     :250, 650
+    Hydration                        :650, 1200
+`}
+/>
+
+Illustrative timings for a mid-range phone on a fast 4G connection; real numbers depend on bundle size, data latency, and server location.
+
+---
+
+## Client-side rendering (CSR)
+
+The server returns a minimal HTML document with a script tag. The browser downloads the JavaScript, executes it, fetches data from APIs, then renders everything.
+
+```html
+<body>
+  <div id="root"></div>
+  <script type="module" src="/assets/app.4f9c1e.js"></script>
+</body>
+```
+
+| Strengths                                                           | Weaknesses                                                         |
+| :------------------------------------------------------------------ | :----------------------------------------------------------------- |
+| Simple hosting: static files on a CDN                               | Nothing visible until JS downloads, parses, runs, and data arrives |
+| Rich, app-like interactions after load; fast subsequent navigations | Data requests start late (after JS), often as waterfalls           |
+| No server rendering cost                                            | Large JS bundles hurt low-end devices most                         |
+| Clear client/server split (an API)                                  | Content in the initial HTML is empty: weaker SEO and link previews |
+
+Fits: authenticated dashboards and tools where SEO does not matter, users return often (cached bundles), and interaction density is high. Vite + React Router or TanStack Router are typical stacks.
+
+---
+
+## Server-side rendering (SSR)
+
+On each request, the server runs the components with request data and returns complete HTML. The browser paints it immediately, then downloads the JavaScript and [hydrates](/fullstack/rendering/hydration-and-streaming).
+
+| Strengths                                                                 | Weaknesses                                                            |
+| :------------------------------------------------------------------------ | :-------------------------------------------------------------------- |
+| Content visible on first response; good LCP when server and data are fast | TTFB includes all server data fetching and rendering, unless streamed |
+| Fresh, personalised per request                                           | Server cost on every request; needs scaling                           |
+| Full HTML for crawlers and link previews                                  | Page is visible before it is interactive (hydration gap)              |
+| Data fetched near the database: short round trips                         | Code runs in two environments, with mismatch risks                    |
+
+Without streaming, SSR is only as fast as the **slowest** data dependency on the page. A page that needs a 50 ms query and a 900 ms recommendations call has a TTFB of about a second. Streaming with Suspense fixes this by sending HTML as each part is ready.
+
+---
+
+## Static site generation (SSG)
+
+HTML is rendered at **build time** for every known route and deployed as files, usually to a CDN.
+
+| Strengths                                          | Weaknesses                                               |
+| :------------------------------------------------- | :------------------------------------------------------- |
+| Fastest TTFB: CDN edge, no computation             | Content is as old as the last build                      |
+| Cheapest and most resilient: no server to fail     | Build time grows with page count (100,000 product pages) |
+| Trivially cacheable (`immutable` assets, CDN HTML) | No per-user content in the HTML                          |
+| Excellent SEO                                      | Dynamic routes must be enumerated at build time          |
+
+Personalised parts can still be added client-side after load (the cart badge, "Hi, Ada"), at the cost of a layout shift or loading state for those parts.
+
+---
+
+## Incremental static regeneration (ISR)
+
+ISR keeps SSG's serving model but regenerates pages after deploy:
+
+- **Time-based**: a page has a revalidation period. The first request after it expires still gets the cached (stale) page immediately, and triggers regeneration in the background; later requests get the new page. This is **stale-while-revalidate** applied to HTML.
+- **On-demand**: after a content change (CMS webhook, admin edit), the app invalidates specific paths or cache tags, and the next request regenerates.
+- **Lazy generation**: pages not built at deploy time are rendered on first request, then cached.
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant U as User
+    participant C as Cache / CDN
+    participant S as Server
+    U->>C: GET /products/42 (cached copy older than revalidate window)
+    C-->>U: stale HTML immediately
+    C->>S: regenerate in background
+    S-->>C: new HTML stored
+    U->>C: next request
+    C-->>U: fresh HTML
+`}
+/>
+
+Guarantees to understand: freshness is **bounded**, not immediate (time-based), and in a multi-instance or multi-region deployment, invalidations must reach every cache layer (a shared cache handler, CDN purge by tag). Next.js with Cache Components expresses this with `use cache`, `cacheLife`, `cacheTag`, and `revalidateTag` ([Data Fetching and Caching](/fullstack/rendering/data-fetching-and-caching)).
+
+---
+
+## Partial prerendering and islands
+
+Most real pages mix static and dynamic content: a product page whose description, images, and layout are static, but whose price (by region), stock, cart, and recommendations are per request.
+
+**Partial prerendering** (the model behind Next.js Cache Components) renders the static shell at build or revalidation time, with Suspense fallbacks marking dynamic holes. On a request:
+
+1. The static shell is served immediately (from cache or CDN): fast TTFB and FCP.
+2. In the same HTTP response, the server renders the dynamic holes and **streams** them in as they complete.
+
+One request, one response, static speed for the shell, request-time freshness for the holes.
+
+**Islands architecture** (Astro, Fresh) takes the inverse view: the page is static HTML by default, and only marked components ship JavaScript and hydrate, each independently (`client:load`, `client:visible`, `client:idle`). Content-heavy sites ship a fraction of the JavaScript a hydrated SPA would. Server Components provide a similar effect inside React: server-only parts never ship or hydrate.
+
+---
+
+## Comparison across metrics
+
+|                         | CSR               | SSR (no streaming)       | Streaming SSR                    | SSG                      | ISR               | Partial prerendering           |
+| :---------------------- | :---------------- | :----------------------- | :------------------------------- | :----------------------- | :---------------- | :----------------------------- |
+| TTFB                    | Fast (tiny shell) | Slow: waits for all data | Fast (shell flushed early)       | Fastest (CDN)            | Fastest (cache)   | Fastest (cached shell)         |
+| FCP                     | Slow (after JS)   | After TTFB               | Early                            | Early                    | Early             | Early                          |
+| LCP                     | Slow (JS + data)  | Depends on slowest data  | When main content's data arrives | Early (if LCP is static) | Early             | Early if static, else streamed |
+| Interactivity           | After JS + data   | After hydration          | After hydration (selective)      | After hydration          | After hydration   | After hydration                |
+| Freshness               | Live              | Live                     | Live                             | Build time               | Bounded staleness | Shell bounded, holes live      |
+| Personalisation         | Yes               | Yes                      | Yes                              | Client-side only         | Client-side only  | In holes                       |
+| Server cost per request | None              | Full render              | Full render                      | None                     | Near none         | Holes only                     |
+| SEO                     | Weak to fair      | Strong                   | Strong                           | Strong                   | Strong            | Strong                         |
+
+---
+
+## SEO and crawlers
+
+- Google renders JavaScript, but in a **second wave**: pages are crawled, queued for rendering in a headless Chromium, then indexed. Rendering may be delayed, and failures (timeouts, blocked resources, errors) leave content unindexed.
+- Many other crawlers and **link preview bots** (social networks, chat apps, some search engines, AI crawlers) do not execute JavaScript at all; they read only the initial HTML. Open Graph tags must be in the server response.
+- Content behind interactions (tabs that fetch on click, infinite scroll without paginated URLs) may never be crawled.
+- Core Web Vitals are a ranking signal, favouring server-rendered and static HTML.
+
+For public content where discovery matters, render HTML on the server or at build time.
+
+---
+
+## Cost and failure modes
+
+| Strategy             | What breaks                                                                         | Mitigation                                                                    |
+| :------------------- | :---------------------------------------------------------------------------------- | :---------------------------------------------------------------------------- |
+| CSR                  | Slow devices, JS errors leave a blank page, API outage shows empty UI               | Error boundaries, skeletons, smaller bundles                                  |
+| SSR                  | Server overload under traffic spikes; slow dependency slows every page; cold starts | Caching, streaming, timeouts and fallbacks per data source, autoscaling       |
+| SSG                  | Builds take too long; stale content after urgent changes                            | ISR, on-demand revalidation, incremental builds                               |
+| ISR                  | Stale content served longer than expected; inconsistent caches across regions       | Tag-based invalidation, shared cache handler, short windows for critical data |
+| All server rendering | Hydration mismatches; secrets leaking into client bundles                           | Deterministic rendering; `server-only` modules                                |
+
+A useful property of static and cached HTML: if the origin goes down, the CDN can keep serving the last good version (`stale-if-error`).
+
+---
+
+## Choosing per route
+
+<Mermaid
+  chart={`
+flowchart TD
+    A{"Is the HTML identical for every visitor?"} -- yes --> B{"How often does it change?"}
+    A -- no --> E{"Does it need SEO or a fast first view?"}
+    B -- "rarely; a rebuild is acceptable" --> C["SSG"]
+    B -- "minutes to hours, or on content edits" --> D["ISR / cached with tag revalidation"]
+    E -- yes --> F{"Is most of the page shared?"}
+    F -- yes --> G["Partial prerendering: static shell + streamed holes"]
+    F -- no --> H["Streaming SSR"]
+    E -- no --> I["CSR within an authenticated app, or SSR for simplicity"]
+`}
+/>
+
+Modern frameworks decide per route, and increasingly per component. A typical store: marketing pages SSG, product pages cached with tag revalidation plus dynamic price and stock holes, search results streaming SSR, checkout SSR with no caching, account dashboard mostly client-side after an SSR shell.
+
+| Framework                       | Model                                                                           |
+| :------------------------------ | :------------------------------------------------------------------------------ |
+| Next.js                         | Server Components, all strategies, Cache Components for component-level caching |
+| React Router (framework mode)   | Loaders and actions per route, SSR or prerendering, web-standard forms          |
+| TanStack Start                  | Type-safe routing, SSR, server functions, streaming                             |
+| Astro                           | Islands, content-first, zero JS by default, any UI library                      |
+| Remix-style SPA mode / Vite SPA | Pure CSR                                                                        |
+| Nuxt, SvelteKit, SolidStart     | Equivalent strategies for Vue, Svelte, Solid                                    |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="SSR vs SSG: what is the trade-off?">
+    SSR builds HTML per request, so it is fresh and personalisable but costs server time and its
+    TTFB depends on data latency. SSG builds once at deploy, so it is the fastest and cheapest to
+    serve but identical for everyone and stale until rebuilt or revalidated.
+  </Accordion>
+  <Accordion title="How does ISR serve fresh content without slowing requests?">
+    It serves the cached page immediately and regenerates in the background when the revalidation
+    window has passed or a tag was invalidated (stale-while-revalidate), so no request waits for
+    rendering except the first render of a new page.
+  </Accordion>
+  <Accordion title="Why can server-side rendering make TTFB worse, and how is that fixed?">
+    Without streaming, the server must finish all data fetching before sending any HTML, so TTFB
+    equals the slowest dependency. Streaming with Suspense sends the shell immediately and the slow
+    parts as they resolve.
+  </Accordion>
+  <Accordion title="Why is client-side rendering weaker for SEO?">
+    The initial HTML has no content. Google renders JavaScript in a delayed second pass that can
+    fail, and many crawlers and link-preview bots never run JavaScript, so content and metadata may
+    not be seen.
+  </Accordion>
+  <Accordion title="What is partial prerendering?">
+    A page is split into a static shell, prerendered and cached, and dynamic holes wrapped in
+    Suspense. The shell is sent immediately and the holes are rendered per request and streamed into
+    the same response.
+  </Accordion>
+</Accordions>

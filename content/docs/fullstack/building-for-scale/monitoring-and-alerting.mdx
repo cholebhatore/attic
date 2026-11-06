@@ -1,0 +1,86 @@
+---
+title: Monitoring and Alerting
+description: The four golden signals, RED and USE methods, SLIs, SLOs, SLAs, error budgets and burn-rate alerts, writing alerts that matter, dashboards, synthetic checks, health endpoints, on-call and incident basics, and tools like Prometheus, Grafana, and Sentry.
+---
+
+A team gets 200 alerts a week, mostly "CPU above 80 percent" on servers that are fine. The one alert that mattered, checkout error rate rising, was lost in the noise. Good monitoring alerts on what users experience, rarely and actionably.
+
+---
+
+## What to measure
+
+**Four golden signals** (Google SRE): latency, traffic, errors, saturation.
+
+| Method  | For                                  | Signals                         |
+| :------ | :----------------------------------- | :------------------------------ |
+| **RED** | Request-driven services              | Rate, Errors, Duration          |
+| **USE** | Resources (CPU, disk, pools, queues) | Utilisation, Saturation, Errors |
+
+Measure latency as percentiles (p50, p95, p99), not averages, and separate successful from failed request latency (fast errors hide slow successes).
+
+---
+
+## SLIs, SLOs, SLAs
+
+| Term             | Meaning                                       | Example                                                           |
+| :--------------- | :-------------------------------------------- | :---------------------------------------------------------------- |
+| **SLI**          | Indicator: a measured ratio of good events    | Successful checkout requests under 500 ms ÷ all checkout requests |
+| **SLO**          | Objective: target for the SLI over a window   | 99.9 percent over 30 days                                         |
+| **SLA**          | Agreement: contractual promise with penalties | 99.5 percent, or credits                                          |
+| **Error budget** | Allowed failure: 100 percent − SLO            | 0.1 percent of 30 days ≈ 43 minutes of full outage equivalent     |
+
+The error budget turns reliability into a decision rule: budget remaining, ship features; budget spent, prioritise reliability work.
+
+---
+
+## Alerting
+
+- **Alert on symptoms** (SLO burn: users are affected) rather than causes (CPU high). Causes go on dashboards.
+- **Burn-rate alerts**: page when the error budget is being consumed fast (for example 14x the sustainable rate over 1 hour), ticket when slow but steady.
+- Every page must be actionable, urgent, and linked to a runbook.
+- Route by severity: page for user impact now, ticket for "fix this week".
+- Review alerts after incidents and delete noisy ones.
+
+```yaml title="Prometheus rule (sketch)"
+- alert: CheckoutHighErrorRate
+  expr: |
+    sum(rate(http_requests_total{route="/checkout",status=~"5.."}[5m]))
+      / sum(rate(http_requests_total{route="/checkout"}[5m])) > 0.02
+  for: 5m
+  labels: { severity: page }
+  annotations:
+    summary: 'Checkout 5xx above 2% for 5 minutes'
+    runbook: 'https://runbooks.example.com/checkout-errors'
+```
+
+---
+
+## Health checks and synthetics
+
+| Check                 | Answers                                             | Used by                                   |
+| :-------------------- | :-------------------------------------------------- | :---------------------------------------- |
+| Liveness (`/livez`)   | Is the process alive? Do not check dependencies     | Restart decisions                         |
+| Readiness (`/readyz`) | Can it serve traffic now (DB reachable, warmed up)? | Load balancer routing                     |
+| Synthetic monitoring  | Does the real user journey work from outside?       | Uptime tools, scheduled Playwright checks |
+
+Checking dependencies in liveness probes causes restart storms when a database blips.
+
+---
+
+## Tools
+
+| Need                                  | Tools                                                            |
+| :------------------------------------ | :--------------------------------------------------------------- |
+| Metrics                               | Prometheus, Grafana Mimir, VictoriaMetrics, cloud metrics        |
+| Dashboards                            | Grafana                                                          |
+| Errors with stack traces and releases | Sentry, Rollbar, Bugsnag                                         |
+| All-in-one APM                        | Datadog, New Relic, Dynatrace, Elastic, Honeycomb                |
+| Uptime / synthetics                   | Checkly, Better Stack, UptimeRobot, Grafana synthetic monitoring |
+| On-call                               | PagerDuty, Opsgenie, incident.io, Grafana OnCall                 |
+| Status page                           | Atlassian Statuspage, Better Stack, Instatus                     |
+
+---
+
+## Incidents in brief
+
+Declare early, assign an incident commander, communicate on a status page, mitigate first (roll back, flip a flag, shed load) and investigate second, then run a **blameless postmortem** with timeline, contributing factors, and tracked action items.

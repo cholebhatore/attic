@@ -1,0 +1,86 @@
+---
+title: Unit and Component Tests
+description: Vitest vs Jest, test structure, mocks and fake timers, React Testing Library query priority, user-event, async UI, and coverage.
+---
+
+A component test that checks `wrapper.state().isOpen === true` passes while the modal is visually broken. A test that clicks the button the way a user does and checks that a dialog with the right name appeared catches it.
+
+---
+
+## The plain-language version
+
+**Vitest** and **Jest** run tests and provide `expect`. **Testing Library** renders components and finds elements the way users do: by role, label, and text. **user-event** simulates real typing and clicking.
+
+| Word                  | Plain meaning                                |
+| :-------------------- | :------------------------------------------- |
+| **test runner**       | Finds and runs tests, reports results.       |
+| **jsdom / happy-dom** | A simulated browser DOM in Node.             |
+| **browser mode**      | Running component tests in a real browser.   |
+| **fake timers**       | Controlling `setTimeout` and dates in tests. |
+
+---
+
+## Vitest vs Jest
+
+|              | Vitest                                                | Jest                                    |
+| :----------- | :---------------------------------------------------- | :-------------------------------------- |
+| Config       | Reuses Vite config                                    | Separate, needs transforms for TS/ESM   |
+| ESM and TS   | Native                                                | Via Babel or ts-jest; ESM still awkward |
+| Speed        | Fast, watch mode by module graph                      | Slower on large TS codebases            |
+| API          | Jest-compatible (`describe`, `it`, `expect`, `vi.fn`) | `jest.fn`                               |
+| Browser mode | Yes                                                   | No                                      |
+
+New projects default to Vitest. Jest remains common in existing codebases and React Native.
+
+---
+
+## A unit test
+
+```ts title="price.test.ts"
+import { describe, it, expect, vi } from 'vitest';
+import { totalWithTax } from './price';
+
+describe('totalWithTax', () => {
+  it('adds 18% tax and rounds to cents', () => {
+    expect(totalWithTax(1000)).toBe(1180); // values in cents
+  });
+
+  it('throws on negative input', () => {
+    expect(() => totalWithTax(-1)).toThrow(/negative/);
+  });
+});
+
+vi.useFakeTimers();
+vi.setSystemTime(new Date('2026-01-01'));
+```
+
+Arrange, act, assert. One behaviour per test, named as a sentence.
+
+---
+
+## Component tests
+
+```tsx title="LoginForm.test.tsx"
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { LoginForm } from './LoginForm';
+
+it('shows an error for a wrong password', async () => {
+  const user = userEvent.setup();
+  render(<LoginForm />);
+
+  await user.type(screen.getByLabelText(/email/i), 'ada@example.com');
+  await user.type(screen.getByLabelText(/password/i), 'wrong');
+  await user.click(screen.getByRole('button', { name: /sign in/i }));
+
+  expect(await screen.findByRole('alert')).toHaveTextContent(/invalid credentials/i);
+});
+```
+
+**Query priority**: `getByRole` > `getByLabelText` > `getByText` > `getByTestId`. If `getByRole` cannot find it, assistive tech probably cannot either. `findBy*` waits for async UI; `queryBy*` returns `null` for asserting absence.
+
+---
+
+## Coverage
+
+`vitest --coverage` reports lines and branches hit. Coverage shows what is untested, not that tested code is correct. A target around 70 to 80 percent on business logic is common; chasing 100 percent leads to brittle tests of trivial code.

@@ -1,0 +1,87 @@
+---
+title: SSO, Passkeys, MFA
+description: Single sign-on as a goal implemented with SAML or OIDC, SAML vs OIDC compared, SCIM provisioning, multi-factor authentication with TOTP, passkeys and WebAuthn, and step-up authentication.
+---
+
+An employee logs into the company identity provider once in the morning and opens Slack, Jira, and GitHub without typing another password. When they leave the company, IT disables one account and access to everything ends. That is single sign-on, and enterprise customers usually require it before buying a B2B product.
+
+---
+
+## The plain-language version
+
+**SSO** is a user-experience goal: log in once, access many independent apps. It is not itself a protocol; it is built with SAML or OIDC. **MFA** requires a second kind of proof beyond a password. **Passkeys** replace passwords with a key pair stored on the user's device, unlocked by fingerprint, face, or PIN.
+
+| Word                   | Plain meaning                                                               |
+| :--------------------- | :-------------------------------------------------------------------------- |
+| **IdP**                | Identity provider: Okta, Microsoft Entra ID, Google Workspace.              |
+| **SP / RP**            | Service provider (SAML) / relying party (OIDC): the app the user logs into. |
+| **assertion**          | SAML's signed XML statement about the user.                                 |
+| **SCIM**               | Standard API for the IdP to create, update, and deactivate users in apps.   |
+| **TOTP**               | Time-based one-time password (authenticator apps).                          |
+| **WebAuthn**           | Browser API for public-key authentication.                                  |
+| **passkey**            | A WebAuthn credential, often synced across devices.                         |
+| **phishing-resistant** | The credential cannot be replayed on a fake site.                           |
+
+---
+
+## Single sign-on
+
+SSO is implemented with:
+
+- **SAML** (Security Assertion Markup Language): XML-based, older, still dominant in enterprise and B2B. The IdP issues a signed XML "assertion" to the SP confirming identity. Browser-redirect based, no OAuth involved.
+- **OIDC**: the modern JSON/REST approach to the same problem (see [OAuth 2.0 and OIDC](/fullstack/auth/oauth2-and-oidc)), increasingly favoured for new SSO because of simpler tooling and mobile support.
+- **OAuth 2.0 used loosely for SSO**: technically incomplete for authentication, so "OAuth2 SSO" in practice usually means OIDC riding on OAuth's flows.
+
+|                     | SAML                                                     | OIDC                         |
+| :------------------ | :------------------------------------------------------- | :--------------------------- |
+| Data format         | XML                                                      | JSON / JWT                   |
+| Transport           | Browser redirects and POST bindings                      | REST + redirects             |
+| Mobile-friendliness | Poor                                                     | Good                         |
+| Typical context     | Enterprise, legacy IdPs (Okta, ADFS)                     | Modern consumer and B2B apps |
+| Known pitfalls      | XML signature wrapping attacks; use a maintained library | Token validation mistakes    |
+
+For B2B, add **SCIM** provisioning so deactivation in the IdP removes app access too, and **domain verification** so a customer's users are routed to their IdP. Providers such as WorkOS, Auth0, Clerk, and Keycloak handle SAML and SCIM so each app does not implement XML signature validation itself.
+
+---
+
+## Multi-factor authentication
+
+Factors: something known (password), something held (phone, security key), something inherent (biometric).
+
+| Method                 | Phishing-resistant | Notes                                           |
+| :--------------------- | :----------------- | :---------------------------------------------- |
+| SMS codes              | No                 | SIM-swap risk; better than nothing              |
+| TOTP app               | No                 | Codes can be phished in real time               |
+| Push approval          | No                 | "MFA fatigue" spam attacks; use number matching |
+| Security key / passkey | **Yes**            | Bound to the site's origin                      |
+
+TOTP stores a shared secret (shown as a QR code at enrolment) and computes `HMAC(secret, floor(time / 30))` truncated to 6 digits. Libraries: `otplib` (Node), `pyotp` (Python). Always issue one-time recovery codes, stored hashed.
+
+---
+
+## Passkeys and WebAuthn
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant B as Browser + authenticator
+    participant S as Server (relying party)
+    S->>B: challenge (random) + rp id
+    B->>B: user unlocks with biometric or PIN
+    B->>B: sign challenge with private key for this site
+    B->>S: signature + credential id
+    S->>S: verify with stored public key, check challenge, origin, counter
+    S-->>B: logged in
+`}
+/>
+
+- At registration the device creates a key pair per site; the server stores only the **public key**. A database leak exposes nothing usable.
+- The browser includes the real origin in what it signs, so a look-alike phishing domain gets a useless signature.
+- Synced passkeys (iCloud Keychain, Google Password Manager, 1Password) survive device loss.
+- Libraries: SimpleWebAuthn (Node), `webauthn` / py_webauthn (Python); Better Auth and Clerk include passkey support.
+
+---
+
+## Step-up authentication
+
+Sensitive actions (changing email, adding a payee, viewing API keys) require re-authentication or a stronger factor even within a valid session. Record `auth_time` and the method used; demand a fresh check if it is older than a few minutes.

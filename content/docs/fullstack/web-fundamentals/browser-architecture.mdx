@@ -1,0 +1,220 @@
+---
+title: Browser Architecture
+description: How a modern browser is built - the multi-process model, site isolation and sandboxing, the renderer's threads, the network stack and its caches, connection pools and resource priorities, storage partitioning, the JavaScript engine pipeline (parsing, bytecode, JIT tiers, hidden classes, inline caches, garbage collection), and the browser event loop.
+---
+
+A tab running an infinite loop freezes, yet other tabs keep working and the browser's own menus stay responsive. A malicious page on one site cannot read the memory of a banking site in another tab, even with a CPU bug like Spectre. Both properties come from how the browser is split into processes and threads. That structure also explains why JavaScript blocks rendering and why the main thread is the scarcest resource on the web.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first of two browser pages. This page covers the machinery (processes, threads, networking, the JS engine, the event loop). The [next page](/fullstack/web-fundamentals/rendering-pipeline) follows bytes of HTML through that machinery to pixels.
+
+A browser is less like one program and more like a small operating system. A privileged **browser process** acts as the manager; each website gets its own sandboxed **renderer process** that cannot touch the disk or the network directly; separate processes handle the GPU and networking. Inside each renderer, one **main thread** runs JavaScript, styles, and layout, which is why heavy JavaScript makes a page feel frozen.
+
+Topics, in order:
+
+1. The multi-process model
+2. Site isolation and the sandbox
+3. Threads inside a renderer
+4. The network stack: caches, connections, priorities
+5. Storage and partitioning
+6. The JavaScript engine
+7. Garbage collection
+8. The browser event loop
+
+| Word                  | Plain meaning                                                                                 |
+| :-------------------- | :-------------------------------------------------------------------------------------------- |
+| **renderer process**  | Sandboxed process that parses, styles, lays out, and runs JS for one site.                    |
+| **site**              | Scheme plus registrable domain: `https://example.com` includes `app.example.com`.             |
+| **sandbox**           | OS-level restrictions preventing a process from accessing files, devices, or other processes. |
+| **IPC**               | Inter-process communication: messages between browser processes.                              |
+| **main thread**       | The renderer thread running JS, style, layout, and most event handling.                       |
+| **compositor thread** | Thread that assembles layers and handles scrolling without the main thread.                   |
+| **JIT**               | Just-in-time compiler turning hot JavaScript into machine code.                               |
+| **task**              | A unit of work on the event loop: a script, an event callback, a timer.                       |
+
+---
+
+## The multi-process model
+
+Chromium's architecture (Firefox's Fission and Safari's WebKit2 are similar):
+
+<Mermaid
+  chart={`
+flowchart TB
+    B["Browser process: UI, tabs, navigation, permissions, storage access, process management"]
+    N["Network service: HTTP stack, caches, cookies, DNS"]
+    G["GPU process: rasterisation and compositing on the GPU"]
+    R1["Renderer: https://bank.example (sandboxed)"]
+    R2["Renderer: https://news.example (sandboxed)"]
+    R3["Renderer: cross-site iframe ads.example (sandboxed)"]
+    U["Utility processes: audio, video decode, storage"]
+    B <-- IPC --> N
+    B <-- IPC --> G
+    B <-- IPC --> R1
+    B <-- IPC --> R2
+    B <-- IPC --> R3
+    R1 -- "fetch via IPC" --> N
+    R1 -- "compositor frames" --> G
+`}
+/>
+
+Why split it:
+
+- **Stability**: a renderer crash kills one site's tabs ("Aw, Snap!"), not the browser.
+- **Security**: renderers handle untrusted content and run untrusted code, so they get the fewest privileges. Exploiting a renderer bug yields a sandboxed process that must find a second bug to escape.
+- **Responsiveness**: the browser UI and scrolling do not wait on a busy page.
+
+The cost is memory: each process has its own copy of engine data. Browsers consolidate processes on low-memory devices.
+
+---
+
+## Site isolation and the sandbox
+
+**Site isolation** puts each site in its own renderer process, including cross-site iframes (an `ads.example` iframe inside `news.example` runs in a separate process).
+
+The motivation was **Spectre** (2018): CPU speculative execution lets code read memory in its own address space it should not be able to access, via timing side channels. If two sites shared a process, a malicious page could read the other site's data. Process boundaries put that data out of reach. Related defences:
+
+- Renderers can only request data for their own site; the browser process enforces this (**Cross-Origin Read Blocking**, CORB, and its successor ORB, prevent a page from pulling another site's JSON or HTML into its process via an `img` or `script` tag).
+- High-resolution timers and `SharedArrayBuffer` are restricted unless a page opts into **cross-origin isolation** with `COOP` and `COEP` headers ([Browser Security Model](/fullstack/web-fundamentals/browser-security-model)).
+
+The **sandbox** uses OS facilities (seccomp-bpf and namespaces on Linux, restricted tokens on Windows, Seatbelt on macOS) so the renderer cannot open files, sockets, or devices. Everything privileged goes through IPC to the browser process, which checks permissions.
+
+---
+
+## Threads inside a renderer
+
+| Thread                | Work                                                                                                        |
+| :-------------------- | :---------------------------------------------------------------------------------------------------------- |
+| **Main thread**       | HTML parsing, running JavaScript, style calculation, layout, paint recording, most event dispatch           |
+| **Compositor thread** | Combines layers, handles scrolling and pinch-zoom, runs compositor-only animations (`transform`, `opacity`) |
+| Raster threads        | Turn paint recordings into pixels (tiles), often on the GPU                                                 |
+| Worker threads        | Web Workers, Service Workers, Worklets: run JS off the main thread with no DOM access                       |
+| Preload scanner       | Looks ahead in HTML for resources to fetch early                                                            |
+
+The main thread is single and shared: while a 300 ms JavaScript task runs, the page cannot respond to clicks, run other scripts, or update layout. Scrolling usually stays smooth because the compositor handles it, **unless** a scroll or touch listener is registered without `{ passive: true }`, which forces the compositor to wait for the main thread before scrolling.
+
+---
+
+## The network stack
+
+All network requests from renderers go through the network service, which manages:
+
+1. **Caches**, checked in order: memory cache (per tab, very fast), service worker (if registered for the scope, it intercepts first), HTTP disk cache, and HTTP/2 push cache (historical).
+2. **DNS** with its own cache, plus prefetching (`dns-prefetch`).
+3. **Connection pools**: per origin; up to 6 HTTP/1.1 connections per host and one multiplexed HTTP/2 or HTTP/3 connection, reused across tabs of the same site. `preconnect` opens one early.
+4. **Resource priorities**: the browser assigns each request a priority from its type and position: CSS in the `head` and fonts are highest, scripts high or medium depending on `async`/`defer`, images low until known to be in the viewport. Low-priority requests may be delayed while critical ones load. `fetchpriority="high|low"` and `<link rel="preload">` adjust this.
+5. **Security checks**: CORS, mixed content blocking, CORB/ORB, HSTS upgrades, Safe Browsing.
+6. **Back/forward cache (bfcache)**: on navigation, the whole page (JS heap included) may be frozen in memory so the back button restores it instantly. Pages using `unload` handlers or `Cache-Control: no-store` are often excluded.
+
+The HTTP cache is **partitioned** by top-level site: a library loaded from a CDN on `site-a.com` is cached separately from the same URL loaded on `site-b.com`. That closed cross-site tracking via cache timing, and ended the benefit of "shared public CDNs" for popular libraries; self-hosting is now as fast.
+
+---
+
+## Storage and partitioning
+
+| Storage                          | Scope                           | API                             | Notes                                       |
+| :------------------------------- | :------------------------------ | :------------------------------ | :------------------------------------------ |
+| Cookies                          | Domain/path; sent with requests | `document.cookie`, `Set-Cookie` | Third-party cookies restricted or blocked   |
+| `localStorage`, `sessionStorage` | Origin                          | Synchronous                     | Blocks the main thread; ~5 MB               |
+| IndexedDB                        | Origin                          | Async                           | Large structured data                       |
+| Cache Storage                    | Origin                          | Async                           | Service workers' response cache             |
+| OPFS                             | Origin                          | Async/sync in workers           | Origin private file system (SQLite in WASM) |
+
+Third-party contexts (iframes and requests embedded in another site) get storage **partitioned** by the top-level site, so an embedded widget cannot recognise the same user across different host sites. Browsers may evict storage under pressure unless the site requests persistence (`navigator.storage.persist()`); Safari deletes script-writable storage for sites not visited in seven days under its tracking prevention rules.
+
+---
+
+## The JavaScript engine
+
+V8 (Chrome, Node.js, Deno, edge runtimes), SpiderMonkey (Firefox), and JavaScriptCore (Safari, Bun) follow the same broad pipeline:
+
+<Mermaid
+  chart={`
+flowchart LR
+    S["Source text"] --> P["Parser -> AST (lazy: inner functions pre-parsed only)"]
+    P --> I["Ignition: bytecode interpreter, collects type feedback"]
+    I -- "warm code" --> SP["Sparkplug: fast baseline compiler"]
+    SP -- "hot code" --> M["Maglev: mid-tier optimising compiler"]
+    M -- "very hot" --> T["TurboFan: optimising compiler using type feedback"]
+    T -- "assumption broken" --> D["Deoptimise back to bytecode"]
+    D --> I
+`}
+/>
+
+- **Parsing** is a real cost at page load: megabytes of JavaScript take tens to hundreds of milliseconds to parse and compile on mid-range phones. Engines parse lazily (functions are pre-parsed until first called) and cache compiled code for repeat visits.
+- **Tiered compilation**: start fast with bytecode, compile hot functions to machine code using observed types.
+- **Hidden classes (shapes) and inline caches**: objects created with the same properties in the same order share a hidden class, so property access compiles to a fixed memory offset. Code that sees one shape at a call site (monomorphic) is fast; many shapes (megamorphic) falls back to slow lookups.
+- **Deoptimisation**: if optimised code's assumptions break (a function that always received integers gets a string), the engine discards the machine code and returns to the interpreter.
+
+Practical consequences: initialise all object properties in constructors in a consistent order, avoid `delete` on hot objects, keep arrays homogeneous, and do not rely on micro-optimisations without measuring; the engine is usually smarter than hand-tuning, but shipping less JavaScript always helps.
+
+---
+
+## Garbage collection
+
+JavaScript memory is managed by a tracing garbage collector: objects reachable from roots (globals, the stack, active closures) live; everything else is collected.
+
+- **Generational**: most objects die young. New objects go into a small **young generation** collected frequently with a fast copying collector (a scavenge); survivors are promoted to the **old generation**, collected less often with mark-sweep-compact.
+- **Incremental and concurrent** marking spread work across small slices and helper threads to avoid long pauses, but GC still shows up as main-thread time in the Performance panel.
+- **Leaks** in web apps are unintentionally reachable objects: listeners never removed, detached DOM nodes still referenced, growing caches or arrays, intervals never cleared, closures capturing large data. Find them with heap snapshots and "detached elements" in DevTools Memory.
+
+---
+
+## The browser event loop
+
+The renderer's main thread runs an event loop defined by the HTML specification:
+
+<Mermaid
+  chart={`
+flowchart TD
+    A["Pick the oldest task from a task queue (script, timer, input event, message, network callback)"] --> B["Run it to completion"]
+    B --> C["Drain the microtask queue (promise callbacks, queueMicrotask, MutationObserver)"]
+    C --> D{"Rendering opportunity? (~every 16.7 ms at 60 Hz, only if something changed)"}
+    D -- yes --> E["Run requestAnimationFrame callbacks"]
+    E --> F["Style, layout, paint (update the rendering)"]
+    F --> G["requestIdleCallback if time remains"]
+    D -- no --> A
+    G --> A
+`}
+/>
+
+Rules that follow:
+
+- A task runs **to completion**; nothing interrupts it, including rendering. A 500 ms task means 500 ms with no frames and no input handling.
+- **Microtasks drain completely** after each task, including ones queued by microtasks, so an endless promise chain starves rendering as surely as a `while (true)` loop.
+- Rendering happens at most once per frame; changing the DOM ten times in one task produces one render.
+- **Input** is high priority: browsers schedule input tasks ahead of other queued tasks when possible, but cannot preempt a running task. Responsiveness requires keeping tasks short (under 50 ms, the **long task** threshold), which is what [INP](/fullstack/performance/core-web-vitals) measures.
+- `setTimeout(fn, 0)` is clamped to at least 4 ms after five nested calls, and timers in background tabs are throttled to once per second or less.
+- `scheduler.yield()` and `scheduler.postTask()` let long work yield to the browser and resume with priority.
+
+The language-level view of tasks and microtasks is in [Event Loop and Async](/fullstack/javascript/event-loop-and-async); Node.js's variant is in [Runtime and Event Loop](/fullstack/nodejs/runtime-and-event-loop).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why do browsers use multiple processes?">
+    Stability (a crashing page does not take down the browser), security (untrusted content runs in
+    sandboxed processes with minimal privileges, and site isolation keeps sites in separate address
+    spaces), and responsiveness (UI and compositing are not blocked by page work).
+  </Accordion>
+  <Accordion title="Why can a page still scroll while JavaScript is busy, and when can't it?">
+    Scrolling is handled by the compositor thread. If the page registers non-passive touch or wheel
+    listeners, the compositor must wait for the main thread to see whether the listener calls
+    preventDefault, so scrolling stalls.
+  </Accordion>
+  <Accordion title="What is a hidden class and why does it matter?">
+    An internal shape shared by objects with the same properties added in the same order. It lets
+    the engine compile property access to fixed offsets and cache lookups; inconsistent shapes make
+    code polymorphic and slower.
+  </Accordion>
+  <Accordion title="Why did the HTTP cache become partitioned, and what did it change?">
+    Shared caches let sites detect whether a user had visited another site by timing cached
+    resources. Partitioning by top-level site closed that leak, and removed the cross-site benefit
+    of loading popular libraries from public CDNs.
+  </Accordion>
+</Accordions>

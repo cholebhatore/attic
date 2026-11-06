@@ -1,0 +1,107 @@
+---
+title: OAuth 2.0 and OIDC
+description: OAuth 2.0 as delegated authorization, its four roles, grant types, the authorization code flow with PKCE step by step, scopes, OpenID Connect ID tokens and userinfo, Sign in with Google, and common mistakes.
+---
+
+A photo-printing site wants to read a user's Google Photos. The old approach was asking for the Google password, which handed the site full access to the whole account. OAuth 2.0 lets Google issue the site a limited, revocable token for photos only, and the password never leaves Google.
+
+---
+
+## The plain-language version
+
+OAuth 2.0 is a **framework**, not a login method or a token type. Its job: let a user grant a third-party application **limited access to their resources** on another service, without sharing their password. Think of a hotel key card: the front desk (authorization server) gives the guest a card that opens one room for three nights, rather than the master key.
+
+**OpenID Connect (OIDC)** is a thin identity layer on top of OAuth 2.0 that adds authentication: it tells the app _who_ logged in.
+
+| Word                     | Plain meaning                                                                   |
+| :----------------------- | :------------------------------------------------------------------------------ |
+| **resource owner**       | The user who owns the data.                                                     |
+| **client**               | The app requesting access.                                                      |
+| **authorization server** | Issues tokens after the user consents (Google, Auth0, Keycloak).                |
+| **resource server**      | API hosting the protected data.                                                 |
+| **scope**                | A named permission: `photos.read`, `email`.                                     |
+| **grant type**           | A way to obtain a token.                                                        |
+| **PKCE**                 | Proof Key for Code Exchange: ties the code to the client that started the flow. |
+| **ID token**             | OIDC's JWT describing the authenticated user.                                   |
+
+---
+
+## OAuth 2.0
+
+- **Roles**: resource owner (the user), client (the requesting app), authorization server (issues tokens), resource server (hosts the protected API).
+- **What OAuth 2.0 issues**: an **access token** scoped to specific permissions. By spec its _format is not defined_; it is often a JWT in practice, but OAuth does not require that.
+- OAuth 2.0 alone tells the client _"this token can access X"_. It says nothing reliable about _who the user is_. Using raw OAuth as a login mechanism ("did we get a token back?") is a known anti-pattern, and precisely the gap OIDC fills.
+
+### Grant types
+
+| Grant                               | Use                                                                                          | Status     |
+| :---------------------------------- | :------------------------------------------------------------------------------------------- | :--------- |
+| **Authorization code + PKCE**       | Web apps, SPAs, mobile, desktop. PKCE removes the need for a client secret in public clients | Standard   |
+| **Client credentials**              | Machine to machine, no user                                                                  | Standard   |
+| **Refresh token**                   | Exchange a refresh token for a new access token                                              | Standard   |
+| **Device authorization**            | TVs and CLIs without a browser ("enter this code on a phone")                                | Standard   |
+| Implicit                            | Tokens in the URL fragment                                                                   | Deprecated |
+| Resource owner password credentials | App collects the user's password                                                             | Deprecated |
+
+OAuth 2.1 consolidates current best practice: PKCE required for all clients, implicit and password grants removed, exact redirect URI matching.
+
+---
+
+## Authorization code flow with PKCE
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant U as User's browser
+    participant C as Client app
+    participant AS as Authorization server
+    participant RS as Resource server
+    C->>C: create code_verifier (random), code_challenge = SHA256(verifier), state
+    C->>U: redirect to AS /authorize?response_type=code&client_id&redirect_uri&scope&state&code_challenge
+    U->>AS: log in + consent
+    AS->>U: redirect to redirect_uri?code=...&state=...
+    U->>C: code + state
+    C->>C: check state matches
+    C->>AS: POST /token (code, code_verifier, client auth if confidential)
+    AS->>AS: SHA256(code_verifier) == code_challenge?
+    AS-->>C: access token (+ refresh token, + ID token with OIDC)
+    C->>RS: API call with Bearer access token
+`}
+/>
+
+- **`state`** binds the response to the request (CSRF protection for the callback).
+- **PKCE**: an attacker who intercepts the code (a malicious app registered for the same redirect scheme on mobile) cannot exchange it without the `code_verifier`.
+- **Exact redirect URI matching** stops tokens being sent to attacker-controlled URLs.
+- Confidential clients (servers) also authenticate with a client secret or private-key JWT.
+
+---
+
+## OpenID Connect
+
+OIDC is **not a competitor to OAuth 2.0**; it is built directly on it.
+
+- Adds the **ID token**: always a JWT, containing identity claims about the authenticated user (`sub`, `email`, `name`, `iss`, `aud`, `nonce`, `auth_time`).
+- Adds a standard **`/userinfo`** endpoint and standard **scopes** (`openid`, `profile`, `email`).
+- Adds **discovery** (`/.well-known/openid-configuration`) listing endpoints and the JWKS URL.
+- In an OIDC flow the client receives _both_: an OAuth **access token** (for calling APIs) and an OIDC **ID token** (for knowing who logged in). They are often confused because both are frequently JWTs, but they serve different audiences: the ID token is for the client app; the access token is for the API.
+
+This is the mechanism behind "Sign in with Google / Microsoft / Apple / GitHub" buttons. (GitHub's classic flow is plain OAuth plus a user API call.)
+
+### Signing in with an OIDC provider
+
+1. Run the code + PKCE flow with `scope=openid email profile` and a `nonce`.
+2. Validate the ID token: signature via the provider's JWKS, `iss`, `aud` equals the client ID, `exp`, and `nonce`.
+3. Find or create a local user keyed by `(provider, sub)`. Do not key on email alone; emails change and can be unverified.
+4. Start the app's own session (cookie) and discard provider tokens unless the app needs to call the provider's APIs.
+
+---
+
+## Common mistakes
+
+- Treating "got an access token" as proof of login (use the ID token).
+- Accepting an ID token whose `aud` is another app's client ID.
+- Linking accounts by unverified email.
+- Storing provider tokens in `localStorage` in a SPA instead of using a BFF.
+- Requesting broad scopes upfront; request incrementally.
+
+Libraries: Auth.js, Better Auth, `openid-client` (Node); Authlib (Python). Self-hosted servers: Keycloak, Ory Hydra, Authentik, Zitadel.

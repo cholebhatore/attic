@@ -1,0 +1,65 @@
+---
+title: Mocking with MSW
+description: Why mock at the network level, MSW handlers for tests and development, per-test overrides, error and latency scenarios, and what not to mock.
+---
+
+Tests that mock `fetch` with `vi.fn().mockResolvedValue(...)` couple every test to how the code calls the API. Swap `fetch` for a client library and every test breaks, though the app still works. Mock Service Worker intercepts at the network level instead, so the code under test runs unchanged.
+
+---
+
+## The plain-language version
+
+**MSW** defines fake API endpoints. In the browser it uses a service worker; in Node it intercepts requests. The app's code thinks it is talking to a real server.
+
+| Word               | Plain meaning                                   |
+| :----------------- | :---------------------------------------------- |
+| **handler**        | A fake endpoint: method + path + response.      |
+| **override**       | Replace a handler for one test (an error case). |
+| **contract drift** | The real API changed; mocks did not.            |
+
+---
+
+## Handlers
+
+```ts title="mocks/handlers.ts"
+import { http, HttpResponse, delay } from 'msw';
+
+export const handlers = [
+  http.get('/api/orders', () => HttpResponse.json([{ id: 1, total: 1180 }])),
+  http.post('/api/orders', async ({ request }) => {
+    const body = await request.json();
+    return HttpResponse.json({ id: 2, ...body }, { status: 201 });
+  }),
+];
+```
+
+```ts title="vitest.setup.ts"
+import { setupServer } from 'msw/node';
+import { handlers } from './mocks/handlers';
+
+export const server = setupServer(...handlers);
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterEach(() => server.resetHandlers());
+afterAll(() => server.close());
+```
+
+```ts title="per-test override"
+server.use(http.get('/api/orders', () => new HttpResponse(null, { status: 500 })));
+server.use(
+  http.get('/api/orders', async () => {
+    await delay(3000);
+    return HttpResponse.json([]);
+  }),
+);
+```
+
+The same handlers run in the browser (`setupWorker`) for developing UI before the backend exists, and in Storybook.
+
+---
+
+## What to mock
+
+- **Mock**: third-party APIs, payment providers, email, time, randomness.
+- **Do not mock**: the code under test, the database in integration tests (use a real one in a container), or the framework.
+
+Keep mocks honest by generating them from an OpenAPI spec or by running [contract tests](/fullstack/testing/backend-testing).

@@ -1,0 +1,100 @@
+---
+title: RabbitMQ and Kafka
+description: RabbitMQ exchanges, bindings, queues, acknowledgements, prefetch, and quorum queues; Kafka topics, partitions, offsets, consumer groups, retention and compaction; cloud alternatives; and how to choose.
+---
+
+RabbitMQ and Kafka are both called message brokers, but they are built on opposite ideas. RabbitMQ is a smart router that delivers messages to queues and forgets them once acknowledged. Kafka is a distributed, append-only log that keeps messages for days and lets every consumer read at its own position.
+
+---
+
+## RabbitMQ
+
+<Mermaid
+  chart={`
+flowchart LR
+    P["Producer"] --> X["Exchange (topic)"]
+    X -- "order.*" --> Q1["Queue: billing"]
+    X -- "order.created" --> Q2["Queue: email"]
+    X -- "#" --> Q3["Queue: audit"]
+    Q1 --> C1["Consumers"]
+    Q2 --> C2["Consumers"]
+`}
+/>
+
+| Concept                | Meaning                                                                                                |
+| :--------------------- | :----------------------------------------------------------------------------------------------------- |
+| Exchange               | Receives messages and routes them: `direct` (exact key), `topic` (patterns), `fanout` (all), `headers` |
+| Binding                | Rule connecting an exchange to a queue                                                                 |
+| Queue                  | Stores messages until consumed and acked                                                               |
+| Prefetch (`basic.qos`) | Max unacked messages per consumer; controls fairness and memory                                        |
+| Quorum queue           | Replicated queue using Raft; the default for durability                                                |
+| Dead-letter exchange   | Where rejected or expired messages go                                                                  |
+
+```python
+# pika / aio-pika style
+await channel.set_qos(prefetch_count=10)
+async with queue.iterator() as messages:
+    async for message in messages:
+        async with message.process(requeue=False):    # ack on success, reject on exception
+            handle(json.loads(message.body))
+```
+
+Strengths: flexible routing, per-message acks, priorities, delayed messages (plugin), low latency, AMQP plus MQTT and STOMP support. RabbitMQ Streams add a Kafka-like log type.
+
+---
+
+## Kafka
+
+<Mermaid
+  chart={`
+flowchart LR
+    P["Producers (key = order id)"] --> T
+    subgraph T["Topic: orders"]
+        P0["Partition 0"]
+        P1["Partition 1"]
+        P2["Partition 2"]
+    end
+    P0 --> G1A["Group billing: consumer A"]
+    P1 --> G1A
+    P2 --> G1B["Group billing: consumer B"]
+    P0 & P1 & P2 --> G2["Group analytics: consumer X"]
+`}
+/>
+
+| Concept            | Meaning                                                                     |
+| :----------------- | :-------------------------------------------------------------------------- |
+| Topic              | Named log                                                                   |
+| Partition          | Ordered, append-only shard of a topic; the unit of parallelism and ordering |
+| Offset             | Position of a record in a partition                                         |
+| Consumer group     | Consumers sharing partitions; each partition read by one member             |
+| Retention          | Records kept by time or size, regardless of consumption                     |
+| Log compaction     | Keep only the latest record per key (changelog topics)                      |
+| Replication factor | Copies of each partition across brokers                                     |
+
+- Producer `acks=all` + `min.insync.replicas=2` for durability; idempotent producer to avoid duplicates on retry.
+- Max consumer parallelism per group = number of partitions.
+- Ecosystem: Kafka Connect (integrations, Debezium for CDC), Kafka Streams and Flink (stream processing), Schema Registry (Avro/Protobuf schemas).
+- Modern Kafka runs without ZooKeeper (KRaft). Compatible alternatives: Redpanda, WarpStream; managed: Confluent Cloud, Amazon MSK.
+
+---
+
+## Cloud and lighter options
+
+| Service                        | Model                                                              |
+| :----------------------------- | :----------------------------------------------------------------- |
+| Amazon SQS (+ SNS for fan-out) | Managed queue; standard (at least once, best-effort order) or FIFO |
+| Google Pub/Sub                 | Managed pub-sub with push or pull                                  |
+| Azure Service Bus              | Queues and topics, sessions for ordering                           |
+| NATS / JetStream               | Lightweight, very fast; JetStream adds persistence                 |
+| Redis Streams                  | When Redis is already there and volumes are modest                 |
+
+---
+
+## Choosing
+
+| Need                                                               | Choose                                                 |
+| :----------------------------------------------------------------- | :----------------------------------------------------- |
+| Background tasks, commands, complex routing                        | RabbitMQ or SQS                                        |
+| High-volume event streams, replay, many independent consumers, CDC | Kafka (or a managed log)                               |
+| Simple jobs in an app                                              | A job queue library over Redis or Postgres (next page) |
+| Minimal operations on a cloud                                      | The cloud provider's queue                             |

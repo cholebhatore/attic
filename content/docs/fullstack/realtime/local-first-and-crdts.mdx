@@ -1,0 +1,68 @@
+---
+title: Local-first and CRDTs
+description: Local-first software, optimistic UI vs local-first sync, conflict resolution strategies, operational transformation vs CRDTs, how a CRDT merges, and tools such as Yjs, Automerge, Zero, ElectricSQL, PowerSync, and Replicache.
+---
+
+Two people edit the same document title offline: one types "Q3 Plan", the other "Q3 Roadmap". When both reconnect, last-write-wins silently discards one edit. Collaborative and offline-first apps need a way to merge concurrent changes that every device agrees on.
+
+---
+
+## The plain-language version
+
+**Local-first** apps keep the primary copy of a user's data on their device and sync in the background. Reads and writes are instant and work offline; the server becomes a sync and backup peer. **CRDTs** (conflict-free replicated data types) are data structures designed so that any two copies, after receiving the same set of changes in any order, end up identical.
+
+| Word                      | Plain meaning                                                                               |
+| :------------------------ | :------------------------------------------------------------------------------------------ |
+| **optimistic UI**         | Show the change immediately, confirm with the server later.                                 |
+| **sync engine**           | Library that replicates data between client storage and the server.                         |
+| **last-write-wins (LWW)** | Keep the change with the latest timestamp.                                                  |
+| **OT**                    | Operational transformation: rewrite concurrent operations against each other (Google Docs). |
+| **CRDT**                  | Data type whose merges are commutative, associative, and idempotent.                        |
+| **convergence**           | All replicas reach the same state.                                                          |
+
+---
+
+## Conflict resolution strategies
+
+| Strategy                  | Behaviour                                                   | Fits                                 |
+| :------------------------ | :---------------------------------------------------------- | :----------------------------------- |
+| Server wins / reject      | Second writer gets a conflict error (`409`, version check)  | Forms, admin data                    |
+| Last-write-wins per field | Latest timestamp per field wins                             | Settings, simple records             |
+| Manual merge              | Show both versions to the user                              | Rare, high-value conflicts           |
+| OT                        | Central server transforms operations                        | Real-time text editors with a server |
+| CRDT                      | Automatic, deterministic merge, no central authority needed | Collaboration, offline-first, P2P    |
+
+---
+
+## How a CRDT merges
+
+A **grow-only counter** per device:
+
+|                            | Device A count | Device B count | Value         |
+| :------------------------- | :------------- | :------------- | :------------ |
+| Start                      | 0              | 0              | 0             |
+| A increments twice offline | 2              | 0              | 2 on A        |
+| B increments once offline  | 0              | 1              | 1 on B        |
+| Merge: take max per device | 2              | 1              | **3** on both |
+
+Taking the per-device maximum gives the same answer regardless of merge order or repeated merges. Text CRDTs (Yjs, Automerge) give every character a unique, ordered ID, so concurrent inserts at the same position interleave deterministically instead of overwriting.
+
+Costs: metadata overhead, "tombstones" for deletions, and merges that are consistent but not always what a human intended (both titles may end up concatenated).
+
+---
+
+## Tools
+
+| Tool                        | Approach                                                                                                        |
+| :-------------------------- | :-------------------------------------------------------------------------------------------------------------- |
+| Yjs                         | CRDT library; editors (TipTap, Lexical, CodeMirror, Monaco) and providers (y-websocket, Hocuspocus, Liveblocks) |
+| Automerge                   | JSON-like CRDT documents with history                                                                           |
+| Zero (Rocicorp), Replicache | Client-side cache with server-authoritative sync, instant queries                                               |
+| ElectricSQL                 | Sync subsets of Postgres to clients                                                                             |
+| PowerSync                   | Postgres/MongoDB ↔ SQLite on device                                                                             |
+| Triplit, InstantDB, Jazz    | Full-stack local-first databases                                                                                |
+
+<Callout type="info">
+  Local-first does not remove the server's authority over permissions and validation. Sync engines
+  still enforce access rules server-side and can reject or transform incoming changes.
+</Callout>

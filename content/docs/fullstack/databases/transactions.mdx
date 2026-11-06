@@ -1,0 +1,106 @@
+---
+title: Transactions
+description: ACID, transaction boundaries in application code, isolation levels and the anomalies each allows, MVCC at a glance, row locks and SELECT FOR UPDATE, deadlocks, optimistic concurrency, and transactions across services.
+---
+
+Two requests buy the last concert ticket at the same moment. Both read `available = 1`, both insert a booking, both decrement. Now `available = -1` and two people have the same seat. Transactions and the right isolation or locking prevent this; a transaction alone at the default isolation level does not.
+
+---
+
+## The plain-language version
+
+A **transaction** groups statements so they all succeed or all fail. **Isolation** decides how much concurrent transactions can see of each other's unfinished work. Stronger isolation prevents more anomalies but causes more waiting or retries.
+
+| Word            | Plain meaning                                                                               |
+| :-------------- | :------------------------------------------------------------------------------------------ |
+| **atomicity**   | All or nothing.                                                                             |
+| **consistency** | Constraints hold before and after.                                                          |
+| **isolation**   | Concurrent transactions do not interfere (to a chosen degree).                              |
+| **durability**  | Committed data survives crashes.                                                            |
+| **MVCC**        | Multi-version concurrency control: readers see a snapshot; writers create new row versions. |
+| **lost update** | Two read-modify-write cycles overwrite each other.                                          |
+| **deadlock**    | Two transactions each wait for a lock the other holds.                                      |
+
+---
+
+## In application code
+
+<Tabs items={['Node (pg)', 'Python (SQLAlchemy)']}>
+<Tab value="Node (pg)">
+
+```ts
+const client = await pool.connect();
+try {
+  await client.query('BEGIN');
+  await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [amount, from]);
+  await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [amount, to]);
+  await client.query('COMMIT');
+} catch (e) {
+  await client.query('ROLLBACK');
+  throw e;
+} finally {
+  client.release();
+}
+```
+
+</Tab>
+<Tab value="Python (SQLAlchemy)">
+
+```python
+async with session.begin():          # commits on success, rolls back on exception
+    await session.execute(update(Account).where(Account.id == src).values(balance=Account.balance - amount))
+    await session.execute(update(Account).where(Account.id == dst).values(balance=Account.balance + amount))
+```
+
+</Tab>
+</Tabs>
+
+Keep transactions short. Never call external APIs (payments, email) inside one: it holds locks and connections while waiting, and a rollback cannot undo the external call. Use the [outbox pattern](/fullstack/message-brokers/job-queues-and-outbox) instead.
+
+---
+
+## Isolation levels
+
+| Level            | Dirty read | Non-repeatable read | Phantom                               | Lost update / write skew                             | Default in                          |
+| :--------------- | :--------- | :------------------ | :------------------------------------ | :--------------------------------------------------- | :---------------------------------- |
+| Read uncommitted | Possible   | Possible            | Possible                              | Possible                                             | (Postgres treats as read committed) |
+| Read committed   | No         | Possible            | Possible                              | Possible                                             | PostgreSQL, Oracle, SQL Server      |
+| Repeatable read  | No         | No                  | Possible in standard, not in Postgres | Lost update blocked in Postgres; write skew possible | MySQL InnoDB                        |
+| Serializable     | No         | No                  | No                                    | No                                                   |                                     |
+
+Under serializable, the database may abort a transaction with a serialization error; the application must **retry** it.
+
+---
+
+## Fixing the ticket race
+
+```sql
+-- 1. Atomic conditional update (simplest, often enough)
+UPDATE events SET available = available - 1 WHERE id = $1 AND available > 0 RETURNING available;
+-- 0 rows updated means sold out
+
+-- 2. Pessimistic lock: other transactions wait on this row
+BEGIN;
+SELECT available FROM events WHERE id = $1 FOR UPDATE;
+-- check, insert booking, update
+COMMIT;
+
+-- 3. Optimistic concurrency: version column, fail if changed
+UPDATE events SET available = $2, version = version + 1 WHERE id = $1 AND version = $3;
+```
+
+Also: a `UNIQUE (event_id, seat_no)` constraint makes double-booking impossible regardless of code bugs. `SKIP LOCKED` lets job workers take different rows without waiting.
+
+---
+
+## Deadlocks
+
+Transaction A locks row 1 then wants row 2; B locks row 2 then wants row 1. The database kills one. Prevent by locking rows in a consistent order (sort IDs), keeping transactions short, and retrying deadlock errors.
+
+---
+
+## Across services
+
+A single database transaction cannot span two services or a database plus a message broker. Options: the outbox pattern, sagas with compensating actions, and idempotent consumers. See [Event-driven architecture](/fullstack/architecture/event-driven).
+
+Internals (WAL, MVCC tuple versions, lock manager): [Databases](/db), starting with [concurrency and multi-user access](/db/foundations/why-databases/concurrency-and-multi-user).

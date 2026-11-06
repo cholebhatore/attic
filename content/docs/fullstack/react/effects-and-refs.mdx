@@ -1,0 +1,312 @@
+---
+title: Effects and Refs
+description: Effects as synchronisation with external systems, the effect lifecycle and timing (insertion, layout, passive), dependency comparison and why lying about dependencies breaks code, cleanup and the StrictMode remount check, race conditions in data fetching, stale closures and useEffectEvent, effect chains and when an effect is not needed, refs and their timing, callback refs, imperative handles, and memory leaks.
+---
+
+A search box fetches results in an effect. Typing "react" quickly fires five requests, and the response for "re" arrives last, overwriting the results for "react". A chat component subscribes to a room in an effect without cleanup; after switching rooms ten times it receives messages from all ten. A component copies props into state with an effect and briefly shows stale data after every change. Effects are the most misused part of React because they look like lifecycle methods but are a synchronisation mechanism.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after [State and Hooks](/fullstack/react/state-and-hooks). Rendering must be pure; effects are the controlled place for side effects that keep a component in sync with something **outside** React: a network connection, a browser API, a third-party widget, a subscription.
+
+The right mental model is not "run this when the component mounts". It is: "while this component is on screen with these values, keep this external thing synchronised; when the values change or the component leaves, undo the old synchronisation." Like a thermostat: it does not care how it got here, it keeps the room at the target temperature, and adjusts whenever the target changes.
+
+Topics, in order:
+
+1. Effects as synchronisation
+2. Lifecycle and timing
+3. Dependencies
+4. Cleanup and the StrictMode check
+5. Race conditions
+6. Stale closures and useEffectEvent
+7. When an effect is not needed
+8. Refs
+9. Callback refs and imperative handles
+10. Leaks and debugging
+
+| Word                 | Plain meaning                                                                |
+| :------------------- | :--------------------------------------------------------------------------- |
+| **effect**           | Code run after commit to synchronise with an external system.                |
+| **dependency array** | The reactive values an effect reads; it re-synchronises when any changes.    |
+| **reactive value**   | Props, state, and anything computed from them during render.                 |
+| **cleanup**          | Function returned by an effect that undoes it.                               |
+| **passive effect**   | `useEffect`: runs after the browser paints.                                  |
+| **layout effect**    | `useLayoutEffect`: runs after DOM mutation, before paint.                    |
+| **ref**              | A mutable container (`.current`) that survives renders without causing them. |
+| **stale closure**    | A function holding values from an old render.                                |
+
+---
+
+## Effects as synchronisation
+
+```tsx
+function ChatRoom({ roomId, serverUrl }: { roomId: string; serverUrl: string }) {
+  useEffect(() => {
+    const connection = createConnection(serverUrl, roomId); // start synchronising
+    connection.connect();
+    return () => connection.disconnect(); // stop synchronising
+  }, [roomId, serverUrl]); // re-sync when these change
+  return <h1>Welcome to {roomId}</h1>;
+}
+```
+
+| Event                          | What runs                                 |
+| :----------------------------- | :---------------------------------------- |
+| Mount with `roomId="general"`  | connect(general)                          |
+| Re-render, same values         | nothing                                   |
+| `roomId` changes to `"travel"` | disconnect(general), then connect(travel) |
+| Unmount                        | disconnect(travel)                        |
+
+Each effect describes **one** synchronisation process. Two unrelated processes (connecting to a room, and logging an analytics visit) belong in two effects with their own dependencies.
+
+---
+
+## Lifecycle and timing
+
+| Hook                 | Runs                                                                               | Blocks paint | Use for                                                                         |
+| :------------------- | :--------------------------------------------------------------------------------- | :----------- | :------------------------------------------------------------------------------ |
+| `useInsertionEffect` | Before DOM mutations                                                               | Yes          | CSS-in-JS libraries injecting style tags                                        |
+| `useLayoutEffect`    | After DOM mutations, before paint                                                  | Yes          | Measuring layout and synchronously repositioning (tooltips, scroll restoration) |
+| `useEffect`          | After paint (usually; flushed synchronously if a discrete event caused the render) | No           | Subscriptions, network, timers, analytics, third-party widgets                  |
+
+Order across a tree: within one commit, effects run **children first, then parents** (a parent's effect can rely on its children's effects having run). On updates, all cleanups for changed effects run before any new setups.
+
+`useLayoutEffect` does nothing on the server (there is no layout), so it warns during SSR; code that must run before paint on the client only should guard or use `useEffect` with care.
+
+---
+
+## Dependencies
+
+React compares each dependency with its previous value using `Object.is`. If all are equal, the effect is skipped.
+
+| Dependency array | Effect runs                                 |
+| :--------------- | :------------------------------------------ |
+| omitted          | After every commit of the component         |
+| `[]`             | After mount only (cleanup on unmount)       |
+| `[a, b]`         | After mount and whenever `a` or `b` changed |
+
+**Every reactive value read inside the effect must be listed.** Dependencies are not chosen; they are determined by the code. The lint rule `react-hooks/exhaustive-deps` computes them.
+
+Silencing the lint rule (lying about dependencies) creates bugs:
+
+```tsx
+useEffect(() => {
+  const id = setInterval(() => setCount(count + 1), 1000); // reads count
+  return () => clearInterval(id);
+}, []); // count missing: the interval forever sees count = 0, so the counter sticks at 1
+```
+
+When an effect re-runs too often, change the code so it does not need the dependency:
+
+| Problem                                                     | Fix                                                             |
+| :---------------------------------------------------------- | :-------------------------------------------------------------- |
+| Reads state only to compute next state                      | Functional update: `setCount(c => c + 1)`                       |
+| Object or function created during render (new every render) | Move it inside the effect, outside the component, or memoise it |
+| Several state updates driven by actions                     | `useReducer`; `dispatch` is stable                              |
+| Needs the latest value but should not re-sync on its change | `useEffectEvent` (below)                                        |
+| Depends on a whole object but uses one field                | Depend on the primitive field                                   |
+
+```tsx
+// Object dependency recreated every render: effect re-runs every render
+const options = { serverUrl, roomId };
+useEffect(() => {
+  connect(options);
+}, [options]);
+
+// Fix: depend on primitives
+useEffect(() => {
+  connect({ serverUrl, roomId });
+}, [serverUrl, roomId]);
+```
+
+---
+
+## Cleanup and the StrictMode check
+
+In development, StrictMode mounts each component, **unmounts it, and mounts it again** immediately, so every effect runs setup → cleanup → setup. If the app behaves differently (two connections, duplicated subscriptions, a double-counted analytics event), the cleanup is missing or incomplete. Real users trigger the same sequence through fast navigation, Suspense, `Activity` (offscreen rendering), and fast refresh.
+
+Typical setup and cleanup pairs:
+
+| Setup                                        | Cleanup                          |
+| :------------------------------------------- | :------------------------------- |
+| `addEventListener`                           | `removeEventListener`            |
+| `setInterval` / `setTimeout`                 | `clearInterval` / `clearTimeout` |
+| `subscribe()`                                | `unsubscribe()`                  |
+| Open WebSocket or connection                 | Close it                         |
+| `fetch` with `AbortController`               | `controller.abort()`             |
+| Initialise a third-party widget (map, chart) | `widget.destroy()`               |
+| `IntersectionObserver.observe`               | `observer.disconnect()`          |
+
+Effects that must not run twice even in development (a one-time app initialisation) belong outside components: in module code or a guard at the app entry.
+
+---
+
+## Race conditions
+
+Responses can arrive in a different order from requests. Without handling, the last response to arrive wins, not the one for the latest input.
+
+```tsx
+useEffect(() => {
+  const controller = new AbortController();
+  setStatus('loading');
+  fetch(`/api/search?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+    .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .then((data) => {
+      setResults(data);
+      setStatus('done');
+    })
+    .catch((err) => {
+      if (err.name !== 'AbortError') setStatus('error');
+    });
+  return () => controller.abort(); // the previous query's request is cancelled
+}, [query]);
+```
+
+When cancellation is not possible (a third-party async API), use an `ignore` flag set in cleanup so stale results are discarded.
+
+Even correct effect-based fetching lacks caching, deduplication, retries, background refresh, and server rendering, and it creates **network waterfalls**: the parent fetches, renders, then the child mounts and fetches. Prefer Server Components, a router loader, or a data library ([Data and State Management](/fullstack/react/data-and-state-management)).
+
+---
+
+## Stale closures and useEffectEvent
+
+Sometimes an effect must read the latest value of something without re-synchronising when it changes. Example: log a page visit with the current cart count, but only re-run when the URL changes.
+
+```tsx
+const onVisit = useEffectEvent((url: string) => {
+  logVisit(url, cartCount); // always sees the latest cartCount
+});
+
+useEffect(() => {
+  onVisit(url);
+}, [url]); // cartCount is not a dependency
+```
+
+An **effect event** is a function whose identity is not reactive and which always reads the latest props and state. It may only be called from inside effects. Before it existed, the workaround was storing the latest value in a ref updated on every render.
+
+---
+
+## When an effect is not needed
+
+Most effects in real codebases should not exist. The rule: effects synchronise with **external** systems. If no external system is involved, there is probably a better place for the code.
+
+| Effect used to...                                                 | Instead                                                                 |
+| :---------------------------------------------------------------- | :---------------------------------------------------------------------- |
+| Compute a value from props or state                               | Compute during render (`useMemo` if expensive)                          |
+| Reset all state when a prop changes                               | Pass a `key`                                                            |
+| Adjust some state when a prop changes                             | Compute from props, or store the previous prop and adjust during render |
+| Respond to a user action (submit, buy, toggle)                    | Do it in the event handler, where the cause is known                    |
+| Notify a parent when local state changes                          | Call the parent's callback in the same event handler, or lift the state |
+| Chain effects (A's effect sets state that triggers B's effect...) | Compute the next state in one event handler or reducer                  |
+| Fetch data for the initial page                                   | Server Components, loaders, or a data library                           |
+| Subscribe to an external store                                    | `useSyncExternalStore`                                                  |
+| Initialise the app once                                           | Module-level code                                                       |
+
+Effect chains are particularly costly: each step is a separate render and commit, and the UI passes through inconsistent intermediate states.
+
+---
+
+## Refs
+
+```tsx
+const inputRef = useRef<HTMLInputElement>(null);
+<input ref={inputRef} />;
+inputRef.current?.focus();
+
+const intervalId = useRef<number | null>(null); // instance variable that persists across renders
+```
+
+A ref is a plain object `{ current }` stored in the hook list. Changing `.current` does not re-render, and React does not track it.
+
+|                        | State                    | Ref                                                                |
+| :--------------------- | :----------------------- | :----------------------------------------------------------------- |
+| Change triggers render | Yes                      | No                                                                 |
+| Read during render     | Yes                      | Avoid (except lazy initialisation)                                 |
+| Value in a render      | Snapshot                 | Current mutable value                                              |
+| Use for                | Anything shown on screen | DOM nodes, timers, previous values, instances of non-React objects |
+
+Timing: React sets DOM refs during the commit phase (after DOM mutation, before layout effects) and sets them to `null` when the node is removed. Reading `ref.current` during render returns the previous commit's node or `null`; read refs in effects and event handlers.
+
+In React 19, `ref` is a regular prop on function components, so `forwardRef` is no longer needed:
+
+```tsx
+function TextInput({ ref, ...props }: React.ComponentProps<'input'>) {
+  return <input ref={ref} {...props} />;
+}
+```
+
+---
+
+## Callback refs and imperative handles
+
+A **callback ref** is a function React calls with the node when it attaches (and, in React 19, whose returned cleanup runs when it detaches). Useful for measuring nodes in lists or attaching observers per node:
+
+```tsx
+<div
+  ref={(node) => {
+    if (!node) return;
+    const observer = new ResizeObserver(([entry]) => setHeight(entry.contentRect.height));
+    observer.observe(node);
+    return () => observer.disconnect();
+  }}
+/>
+```
+
+`useImperativeHandle` exposes a limited API instead of the raw DOM node, keeping the component's internals encapsulated:
+
+```tsx
+function VideoPlayer({ ref, src }: { ref: React.Ref<{ play(): void }>; src: string }) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  useImperativeHandle(ref, () => ({ play: () => videoRef.current?.play() }), []);
+  return <video ref={videoRef} src={src} />;
+}
+```
+
+Imperative APIs are for things that cannot be expressed as props: focus, scroll, media playback, animations, integrating non-React libraries.
+
+---
+
+## Leaks and debugging
+
+Common sources of memory leaks and ghost updates in React apps:
+
+- Missing cleanup for listeners, intervals, subscriptions, observers.
+- Async work completing after unmount and calling setters (harmless since React 18, but the work and its memory were wasted; abort it).
+- Closures stored in long-lived module caches or global event buses that capture component state.
+- Third-party widgets never destroyed.
+
+Debugging: the React DevTools Profiler shows which component rendered and why ("hook 3 changed"); `why-did-you-render` and the Profiler's "highlight updates" expose unexpected renders; the Chrome Memory panel's heap snapshots reveal detached DOM nodes still referenced by closures.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between useEffect and useLayoutEffect?">
+    useLayoutEffect runs synchronously after DOM mutations and before the browser paints, so it can
+    measure and adjust layout without flicker but blocks painting. useEffect runs after paint and
+    does not block it; it is the default for subscriptions and network work.
+  </Accordion>
+  <Accordion title="Why does StrictMode run effects twice in development?">
+    It mounts, unmounts, and remounts components to verify that every effect's cleanup fully undoes
+    its setup, since real usage (navigation, Suspense, offscreen rendering, fast refresh) repeats
+    those transitions.
+  </Accordion>
+  <Accordion title="How are race conditions prevented when fetching in an effect?">
+    Cancel or ignore the previous request in the cleanup function, with an AbortController or an
+    ignore flag, so only the response for the latest dependencies updates state. Better still, use a
+    data library or server data loading.
+  </Accordion>
+  <Accordion title="Why shouldn't the exhaustive-deps lint rule be silenced?">
+    Missing dependencies leave the effect reading stale values from an old render. When an effect
+    re-runs too often, the fix is to restructure the code (functional updates, moving objects inside
+    the effect, effect events), not to omit dependencies.
+  </Accordion>
+  <Accordion title="When should a ref be used instead of state?">
+    When the value must persist across renders but changing it should not re-render: DOM nodes,
+    timer IDs, previous values, mutable instances of non-React objects. Anything displayed should be
+    state.
+  </Accordion>
+</Accordions>

@@ -1,0 +1,185 @@
+---
+title: JWT
+description: JWT structure, registered claims, HMAC vs RSA vs ECDSA vs EdDSA signing, key rotation with JWKS and kid, a validation checklist, JWS vs JWE, signing and verifying in Node and Python, and revoking tokens early.
+---
+
+An API accepts a JWT whose header says `"alg": "none"` and whose payload says `"role": "admin"`. The library honoured the token's own claim about how it should be checked. Most JWT vulnerabilities are validation mistakes like this, not weaknesses in the format.
+
+---
+
+## The plain-language version
+
+A JWT is a small JSON document with a signature, written as three base64url parts separated by dots. Anyone can read it; only the holder of the key can produce a valid signature. A server trusts the claims inside only after checking the signature **and** the claims (expiry, issuer, audience).
+
+| Word                    | Plain meaning                                               |
+| :---------------------- | :---------------------------------------------------------- |
+| **JWS**                 | JSON Web Signature: signed JWT (the usual kind).            |
+| **JWE**                 | JSON Web Encryption: encrypted JWT, contents hidden.        |
+| **claim**               | A field in the payload: `sub`, `exp`, `role`.               |
+| **HMAC (HS256)**        | Symmetric signature: one shared secret signs and verifies.  |
+| **RSA / ECDSA / EdDSA** | Asymmetric: private key signs, public key verifies.         |
+| **JWKS**                | JSON Web Key Set: published public keys at a URL.           |
+| **kid**                 | Key ID in the header, picking which key verified the token. |
+
+---
+
+## Structure
+
+```text
+eyJhbGciOiJFUzI1NiIsImtpZCI6IjIwMjYtMTEifQ.eyJzdWIiOiJ1XzE5IiwiZXhwIjoxNzYyNDI1MDAwfQ.MEUCIQD...
+         header                                      payload                                  signature
+```
+
+```json
+// header
+{ "alg": "ES256", "typ": "JWT", "kid": "2026-11" }
+// payload
+{
+  "iss": "https://auth.shop.example",
+  "sub": "u_19",
+  "aud": "https://api.shop.example",
+  "exp": 1762425000,
+  "iat": 1762424100,
+  "jti": "7f3a9c",
+  "scope": "orders:read orders:write"
+}
+```
+
+Signature = `sign(base64url(header) + "." + base64url(payload), key)`.
+
+### Registered claims
+
+| Claim | Meaning                                                  |
+| :---- | :------------------------------------------------------- |
+| `iss` | Issuer: who created it                                   |
+| `sub` | Subject: whom it is about (user ID)                      |
+| `aud` | Audience: who should accept it                           |
+| `exp` | Expiry (Unix seconds)                                    |
+| `nbf` | Not valid before                                         |
+| `iat` | Issued at                                                |
+| `jti` | Unique token ID (for revocation lists, replay detection) |
+
+Keep payloads small (they travel on every request) and never include secrets or personal data that should not be readable.
+
+---
+
+## Signing algorithms
+
+| `alg`           | Type                          | Who can verify                                        | Use                                                       |
+| :-------------- | :---------------------------- | :---------------------------------------------------- | :-------------------------------------------------------- |
+| HS256           | HMAC + SHA-256, shared secret | Anyone with the secret, who can also **forge** tokens | Single service that both issues and verifies              |
+| RS256           | RSA signature                 | Anyone with the public key                            | Common with identity providers; large keys and signatures |
+| ES256           | ECDSA P-256                   | Public key                                            | Smaller and faster than RSA                               |
+| EdDSA (Ed25519) | Edwards-curve signature       | Public key                                            | Modern, fast, hard to misuse                              |
+
+With many services verifying tokens, use an asymmetric algorithm: only the auth service holds the private key, and a compromised API cannot mint tokens.
+
+### Key rotation with JWKS
+
+The issuer publishes public keys at `/.well-known/jwks.json`. Each token's `kid` names the signing key. To rotate: publish the new key, start signing with it, keep the old key published until all tokens signed with it have expired, then remove it. Verifiers cache the JWKS and refetch on an unknown `kid` (with rate limiting).
+
+---
+
+## Validation checklist
+
+1. Parse the header; **reject any `alg` not on an explicit allow-list** (never `none`; never let the token choose between HMAC and RSA).
+2. Pick the key by `kid` from the trusted JWKS, never from a URL inside the token (`jku`, `x5u`).
+3. Verify the signature.
+4. Check `exp` and `nbf` with small clock skew (30 to 60 seconds).
+5. Check `iss` and `aud` match exactly.
+6. Check token type where relevant (an ID token must not be accepted as an access token).
+7. Then authorize using `sub` and scopes.
+
+<Tabs items={['Node.js (jose)', 'Python (PyJWT)']}>
+<Tab value="Node.js (jose)">
+
+```ts
+import { SignJWT, jwtVerify, createRemoteJWKSet, importPKCS8 } from 'jose';
+
+const privateKey = await importPKCS8(process.env.JWT_PRIVATE_KEY!, 'EdDSA');
+const token = await new SignJWT({ scope: 'orders:read' })
+  .setProtectedHeader({ alg: 'EdDSA', kid: '2026-11' })
+  .setSubject('u_19')
+  .setIssuer('https://auth.shop.example')
+  .setAudience('https://api.shop.example')
+  .setIssuedAt()
+  .setExpirationTime('15m')
+  .sign(privateKey);
+
+const JWKS = createRemoteJWKSet(new URL('https://auth.shop.example/.well-known/jwks.json'));
+const { payload } = await jwtVerify(token, JWKS, {
+  algorithms: ['EdDSA'],
+  issuer: 'https://auth.shop.example',
+  audience: 'https://api.shop.example',
+  clockTolerance: 30,
+});
+```
+
+</Tab>
+<Tab value="Python (PyJWT)">
+
+```python
+import jwt
+from datetime import datetime, timedelta, timezone
+
+now = datetime.now(timezone.utc)
+token = jwt.encode(
+    {"sub": "u_19", "iss": "https://auth.shop.example", "aud": "https://api.shop.example",
+     "iat": now, "exp": now + timedelta(minutes=15), "scope": "orders:read"},
+    PRIVATE_KEY, algorithm="EdDSA", headers={"kid": "2026-11"},
+)
+
+jwks = jwt.PyJWKClient("https://auth.shop.example/.well-known/jwks.json")
+signing_key = jwks.get_signing_key_from_jwt(token)
+claims = jwt.decode(
+    token, signing_key.key, algorithms=["EdDSA"],
+    audience="https://api.shop.example", issuer="https://auth.shop.example", leeway=30,
+)
+```
+
+</Tab>
+</Tabs>
+
+---
+
+## Revoking a JWT early
+
+Scenario: an Express API issues JWTs valid for one hour. Thirty minutes after login, an administrator bans the user. The token is still valid. How is access stopped immediately?
+
+JWTs are self-contained and remain valid until they expire, so early revocation needs **additional server-side state**. Options, from lightest to heaviest:
+
+| Approach                             | How                                                                                                                                | Cost                                         |
+| :----------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------- |
+| Short access tokens + refresh tokens | Access token lives 5 to 15 minutes; ban revokes refresh tokens so no new access token is issued                                    | Access continues until current token expires |
+| Token version per user               | Store `tokenVersion` on the user; put it in the JWT; increment on ban, password change, or "log out everywhere"; reject mismatches | One cached lookup per request                |
+| Denylist of `jti`                    | Store revoked token IDs in Redis with TTL = remaining lifetime; check on each request                                              | Lookup per request; list stays small         |
+| Check user status per request        | Look up `user.banned` (cached) on each request                                                                                     | Reintroduces a lookup; most direct           |
+| Opaque tokens + introspection        | Replace JWT with a lookup-based token                                                                                              | Fully stateful                               |
+
+For "immediately", combine short-lived access tokens, refresh token revocation, and a Redis denylist or token-version check. That blocks the user at once while keeping most requests cheap. Details of the refresh side are on the [next page](/fullstack/auth/access-and-refresh-tokens).
+
+---
+
+## JWS vs JWE
+
+A normal JWT is a JWS: readable by anyone. A JWE encrypts the payload so only the recipient can read it, useful when tokens pass through parties that should not see the claims. Most apps never need JWE; keep sensitive data out of tokens instead. **PASETO** is an alternative token format with fewer algorithm choices to get wrong.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="A user is banned while their 1-hour JWT is still valid. How is access blocked immediately?">
+    Add server-side state: a Redis denylist of the token's jti or a per-user token version checked
+    on each request, and revoke their refresh tokens so no new access tokens are issued. Use short
+    access-token lifetimes to bound exposure in general.
+  </Accordion>
+  <Accordion title="Is a JWT encrypted?">
+    A standard JWT (JWS) is only signed. Its payload is base64url-encoded and readable by anyone.
+    JWE is the encrypted variant.
+  </Accordion>
+  <Accordion title="HS256 or RS256 for a system with ten microservices?">
+    An asymmetric algorithm such as RS256, ES256, or EdDSA. With HS256 every verifying service holds
+    the secret and could forge tokens.
+  </Accordion>
+</Accordions>

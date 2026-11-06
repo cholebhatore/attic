@@ -1,0 +1,245 @@
+---
+title: HTTPS and TLS
+description: What TLS guarantees, the cryptographic building blocks (hashes, MACs, symmetric AEAD ciphers, Diffie-Hellman key exchange with a worked example, signatures), certificates and X.509, chain validation, revocation and OCSP stapling, Certificate Transparency, the TLS 1.3 handshake vs TLS 1.2, session resumption and 0-RTT, SNI and ECH, HSTS, mTLS, and certificate operations.
+---
+
+On shared Wi-Fi, anyone on the network can read and modify plain HTTP traffic: passwords, session cookies, and injected scripts in pages. HTTPS is HTTP carried inside **TLS**, and it is what makes `Secure` cookies, login forms, service workers, and most modern browser APIs possible (they require a secure context).
+
+---
+
+## The plain-language version
+
+**Where this sits:** between TCP (or inside QUIC) and HTTP. TLS turns an untrusted network path into a private, tamper-evident channel to a verified server.
+
+TLS gives three guarantees:
+
+1. **Confidentiality**: eavesdroppers cannot read the traffic.
+2. **Integrity**: any modification is detected.
+3. **Authentication**: the server is really the owner of `bank.com` (and optionally the client is who it claims).
+
+It works like a diplomatic exchange: the server shows a passport (certificate) stamped by an authority the browser trusts; both sides then agree on a fresh secret key over the open channel in a way an eavesdropper cannot reproduce, and use it to encrypt everything that follows.
+
+Topics, in order:
+
+1. Cryptographic building blocks
+2. Key exchange: Diffie-Hellman, with numbers
+3. Certificates and chain validation
+4. Revocation and Certificate Transparency
+5. The TLS 1.3 handshake (and what changed from 1.2)
+6. Resumption and 0-RTT
+7. SNI, ECH, and what HTTPS does not hide
+8. HSTS
+9. mTLS
+10. Certificates in operation
+
+| Word                        | Plain meaning                                                                                                              |
+| :-------------------------- | :------------------------------------------------------------------------------------------------------------------------- |
+| **hash**                    | One-way fingerprint of data (SHA-256).                                                                                     |
+| **MAC**                     | Message authentication code: a keyed hash proving integrity and origin.                                                    |
+| **symmetric cipher**        | Same key encrypts and decrypts (AES, ChaCha20). Fast.                                                                      |
+| **AEAD**                    | Authenticated encryption with associated data: encryption plus integrity in one step (AES-GCM, ChaCha20-Poly1305).         |
+| **public/private key pair** | Two linked keys: anyone can verify or encrypt with the public one; only the holder of the private one can sign or decrypt. |
+| **certificate**             | A signed statement binding a domain name to a public key.                                                                  |
+| **CA**                      | Certificate authority: an organisation that signs certificates and is trusted by browsers.                                 |
+| **forward secrecy**         | Compromising a long-term private key later does not expose past sessions.                                                  |
+| **cipher suite**            | The set of algorithms used in a session.                                                                                   |
+
+---
+
+## Cryptographic building blocks
+
+| Primitive             | Job in TLS                                           | Algorithms                                                     | Notes                                              |
+| :-------------------- | :--------------------------------------------------- | :------------------------------------------------------------- | :------------------------------------------------- |
+| Hash                  | Transcript hashing, key derivation                   | SHA-256, SHA-384                                               | Collision-resistant; MD5 and SHA-1 are broken      |
+| Key derivation (HKDF) | Turn the shared secret into several keys             | HKDF-SHA256                                                    | Separate keys per direction and purpose            |
+| Key exchange          | Agree on a secret over a public channel              | ECDHE with X25519 or P-256; hybrid post-quantum X25519MLKEM768 | Fresh per connection                               |
+| Signature             | Server proves it holds the certificate's private key | ECDSA, RSA-PSS, Ed25519                                        | Long-term key                                      |
+| AEAD cipher           | Encrypt and authenticate records                     | AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305                    | ChaCha20 is faster on devices without AES hardware |
+
+Asymmetric operations are thousands of times slower than symmetric ones, so TLS uses asymmetric cryptography only during the handshake (to authenticate and agree on keys), then symmetric AEAD for all data.
+
+Browsers now negotiate **hybrid post-quantum key exchange** (X25519 combined with ML-KEM) by default, so recorded traffic cannot be decrypted later by a future quantum computer.
+
+---
+
+## Key exchange: Diffie-Hellman with numbers
+
+How can two parties agree on a secret while an eavesdropper sees every message? Diffie-Hellman with tiny numbers (real TLS uses elliptic curves with 256-bit values):
+
+1. Public parameters: prime p = 23, generator g = 5.
+2. Client picks secret a = 6 and sends A = g^a mod p = 5^6 mod 23 = 15625 mod 23 = **8**.
+3. Server picks secret b = 15 and sends B = g^b mod p = 5^15 mod 23 = **19**.
+4. Client computes B^a mod p = 19^6 mod 23 = **2**.
+5. Server computes A^b mod p = 8^15 mod 23 = **2**.
+
+Both reach the shared secret 2. The eavesdropper saw p, g, 8, and 19, and must solve the discrete logarithm problem (find a from 8 = 5^a mod 23) to get the secret, which is infeasible at real key sizes.
+
+Because client and server generate **fresh ephemeral** values per connection (the "E" in ECDHE) and discard them, a stolen certificate private key later cannot decrypt recorded sessions: **forward secrecy**. TLS 1.2's old RSA key exchange (the client encrypts the secret with the server's public key) lacked this and was removed in TLS 1.3.
+
+Diffie-Hellman alone does not prevent a **man in the middle** who runs one exchange with each side. That is why the server also **signs** the handshake with its certificate key.
+
+---
+
+## Certificates and chain validation
+
+An X.509 certificate contains: subject public key, **Subject Alternative Names** (the domains it covers, including wildcards like `*.example.com`, which cover one label only), issuer, validity period (`notBefore`, `notAfter`), serial number, extensions (key usage, constraints), and the issuer's signature.
+
+<Mermaid
+  chart={`
+flowchart TD
+    R["Root CA certificate (self-signed, in browser/OS trust store)"] -- signs --> I["Intermediate CA certificate"]
+    I -- signs --> L["Leaf certificate: shop.example.com"]
+    L -. "public key used to verify" .-> SIG["Handshake signature (CertificateVerify)"]
+`}
+/>
+
+The server sends its leaf and intermediate certificates. The client:
+
+1. Builds a chain from the leaf up to a **root in its trust store** (the OS or browser root program: Mozilla, Apple, Microsoft, Chrome).
+2. Verifies each signature with the issuer's public key.
+3. Checks validity dates, that intermediates are allowed to issue certificates, and name constraints.
+4. Checks the hostname matches a SAN entry.
+5. Checks revocation (policy varies, below) and Certificate Transparency proofs.
+6. Verifies the server's handshake signature with the leaf's public key, proving possession of the private key.
+
+Roots are kept offline; intermediates do day-to-day signing so a compromised intermediate can be revoked without replacing the root. A server that forgets to send its intermediate works in browsers that cache intermediates and fails in others (and in many API clients): the classic "works in Chrome, fails in curl" certificate bug. Test with `openssl s_client -connect host:443 -servername host -showcerts` or SSL Labs.
+
+| Validation level      | Proves                                     | Use                                               |
+| :-------------------- | :----------------------------------------- | :------------------------------------------------ |
+| DV (domain validated) | Control of the domain (via ACME challenge) | Nearly all sites                                  |
+| OV / EV               | Organisation identity checks               | Little user-visible difference in modern browsers |
+
+---
+
+## Revocation and Certificate Transparency
+
+If a private key leaks, its certificate must be **revoked** before it expires.
+
+| Mechanism                                 | How                                                            | Problem                                                                                                 |
+| :---------------------------------------- | :------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------ |
+| CRL                                       | CA publishes a list of revoked serials                         | Large, slow to update                                                                                   |
+| OCSP                                      | Client asks the CA's responder about one certificate           | Privacy leak, latency, and clients "soft-fail" if unreachable                                           |
+| OCSP stapling                             | Server attaches a recent signed OCSP response to the handshake | Fixes privacy and latency; Let's Encrypt has since ended OCSP in favour of CRLs                         |
+| Browser-pushed CRL sets (CRLite, CRLSets) | Browser downloads compressed revocation data                   | Browser-specific                                                                                        |
+| **Short-lived certificates**              | Certificates valid for days                                    | Revocation matters less; the CA/Browser Forum is reducing maximum lifetimes in steps to 47 days by 2029 |
+
+**Certificate Transparency** (CT): CAs must log every certificate in public, append-only logs, and browsers require proof of logging (SCTs). Domain owners can monitor logs (crt.sh, Cert Spotter) and spot certificates issued for their domains without their knowledge. **CAA** DNS records restrict which CAs may issue for a domain.
+
+---
+
+## The TLS 1.3 handshake
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: ClientHello: versions, cipher suites, key_share (X25519 public), SNI, ALPN (h2), random
+    Note over S: Compute shared secret from key shares, derive handshake keys
+    S->>C: ServerHello: chosen suite, key_share
+    S->>C: {EncryptedExtensions (ALPN result)}
+    S->>C: {Certificate chain}
+    S->>C: {CertificateVerify: signature over transcript}
+    S->>C: {Finished: MAC over transcript}
+    Note over C: Verify chain, signature, Finished. Derive application keys
+    C->>S: {Finished}
+    C->>S: [HTTP request, encrypted with application keys]
+`}
+/>
+
+Braces mark messages already encrypted with handshake keys. Key points:
+
+- The client **guesses** the key exchange group and sends its key share in the first message, so the whole handshake takes **one round trip**. A wrong guess costs one extra RTT (HelloRetryRequest).
+- The certificate is encrypted, hiding which site's certificate is served from passive observers.
+- `CertificateVerify` signs a hash of the entire **transcript**, binding the server's identity to this exact exchange and preventing downgrade attacks.
+- **ALPN** negotiates HTTP/2 or HTTP/1.1 inside the handshake, at no extra cost.
+
+### TLS 1.2 vs 1.3
+
+|                     | TLS 1.2                                        | TLS 1.3                                                                                |
+| :------------------ | :--------------------------------------------- | :------------------------------------------------------------------------------------- |
+| Full handshake      | 2 RTT                                          | 1 RTT                                                                                  |
+| Resumption          | 1 RTT                                          | 1 RTT, or 0-RTT with early data                                                        |
+| Key exchange        | RSA or (EC)DHE                                 | (EC)DHE only: forward secrecy always                                                   |
+| Ciphers             | Many, including CBC modes and RC4 historically | Five AEAD suites                                                                       |
+| Certificate privacy | Sent in clear                                  | Encrypted                                                                              |
+| Removed             |                                                | RSA key transport, static DH, compression, renegotiation, SHA-1, CBC, custom DH groups |
+
+Many historic TLS attacks (BEAST, POODLE, Lucky13, CRIME, FREAK, Logjam, ROBOT) targeted features TLS 1.3 removed. Servers today should offer TLS 1.3 and 1.2 only.
+
+---
+
+## Resumption and 0-RTT
+
+After a full handshake, the server issues a **session ticket** (an encrypted blob containing the resumption secret). On reconnecting, the client presents it (PSK resumption), skipping certificate validation work.
+
+With **0-RTT**, the client also sends application data in its first flight, encrypted with keys derived from the ticket. Because the server has not yet contributed fresh randomness, an attacker can **replay** that early data. Servers and CDNs therefore accept 0-RTT only for safe, idempotent requests (typically `GET` without side effects), and frameworks expose whether a request arrived as early data (the `Early-Data: 1` header and `425 Too Early` status).
+
+Session ticket keys must be rotated and shared across a server fleet; a leaked ticket key breaks forward secrecy for sessions using it.
+
+---
+
+## SNI, ECH, and what HTTPS does not hide
+
+- **SNI** (Server Name Indication) puts the hostname in the ClientHello so one IP can host many certificates. It is sent in clear text, so network observers see which site is visited.
+- **Encrypted Client Hello (ECH)** encrypts the inner ClientHello, including SNI, using a key published in the site's `HTTPS` DNS record. Supported by major browsers and Cloudflare.
+
+Even with HTTPS, observers can see: the IP addresses, the hostname (without ECH and encrypted DNS), timing, and approximate sizes of requests and responses. HTTPS protects the channel only: a compromised server, a malicious browser extension, or XSS on the page are all outside its scope.
+
+---
+
+## HSTS
+
+A user types `bank.com`. The browser tries `http://bank.com` first; the server redirects to HTTPS. An attacker on the network can intercept that first plaintext request and keep the user on HTTP (**SSL stripping**).
+
+```http
+Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+```
+
+After seeing this header over HTTPS once, the browser rewrites all future `http://` requests to that host to `https://` internally for `max-age` seconds and refuses to let users click through certificate errors. The **HSTS preload list**, compiled into browsers, protects even the very first visit. `includeSubDomains` with preload is hard to undo; every subdomain must support HTTPS first.
+
+---
+
+## mTLS
+
+In **mutual TLS**, the server also requests a client certificate and verifies it. Used between microservices (service meshes such as Istio and Linkerd issue short-lived workload certificates automatically), for B2B APIs, IoT devices, and zero-trust networks. It authenticates machines, not users, and certificate distribution and rotation become the operational work.
+
+---
+
+## Certificates in operation
+
+- **ACME** (RFC 8555) automates issuance: the client proves domain control by serving a token over HTTP (`http-01`), creating a DNS TXT record (`dns-01`, required for wildcards), or via TLS-ALPN (`tls-alpn-01`). Let's Encrypt issues free certificates this way; Caddy, Traefik, cert-manager, and Certbot automate renewal.
+- **TLS termination**: commonly at the CDN or load balancer, with the backend reached over a private network or re-encrypted. Know where plaintext exists.
+- **Key storage**: private keys belong in the load balancer or a KMS/HSM, never in images or repositories.
+- **Monitoring**: alert on expiry well in advance; expired certificates have caused outages at large companies repeatedly.
+- **Mixed content**: an HTTPS page loading `http://` scripts has them blocked; `upgrade-insecure-requests` in CSP helps during migrations.
+- **Cost**: TLS 1.3 handshakes are cheap on modern hardware (AES instructions, elliptic curves); "HTTPS is slow" is no longer true, and HTTP/2 and HTTP/3 require it anyway.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why doesn't TLS use asymmetric encryption for all data?">
+    Asymmetric operations are orders of magnitude slower. TLS uses them only to authenticate and
+    agree on keys, then encrypts bulk data with a symmetric AEAD cipher.
+  </Accordion>
+  <Accordion title="What is forward secrecy and how does TLS 1.3 guarantee it?">
+    Past sessions stay private even if the server's long-term private key is later stolen. TLS 1.3
+    only allows ephemeral (EC)DHE key exchange, so session keys are never derivable from the
+    certificate key.
+  </Accordion>
+  <Accordion title="How does a browser know it is talking to the real server?">
+    It validates the certificate chain to a trusted root, checks the hostname against the SANs,
+    checks validity and CT proofs, and verifies the server's signature over the handshake transcript
+    with the certificate's public key.
+  </Accordion>
+  <Accordion title="Why does a site work in a browser but fail with a certificate error in curl or Node?">
+    Usually a missing intermediate certificate. Browsers may have it cached or fetch it; most other
+    clients require the server to send the full chain.
+  </Accordion>
+  <Accordion title="What does HSTS protect against that a redirect does not?">
+    SSL stripping on the first plaintext request. HSTS makes the browser switch to HTTPS before
+    sending anything; preload extends that to the first visit.
+  </Accordion>
+</Accordions>

@@ -1,0 +1,120 @@
+---
+title: Type System
+description: Structural typing, inference, type vs interface, unions and narrowing, discriminated unions, generics, utility types, unknown vs any, and strict tsconfig.
+---
+
+TypeScript's types describe shapes, not names. Two types with the same properties are interchangeable, which is unlike Java or C#, and explains many "why does this compile" moments.
+
+---
+
+## The plain-language version
+
+TypeScript checks that values are used according to their shapes. It infers most types; annotations go on function boundaries. **Unions** say "one of these", and **narrowing** (checks like `typeof` or `in`) tells the checker which one is present. **Generics** are type parameters, like function parameters for types.
+
+| Word                  | Plain meaning                                                  |
+| :-------------------- | :------------------------------------------------------------- |
+| **structural typing** | Compatible if the shape matches, regardless of name.           |
+| **inference**         | The compiler works out the type from the value.                |
+| **union**             | `A \| B`: either type.                                         |
+| **narrowing**         | Refining a union after a check.                                |
+| **generic**           | A type with a parameter: `Array<T>`.                           |
+| **any / unknown**     | `any` turns checking off; `unknown` forces a check before use. |
+
+---
+
+## Basics
+
+```ts
+type User = { id: string; name: string; email?: string }; // optional
+interface Admin extends User {
+  permissions: string[];
+}
+
+function greet(user: User): string {
+  return `Hi ${user.name}`;
+}
+const u = { id: '1', name: 'Ada', age: 36 };
+greet(u); // OK: extra properties are fine when passing a variable (structural)
+```
+
+`type` and `interface` overlap heavily. Interfaces can be merged and extended; type aliases can express unions and mapped types. Pick one convention per codebase.
+
+---
+
+## Unions and narrowing
+
+```ts
+type Result = { status: 'ok'; data: User } | { status: 'error'; message: string };
+
+function render(r: Result) {
+  switch (r.status) {
+    case 'ok':
+      return r.data.name; // r narrowed to the ok branch
+    case 'error':
+      return r.message;
+    default: {
+      const never: never = r;
+      return never;
+    } // exhaustiveness check
+  }
+}
+```
+
+**Discriminated unions** (a shared literal field like `status`) model states without impossible combinations such as `loading: true` together with `error` set.
+
+---
+
+## Generics
+
+```ts
+function first<T>(items: T[]): T | undefined {
+  return items[0];
+}
+const n = first([1, 2, 3]); // number | undefined
+
+async function getJson<T>(url: string): Promise<T> {
+  const res = await fetch(url);
+  return res.json() as Promise<T>; // a promise, not a check: see runtime validation
+}
+```
+
+---
+
+## Utility types
+
+| Utility                      | Result                  |
+| :--------------------------- | :---------------------- |
+| `Partial<User>`              | All fields optional     |
+| `Required<User>`             | All fields required     |
+| `Pick<User, 'id' \| 'name'>` | Only those fields       |
+| `Omit<User, 'email'>`        | All but those           |
+| `Record<string, number>`     | Object map              |
+| `ReturnType<typeof fn>`      | What a function returns |
+| `Awaited<P>`                 | Unwrapped promise type  |
+
+`as const` freezes literals; `satisfies` checks a value against a type without widening it.
+
+---
+
+## tsconfig essentials
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+`strict` is non-negotiable for new code. Frontend projects using a bundler set `"moduleResolution": "Bundler"`.
+
+<Callout type="warn">
+  `any` spreads: anything touched by an `any` becomes unchecked. Use `unknown` for untrusted data
+  and narrow it, ideally with a schema.
+</Callout>

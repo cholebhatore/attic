@@ -1,0 +1,116 @@
+---
+title: Deployment on a VPS
+description: Deploying a full stack app to a single Linux VPS - initial hardening, DNS, Docker Compose, Caddy or Nginx as a reverse proxy with automatic HTTPS, systemd and PM2 alternatives, zero-downtime updates, logs, backups, and monitoring.
+---
+
+A small VPS costs a few dollars a month and can run an API, a database, Redis, and a frontend for a modest-traffic product. Setting one up end to end is the best way to understand what platforms do behind the scenes.
+
+---
+
+## The plan
+
+<Mermaid
+  chart={`
+flowchart LR
+    U["Users"] -- "HTTPS :443" --> C["Caddy (TLS, reverse proxy)"]
+    C --> W["web container :3000"]
+    C --> A["api container :8000"]
+    A --> P["postgres (volume)"]
+    A --> R["redis"]
+    B["Backup job"] --> S3["Object storage"]
+`}
+/>
+
+---
+
+## 1. Prepare the server
+
+```bash
+# as root, once
+adduser deploy && usermod -aG sudo deploy
+mkdir -p /home/deploy/.ssh && cp ~/.ssh/authorized_keys /home/deploy/.ssh/ && chown -R deploy: /home/deploy/.ssh
+# /etc/ssh/sshd_config: PermitRootLogin no, PasswordAuthentication no ; then systemctl restart ssh
+ufw allow OpenSSH && ufw allow 80,443/tcp && ufw enable
+apt install -y unattended-upgrades fail2ban
+curl -fsSL https://get.docker.com | sh && usermod -aG docker deploy
+```
+
+Or run the [Ansible playbook](/fullstack/infrastructure-as-code/ansible). Point DNS `A`/`AAAA` records for the domain at the server's IP ([DNS](/fullstack/web-fundamentals/domains-and-dns)).
+
+---
+
+## 2. Compose and Caddy
+
+```yaml title="/srv/shop/compose.yaml"
+services:
+  caddy:
+    image: caddy:2
+    ports: ['80:80', '443:443']
+    volumes: ['./Caddyfile:/etc/caddy/Caddyfile', 'caddy_data:/data']
+    restart: unless-stopped
+  web:
+    image: ghcr.io/acme/shop-web:${TAG}
+    restart: unless-stopped
+  api:
+    image: ghcr.io/acme/shop-api:${TAG}
+    env_file: .env
+    restart: unless-stopped
+    depends_on: [db, redis]
+  db:
+    image: postgres:17
+    env_file: .env.db
+    volumes: ['pgdata:/var/lib/postgresql/data']
+    restart: unless-stopped
+  redis:
+    image: valkey/valkey:8
+    restart: unless-stopped
+volumes: { caddy_data: {}, pgdata: {} }
+```
+
+```text title="/srv/shop/Caddyfile"
+shop.example.com {
+    encode zstd gzip
+    handle /api/* {
+        reverse_proxy api:8000
+    }
+    handle {
+        reverse_proxy web:3000
+    }
+}
+```
+
+Caddy obtains and renews Let's Encrypt certificates automatically. The Nginx equivalent needs Certbot plus `proxy_set_header` lines for `Host`, `X-Forwarded-For`, and `X-Forwarded-Proto`, and `Upgrade`/`Connection` headers for WebSockets. Database and Redis ports are not published, so they are reachable only inside the Compose network.
+
+---
+
+## 3. Deploy updates
+
+```bash
+# from CI over SSH, after pushing images tagged with the commit SHA
+ssh deploy@shop.example.com "cd /srv/shop && export TAG=$GITHUB_SHA \
+  && docker compose pull && docker compose run --rm api migrate && docker compose up -d"
+```
+
+`up -d` recreates changed containers, which causes a few seconds of downtime per service. For zero downtime on one host: run two app replicas behind Caddy with health checks and update them one at a time, or use tools that automate this (Kamal, Dokku, Coolify, Dokploy).
+
+### Without Docker
+
+Run the app directly with a process manager: **systemd** units (`Restart=always`, `EnvironmentFile=`) or **PM2** for Node (`pm2 start dist/server.js -i max`, `pm2 startup`), and Gunicorn/Uvicorn under systemd for Python.
+
+---
+
+## 4. Operate it
+
+| Concern    | Minimum                                                                                    |
+| :--------- | :----------------------------------------------------------------------------------------- |
+| Backups    | Nightly `pg_dump` to object storage with retention, plus provider snapshots; test restores |
+| Logs       | `docker compose logs`; ship to a log service for search and retention                      |
+| Monitoring | Uptime check on `/healthz`, error tracking (Sentry), disk and memory alerts                |
+| Updates    | Unattended security upgrades; rebuild images for base image patches                        |
+| Secrets    | `.env` files readable only by the deploy user, or a secrets manager                        |
+
+<Callout type="warn">
+  A single VPS is a single point of failure, and the database on it is the riskiest part. Managed
+  Postgres removes backup and failover work for a modest cost, and is often the first thing to move
+  off the box.
+</Callout>

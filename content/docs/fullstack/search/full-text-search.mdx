@@ -1,0 +1,82 @@
+---
+title: Full-text Search
+description: How an inverted index is built and queried, the analysis pipeline, TF-IDF and BM25 ranking, and PostgreSQL full-text search with tsvector, tsquery, GIN indexes, weights, ranking, highlighting, and trigram fuzzy matching.
+---
+
+Before adding Elasticsearch to the stack, it is worth knowing that PostgreSQL ships a capable full-text engine. For many apps it is enough, and it stays transactionally consistent with the data it searches.
+
+---
+
+## How an inverted index works
+
+Documents:
+
+1. "Red running shoes"
+2. "Running jacket"
+3. "Red jacket"
+
+After analysis (lowercase, stem), the index is:
+
+| Term     | Postings |
+| :------- | :------- |
+| `red`    | 1, 3     |
+| `run`    | 1, 2     |
+| `shoe`   | 1        |
+| `jacket` | 2, 3     |
+
+Query "red jacket" → intersect or union postings for `red` and `jacket` → documents 3 (both terms), then 1 and 2 (one term each).
+
+### Analysis pipeline
+
+Character filters (strip HTML) → tokenizer (split on whitespace and punctuation, or n-grams for autocomplete) → token filters (lowercase, stop words, stemming, synonyms, ASCII folding: "café" → "cafe"). The same analysis runs on documents at index time and on queries at search time.
+
+---
+
+## Ranking: TF-IDF and BM25
+
+- **Term frequency**: more occurrences in a document, more relevant.
+- **Inverse document frequency**: rare terms matter more than common ones ("ultralight" beats "shoe").
+- **BM25** adds saturation (the 10th occurrence adds little) and length normalisation (a match in a short title beats one in a long article).
+
+Real relevance also blends field boosts (title over body), recency, popularity, and business rules.
+
+---
+
+## PostgreSQL full-text search
+
+```sql
+ALTER TABLE products ADD COLUMN search tsvector
+  GENERATED ALWAYS AS (
+    setweight(to_tsvector('english', coalesce(name, '')), 'A') ||
+    setweight(to_tsvector('english', coalesce(description, '')), 'B')
+  ) STORED;
+
+CREATE INDEX products_search_idx ON products USING gin (search);
+
+SELECT id, name,
+       ts_rank_cd(search, q) AS rank,
+       ts_headline('english', description, q) AS snippet
+FROM products, websearch_to_tsquery('english', 'red running -kids') AS q
+WHERE search @@ q
+ORDER BY rank DESC
+LIMIT 20;
+```
+
+- `websearch_to_tsquery` accepts Google-like syntax: quotes, `or`, `-exclude`.
+- Weights A–D let name matches outrank description matches.
+- Built-in ranking is simpler than BM25; extensions such as `pg_search` (ParadeDB) add BM25 inside Postgres.
+
+### Fuzzy matching with trigrams
+
+```sql
+CREATE EXTENSION pg_trgm;
+CREATE INDEX products_name_trgm ON products USING gin (name gin_trgm_ops);
+SELECT name FROM products WHERE name % 'runing shoos' ORDER BY similarity(name, 'runing shoos') DESC;
+-- also speeds up ILIKE '%term%'
+```
+
+---
+
+## Where Postgres FTS runs out
+
+Advanced typo tolerance, faceting at scale, per-language analysers beyond the built-ins, synonyms management, "search as you type" across millions of documents, and relevance tuning tools. At that point, a [dedicated engine](/fullstack/search/search-engines-and-vectors) earns its operational cost.

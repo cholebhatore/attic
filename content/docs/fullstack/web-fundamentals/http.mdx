@@ -1,0 +1,309 @@
+---
+title: HTTP
+description: HTTP semantics in depth - resources and representations, message structure, methods and their safety, idempotency, and cacheability, the status code classes, header categories, content negotiation, conditional and range requests, cookies and state, redirects, connection management, and message framing.
+---
+
+A form submits twice because a user double-clicked, and two orders are created. A CDN serves one user's account page to another. A file download restarts from zero after a dropped connection. All three are HTTP semantics problems: the protocol already defines how to make retries safe, which responses may be shared, and how to resume transfers.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the application protocol of the web, running over TCP+TLS ([HTTP/1.1, HTTP/2](/fullstack/web-fundamentals/http-versions)) or QUIC (HTTP/3). This page covers what HTTP **means** (semantics, defined in RFC 9110), which is identical in every version. The next page covers how each version puts those messages on the wire.
+
+A client sends a **request**: a method (what to do), a target (which resource), headers (metadata), and an optional body. The server returns a **response**: a status code (what happened), headers, and an optional body. HTTP is **stateless**: each request stands alone; anything the server must remember about the client travels with each request (cookies, tokens).
+
+Topics, in order:
+
+1. Resources, URLs, and representations
+2. Message structure
+3. Methods: safe, idempotent, cacheable
+4. Status codes
+5. Headers by category
+6. Content negotiation
+7. Conditional requests
+8. Range requests
+9. Cookies and state
+10. Redirects
+11. Connections and framing
+
+| Word               | Plain meaning                                                                                |
+| :----------------- | :------------------------------------------------------------------------------------------- |
+| **resource**       | Anything identified by a URL: a document, an order, a search result.                         |
+| **representation** | A particular encoding of a resource's state: JSON, HTML, gzip-compressed, English.           |
+| **safe**           | The client does not request any state change.                                                |
+| **idempotent**     | Repeating the request has the same intended effect as sending it once.                       |
+| **cacheable**      | A response that caches may store and reuse.                                                  |
+| **validator**      | A value used to check whether a stored response is still current: `ETag` or `Last-Modified`. |
+| **origin server**  | The server that owns the resource, as opposed to proxies and caches between.                 |
+
+---
+
+## Resources, URLs, and representations
+
+```text
+https://shop.example.com:443/api/orders/981?expand=items#summary
+\___/   \______________/\__/\_______________/\__________/\______/
+scheme       host       port       path          query    fragment
+```
+
+- The **fragment** never reaches the server; it is handled by the browser.
+- The **origin** is scheme + host + port; it is the unit of browser security ([Browser Security Model](/fullstack/web-fundamentals/browser-security-model)).
+- Reserved characters in paths and queries must be **percent-encoded** (`space` → `%20`). Building URLs by string concatenation without encoding is a common bug and an injection risk; use `URL` and `URLSearchParams` (or `urllib.parse`).
+
+A server never sends "the resource", only a **representation** of it. The same resource `/reports/q3` can have an HTML, PDF, and JSON representation, compressed or not, in several languages.
+
+---
+
+## Message structure
+
+```http
+POST /api/orders HTTP/1.1
+Host: shop.example.com
+Content-Type: application/json
+Content-Length: 27
+Accept: application/json
+Authorization: Bearer eyJhbGciOi...
+Idempotency-Key: 4f1c2d1e-7a8b-4c3d-9e0f-112233445566
+
+{"productId": 42, "qty": 1}
+```
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+Location: /api/orders/981
+Cache-Control: no-store
+Content-Length: 41
+
+{"id": 981, "status": "pending", "qty": 1}
+```
+
+- **Start line**: method, target, version / version, status code, reason phrase.
+- **Header fields**: case-insensitive names. Fields with the same name can be combined with commas (except `Set-Cookie`).
+- **Empty line**, then the **body**, whose length is known from `Content-Length`, chunked encoding, or the end of the connection.
+
+---
+
+## Methods
+
+| Method          | Meaning                                                     | Safe | Idempotent        | Cacheable | Body           |
+| :-------------- | :---------------------------------------------------------- | :--- | :---------------- | :-------- | :------------- |
+| `GET`           | Transfer a representation                                   | Yes  | Yes               | Yes       | Not meaningful |
+| `HEAD`          | Same as GET without body                                    | Yes  | Yes               | Yes       | No             |
+| `OPTIONS`       | Describe communication options (CORS preflight)             | Yes  | Yes               | No        | Optional       |
+| `POST`          | Process the enclosed representation per resource semantics  | No   | No                | Rarely    | Yes            |
+| `PUT`           | Replace the target's state with the enclosed representation | No   | Yes               | No        | Yes            |
+| `PATCH`         | Apply a partial modification (RFC 5789)                     | No   | Not by definition | No        | Yes            |
+| `DELETE`        | Remove the association between target and its state         | No   | Yes               | No        | Rarely         |
+| `QUERY` (draft) | Safe, idempotent query with a body                          | Yes  | Yes               | Yes       | Yes            |
+
+### Why these properties matter
+
+- **Safe** methods can be prefetched, crawled, retried, and repeated by caches and browsers freely. A `GET /logout` or `GET /delete?id=5` link will eventually be triggered by a prefetcher or crawler. State changes never belong on `GET`.
+- **Idempotent** methods can be retried automatically after a network failure, because the client cannot know whether the first attempt reached the server. Browsers, proxies, and HTTP clients retry idempotent requests on connection failures; they do not retry `POST`.
+  - Idempotency is about the **effect on server state**, not the response. A second `DELETE /orders/981` may return `404` instead of `204`, but the end state (order gone) is the same.
+  - `PUT /users/7 {"name":"Ada"}` is idempotent. `PATCH /cart {"op":"add","item":42}` is not; `PATCH /users/7 {"name":"Ada"}` (JSON Merge Patch setting a value) effectively is.
+  - To make `POST` safely retryable, APIs use an **idempotency key** ([details](/fullstack/building-for-scale/degradation-and-idempotency)).
+- **Cacheable**: responses to `GET` and `HEAD` are cacheable by default when they have explicit freshness or validators; `POST` responses only with explicit freshness and a `Content-Location`, which almost nobody uses.
+
+---
+
+## Status codes
+
+| Class             | Meaning                       | Codes worth knowing                                                                                                                                                                                                                                                      |
+| :---------------- | :---------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1xx Informational | Interim response              | `100 Continue` (client may send a large body), `101 Switching Protocols` (WebSocket), `103 Early Hints` (preload links before the final response)                                                                                                                        |
+| 2xx Success       | Request succeeded             | `200 OK`, `201 Created` (+ `Location`), `202 Accepted` (async processing), `204 No Content`, `206 Partial Content`                                                                                                                                                       |
+| 3xx Redirection   | Further action needed         | `301`, `302`, `303`, `307`, `308`, `304 Not Modified`                                                                                                                                                                                                                    |
+| 4xx Client error  | Request is wrong              | `400`, `401`, `403`, `404`, `405 Method Not Allowed` (+ `Allow`), `406`, `409 Conflict`, `410 Gone`, `412 Precondition Failed`, `413 Content Too Large`, `415 Unsupported Media Type`, `422 Unprocessable Content`, `428 Precondition Required`, `429 Too Many Requests` |
+| 5xx Server error  | Server failed a valid request | `500`, `501 Not Implemented`, `502 Bad Gateway`, `503 Service Unavailable` (+ `Retry-After`), `504 Gateway Timeout`                                                                                                                                                      |
+
+Distinctions that are often blurred:
+
+| Pair                    | Difference                                                                                                                                                           |
+| :---------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `401` vs `403`          | `401`: no valid credentials (must include `WWW-Authenticate`). `403`: credentials are valid but not sufficient.                                                      |
+| `400` vs `422`          | `400`: malformed (unparseable JSON). `422`: well-formed but semantically invalid.                                                                                    |
+| `404` vs `410`          | `410` says the resource existed and is permanently gone; caches and crawlers can drop it.                                                                            |
+| `502` vs `503` vs `504` | `502`: upstream sent an invalid response or refused the connection. `503`: deliberately unavailable (overload, maintenance). `504`: upstream did not answer in time. |
+| `200` vs `204`          | `204` has no body; a client must not try to parse one.                                                                                                               |
+
+Clients treat an unknown code as the `x00` of its class, so a custom `499` is handled like `400`.
+
+---
+
+## Headers by category
+
+| Category                          | Headers                                                                                          |
+| :-------------------------------- | :----------------------------------------------------------------------------------------------- |
+| Representation                    | `Content-Type`, `Content-Encoding`, `Content-Language`, `Content-Length`, `Content-Location`     |
+| Content negotiation               | `Accept`, `Accept-Encoding`, `Accept-Language`, `Vary`                                           |
+| Conditional                       | `ETag`, `Last-Modified`, `If-None-Match`, `If-Modified-Since`, `If-Match`, `If-Unmodified-Since` |
+| Caching                           | `Cache-Control`, `Age`, `Expires` ([HTTP caching](/fullstack/performance/http-caching))          |
+| Auth                              | `Authorization`, `WWW-Authenticate`, `Proxy-Authorization`                                       |
+| State                             | `Cookie`, `Set-Cookie`                                                                           |
+| Routing and proxies               | `Host`, `Forwarded`, `X-Forwarded-For`, `Via`                                                    |
+| Connection (HTTP/1.1, hop-by-hop) | `Connection`, `Keep-Alive`, `Transfer-Encoding`, `Upgrade`                                       |
+| Security                          | `Strict-Transport-Security`, `Content-Security-Policy`, CORS headers                             |
+| Retry and limits                  | `Retry-After`, `RateLimit`, `RateLimit-Policy`                                                   |
+
+**End-to-end** headers travel to the final recipient; **hop-by-hop** headers (`Connection`, `Transfer-Encoding`, `Keep-Alive`, `Upgrade`) apply only to one connection and are removed by proxies. HTTP/2 and HTTP/3 forbid connection-specific headers entirely.
+
+### Content-Type and encoding
+
+`Content-Type: text/html; charset=utf-8` declares the media type and character encoding. A missing or wrong `Content-Type` causes browsers to sniff (a security risk, stopped with `X-Content-Type-Options: nosniff`) and APIs to misparse bodies. `Content-Encoding: br` (Brotli) or `gzip` means the body is compressed; the client advertised support with `Accept-Encoding`.
+
+---
+
+## Content negotiation
+
+```http
+GET /reports/q3
+Accept: application/pdf, text/html;q=0.8, */*;q=0.1
+Accept-Language: hi-IN, en;q=0.7
+Accept-Encoding: br, gzip
+```
+
+The `q` value is a preference weight from 0 to 1. The server picks the best representation it can produce, or returns `406 Not Acceptable` (most servers just pick a default).
+
+The response must say what varied:
+
+```http
+Content-Type: text/html; charset=utf-8
+Content-Language: hi-IN
+Content-Encoding: br
+Vary: Accept, Accept-Language, Accept-Encoding
+```
+
+Without `Vary`, a shared cache could store the Hindi HTML and serve it to an English PDF request. `Vary` is also why caching responses that vary on `Cookie` or `Authorization` destroys cache hit rates.
+
+---
+
+## Conditional requests
+
+Conditional headers make requests depend on the current state of the resource, which serves two very different goals: cheap revalidation and safe concurrent updates.
+
+### Revalidation (reads)
+
+```http
+GET /api/catalog
+If-None-Match: "v42"
+
+HTTP/1.1 304 Not Modified
+ETag: "v42"
+```
+
+A `304` has no body. The client reuses its stored copy, paying one round trip but no transfer.
+
+| Validator       | Strength                      | Notes                                      |
+| :-------------- | :---------------------------- | :----------------------------------------- |
+| `ETag: "v42"`   | Strong: byte-identical        | Hash of content or a version number        |
+| `ETag: W/"v42"` | Weak: semantically equivalent | Allows different compression or whitespace |
+| `Last-Modified` | One-second resolution         | Fallback when no ETag                      |
+
+### Optimistic concurrency (writes)
+
+Two editors open article version `"v7"`. The first saves with `If-Match: "v7"` and succeeds, producing `"v8"`. The second saves with `If-Match: "v7"` and gets `412 Precondition Failed` instead of silently overwriting the first edit (the **lost update** problem). APIs can require it with `428 Precondition Required`.
+
+```http
+PUT /articles/12
+If-Match: "v7"
+Content-Type: application/json
+
+HTTP/1.1 412 Precondition Failed
+```
+
+`If-None-Match: *` on a `PUT` means "create only if it does not exist", preventing two clients from both creating the same resource.
+
+---
+
+## Range requests
+
+```http
+GET /videos/intro.mp4
+Range: bytes=1048576-2097151
+
+HTTP/1.1 206 Partial Content
+Content-Range: bytes 1048576-2097151/52428800
+Accept-Ranges: bytes
+```
+
+Used for resuming downloads, video seeking, and parallel downloads. `If-Range` with an ETag ensures the remaining bytes come from the same version of the file; if it changed, the server sends the full new file. Object storage (S3, R2) supports ranges natively.
+
+---
+
+## Cookies and state
+
+HTTP is stateless; cookies (RFC 6265) add client-side state that the browser sends back automatically.
+
+```http
+HTTP/1.1 200 OK
+Set-Cookie: __Host-sid=8f3a...; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=604800
+```
+
+```http
+GET /account
+Cookie: __Host-sid=8f3a...; theme=dark
+```
+
+- Each `Set-Cookie` sets one cookie; the browser stores it keyed by name, domain, and path.
+- Without `Max-Age`/`Expires`, it is a **session cookie**, deleted when the browser session ends (browsers that restore sessions may keep it).
+- Limits: about 4 KB per cookie and a few dozen per domain; every cookie is sent with every matching request, so large cookies add bytes to every request, including static assets on the same domain.
+- Attributes (`HttpOnly`, `Secure`, `SameSite`, `Domain`, `Path`, prefixes) and third-party restrictions: [Browser Security Model](/fullstack/web-fundamentals/browser-security-model). Using cookies for sessions: [Sessions](/fullstack/auth/sessions).
+
+---
+
+## Redirects
+
+| Code                     | Permanent | Method on redirect                  | Use                                                                                                |
+| :----------------------- | :-------- | :---------------------------------- | :------------------------------------------------------------------------------------------------- |
+| `301 Moved Permanently`  | Yes       | Browsers may change `POST` to `GET` | Moved pages (historically)                                                                         |
+| `308 Permanent Redirect` | Yes       | Preserved                           | Permanent move of APIs and forms                                                                   |
+| `302 Found`              | No        | Browsers may change `POST` to `GET` | Generic temporary redirect                                                                         |
+| `307 Temporary Redirect` | No        | Preserved                           | Temporary move keeping method and body                                                             |
+| `303 See Other`          | No        | Always `GET`                        | **Post/Redirect/Get**: after a form `POST`, redirect to a result page so refresh does not resubmit |
+
+Permanent redirects are cached by browsers, sometimes indefinitely; a wrong `301` is hard to undo. Redirect chains cost a round trip each (`http://` → `https://` → `www.` → `/home` is three extra trips). Open redirects (`?next=` accepting any URL) are a phishing vector.
+
+---
+
+## Connections and framing
+
+- HTTP/1.1 connections are **persistent** by default: many requests reuse one TCP connection sequentially (`Connection: close` ends it).
+- The receiver must know where each body ends:
+  - `Content-Length: 1234`, or
+  - `Transfer-Encoding: chunked`: a series of length-prefixed chunks ending with a zero-length chunk, used when the size is unknown in advance (streamed responses).
+- **Request smuggling**: when a front-end proxy and a back-end server disagree about where a request ends (one trusts `Content-Length`, the other `Transfer-Encoding`), an attacker can hide a second request inside the first. Prevention: normalised parsing, rejecting ambiguous messages, and HTTP/2 end to end.
+- **Trailers** are headers sent after a chunked or HTTP/2 body (gRPC sends its status in trailers).
+
+Version differences (pipelining, multiplexing, header compression, QUIC) are on the [next page](/fullstack/web-fundamentals/http-versions).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Is PATCH idempotent?">
+    Not by definition. A patch that sets values (JSON Merge Patch with fixed values) is effectively
+    idempotent; a patch that appends or increments is not. PUT and DELETE are required to be
+    idempotent.
+  </Accordion>
+  <Accordion title="Why should GET never change state?">
+    GET is defined as safe, so browsers prefetch it, crawlers follow it, caches replay it, and
+    clients retry it. Any state change behind a GET will eventually be triggered unintentionally.
+  </Accordion>
+  <Accordion title="How does HTTP prevent two users overwriting each other's edits?">
+    Conditional requests: the client sends If-Match with the ETag it last saw. If the resource
+    changed, the server returns 412 Precondition Failed instead of applying the update.
+  </Accordion>
+  <Accordion title="Why does Vary matter for caching?">
+    It tells caches which request headers changed the response. Without it, a cache can serve a
+    representation (language, encoding, user-specific content) to a request that should have
+    received a different one.
+  </Accordion>
+  <Accordion title="Why use 303 after a form POST?">
+    Post/Redirect/Get: the browser follows with a GET to the result page, so refreshing or pressing
+    back does not resubmit the form.
+  </Accordion>
+</Accordions>

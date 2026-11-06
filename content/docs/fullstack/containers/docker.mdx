@@ -1,0 +1,105 @@
+---
+title: Docker
+description: Dockerfile instructions, layer caching and instruction order, .dockerignore, multi-stage builds for Node.js and Python with uv, running as non-root, image size, tags and digests, everyday commands, and container security basics.
+---
+
+A Node image is 1.4 GB and rebuilds from scratch on every code change because `COPY . .` comes before `npm install`. Reordering two lines and adding a multi-stage build brings it to about 150 MB with rebuilds in seconds. Dockerfiles reward knowing how layers and caching work.
+
+---
+
+## Layers and caching
+
+Each instruction creates a layer. When building, Docker reuses cached layers until it reaches an instruction whose inputs changed; everything after is rebuilt. So: copy dependency manifests and install first (changes rarely), then copy source code (changes often).
+
+```text title=".dockerignore"
+node_modules
+.git
+.env
+dist
+.venv
+__pycache__
+```
+
+---
+
+## Node.js multi-stage build
+
+```dockerfile title="Dockerfile"
+# 1. Install all deps and build
+FROM node:24-slim AS build
+WORKDIR /app
+RUN corepack enable
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm build && pnpm prune --prod
+
+# 2. Minimal runtime
+FROM node:24-slim
+WORKDIR /app
+ENV NODE_ENV=production
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY package.json ./
+USER node
+EXPOSE 3000
+CMD ["node", "dist/server.js"]
+```
+
+---
+
+## Python multi-stage build with uv
+
+```dockerfile title="Dockerfile"
+FROM python:3.13-slim AS build
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+WORKDIR /app
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-dev --no-install-project
+COPY . .
+RUN uv sync --locked --no-dev
+
+FROM python:3.13-slim
+WORKDIR /app
+COPY --from=build /app /app
+ENV PATH="/app/.venv/bin:$PATH"
+RUN useradd --create-home app
+USER app
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+Pin the uv image to a version tag in real projects rather than `latest`.
+
+---
+
+## Good practice
+
+| Practice                                         | Why                                                                                                                |
+| :----------------------------------------------- | :----------------------------------------------------------------------------------------------------------------- |
+| Slim or distroless base images                   | Fewer packages, smaller attack surface                                                                             |
+| Pin base image versions (or digests)             | Reproducible builds                                                                                                |
+| Run as non-root (`USER`)                         | Limits damage from a compromise                                                                                    |
+| Exec-form `CMD ["node", ...]`                    | Process is PID 1 and receives `SIGTERM` for [graceful shutdown](/fullstack/backend-fundamentals/request-lifecycle) |
+| One process per container                        | Scaling and logs stay simple                                                                                       |
+| Logs to stdout/stderr                            | The platform collects them                                                                                         |
+| Config via env vars, secrets via the platform    | Never bake secrets into layers; they remain in image history                                                       |
+| Scan images (Trivy, Docker Scout, Grype)         | Known CVEs in base packages                                                                                        |
+| BuildKit cache mounts (`RUN --mount=type=cache`) | Faster dependency installs                                                                                         |
+
+---
+
+## Everyday commands
+
+```bash
+docker build -t shop-api:dev .
+docker run --rm -p 3000:3000 --env-file .env shop-api:dev
+docker ps; docker logs -f <id>; docker exec -it <id> sh
+docker image ls; docker system df; docker system prune
+docker tag shop-api:dev ghcr.io/acme/shop-api:1.4.0
+docker push ghcr.io/acme/shop-api:1.4.0
+docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/acme/shop-api:1.4.0 --push .
+```
+
+Tag images with the Git SHA or a version, never deploy `latest`: it changes underneath and makes rollbacks ambiguous. Apple Silicon laptops build `arm64` by default; build for the server's architecture.

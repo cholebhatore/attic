@@ -1,0 +1,96 @@
+---
+title: Branching and History
+description: Merge vs rebase, fast-forwards, conflicts, interactive rebase, cherry-pick, reset vs revert, stash, and safe force-pushing.
+---
+
+Two developers rebase the same shared branch and force-push. One of them silently overwrites the other's commits. Knowing which operations rewrite history, and where that is safe, prevents most team Git incidents.
+
+---
+
+## The plain-language version
+
+**Merge** joins two lines of history with a new commit that has two parents. **Rebase** replays commits on top of another branch, creating new copies. Merge preserves what happened; rebase produces a straight line. Rewriting history is fine on a private branch and harmful on a shared one.
+
+| Word             | Plain meaning                                            |
+| :--------------- | :------------------------------------------------------- |
+| **fast-forward** | The branch ref just moves ahead; no merge commit needed. |
+| **merge commit** | A commit with two parents joining branches.              |
+| **rebase**       | Re-apply commits on a new base, producing new hashes.    |
+| **squash**       | Combine several commits into one.                        |
+| **cherry-pick**  | Copy one commit onto the current branch.                 |
+| **revert**       | A new commit that undoes an earlier one.                 |
+
+---
+
+## Merge vs rebase
+
+```bash
+git switch feature
+git rebase main          # replay feature commits on top of main
+git switch main
+git merge --ff-only feature
+```
+
+|                         | Merge         | Rebase                            |
+| :---------------------- | :------------ | :-------------------------------- |
+| History                 | True, branchy | Linear, rewritten                 |
+| Hashes                  | Unchanged     | New for replayed commits          |
+| Conflicts               | Resolved once | Possibly once per replayed commit |
+| Safe on shared branches | Yes           | No                                |
+
+The golden rule: do not rebase commits that others have already pulled. Many teams use **squash merge** on pull requests, so `main` gets one commit per PR regardless of branch history.
+
+---
+
+## Conflicts
+
+A conflict means both sides changed the same lines. Git writes markers:
+
+```text
+<<<<<<< HEAD
+const timeout = 5000;
+=======
+const timeout = 10_000;
+>>>>>>> feature
+```
+
+Edit to the intended result, `git add`, then `git merge --continue` or `git rebase --continue`. `git rebase --abort` returns to the start. `git config --global rerere.enabled true` remembers resolutions for repeated conflicts.
+
+---
+
+## Rewriting local history
+
+```bash
+git commit --amend                # fix the last commit
+git rebase -i HEAD~4              # reorder, squash, edit, drop (interactive editor)
+git commit --fixup abc123         # mark a fix for a commit
+git rebase -i --autosquash main   # fold fixups in
+```
+
+---
+
+## Undoing
+
+| Situation                         | Command                                                       |
+| :-------------------------------- | :------------------------------------------------------------ |
+| Undo last commit, keep changes    | `git reset --soft HEAD~1`                                     |
+| Undo a pushed commit safely       | `git revert <sha>`                                            |
+| Discard local changes to a file   | `git restore path`                                            |
+| Park work temporarily             | `git stash push -m "wip"`, later `git stash pop`              |
+| Copy one commit across            | `git cherry-pick <sha>`                                       |
+| Find which commit broke something | `git bisect start`, `git bisect bad`, `git bisect good <sha>` |
+
+If a force-push is needed on a personal branch, use `git push --force-with-lease`, which refuses if the remote moved since the last fetch.
+
+---
+
+## Branching strategies
+
+- **Trunk-based**: short-lived branches merged into `main` daily, unfinished work behind [feature flags](/fullstack/building-for-scale/degradation-and-idempotency). Common with continuous deployment.
+- **GitHub flow**: branch, PR, review, merge, deploy.
+- **Git flow**: `develop`, `release`, `hotfix` branches. Heavier; suits versioned releases more than web apps.
+
+<Callout type="warn">
+  Line endings: on Windows, set `core.autocrlf=true` or add a `.gitattributes` with `* text=auto` so
+  diffs are not full of CRLF changes.
+</Callout>

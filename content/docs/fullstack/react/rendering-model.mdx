@@ -1,0 +1,283 @@
+---
+title: Rendering Model
+description: React's core model - UI as a function of state, what JSX compiles to, elements vs components vs instances, the render and commit phases, purity and why StrictMode double-invokes, reconciliation and its O(n) heuristics, keys and identity, state preservation by position, and what does and does not trigger a re-render.
+---
+
+A list of editable rows uses the array index as its `key`. Deleting the first row makes every other row's typed text shift up by one. A component defined inside another component loses its input focus on every keystroke. A modal's state resets whenever its parent switches from a `div` to a `section` wrapper. None of these are React bugs: React is doing exactly what its identity and reconciliation rules say. This page is those rules.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first React page. Everything else (hooks, effects, performance, Server Components) assumes this model.
+
+React treats the UI as the output of a function: given props and state, a component returns a **description** of what the screen should look like. React does not let components touch the DOM directly. Instead it calls them (**render**), compares the new description with the previous one (**reconcile**), and applies only the differences to the DOM (**commit**). Think of an architect who redraws the whole blueprint whenever anything changes, and a builder who compares the new blueprint with the old one and moves only the walls that changed.
+
+Topics, in order:
+
+1. UI as a function of state
+2. JSX, elements, components, instances
+3. Render phase and commit phase
+4. Purity and StrictMode
+5. Reconciliation: the diffing algorithm
+6. Keys and identity
+7. State is tied to position in the tree
+8. What triggers a render, and what a render costs
+
+| Word                 | Plain meaning                                                                         |
+| :------------------- | :------------------------------------------------------------------------------------ |
+| **element**          | A plain, immutable object describing UI: `{ type, props, key }`.                      |
+| **component**        | A function that returns elements.                                                     |
+| **instance / fiber** | React's internal record for a component at a position in the tree, holding its state. |
+| **render**           | Calling components to produce a new element tree. No DOM changes.                     |
+| **reconciliation**   | Comparing the new tree with the previous one to find changes.                         |
+| **commit**           | Applying changes to the DOM and running layout effects and refs.                      |
+| **key**              | A stable identity for an element among its siblings.                                  |
+| **mount / unmount**  | Instance created and inserted / removed and its state destroyed.                      |
+| **virtual DOM**      | Informal name for the element tree React compares; not a copy of the real DOM.        |
+
+---
+
+## UI as a function of state
+
+$$
+\text{UI} = f(\text{state})
+$$
+
+Imperative UI code (jQuery era) mutates the DOM step by step: "on click, add class, append node, update counter". With several interacting features, the number of possible transitions grows quickly and the DOM drifts out of sync with the data. React's declarative model only asks: given this state, what should the UI be? React works out the transitions.
+
+Consequences that shape everything else:
+
+- The **state** is the single source of truth; the DOM is derived.
+- Rendering must be cheap and safe to repeat, because React may call components often, more than once, or throw the result away.
+- Anything that is not a pure description of UI (fetching, subscriptions, timers, manual DOM work) needs an explicit escape hatch: event handlers or [effects](/fullstack/react/effects-and-refs).
+
+---
+
+## JSX, elements, components, instances
+
+JSX is syntax that compiles to function calls. With the modern automatic runtime:
+
+```tsx
+// Source
+<Button variant="primary" onClick={save}>
+  Save
+</Button>;
+
+// Compiled (react/jsx-runtime)
+import { jsx as _jsx } from 'react/jsx-runtime';
+_jsx(Button, { variant: 'primary', onClick: save, children: 'Save' });
+```
+
+Calling it produces an **element**, a small immutable object:
+
+```js
+{
+  $$typeof: Symbol.for('react.transitional.element'),
+  type: Button,               // a function, or a string like 'div' for host elements
+  key: null,
+  props: { variant: 'primary', onClick: save, children: 'Save' },
+}
+```
+
+| Concept          | What it is                                                                       | Lifetime                              |
+| :--------------- | :------------------------------------------------------------------------------- | :------------------------------------ |
+| Component        | The function `Button`                                                            | Defined once in code                  |
+| Element          | Description returned on one render                                               | Created every render, discarded after |
+| Instance (fiber) | React's record for `Button` at one place in the tree; holds state, effects, refs | From mount to unmount                 |
+
+Creating elements is cheap; they are plain objects. "Re-rendering" a component means calling its function again to get new elements, not rebuilding DOM.
+
+---
+
+## Render phase and commit phase
+
+<Mermaid
+  chart={`
+flowchart LR
+    T["Trigger: initial mount, setState, parent render, context change"] --> R["Render phase: call components, build new tree, diff against current tree"]
+    R --> C["Commit phase: apply DOM mutations"]
+    C --> L["Layout effects and ref callbacks (synchronous, before paint)"]
+    L --> P["Browser paints"]
+    P --> E["Passive effects (useEffect), after paint"]
+`}
+/>
+
+|                                             | Render phase                                                 | Commit phase                                     |
+| :------------------------------------------ | :----------------------------------------------------------- | :----------------------------------------------- |
+| What happens                                | Components are called; the new tree is compared with the old | DOM is mutated; refs attached; effects scheduled |
+| Side effects allowed                        | No                                                           | Yes (in effects and ref callbacks)               |
+| Can be interrupted, restarted, or discarded | Yes (concurrent rendering)                                   | No: synchronous and atomic                       |
+| Visible to users                            | No                                                           | Yes                                              |
+
+Because the render phase can run without committing (an interrupted concurrent render, a Suspense boundary waiting, a transition superseded by a newer one), code that runs during render must not do anything that matters if the render is thrown away. That is the reason behind **purity**. How the render phase is scheduled and interrupted is covered in [Fiber and Scheduling](/fullstack/react/fiber-and-scheduling).
+
+---
+
+## Purity and StrictMode
+
+A pure component, given the same props, state, and context, returns the same elements and changes nothing outside itself during render.
+
+Impure render code and its symptoms:
+
+```tsx
+let renderCount = 0;
+function Counter() {
+  renderCount++; // mutates outside state during render
+  const id = Math.random(); // differs between server and client: hydration mismatch
+  items.push('x'); // mutates a prop or module array
+  fetch('/api/track'); // side effect: runs on every (even discarded) render
+  return <p>{renderCount}</p>;
+}
+```
+
+**StrictMode** (development only) exposes impurity by:
+
+- Calling component functions, initialisers, and reducers **twice** and discarding one result.
+- Mounting, unmounting, and remounting every component once, running effects, their cleanups, and effects again.
+- Re-running ref callbacks.
+
+If a component behaves differently under that double invocation, it has a bug that would surface later under concurrent rendering, fast refresh, offscreen rendering, or Suspense. Logging twice in development is the expected symptom, not a problem to disable.
+
+Mutating **local** variables created during the render is fine; purity concerns observable effects outside the component.
+
+---
+
+## Reconciliation
+
+A general algorithm to transform one tree into another in the fewest operations is O(n³) in the number of nodes: a tree of 1,000 elements would need on the order of a billion comparisons. React instead uses an O(n) heuristic based on two assumptions:
+
+1. **Elements of different types produce different trees.** If the type changes at a position (`div` → `section`, `<ProfileCard>` → `<ProfileEditor>`), React does not compare children; it **unmounts the old subtree** (destroying its state and DOM) and mounts a new one.
+2. **Keys mark which children are stable across renders.** Among siblings, React matches old and new children by key (or by index when there are no keys).
+
+The algorithm for one node:
+
+| Old element            | New element         | Action                                                                   |
+| :--------------------- | :------------------ | :----------------------------------------------------------------------- |
+| Same host type (`div`) | Same host type      | Keep the DOM node, update only changed attributes, recurse into children |
+| Same component type    | Same component type | Keep the instance and its state, re-render it with new props, recurse    |
+| Different type         |                     | Unmount the old subtree, mount the new one                               |
+| Exists                 | `null` / `false`    | Unmount                                                                  |
+
+For lists of children, React walks old and new lists together. With keys, it builds a map of old children by key, so moves, insertions, and deletions anywhere in the list are matched correctly.
+
+---
+
+## Keys and identity
+
+```tsx
+{
+  todos.map((todo, index) => (
+    <TodoRow key={index} todo={todo} /> // identity = position
+  ));
+}
+```
+
+Deleting the first item with index keys:
+
+| Position | Before (key → todo) | After (key → todo) | What React thinks       |
+| :------- | :------------------ | :----------------- | :---------------------- |
+| 0        | 0 → "Buy milk"      | 0 → "Call bank"    | Row 0 changed its props |
+| 1        | 1 → "Call bank"     | 1 → "Book flight"  | Row 1 changed its props |
+| 2        | 2 → "Book flight"   | (gone)             | Row 2 was deleted       |
+
+React keeps the instances at keys 0 and 1 (with their local state, such as an input's typed text or an expanded panel) and deletes the last instance. The local state of "Buy milk" now appears next to "Call bank". With `key={todo.id}`, React sees that the first instance was removed and the others moved, and state follows the right item.
+
+Rules:
+
+- Keys must be **stable, unique among siblings, and derived from the data** (a database ID). Index keys are acceptable only for static lists that never reorder, filter, or insert.
+- Never generate keys during render (`key={Math.random()}` or `crypto.randomUUID()`): every render creates new identities, so every row unmounts and remounts, losing state and focus and costing full DOM recreation.
+- Keys are also a **reset switch**: `<ChatThread key={threadId} />` gives each thread a fresh instance with fresh state, instead of syncing state with effects when `threadId` changes.
+
+---
+
+## State is tied to position
+
+React stores state in the instance at a **position in the tree**, identified by the chain of component types (and keys) from the root. Same type at the same position means state is preserved, even if the JSX that produced it is different code:
+
+```tsx
+// State of <Counter> is preserved when isFancy toggles: same type, same position
+{
+  isFancy ? <Counter style="fancy" /> : <Counter style="plain" />;
+}
+
+// State is reset: the position's type changes from Counter to a div wrapping Counter
+{
+  isFancy ? (
+    <div>
+      <Counter />
+    </div>
+  ) : (
+    <Counter />
+  );
+}
+```
+
+The classic bug:
+
+```tsx
+function Form() {
+  function Field() {
+    // new function identity every render of Form
+    return <input />;
+  }
+  return <Field />; // type differs each render: unmount + mount
+}
+```
+
+Each render of `Form` creates a new `Field` function. React sees a different type, unmounts the old input, and mounts a new one, losing focus and typed text after every keystroke. Define components at module level.
+
+---
+
+## What triggers a render
+
+| Trigger                                                          | Re-renders                                                             |
+| :--------------------------------------------------------------- | :--------------------------------------------------------------------- |
+| `setState` / `dispatch` with a value that differs by `Object.is` | That component and, by default, all its descendants                    |
+| Parent re-renders                                                | The child, **even if its props did not change**, unless it is memoised |
+| A context value changes (by `Object.is`)                         | Every component reading that context, regardless of memoisation        |
+| An external store subscribed via `useSyncExternalStore` changes  | Subscribed components                                                  |
+| Key or type change at a position                                 | Remount (state reset), not just re-render                              |
+
+What does **not** trigger a render: mutating an object held in state (React sees the same reference), changing a ref's `.current`, changing a module variable.
+
+### What a render costs
+
+A render is not a DOM update. React calls component functions and compares elements; only differences reach the DOM. For most components that is microseconds to low milliseconds. Re-renders become a problem when:
+
+- A component tree is large (thousands of elements) and re-renders on every keystroke or scroll event.
+- A component does expensive computation during render (sorting 10,000 rows) without memoisation.
+- A context value used by many components changes frequently.
+
+The approach is to **measure first** with the React DevTools Profiler, then apply the techniques on the [Performance](/fullstack/react/performance) page.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between an element, a component, and an instance?">
+    A component is the function. An element is the immutable object describing what to render,
+    created on every render. An instance (fiber) is React's persistent record for a component at a
+    position in the tree, holding its state and effects from mount to unmount.
+  </Accordion>
+  <Accordion title="Why does React use keys, and what goes wrong with index keys?">
+    Keys identify children across renders so React can match instances and their state when items
+    move, are inserted, or removed. Index keys tie identity to position, so after inserting or
+    deleting, state attaches to the wrong item.
+  </Accordion>
+  <Accordion title="Why is React's diff O(n) and what assumptions make that possible?">
+    It assumes elements of different types produce different subtrees (so it replaces rather than
+    compares them) and uses keys to match children within a list, comparing each node only with its
+    counterpart at the same position.
+  </Accordion>
+  <Accordion title="Does re-rendering mean the DOM is updated?">
+    No. Rendering calls components and computes a new element tree; the commit phase applies only
+    the differences. Many renders result in no DOM changes at all.
+  </Accordion>
+  <Accordion title="Why does StrictMode call components twice?">
+    To expose impure render logic and missing effect cleanups, which would otherwise cause bugs
+    under concurrent rendering, Suspense, offscreen rendering, and fast refresh, where React may
+    render without committing or remount components.
+  </Accordion>
+</Accordions>

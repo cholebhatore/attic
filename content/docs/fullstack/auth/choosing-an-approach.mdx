@@ -1,0 +1,70 @@
+---
+title: Choosing an Approach
+description: Scenario-based recommendations for sessions, tokens, OAuth, OIDC, SSO, and API keys, the banking application question, build vs buy, and auth libraries and hosted providers for Node.js and Python.
+---
+
+The recurring theme of this section: **framework, scheme, and token format are three independent decisions**. Most "which auth should I use" confusion resolves once those three are pulled apart and matched to the scenario.
+
+---
+
+## By scenario
+
+| Scenario                                                                           | Reasonable choice                                                                                    |
+| :--------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------- |
+| Traditional server-rendered web app (Django, Rails, Next.js with server rendering) | Stateful session + `HttpOnly` cookie                                                                 |
+| SPA or mobile app calling its own API                                              | Short JWT access token (in memory) + `HttpOnly` cookie refresh token, or a BFF with a session cookie |
+| Third-party app needing limited access to users' data on the platform              | OAuth 2.0 (authorization code + PKCE)                                                                |
+| "Log in with X" identity delegation                                                | OpenID Connect                                                                                       |
+| Enterprise customers joining with their identity provider                          | SAML or OIDC (SSO), plus SCIM                                                                        |
+| Service-to-service / machine access                                                | API key, OAuth 2.0 client credentials, or mTLS                                                       |
+| Internal tooling, low risk, quick setup                                            | Basic auth over TLS (eyes open about its limits), or an SSO proxy                                    |
+| Many microservices verifying users                                                 | Asymmetric JWTs validated via JWKS at each service or at the gateway                                 |
+
+---
+
+## The banking question
+
+_Designing authentication for a banking application: session-based or JWT-based?_
+
+Lean towards **session-based** authentication:
+
+- Banks usually have a central backend and do not need the scaling benefits of stateless tokens.
+- Sessions allow **immediate revocation**, forced logout across devices, and tight server-side control over active sessions (idle timeouts, concurrent session limits, device binding).
+- Every request is checked against current server state, so a frozen account or a fraud flag takes effect at once.
+
+Those properties matter most in high-security applications. Add short idle timeouts, step-up authentication (passkeys or MFA) for transfers and payee changes, strict `SameSite` cookies with CSRF tokens, and detailed audit logs. If mobile apps or partner APIs need tokens, use short-lived, sender-constrained tokens (DPoP or mTLS) backed by server-side session state, following FAPI (Financial-grade API) profiles.
+
+---
+
+## Build vs buy
+
+Building auth means owning password storage, email verification, password resets, MFA, rate limiting, session management, account recovery, audit logs, and every future security fix. A library or provider is the default unless there is a specific reason.
+
+| Option                                   | Type                         | Notes                                                             |
+| :--------------------------------------- | :--------------------------- | :---------------------------------------------------------------- |
+| Better Auth                              | TS library, self-hosted      | Sessions, OAuth, passkeys, 2FA, organisations; framework-agnostic |
+| Auth.js                                  | TS library                   | OAuth/OIDC providers for Next.js and others                       |
+| Lucia-style guides (The Copenhagen Book) | Patterns, no library         | For building sessions by hand correctly                           |
+| Passport.js                              | Node middleware              | Older, strategy-based                                             |
+| Django auth / django-allauth             | Python                       | Built in + social login                                           |
+| FastAPI Users, Authlib                   | Python                       | User management; OAuth/OIDC client and server                     |
+| Clerk, Auth0, WorkOS, Stytch             | Hosted                       | Fast to ship, UI included, SSO and SCIM for B2B; cost per user    |
+| Supabase Auth, Firebase Auth, Cognito    | Platform-bundled             | Good when already on that platform                                |
+| Keycloak, Zitadel, Authentik, Ory        | Self-hosted identity servers | Full OIDC/SAML server under the team's control                    |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Session-based or JWT-based auth for a banking app?">
+    Session-based: a central backend does not need stateless scaling, and sessions give immediate
+    revocation, forced logout across devices, and tight server-side control, which matter most in
+    high-security systems.
+  </Accordion>
+  <Accordion title="When are JWTs the better choice?">
+    When many independent services or third parties must verify identity without sharing a session
+    store, or when an external identity provider issues tokens. Pair them with short lifetimes and
+    revocable refresh tokens.
+  </Accordion>
+</Accordions>

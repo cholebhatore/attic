@@ -1,0 +1,79 @@
+---
+title: Indexes
+description: How a B-tree index speeds up lookups, composite index column order, covering indexes, partial and expression indexes, other index types, why the planner ignores an index, and the write cost of indexes.
+---
+
+A query filtering 5 million orders by `customer_id` takes 1.8 seconds. One `CREATE INDEX` later it takes 0.3 ms. Indexes are the largest single performance lever an application developer controls, and also a common source of slow writes when overused.
+
+---
+
+## The plain-language version
+
+An index is the index at the back of a book: a sorted list of values with pointers to where each row lives. Instead of reading every page (**sequential scan**), the database jumps to the right entries. Every index must also be updated on each insert and update.
+
+| Word                | Plain meaning                                                                                               |
+| :------------------ | :---------------------------------------------------------------------------------------------------------- |
+| **B-tree**          | Balanced sorted tree; the default index type. Supports `=`, `<`, `>`, `BETWEEN`, prefix `LIKE`, `ORDER BY`. |
+| **sequential scan** | Reading the whole table.                                                                                    |
+| **index scan**      | Using the index, then fetching rows.                                                                        |
+| **index-only scan** | Answering from the index alone.                                                                             |
+| **selectivity**     | How few rows a condition matches; high selectivity favours indexes.                                         |
+| **composite index** | Index on several columns, in order.                                                                         |
+
+---
+
+## Composite indexes and column order
+
+An index on `(customer_id, created_at)` is sorted by customer, then by date within each customer, like a phone book sorted by last name then first name.
+
+| Query                                                     | Uses `(customer_id, created_at)`?      |
+| :-------------------------------------------------------- | :------------------------------------- |
+| `WHERE customer_id = 7`                                   | Yes                                    |
+| `WHERE customer_id = 7 AND created_at > '2026-01-01'`     | Yes, fully                             |
+| `WHERE customer_id = 7 ORDER BY created_at DESC LIMIT 20` | Yes, no sort needed                    |
+| `WHERE created_at > '2026-01-01'`                         | Generally no (leftmost column missing) |
+
+Rule of thumb: equality columns first, then range or sort columns.
+
+---
+
+## Useful variants
+
+```sql
+CREATE INDEX CONCURRENTLY idx_orders_customer_created ON orders (customer_id, created_at DESC);
+CREATE INDEX idx_orders_pending ON orders (created_at) WHERE status = 'pending';      -- partial
+CREATE INDEX idx_users_email_lower ON users (lower(email));                          -- expression
+CREATE INDEX idx_orders_cover ON orders (customer_id) INCLUDE (total_cents, status); -- covering
+```
+
+`CONCURRENTLY` (PostgreSQL) builds without blocking writes, which is required on busy production tables.
+
+| Type (PostgreSQL)         | For                                          |
+| :------------------------ | :------------------------------------------- |
+| B-tree                    | Most things                                  |
+| Hash                      | Equality only                                |
+| GIN                       | `jsonb`, arrays, full-text search            |
+| GiST / SP-GiST            | Geometry, ranges, nearest neighbour          |
+| BRIN                      | Huge, naturally ordered tables (time series) |
+| HNSW / IVFFlat (pgvector) | Vector similarity                            |
+
+---
+
+## Why an index is not used
+
+- The condition wraps the column: `WHERE lower(email) = ...` without an expression index, `WHERE created_at::date = ...`, or `WHERE amount + 0 > 5`.
+- Leading wildcard: `LIKE '%gmail.com'` (B-tree cannot help; use trigram GIN).
+- Low selectivity: matching 40 percent of rows is cheaper as a sequential scan.
+- Type mismatch between column and parameter.
+- Stale statistics; run `ANALYZE`.
+- `OR` across different columns (sometimes rewrite as `UNION`).
+
+Check with `EXPLAIN ANALYZE`; see [Profiling](/fullstack/databases/profiling).
+
+---
+
+## The cost
+
+Each index slows inserts and updates, uses disk and memory, and adds vacuum work. Index for the queries that actually run (from `pg_stat_statements`), and drop unused indexes (`pg_stat_user_indexes.idx_scan = 0`). Foreign key columns usually deserve an index, since joins and cascading deletes use them.
+
+Index internals (page layout, B+ tree structure, fill factor): [Databases](/db), starting with [querying and indexing](/db/foundations/why-databases/querying-and-indexing).

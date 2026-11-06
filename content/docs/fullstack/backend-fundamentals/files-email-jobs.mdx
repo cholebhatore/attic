@@ -1,0 +1,60 @@
+---
+title: Files, Email, and Jobs
+description: File uploads with presigned URLs and object storage, upload validation, transactional email and deliverability, and moving work to background jobs and scheduled tasks.
+---
+
+An API accepts 200 MB video uploads through the app server, saves them to local disk, and sends a confirmation email inline. Uploads time out, files vanish on redeploy, and the email provider's slow afternoon makes the endpoint slow too. Each of these belongs somewhere other than the request handler.
+
+---
+
+## File uploads
+
+Store files in **object storage** (S3, Cloudflare R2, GCS, MinIO locally), not on the app server's disk, which is not shared between instances and is wiped on redeploy.
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant B as Browser
+    participant A as API
+    participant S as Object storage
+    B->>A: POST /uploads (filename, type, size)
+    A->>A: auth + validate
+    A-->>B: presigned PUT URL (expires in 5 min)
+    B->>S: PUT file directly
+    B->>A: POST /uploads/complete (key)
+    A->>A: verify object, save metadata, enqueue processing
+`}
+/>
+
+**Presigned URLs** let the browser upload straight to storage, so large files never pass through the app.
+
+Validation:
+
+- Check size and type server-side; `Content-Type` and file extensions can be faked, so inspect magic bytes for anything processed.
+- Generate storage keys server-side (`uploads/u_19/7f3a.jpg`), never use the client's filename as a path.
+- Scan untrusted files, strip image metadata, serve user content from a separate domain to contain XSS.
+- Serve via a CDN with signed URLs for private files.
+
+---
+
+## Email
+
+- Use a provider (Resend, Postmark, SES, SendGrid) over raw SMTP.
+- Deliverability needs DNS records: **SPF** (who may send), **DKIM** (signature), **DMARC** (policy). See [DNS](/fullstack/web-fundamentals/domains-and-dns).
+- Separate transactional mail (password reset) from marketing mail, ideally on different subdomains.
+- Templates: React Email or MJML for HTML that survives email clients.
+- Send from a background job, not inside the request.
+
+---
+
+## Background jobs
+
+Anything slow, retryable, or not needed for the response goes to a queue: emails, image resizing, webhooks, report generation, syncing to third parties.
+
+| Need              | Node.js                               | Python                    |
+| :---------------- | :------------------------------------ | :------------------------ |
+| Job queue         | BullMQ (Redis), pg-boss (Postgres)    | Celery, Dramatiq, RQ, arq |
+| Durable workflows | Temporal, Inngest, Trigger.dev        | Temporal                  |
+| Scheduled (cron)  | BullMQ repeatable jobs, platform cron | Celery beat, APScheduler  |
+
+Rules: jobs must be **idempotent** (they will run twice sometimes), have retries with backoff, and land in a dead-letter queue after repeated failures. Details in [Job Queues and the Outbox](/fullstack/message-brokers/job-queues-and-outbox).

@@ -1,0 +1,84 @@
+---
+title: Offline and Push
+description: The app shell model, offline data with IndexedDB, queuing writes with background sync, conflict handling, and Web Push with VAPID keys.
+---
+
+A field technician fills in a form in a basement with no signal. An offline-capable app saves it locally and sends it when the connection returns, instead of losing the work.
+
+---
+
+## The plain-language version
+
+**Offline reads**: cache the app shell and recent data. **Offline writes**: store changes locally and replay them later. **Push**: the server sends a message through the browser vendor's push service, and the service worker shows a notification even when the site is closed.
+
+| Word                  | Plain meaning                                                    |
+| :-------------------- | :--------------------------------------------------------------- |
+| **app shell**         | Minimal HTML, CSS, JS to render the UI frame, cached at install. |
+| **IndexedDB**         | Browser database for structured data.                            |
+| **background sync**   | Browser retries a queued task when connectivity returns.         |
+| **VAPID**             | Key pair identifying the server to push services.                |
+| **push subscription** | Endpoint URL + keys for one browser.                             |
+
+---
+
+## Offline data
+
+```ts
+import { openDB } from 'idb';
+const db = await openDB('app', 1, {
+  upgrade: (d) => d.createObjectStore('outbox', { autoIncrement: true }),
+});
+
+async function saveReport(report: Report) {
+  await db.add('outbox', report); // persist first
+  const reg = await navigator.serviceWorker.ready;
+  await reg.sync?.register('flush-outbox'); // background sync where supported
+}
+```
+
+The service worker flushes the outbox on the `sync` event, or the page retries on the `online` event. Each queued write needs an [idempotency key](/fullstack/building-for-scale/degradation-and-idempotency) so a replay does not create duplicates. Conflicts (two devices edited the same record) need a rule: last write wins, server wins, or [CRDTs](/fullstack/realtime/local-first-and-crdts).
+
+---
+
+## Web Push
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant P as Page
+    participant SW as Service worker
+    participant S as App server
+    participant PS as Push service (browser vendor)
+    P->>P: Notification.requestPermission()
+    P->>SW: pushManager.subscribe(VAPID public key)
+    SW-->>P: subscription (endpoint, keys)
+    P->>S: save subscription
+    S->>PS: encrypted message signed with VAPID private key
+    PS->>SW: push event
+    SW->>SW: showNotification()
+`}
+/>
+
+```ts title="server (Node)"
+import webpush from 'web-push';
+webpush.setVapidDetails('mailto:ops@example.com', PUBLIC_KEY, PRIVATE_KEY);
+await webpush.sendNotification(
+  subscription,
+  JSON.stringify({ title: 'Order shipped', url: '/orders/981' }),
+);
+```
+
+```js title="sw.js"
+self.addEventListener('push', (e) => {
+  const data = e.data.json();
+  e.waitUntil(self.registration.showNotification(data.title, { data }));
+});
+self.addEventListener('notificationclick', (e) =>
+  e.waitUntil(clients.openWindow(e.notification.data.url)),
+);
+```
+
+<Callout type="warn">
+  Ask for notification permission after a user action that explains the value, not on page load. A
+  denied permission is very hard to recover.
+</Callout>

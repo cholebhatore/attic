@@ -1,0 +1,301 @@
+---
+title: React 19 and Patterns
+description: Actions and async transitions, form actions, useActionState, useFormStatus, useOptimistic semantics, the use API, document metadata and resource preloading, ref and context changes, error handling (error boundaries, root error callbacks), composition patterns (children and slots, compound components, render props, headless components, controlled/uncontrolled APIs), and anti-patterns.
+---
+
+Before React 19, a "save" button needed `isSaving` state, `error` state, a `try/finally`, disabling logic, and an optimistic copy of data, re-implemented in every form. React 19 moved that pattern into the framework as **Actions**. Alongside the new APIs, a small set of composition patterns determines whether a component library stays flexible or collapses under configuration props.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the last React page before [Rendering: SSR and SSG](/fullstack/rendering). It covers the newer APIs and the long-standing patterns for designing components.
+
+An **action** is an async function React runs inside a transition: React tracks whether it is pending, keeps the UI responsive, and coordinates optimistic updates and errors. Forms can call actions directly through their `action` attribute, so they work like HTML forms and submit even before JavaScript loads (when the action is a Server Function).
+
+Topics, in order:
+
+1. Actions and async transitions
+2. Form actions, useActionState, useFormStatus
+3. useOptimistic
+4. The use API
+5. Metadata, stylesheets, and preloading
+6. Ref and context changes
+7. Error handling
+8. Composition patterns
+9. Anti-patterns
+
+| Word                        | Plain meaning                                                                            |
+| :-------------------------- | :--------------------------------------------------------------------------------------- |
+| **action**                  | Async function run in a transition, with pending and error tracking.                     |
+| **Server Function**         | Server-side function callable from the client (`'use server'`), often used as an action. |
+| **progressive enhancement** | Works without JavaScript; JavaScript improves it.                                        |
+| **error boundary**          | Component catching render errors in its subtree and showing a fallback.                  |
+| **compound components**     | A set of components sharing implicit state (`Tabs`, `Tabs.List`, `Tabs.Panel`).          |
+| **headless component**      | Behaviour and accessibility without markup or styles.                                    |
+
+---
+
+## Actions and async transitions
+
+```tsx
+const [isPending, startTransition] = useTransition();
+
+function onSave() {
+  startTransition(async () => {
+    const error = await updateName(name);
+    if (error) {
+      setError(error);
+      return;
+    }
+    startTransition(() => router.push('/profile')); // state updates after await need their own transition
+  });
+}
+```
+
+- While the async function runs, `isPending` is `true`; the existing UI stays interactive.
+- Multiple actions are queued and can be reflected through optimistic state.
+- State updates made after an `await` are not automatically part of the transition (an async context limitation); wrapping them in another `startTransition` keeps them non-urgent.
+
+---
+
+## Form actions, useActionState, useFormStatus
+
+```tsx
+'use client';
+import { useActionState } from 'react';
+import { useFormStatus } from 'react-dom';
+import { updateProfile } from './actions'; // 'use server' function
+
+function SubmitButton() {
+  const { pending } = useFormStatus(); // reads the nearest parent form's status
+  return <button disabled={pending}>{pending ? 'Saving…' : 'Save'}</button>;
+}
+
+export function ProfileForm({ initial }: { initial: Profile }) {
+  const [state, formAction, isPending] = useActionState(updateProfile, { errors: {} });
+  return (
+    <form action={formAction}>
+      <input name="name" defaultValue={initial.name} aria-invalid={!!state.errors.name} />
+      {state.errors.name && <p role="alert">{state.errors.name}</p>}
+      <SubmitButton />
+    </form>
+  );
+}
+```
+
+```ts title="actions.ts"
+'use server';
+export async function updateProfile(prev: FormState, formData: FormData): Promise<FormState> {
+  const user = await requireUser();
+  const parsed = ProfileSchema.safeParse(Object.fromEntries(formData));
+  if (!parsed.success) return { errors: z.flattenError(parsed.error).fieldErrors };
+  await db.user.update({ where: { id: user.id }, data: parsed.data });
+  revalidatePath('/profile');
+  return { errors: {} };
+}
+```
+
+Behaviour:
+
+- `<form action={fn}>` calls `fn(formData)` inside a transition and resets uncontrolled fields after a successful submit.
+- `useActionState(action, initialState)` returns the latest returned state, a wrapped action, and a pending flag. The action receives the previous state first.
+- With a Server Function and server rendering, the form posts to the server before hydration, so it works with JavaScript disabled or still loading (pass a permalink as the third argument for redirect-after-post).
+- `useFormStatus` must be called from a component **inside** the form.
+
+---
+
+## useOptimistic
+
+```tsx
+function Thread({ messages, send }: { messages: Message[]; send: (text: string) => Promise<void> }) {
+  const [optimistic, addOptimistic] = useOptimistic(
+    messages,
+    (current, text: string) => [...current, { id: 'temp', text, sending: true }],
+  );
+
+  async function action(formData: FormData) {
+    const text = String(formData.get('text'));
+    addOptimistic(text);           // shows immediately
+    await send(text);              // when it settles, React reverts to the real `messages` prop
+  }
+  return (/* render optimistic list and <form action={action}> */);
+}
+```
+
+Semantics: the optimistic value exists only while an action or transition is pending. When it finishes, React renders with the real state again: if the server succeeded and the parent re-fetched, the real list contains the message; if it failed, the optimistic message disappears (show an error to explain why). There is no manual rollback.
+
+---
+
+## The use API
+
+```tsx
+function Comments({ commentsPromise }: { commentsPromise: Promise<Comment[]> }) {
+  const comments = use(commentsPromise); // suspends until resolved; throws to error boundary if rejected
+  return comments.map((c) => <p key={c.id}>{c.text}</p>);
+}
+
+function Panel({ show }: { show: boolean }) {
+  if (!show) return null;
+  const theme = use(ThemeContext); // unlike useContext, allowed after conditions
+  return <div className={theme} />;
+}
+```
+
+- `use` reads a promise or a context. It can be called conditionally because it does not occupy a slot in the hook list.
+- The promise must come from outside the render (a Server Component prop, a cache, a router loader); a promise created during render is new each time and suspends forever.
+- A common pattern: a Server Component starts a fetch **without awaiting**, passes the promise to a Client Component, and the client reads it with `use` inside Suspense. The page streams while the data loads.
+
+---
+
+## Metadata, stylesheets, and preloading
+
+React 19 hoists `title`, `meta`, and `link` elements rendered anywhere in the tree into `head`, and supports stylesheet precedence:
+
+```tsx
+function BlogPost({ post }: { post: Post }) {
+  return (
+    <article>
+      <title>{post.title}</title>
+      <meta name="description" content={post.summary} />
+      <link rel="stylesheet" href="/post.css" precedence="default" />
+      <h1>{post.title}</h1>
+    </article>
+  );
+}
+```
+
+`react-dom` also exports resource hints usable from components: `preload`, `preinit`, `preconnect`, `prefetchDNS`. Frameworks with their own metadata APIs (Next.js `metadata`) build on this.
+
+---
+
+## Ref and context changes
+
+- `ref` is a regular prop for function components; `forwardRef` is unnecessary.
+- Ref callbacks may return a cleanup function.
+- `<Context value={...}>` can be rendered directly as a provider.
+- `useDeferredValue(value, initialValue)` accepts an initial value for the first render.
+- Hydration errors report a single diff of what mismatched instead of many warnings.
+- Custom elements (web components) receive props as properties and events properly ([Web Components](/fullstack/web-components)).
+
+---
+
+## Error handling
+
+```tsx
+<ErrorBoundary fallback={<p>Could not load comments.</p>} onError={(e) => report(e)}>
+  <Suspense fallback={<Spinner />}>
+    <Comments commentsPromise={p} />
+  </Suspense>
+</ErrorBoundary>
+```
+
+- Error boundaries catch errors during **rendering**, lifecycle methods, and effects of their subtree. They do not catch errors in event handlers or arbitrary async code; handle those with `try/catch` and state.
+- They must be class components (or a library such as `react-error-boundary`).
+- Place boundaries around independent regions (a widget, a route segment) so one failure does not blank the page.
+- `createRoot(el, { onCaughtError, onUncaughtError, onRecoverableError })` centralises error reporting; React 19 no longer re-throws caught errors to `window.onerror`.
+
+---
+
+## Composition patterns
+
+### Children and slots
+
+```tsx
+<Layout sidebar={<Nav />} header={<Breadcrumbs />}>
+  <Article />
+</Layout>
+```
+
+Passing elements is more flexible than configuration props (`showSidebar`, `sidebarItems`, `sidebarCollapsed`...), keeps components decoupled, and lets parents render expensive content once ([Performance](/fullstack/react/performance)).
+
+### Compound components
+
+```tsx
+<Tabs defaultValue="account">
+  <Tabs.List>
+    <Tabs.Trigger value="account">Account</Tabs.Trigger>
+    <Tabs.Trigger value="billing">Billing</Tabs.Trigger>
+  </Tabs.List>
+  <Tabs.Panel value="account">
+    <AccountForm />
+  </Tabs.Panel>
+  <Tabs.Panel value="billing">
+    <BillingForm />
+  </Tabs.Panel>
+</Tabs>
+```
+
+The parent holds state and provides it through context; children read it. Users compose and order parts freely, and the API stays small. Radix UI and most design systems use this pattern.
+
+### Render props and custom hooks
+
+Render props (`<DataTable renderRow={(row) => ...} />`) pass a function that returns UI; they are still useful for per-item customisation. For sharing stateful logic, custom hooks replaced most render props and higher-order components.
+
+### Headless components
+
+Libraries such as Radix, React Aria, TanStack Table, and Downshift provide state, keyboard interaction, and ARIA, leaving markup and styling to the app. They separate the hard, generic part (accessible behaviour) from the brand-specific part (appearance).
+
+### Controlled and uncontrolled APIs
+
+Reusable components should support both:
+
+```tsx
+function Toggle({ checked, defaultChecked = false, onCheckedChange }: ToggleProps) {
+  const [internal, setInternal] = useState(defaultChecked);
+  const isControlled = checked !== undefined;
+  const value = isControlled ? checked : internal;
+  const set = (next: boolean) => {
+    if (!isControlled) setInternal(next);
+    onCheckedChange?.(next);
+  };
+  return <button role="switch" aria-checked={value} onClick={() => set(!value)} />;
+}
+```
+
+### Container and presentational split
+
+Data loading and side effects in one component, pure rendering in another. Server Components formalise this split: data-fetching server parents, interactive client leaves.
+
+---
+
+## Anti-patterns
+
+| Anti-pattern                               | Why it hurts                       | Instead                                   |
+| :----------------------------------------- | :--------------------------------- | :---------------------------------------- |
+| Effects that copy props into state         | Stale data, extra renders          | Derive during render; `key` to reset      |
+| Components defined inside components       | Remount every render               | Module-level components                   |
+| One context for everything                 | App-wide re-renders                | Split contexts or a store                 |
+| Fetching in effects without a cache        | Waterfalls, races, no dedup        | Server data, loaders, TanStack Query      |
+| `memo` everywhere by default               | Complexity without gain            | Measure; structural fixes; React Compiler |
+| Huge "god" components with dozens of props | Hard to change and test            | Composition, smaller components           |
+| Mutating state or props                    | Missed updates, compiler bail-outs | Immutable updates                         |
+| Index keys in dynamic lists                | State attached to wrong items      | Stable IDs                                |
+| Business logic inside components           | Untestable, duplicated             | Pure functions, hooks, server code        |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What problem do Actions solve?">
+    They standardise async mutations: React tracks pending state, runs them as transitions so the UI
+    stays responsive, integrates with forms (including progressive enhancement), and coordinates
+    optimistic updates and errors, replacing hand-written loading and error state.
+  </Accordion>
+  <Accordion title="How does useOptimistic roll back on failure?">
+    It does not need explicit rollback: the optimistic value only exists while the action is
+    pending. Afterwards React renders from real state, which either includes the confirmed change or
+    does not.
+  </Accordion>
+  <Accordion title="What can and cannot error boundaries catch?">
+    They catch errors thrown while rendering, in lifecycle methods, and in effects of their subtree,
+    including rejected promises read with use. They do not catch errors in event handlers, timers,
+    or other async code outside rendering.
+  </Accordion>
+  <Accordion title="Why prefer composition (children, slots) over configuration props?">
+    It keeps components decoupled and flexible, avoids an ever-growing prop API, lets callers
+    control content and order, and lets parents create expensive subtrees that are not re-rendered
+    by the container's state changes.
+  </Accordion>
+</Accordions>

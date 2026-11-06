@@ -1,0 +1,60 @@
+---
+title: Pooling and Failure Modes
+description: Why database connections are expensive, connection pools and sizing, pool exhaustion, serverless connection storms, timeouts, long transactions, lock contention, replication lag, disk and vacuum problems, and backups.
+---
+
+Traffic doubles for a sale. Each of 40 app instances opens a pool of 20 connections, PostgreSQL's limit is 100, and new requests fail with "too many clients". The database had spare CPU; it ran out of connections. Most database outages come from a short list of failure modes like this one.
+
+---
+
+## Connection pooling
+
+Opening a database connection costs a TCP and TLS handshake, authentication, and (in PostgreSQL) a new server process with its own memory. A **pool** keeps connections open and lends them to requests.
+
+| Setting                              | Meaning                                                       |
+| :----------------------------------- | :------------------------------------------------------------ |
+| `max` / `pool_size`                  | Connections per app instance                                  |
+| `idleTimeout`                        | Close unused connections after this long                      |
+| `connectionTimeout` / `pool_timeout` | How long a request waits for a free connection before failing |
+| `pool_pre_ping`                      | Check a connection is alive before use                        |
+
+**Sizing**: total connections = instances × pool size, which must fit under the database limit with headroom. More connections is not more throughput: past roughly a few per CPU core on the database, they contend for CPU and locks. When many instances or serverless functions connect, put a server-side pooler in between: **PgBouncer** or a managed pooler (RDS Proxy, Supavisor, Neon's pooler). See [replicas and pooling](/fullstack/scaling-databases/replicas-and-pooling).
+
+---
+
+## Failure modes
+
+| Failure                                       | Symptom                                              | Cause                                                                         | Mitigation                                                                    |
+| :-------------------------------------------- | :--------------------------------------------------- | :---------------------------------------------------------------------------- | :---------------------------------------------------------------------------- |
+| Pool exhaustion                               | Requests hang then time out waiting for a connection | Slow queries, N+1, connections held during external calls, leaked connections | Fix slow queries, short transactions, pool wait timeout, release in `finally` |
+| Too many connections                          | "too many clients already"                           | Instances × pool size over the limit; serverless scale-out                    | PgBouncer, smaller pools                                                      |
+| Slow query cascade                            | Latency climbs everywhere                            | One unindexed query under load saturates CPU or I/O                           | `statement_timeout`, indexes, query review                                    |
+| Long-running transaction                      | Table bloat, blocked DDL, growing disk               | Forgotten open transaction, idle in transaction                               | `idle_in_transaction_session_timeout`, monitoring                             |
+| Lock contention                               | Writes queue on hot rows                             | Counter rows, `ALTER TABLE` waiting behind a long query                       | Shard counters, `lock_timeout`, batch updates                                 |
+| Deadlocks                                     | Errors on concurrent writes                          | Inconsistent lock order                                                       | Consistent ordering, retries                                                  |
+| Replication lag                               | User saves, reloads, sees old data                   | Reads from a replica behind the primary                                       | Read-your-writes routing to primary, lag monitoring                           |
+| Disk full                                     | Writes fail, database may stop                       | Bloat, WAL retention from a stuck replication slot, logs                      | Alerts at 70–80 percent, vacuum, slot monitoring                              |
+| Vacuum / transaction ID wraparound (Postgres) | Forced shutdown to protect data                      | Autovacuum blocked or too slow                                                | Tune autovacuum, avoid long transactions                                      |
+| Failover                                      | Seconds of errors, connections dropped               | Primary crash, maintenance                                                    | Retries with backoff, DNS/endpoint-based reconnect                            |
+
+---
+
+## Timeouts to set
+
+```sql
+ALTER ROLE app SET statement_timeout = '5s';
+ALTER ROLE app SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE app SET lock_timeout = '3s';
+```
+
+Plus the pool's acquire timeout on the app side. A clear error after 5 seconds beats a hung request holding resources for 60.
+
+---
+
+## Backups
+
+- Automated snapshots plus continuous WAL archiving enable **point-in-time recovery** (restore to any second).
+- A backup that has never been restored is a hope, not a backup. Test restores regularly.
+- Know the RPO (how much data can be lost) and RTO (how long recovery may take).
+
+Durability and recovery theory: [durability, backup, and recovery](/db/foundations/why-databases/durability-backup-recovery). Connection internals: [client-server connections](/db/foundations/core-concepts/client-server-connections).

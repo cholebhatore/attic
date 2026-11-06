@@ -1,0 +1,373 @@
+---
+title: Event Loop and Async
+description: How asynchronous JavaScript works - run-to-completion, the call stack, task and microtask queues, ordering puzzles worked step by step, callbacks and their problems, promise states, chaining and resolution, how await desugars, sequential vs parallel vs limited concurrency, combinators, error propagation and unhandled rejections, cancellation with AbortSignal, timers and their real behaviour, and async iteration.
+---
+
+```js
+console.log('A');
+setTimeout(() => console.log('B'), 0);
+Promise.resolve().then(() => console.log('C'));
+queueMicrotask(() => console.log('D'));
+(async () => {
+  console.log('E');
+  await null;
+  console.log('F');
+})();
+console.log('G');
+```
+
+This prints `A E G C D F B`. A promise callback runs before a zero-delay timer; code after an `await` runs later even if nothing was awaited. The same rules explain why a long loop freezes a page, why `forEach` with `async` callbacks does not wait, and why one unhandled rejection can crash a Node.js server.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after the language pages. The browser's version of the loop (rendering steps) is in [Browser Architecture](/fullstack/web-fundamentals/browser-architecture); Node.js's phases are in [Runtime and Event Loop](/fullstack/nodejs/runtime-and-event-loop).
+
+JavaScript runs one piece of code at a time on a single thread. Slow operations (network, timers, disk) are handed to the host environment (browser or Node), which runs them elsewhere and, when they finish, puts a callback in a queue. The **event loop** takes the next callback when the current code has finished. **Promises** represent results that will arrive later; **async/await** lets code wait for them without blocking the thread. Think of a single chef with a list of order tickets: the chef never stops mid-dish, but while the oven bakes, the chef works on the next ticket.
+
+Topics, in order:
+
+1. Run-to-completion and the call stack
+2. Tasks and microtasks
+3. Ordering, worked step by step
+4. Callbacks
+5. Promises
+6. async/await
+7. Concurrency patterns
+8. Errors and unhandled rejections
+9. Cancellation
+10. Timers
+11. Async iteration
+
+| Word                    | Plain meaning                                                                             |
+| :---------------------- | :---------------------------------------------------------------------------------------- |
+| **run-to-completion**   | A task runs fully before any other task starts.                                           |
+| **task (macrotask)**    | A queued callback: script, timer, I/O completion, UI event, message.                      |
+| **microtask**           | A high-priority queued callback: promise reactions, `queueMicrotask`, `MutationObserver`. |
+| **promise**             | Object representing an eventual value: pending, then fulfilled or rejected.               |
+| **settled**             | Fulfilled or rejected; never changes again.                                               |
+| **thenable**            | Any object with a `then` method; promises adopt their state.                              |
+| **unhandled rejection** | A rejected promise with no rejection handler attached in time.                            |
+
+---
+
+## Run-to-completion and the call stack
+
+Once a function starts running, nothing else in the same thread runs until the stack is empty. No other callback interrupts it, including clicks, timers, or network responses, which simply wait in their queues.
+
+```js
+const start = Date.now();
+setTimeout(() => console.log('timer after', Date.now() - start, 'ms'), 0);
+while (Date.now() - start < 2000) {} // blocks for 2 s
+// timer after ~2000 ms
+```
+
+Run-to-completion makes reasoning simple (no data races between two pieces of JavaScript on the same thread) but means any long synchronous work blocks everything: in a browser, the page freezes; in Node, every request waits.
+
+---
+
+## Tasks and microtasks
+
+<Mermaid
+  chart={`
+flowchart TD
+    S["Call stack empty?"] --> T["Take ONE task from the task queue"]
+    T --> R["Run it to completion"]
+    R --> M["Run ALL microtasks, including ones queued while draining"]
+    M --> B{"Browser: rendering opportunity?"}
+    B -- yes --> RF["rAF callbacks, style, layout, paint"]
+    B -- no --> S
+    RF --> S
+`}
+/>
+
+| Source                                     | Queue                                            |
+| :----------------------------------------- | :----------------------------------------------- |
+| `setTimeout`, `setInterval`                | Task                                             |
+| I/O completion (network, file)             | Task                                             |
+| UI events (click, keydown)                 | Task                                             |
+| `MessageChannel`, `postMessage`            | Task                                             |
+| `setImmediate` (Node)                      | Task (check phase)                               |
+| Promise `then`/`catch`/`finally` reactions | Microtask                                        |
+| Continuation after `await`                 | Microtask                                        |
+| `queueMicrotask`                           | Microtask                                        |
+| `MutationObserver`                         | Microtask                                        |
+| `process.nextTick` (Node)                  | Its own queue, drained before promise microtasks |
+
+The rule: **after each task, the microtask queue is drained completely** before the next task or rendering. Microtasks queued during draining run in the same drain, so an endless chain of microtasks starves tasks and rendering just like an infinite loop.
+
+---
+
+## Ordering, worked step by step
+
+Using the opening example:
+
+| Step | Runs                                        | Output  | Task queue | Microtask queue        |
+| :--- | :------------------------------------------ | :------ | :--------- | :--------------------- |
+| 1    | `console.log('A')`                          | A       |            |                        |
+| 2    | `setTimeout` registers timer                |         | B          |                        |
+| 3    | `Promise.resolve().then` queues reaction    |         | B          | C                      |
+| 4    | `queueMicrotask`                            |         | B          | C, D                   |
+| 5    | async IIFE runs synchronously until `await` | E       | B          | C, D, F (continuation) |
+| 6    | `console.log('G')`                          | G       | B          | C, D, F                |
+| 7    | Script task ends: drain microtasks          | C, D, F | B          |                        |
+| 8    | Next task: timer                            | B       |            |                        |
+
+Key insight: an `async` function runs **synchronously** until its first `await`; everything after the `await` is a microtask, even when awaiting a non-promise value.
+
+---
+
+## Callbacks
+
+Before promises, asynchronous APIs took callbacks, by convention error-first in Node:
+
+```js
+fs.readFile('a.txt', (err, a) => {
+  if (err) return handle(err);
+  fs.readFile('b.txt', (err, b) => {
+    if (err) return handle(err);
+    save(a + b, (err) => {
+      if (err) return handle(err);
+      done();
+    });
+  });
+});
+```
+
+Problems: deep nesting, error handling repeated at every level, no composition (running things in parallel needs manual counters), and **inversion of control**: a third-party API might call the callback twice, never, or synchronously sometimes and asynchronously other times ("releasing Zalgo"). Promises solve these by being one-shot, always asynchronous, and composable. Node's `util.promisify` and the `node:fs/promises` APIs convert callback APIs.
+
+---
+
+## Promises
+
+A promise is a state machine:
+
+<Mermaid
+  chart={`
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Fulfilled: resolve(value)
+    Pending --> Rejected: reject(reason) or throw
+    Fulfilled --> [*]
+    Rejected --> [*]
+`}
+/>
+
+- It settles **at most once**; later `resolve`/`reject` calls are ignored.
+- Handlers attached after settlement still run (asynchronously, as microtasks).
+- `then` returns a **new promise**, resolved with the handler's return value, enabling chains:
+
+```js
+fetch('/api/user')
+  .then((res) => res.json()) // returning a promise: the chain waits for it
+  .then((user) => fetch(`/api/orders?u=${user.id}`))
+  .then((res) => res.json())
+  .catch((err) => showError(err)) // catches rejections from any step above
+  .finally(() => hideSpinner()); // runs either way, passes the result through
+```
+
+**Resolution procedure**: resolving a promise with another promise or thenable makes it **adopt** that state (it does not nest). Resolving with a value fulfils it.
+
+The promise constructor runs its executor **synchronously**; only the reactions are asynchronous:
+
+```js
+new Promise((resolve) => {
+  console.log('executor');
+  resolve();
+});
+console.log('after');
+// executor, after
+```
+
+---
+
+## async/await
+
+`async` functions always return a promise. `await` suspends the function until the awaited promise settles, then resumes it in a microtask with the value, or throws the rejection reason at that point.
+
+```js
+async function loadOrders(userId) {
+  const res = await fetch(`/api/orders?u=${userId}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`); // becomes a rejection of loadOrders()
+  return res.json(); // fulfils loadOrders() with the data
+}
+```
+
+Roughly equivalent to:
+
+```js
+function loadOrders(userId) {
+  return fetch(`/api/orders?u=${userId}`).then((res) => {
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  });
+}
+```
+
+Engines implement `await` with the same suspension machinery as generators: the function's local state is saved, and a promise reaction resumes it. Stack traces across `await` are reconstructed by modern engines ("async stack traces").
+
+`return await` inside `try` matters: `return promise` (without `await`) inside a `try` block lets a rejection escape the `catch`.
+
+---
+
+## Concurrency patterns
+
+### Sequential vs parallel
+
+```js
+// Sequential: total ≈ a + b + c
+for (const id of ids) results.push(await fetchItem(id));
+
+// Parallel: total ≈ max(a, b, c)
+const results2 = await Promise.all(ids.map((id) => fetchItem(id)));
+```
+
+Parallel is faster but unbounded: 5,000 IDs means 5,000 simultaneous requests, which can exhaust sockets, trigger rate limits, or overload a database.
+
+### Limited concurrency
+
+```js
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++; // safe: no await between read and increment
+      results[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+await mapLimit(ids, 10, fetchItem); // at most 10 in flight
+```
+
+Libraries: `p-limit`, `p-map`. Python uses `asyncio.Semaphore`.
+
+### Combinators
+
+| Combinator                | Fulfils when                                      | Rejects when                          | Use                                                        |
+| :------------------------ | :------------------------------------------------ | :------------------------------------ | :--------------------------------------------------------- |
+| `Promise.all`             | All fulfil (array of values, in input order)      | First rejection (others keep running) | All results required                                       |
+| `Promise.allSettled`      | All settle (array of `{status, value \| reason}`) | Never                                 | Partial success acceptable                                 |
+| `Promise.race`            | First to settle fulfils                           | First to settle rejects               | Timeouts (prefer `AbortSignal.timeout`)                    |
+| `Promise.any`             | First to fulfil                                   | All reject (`AggregateError`)         | Fastest of redundant sources                               |
+| `Promise.withResolvers()` |                                                   |                                       | Creating a promise whose resolve/reject are used elsewhere |
+
+### Loops
+
+```js
+items.forEach(async (item) => {
+  await save(item);
+}); // does NOT wait; errors become unhandled
+for (const item of items) await save(item); // sequential
+await Promise.all(items.map(save)); // parallel
+```
+
+---
+
+## Errors and unhandled rejections
+
+- `throw` inside an `async` function or `then` handler rejects the resulting promise.
+- `try/catch` around `await` catches rejections; `.catch()` handles them in chains.
+- A rejection with no handler attached by the end of the microtask drain is an **unhandled rejection**:
+  - Browsers log it and fire `unhandledrejection` on `window`.
+  - Node.js (since v15) **crashes the process** by default. One forgotten `await` on a failing call in a request handler can take down the server, which is why frameworks wrap handlers and why `@typescript-eslint/no-floating-promises` exists.
+- Deliberately fire-and-forget calls still need a `.catch()`:
+
+```js
+void sendAnalytics(event).catch((err) => logger.warn({ err }, 'analytics failed'));
+```
+
+- Always reject with `Error` objects (they carry stack traces), and preserve causes: `throw new Error('save failed', { cause: err })`.
+
+---
+
+## Cancellation
+
+Promises cannot be cancelled themselves; operations are cancelled through **`AbortSignal`**:
+
+```js
+const controller = new AbortController();
+const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]); // user cancel OR 5 s
+
+try {
+  const res = await fetch('/api/report', { signal });
+  const data = await res.json();
+} catch (err) {
+  if (err.name === 'AbortError' || err.name === 'TimeoutError') {
+    // cancelled or timed out
+  } else throw err;
+}
+
+// elsewhere: controller.abort();
+```
+
+Pass signals through custom async functions so the whole chain stops (check `signal.aborted`, listen to `abort`, pass to `fetch`, database drivers, and `setTimeout` from `node:timers/promises`). Cancellation matters for search-as-you-type, navigation away from pages, and server request timeouts: work for a request whose client disconnected is wasted capacity.
+
+---
+
+## Timers
+
+| Fact                                                                                         | Consequence                                                                                                           |
+| :------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------- |
+| The delay is a **minimum**, not a guarantee                                                  | A busy thread delays timers arbitrarily                                                                               |
+| Browsers clamp nested timers (5+ levels) to at least 4 ms                                    | `setTimeout(fn, 0)` loops are slower than expected                                                                    |
+| Background tabs throttle timers to once per second or less (more aggressively after minutes) | Polling and countdowns drift in hidden tabs                                                                           |
+| `setInterval` does not wait for async work                                                   | Overlapping executions if the callback takes longer than the interval; prefer recursive `setTimeout` after completion |
+| Timer callbacks capture variables like any closure                                           | Stale values ([Closures](/fullstack/javascript/scope-closures-this))                                                  |
+| Node timers keep the process alive                                                           | `timer.unref()` for timers that should not                                                                            |
+
+For precise animation, use `requestAnimationFrame`; for measuring durations, `performance.now()` (monotonic) rather than `Date.now()` (wall clock, can jump).
+
+---
+
+## Async iteration
+
+```js
+for await (const page of paginate('/api/orders')) {
+  for (const order of page.items) process(order);
+}
+
+async function* paginate(url) {
+  let next = url;
+  while (next) {
+    const res = await fetch(next);
+    const body = await res.json();
+    yield body;
+    next = body.nextCursor ? `${url}?after=${body.nextCursor}` : null;
+  }
+}
+```
+
+Async iterators pull data on demand, which gives natural **backpressure**: the next page is not fetched until the consumer asks. Node streams and Web `ReadableStream`s are async iterable.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between a task and a microtask?">
+    Tasks (timers, I/O, UI events) are processed one per loop iteration. Microtasks (promise
+    reactions, await continuations, queueMicrotask) are drained completely after every task, before
+    the next task or rendering, so they always run sooner than pending tasks.
+  </Accordion>
+  <Accordion title="Is JavaScript single-threaded?">
+    Each realm runs JavaScript on one thread with run-to-completion. The host uses other threads for
+    I/O, networking, and timers, and Web Workers or worker_threads provide parallel JavaScript with
+    separate memory and message passing.
+  </Accordion>
+  <Accordion title="Why doesn't forEach wait for async callbacks?">
+    forEach ignores the promises its callback returns. Use for...of with await for sequential work
+    or Promise.all with map for parallel work.
+  </Accordion>
+  <Accordion title="What happens to an unhandled promise rejection in Node.js?">
+    Since Node 15, the process crashes by default. Every promise must be awaited or have a rejection
+    handler, including fire-and-forget calls.
+  </Accordion>
+  <Accordion title="How is a fetch cancelled or given a timeout?">
+    Pass an AbortSignal: from an AbortController (call abort()), AbortSignal.timeout(ms), or
+    AbortSignal.any combining several. The fetch rejects with an AbortError or TimeoutError.
+  </Accordion>
+</Accordions>

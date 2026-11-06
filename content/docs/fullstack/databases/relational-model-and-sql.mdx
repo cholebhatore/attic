@@ -1,0 +1,100 @@
+---
+title: Relational Model and SQL
+description: Tables, rows, primary and foreign keys, constraints, joins, grouping and aggregation, subqueries, CTEs, window functions, upserts, and NULL behaviour.
+---
+
+An ORM hides SQL until a report needs "each customer's three most recent orders with their running total", and the ORM code becomes 40 lines that run 200 queries. A window function does it in one. SQL is the most durable skill in the stack; it has outlived every framework.
+
+---
+
+## The plain-language version
+
+Data lives in **tables** of rows and columns. Each row has a **primary key**; **foreign keys** link rows across tables. SQL describes _what_ result is wanted, and the database's planner decides _how_ to compute it.
+
+| Word                | Plain meaning                                                     |
+| :------------------ | :---------------------------------------------------------------- |
+| **primary key**     | Column(s) uniquely identifying a row.                             |
+| **foreign key**     | Column referencing another table's key; enforces the link exists. |
+| **constraint**      | Rule the database enforces: `NOT NULL`, `UNIQUE`, `CHECK`.        |
+| **join**            | Combining rows from tables by a condition.                        |
+| **CTE**             | Common table expression: a named subquery (`WITH`).               |
+| **window function** | Calculation across related rows without collapsing them.          |
+
+---
+
+## Schema with constraints
+
+```sql
+CREATE TABLE customers (
+  id         bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  email      text NOT NULL UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE orders (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  customer_id bigint NOT NULL REFERENCES customers(id),
+  total_cents integer NOT NULL CHECK (total_cents >= 0),
+  status      text NOT NULL DEFAULT 'pending',
+  created_at  timestamptz NOT NULL DEFAULT now()
+);
+```
+
+Constraints in the database hold no matter which service, script, or person writes the data. Application validation is for user-friendly messages; database constraints are for correctness.
+
+---
+
+## Joins
+
+| Join         | Returns                                    |
+| :----------- | :----------------------------------------- |
+| `INNER JOIN` | Rows with a match on both sides            |
+| `LEFT JOIN`  | All left rows, matched right rows or NULLs |
+| `FULL JOIN`  | All rows from both sides                   |
+| `CROSS JOIN` | Every combination                          |
+
+```sql
+-- customers with no orders
+SELECT c.* FROM customers c
+LEFT JOIN orders o ON o.customer_id = c.id
+WHERE o.id IS NULL;
+```
+
+---
+
+## Aggregation, CTEs, windows
+
+```sql
+-- revenue per customer, only big spenders
+SELECT customer_id, count(*) AS orders, sum(total_cents) AS revenue
+FROM orders
+WHERE status = 'paid'
+GROUP BY customer_id
+HAVING sum(total_cents) > 100000
+ORDER BY revenue DESC;
+
+-- three most recent orders per customer, with running total
+WITH ranked AS (
+  SELECT o.*,
+         row_number() OVER (PARTITION BY customer_id ORDER BY created_at DESC) AS rn,
+         sum(total_cents) OVER (PARTITION BY customer_id ORDER BY created_at) AS running_total
+  FROM orders o
+)
+SELECT * FROM ranked WHERE rn <= 3;
+```
+
+Logical order of evaluation: `FROM`/`JOIN` → `WHERE` → `GROUP BY` → `HAVING` → `SELECT` → `ORDER BY` → `LIMIT`. That is why a `SELECT` alias cannot be used in `WHERE`.
+
+---
+
+## Upserts and NULL
+
+```sql
+INSERT INTO inventory (sku, qty) VALUES ('A1', 5)
+ON CONFLICT (sku) DO UPDATE SET qty = inventory.qty + EXCLUDED.qty;   -- PostgreSQL
+-- MySQL: ON DUPLICATE KEY UPDATE qty = qty + VALUES(qty)
+```
+
+`NULL` means unknown: `NULL = NULL` is not true, so use `IS NULL`. `count(column)` skips NULLs; `count(*)` does not. `NOT IN` with a NULL in the list returns nothing; prefer `NOT EXISTS`.
+
+Deeper coverage of the relational model and query processing: [Databases](/db), starting with [the query lifecycle](/db/foundations/big-picture-flow/query-lifecycle).

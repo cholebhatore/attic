@@ -1,0 +1,191 @@
+---
+title: URL to Pixels
+description: The complete journey from typing a URL to an interactive page - input handling, navigation and process selection, caches and HSTS, DNS, connection setup, TLS, the HTTP exchange, the server side, response handling, parsing and subresource loading, rendering, interactivity, and a worked timeline with where to optimise each step.
+---
+
+"What happens when a URL is typed into the browser and Enter is pressed?" is the most common web engineering interview question because every layer of the stack takes part. This page strings the earlier pages together into one timeline, with enough detail at each step to go as deep as an interviewer wants.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the capstone of [Web Fundamentals](/fullstack/web-fundamentals). Each step links to the page that covers it in depth.
+
+The browser decides what was typed, checks whether it already has the answer, finds the server's address, opens a secure connection, asks for the page, and waits while the server builds it. Then it reads the HTML, fetches everything the HTML refers to, lays out and draws the page, and runs the JavaScript that makes it interactive.
+
+<Mermaid
+  chart={`
+flowchart TD
+    A["1. Input: URL or search?"] --> B["2. Navigation starts: beforeunload, process choice"]
+    B --> C["3. Caches: service worker, HTTP cache, bfcache; HSTS upgrade"]
+    C --> D["4. DNS resolution"]
+    D --> E["5. TCP or QUIC connection"]
+    E --> F["6. TLS handshake"]
+    F --> G["7. HTTP request"]
+    G --> H["8. Server side: CDN, load balancer, app, data"]
+    H --> I["9. Response: status, headers, streamed body"]
+    I --> J["10. Commit navigation to a renderer"]
+    J --> K["11. Parse HTML, fetch subresources"]
+    K --> L["12. Style, layout, paint, composite: first paint"]
+    L --> M["13. Scripts run, hydration: interactive"]
+    M --> N["14. After load: lazy content, analytics, prefetch"]
+`}
+/>
+
+---
+
+## 1. Input
+
+- The browser UI (in the browser process) decides whether the text is a URL or a search query. `example.com` becomes `https://example.com/` in modern browsers (HTTPS-first); `example` might become a search.
+- The string is parsed per the URL standard: scheme, host (converted to punycode if it contains Unicode), port, path, query. Address-bar suggestions may already have **preconnected** or prerendered the likely destination (Speculation Rules).
+
+## 2. Navigation starts
+
+- If a page is currently open, its `beforeunload` handler may run.
+- The browser process starts the navigation request itself (the renderer for the old page is not trusted with it) and decides which renderer process will eventually host the new site ([site isolation](/fullstack/web-fundamentals/browser-architecture)).
+
+## 3. Caches and HSTS
+
+In order of what can short-circuit the network:
+
+1. **Back/forward cache**: on back/forward navigation, a frozen copy of the whole page may be restored instantly.
+2. **Prerendered page**: if speculation rules prerendered it, it activates immediately.
+3. **Service worker**: if one controls this scope, its `fetch` handler can answer from Cache Storage (offline-capable apps).
+4. **HTTP cache**: a fresh cached HTML response is used directly; a stale one is revalidated (`If-None-Match`). HTML is usually `no-cache`, so a revalidation round trip still happens ([HTTP Caching](/fullstack/performance/http-caching)).
+5. **HSTS**: if the host is on the HSTS list (preloaded or previously seen), `http://` is rewritten to `https://` before any request leaves ([TLS](/fullstack/web-fundamentals/https-and-tls)).
+
+## 4. DNS
+
+Browser DNS cache → OS cache (`/etc/hosts`) → recursive resolver (possibly over DoH) → root → TLD → authoritative servers, each level cached by TTL. The browser may also query the `HTTPS` record to learn that the server supports HTTP/3 and ECH. Cost: 0 ms (cached) to several hundred ms (cold, far resolver). [Domains and DNS](/fullstack/web-fundamentals/domains-and-dns).
+
+## 5. Connection
+
+- If an open connection to the origin exists (or a coalescable HTTP/2 connection), it is reused: no handshake.
+- Otherwise: Happy Eyeballs races IPv6 and IPv4; TCP three-way handshake (1 RTT), or QUIC if HTTP/3 is known to be available.
+- Proxies and VPNs, if configured, sit in this step. [TCP, UDP, QUIC](/fullstack/web-fundamentals/tcp-udp-quic).
+
+## 6. TLS
+
+ClientHello (SNI, ALPN `h2`/`http/1.1`, key share) → ServerHello, encrypted certificate chain, signature, Finished → client validates the chain, hostname, CT, and signature. 1 RTT with TLS 1.3 (merged into the QUIC handshake for HTTP/3; 0-RTT possible on resumption).
+
+## 7. HTTP request
+
+```http
+GET / HTTP/2
+:authority: shop.example.com
+accept: text/html,application/xhtml+xml,...
+accept-encoding: gzip, deflate, br, zstd
+accept-language: en-IN,en;q=0.9
+cookie: __Host-sid=...
+sec-fetch-dest: document
+sec-fetch-mode: navigate
+sec-fetch-site: none
+user-agent: ...
+```
+
+The `Sec-Fetch-*` headers tell the server what kind of request this is and where it came from, which servers can use to reject cross-site requests to sensitive endpoints. [HTTP](/fullstack/web-fundamentals/http), [HTTP Versions](/fullstack/web-fundamentals/http-versions).
+
+## 8. Server side
+
+<Mermaid
+  chart={`
+flowchart LR
+    R["Request"] --> CDN["CDN PoP: TLS termination, WAF, cache lookup"]
+    CDN -- hit --> OUT["Response"]
+    CDN -- miss --> LB["Load balancer"]
+    LB --> APP["App server: middleware, auth, routing"]
+    APP --> CACHE["Redis"]
+    APP --> DB["Database"]
+    APP --> SVC["Other services"]
+    APP -- "SSR or static HTML" --> OUT
+`}
+/>
+
+1. A **CDN** may answer from cache, or forward to the origin over a warm connection.
+2. A **load balancer** picks a healthy app instance.
+3. The app runs middleware (request ID, logging, session or token check, rate limit), routes, loads data from caches and databases, and renders HTML (server-side rendering), or returns a prebuilt file.
+4. With **streaming SSR**, the server can send the `head` and page shell immediately and stream the rest as data arrives; with `103 Early Hints`, it can tell the browser to preload CSS before the response even starts.
+
+Server time shows up as **TTFB**. [Request Lifecycle](/fullstack/backend-fundamentals/request-lifecycle), [Rendering Strategies](/fullstack/rendering/rendering-strategies).
+
+## 9. Response
+
+The browser reads the status (following redirects, each costing a round trip), headers (`Content-Type`, `Content-Encoding` for decompression, `Cache-Control` for storage, `Set-Cookie`, security headers such as CSP and HSTS), and starts receiving the body as a stream. A `Content-Disposition: attachment` or non-HTML type turns the navigation into a download instead.
+
+## 10. Commit
+
+The browser process hands the response stream to the chosen renderer process, updates the address bar and history, and the old page is unloaded (or placed in bfcache).
+
+## 11. Parsing and subresources
+
+- The HTML parser builds the DOM incrementally as bytes arrive; the **preload scanner** discovers CSS, scripts, and images early.
+- CSS downloads at highest priority and blocks rendering; `defer` and module scripts download in parallel; plain scripts block parsing.
+- Each subresource repeats steps 3 to 9 (usually reusing the connection; cross-origin resources need their own DNS, TCP, and TLS).
+
+[Rendering Pipeline](/fullstack/web-fundamentals/rendering-pipeline).
+
+## 12. Rendering
+
+Once the DOM up to the visible content and all render-blocking CSS are ready: style → layout → paint → raster → composite. **First Contentful Paint** happens here; **Largest Contentful Paint** once the main image or text block is drawn. Web fonts may swap in, and images without dimensions can shift layout (CLS).
+
+## 13. Interactivity
+
+`defer` scripts run after parsing (then `DOMContentLoaded`). Framework code hydrates server-rendered HTML, attaching event handlers; until that finishes, clicks may do nothing. Long JavaScript tasks here delay input response, measured by INP. The `load` event fires when all subresources (images, iframes) have finished.
+
+## 14. After load
+
+Lazy-loaded images and components, analytics beacons, service worker installation, and prefetching likely next pages.
+
+---
+
+## A worked timeline
+
+A first visit from Mumbai to a server in Singapore (RTT 60 ms), no CDN, HTTP/2, TLS 1.3, server render time 120 ms, 30 KB HTML, one 50 KB CSS file, one 200 KB JS bundle, a 150 KB hero image. Estimates, not measurements:
+
+| Step                                                               | Time (ms) | Cumulative (ms)  |
+| :----------------------------------------------------------------- | :-------- | :--------------- |
+| DNS (resolver nearby, authoritative far)                           | 40        | 40               |
+| TCP handshake                                                      | 60        | 100              |
+| TLS 1.3                                                            | 60        | 160              |
+| Request + server render + first byte                               | 60 + 120  | 340 (TTFB)       |
+| HTML download (slow start: ~2 RTT for 30 KB)                       | 60        | 400              |
+| CSS request (same connection) + download                           | 60–120    | ~500             |
+| First Contentful Paint                                             |           | ~520             |
+| Hero image (discovered by preload scanner, competes for bandwidth) | 120–180   | ~600–650 (LCP)   |
+| JS download and execution, hydration                               | 150 + 200 | ~850 interactive |
+
+Levers, by step:
+
+| Step                   | Lever                                                                 |
+| :--------------------- | :-------------------------------------------------------------------- |
+| DNS, TCP, TLS (220 ms) | CDN near users (cuts to ~30 ms), HTTP/3, connection reuse             |
+| Server render (120 ms) | Caching, faster queries, streaming the shell first, static generation |
+| CSS round trip         | Inline critical CSS, 103 Early Hints, preload                         |
+| LCP image              | `fetchpriority="high"`, modern formats, responsive sizes, CDN         |
+| JS and hydration       | Ship less JavaScript, Server Components, code splitting               |
+
+---
+
+## Interview tips
+
+<Callout type="info">
+  List the steps first, then go deep on whichever layer the interviewer picks. Mentioning caches at
+  every layer, connection reuse, the preload scanner, render-blocking CSS, and hydration shows
+  real-world understanding rather than memorised steps.
+</Callout>
+
+<Accordions>
+  <Accordion title="Which steps can be skipped entirely on a repeat visit?">
+    DNS (cached), TCP and TLS (reused connection or 0-RTT resumption), static subresources (fresh in
+    the HTTP cache with immutable caching), and potentially the whole page (bfcache, service worker
+    cache, or a CDN-cached HTML response).
+  </Accordion>
+  <Accordion title="What determines TTFB?">
+    DNS, connection and TLS setup, network RTT to whichever server answers (CDN or origin), queueing
+    at load balancers, and server processing time including data access and rendering.
+  </Accordion>
+  <Accordion title="Why can a server-rendered page be visible but not clickable?">
+    The HTML is painted before the JavaScript has downloaded, executed, and hydrated the components
+    that attach event handlers.
+  </Accordion>
+</Accordions>

@@ -1,0 +1,94 @@
+---
+title: Streamed Responses
+description: Buffering vs streaming, chunked transfer encoding and HTTP/2 frames, early head flush, streaming HTML, NDJSON and SSE for data, Web Streams in Node and Python, and proxy buffering.
+---
+
+A report endpoint builds 50,000 rows in memory, then sends them. Memory spikes, and the client sees nothing for 12 seconds. Streamed, the first rows arrive in milliseconds and memory stays flat. Streaming is also how SSR pages and LLM answers appear progressively.
+
+---
+
+## The plain-language version
+
+A **buffered** response is built fully, then sent. A **streamed** response is sent in pieces as they are ready, over one HTTP response. The client can start using the first piece immediately.
+
+| Word                 | Plain meaning                                                             |
+| :------------------- | :------------------------------------------------------------------------ |
+| **chunked transfer** | HTTP/1.1 body sent in length-prefixed chunks, total size unknown upfront. |
+| **flush**            | Push buffered bytes to the network now.                                   |
+| **NDJSON**           | Newline-delimited JSON: one JSON object per line.                         |
+| **SSE**              | Server-Sent Events: `text/event-stream` messages over HTTP.               |
+| **backpressure**     | Slowing the producer when the consumer cannot keep up.                    |
+
+---
+
+## What streaming improves
+
+- **TTFB and first paint**: send the `<head>` (with CSS and preload links) immediately so the browser starts fetching while the server still queries data.
+- **Perceived speed**: show content progressively ([Suspense streaming](/fullstack/rendering/hydration-and-streaming)).
+- **Memory**: large exports or file proxies never fully load into memory.
+- **Long-running results**: LLM tokens, progress updates.
+
+---
+
+## Streaming data
+
+<Tabs items={['Node.js', 'Python (FastAPI)']}>
+<Tab value="Node.js">
+
+```ts
+app.get('/api/export', async (req, res) => {
+  res.setHeader('Content-Type', 'application/x-ndjson');
+  for await (const row of db.streamRows('SELECT * FROM orders')) {
+    if (!res.write(JSON.stringify(row) + '\n')) {
+      await new Promise((r) => res.once('drain', r)); // backpressure
+    }
+  }
+  res.end();
+});
+```
+
+</Tab>
+<Tab value="Python (FastAPI)">
+
+```python
+from fastapi.responses import StreamingResponse
+import json
+
+@app.get("/api/export")
+async def export():
+    async def rows():
+        async for row in db.stream("SELECT * FROM orders"):
+            yield json.dumps(row) + "\n"
+    return StreamingResponse(rows(), media_type="application/x-ndjson")
+```
+
+</Tab>
+</Tabs>
+
+Client side, read the body as a stream:
+
+```ts
+const res = await fetch('/api/export');
+const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
+for (;;) {
+  const { value, done } = await reader.read();
+  if (done) break;
+  console.log(value); // may contain partial lines: buffer until '\n'
+}
+```
+
+SSE is covered in [Real-time transports](/fullstack/realtime/transports) and streaming LLM output in [AI Integration](/fullstack/ai-integration/streaming-and-structured-output).
+
+---
+
+## Things that break streaming
+
+- **Proxy buffering**: Nginx buffers by default. Set `proxy_buffering off;` or send `X-Accel-Buffering: no`.
+- **Compression middleware** that waits for the whole body.
+- **Serverless platforms** without streaming support, or with response size limits.
+- Once headers are sent, the status code cannot change. Errors mid-stream must be signalled in the body.
+
+<Callout type="info">
+  Next.js, React Router, and Astro stream HTML automatically when Suspense or deferred data is used.
+  Under the hood they write to a Web `ReadableStream`, the same API used above.
+</Callout>

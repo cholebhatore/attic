@@ -1,0 +1,90 @@
+---
+title: Traffic Control
+description: Throttling vs rate limiting, algorithms (fixed window, sliding window, token bucket, leaky bucket, GCRA), where to enforce limits, backpressure in queues, streams, and services, load shedding with priorities, and load shifting in time and space.
+---
+
+A partner integration bug sends 4,000 requests per second, ten times normal traffic. Without limits, every customer suffers. With per-client rate limits, the partner gets `429`s and everyone else does not notice. Traffic control decides what happens when demand exceeds capacity: who waits, who is refused, and what moves elsewhere.
+
+---
+
+## The plain-language version
+
+| Technique         | Analogy                                                      | Effect                                               |
+| :---------------- | :----------------------------------------------------------- | :--------------------------------------------------- |
+| **Rate limiting** | A ticket gate allowing N people per minute per person        | Rejects excess requests from one client              |
+| **Throttling**    | Slowing a conveyor belt                                      | Delays or slows excess requests instead of rejecting |
+| **Backpressure**  | A full restaurant telling the host to stop seating           | Downstream signals upstream to slow down             |
+| **Load shedding** | Closing the doors when the building is at fire-code capacity | Drops low-priority work so the rest succeeds         |
+| **Load shifting** | Doing laundry at night when electricity is cheap             | Moves work to a different time or place              |
+
+---
+
+## Rate limiting algorithms
+
+| Algorithm              | How                                                              | Bursts                   | Notes                                          |
+| :--------------------- | :--------------------------------------------------------------- | :----------------------- | :--------------------------------------------- |
+| Fixed window           | Count per clock window                                           | Up to 2x at window edges | Simplest (`INCR` + `EXPIRE`)                   |
+| Sliding window log     | Timestamps of each request in a window                           | Exact                    | Memory per request                             |
+| Sliding window counter | Weighted current + previous window counts                        | Smooth approximation     | Cheap, accurate enough                         |
+| Token bucket           | Bucket refills at rate r, capacity b; each request takes a token | Allows bursts up to b    | Common for APIs                                |
+| Leaky bucket           | Requests queue and drain at a fixed rate                         | Smooths output           | Shapes traffic                                 |
+| GCRA                   | Token bucket expressed as a theoretical arrival time             | Like token bucket        | One value per key; used by many Redis limiters |
+
+Redis implementations are in [Redis patterns](/fullstack/redis/patterns).
+
+### Where to enforce
+
+- Edge / CDN / WAF: per IP, against floods and bots.
+- API gateway: per API key, per plan.
+- Application: per user and per expensive operation (login, AI calls, exports).
+- Downstream clients: limit calls to third-party APIs to stay within their quotas.
+
+Return `429` with `Retry-After` and rate limit headers ([REST in practice](/fullstack/apis/rest-in-practice)). Limit by authenticated identity where possible; IP limits punish users behind shared NAT.
+
+---
+
+## Backpressure
+
+When a consumer cannot keep up, an unbounded buffer between it and the producer grows until memory runs out, and latency grows with it. Backpressure keeps buffers **bounded** and pushes the signal upstream:
+
+- **Streams**: `write()` returning `false` and `drain` in Node; async iteration that awaits ([Streams and workers](/fullstack/nodejs/streams-and-workers)).
+- **Queues**: bounded queues; producers block, slow down, or get rejected when full. Monitor queue age.
+- **Services**: return `503` or `429` when at capacity; callers back off.
+- **Pull-based consumers**: workers fetch only as much as they can process (Kafka, SQS, prefetch limits in RabbitMQ).
+- **Concurrency limits**: cap in-flight requests per process; adaptive limiters adjust the cap from observed latency.
+
+---
+
+## Load shedding
+
+When the whole service is overloaded, serving everyone slowly means serving no one within their timeout. Shedding rejects some work early and cheaply so accepted work completes.
+
+- Measure overload by in-flight requests, queue time, or event-loop lag, not just CPU.
+- Reject before doing expensive work (at the edge of the request).
+- **Prioritise**: shed background jobs, prefetches, and analytics before checkout and login. Tag requests with a priority.
+- Drop requests that have waited longer than the client's timeout; finishing them is wasted work.
+
+```ts
+let inFlight = 0;
+const MAX = 200;
+app.use((req, res, next) => {
+  if (inFlight >= MAX && req.headers['x-priority'] !== 'critical') {
+    return res.status(503).set('Retry-After', '2').end();
+  }
+  inFlight++;
+  res.on('close', () => inFlight--);
+  next();
+});
+```
+
+---
+
+## Load shifting
+
+Moving demand rather than refusing it:
+
+- **In time**: queue non-urgent work (emails, reports, reindexing, AI batch jobs) and process it at a steady rate or off-peak; schedule heavy cron jobs away from peak hours; use batch APIs with lower prices.
+- **In space**: route traffic to regions or clusters with spare capacity; serve from CDNs and caches instead of origins.
+- **To the client**: precompute and cache, let clients poll less often under load (server-suggested intervals).
+
+Queues turn traffic spikes into longer backlogs instead of errors, which is load levelling. The trade-off is latency for the shifted work.

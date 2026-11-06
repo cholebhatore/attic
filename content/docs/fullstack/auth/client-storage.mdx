@@ -1,0 +1,57 @@
+---
+title: Client-side Storage
+description: Where the client keeps session IDs, access tokens, and refresh tokens - httpOnly cookies, localStorage, sessionStorage, memory - with their XSS and CSRF exposure, the recommended split, the BFF pattern, and mobile storage.
+---
+
+Where the _client_ keeps its session ID, access token, or refresh token materially changes the system's attack surface. There is no location immune to every attack; each choice trades one exposure for another.
+
+---
+
+## The plain-language version
+
+Cookies marked `HttpOnly` are invisible to JavaScript, so injected scripts cannot steal them, but the browser sends them automatically, which enables request forgery. `localStorage` is never sent automatically, but any script on the page can read it.
+
+| Word           | Plain meaning                                                                     |
+| :------------- | :-------------------------------------------------------------------------------- |
+| **XSS**        | Attacker's JavaScript running on the site.                                        |
+| **CSRF**       | Another site tricking the browser into sending a request with the user's cookies. |
+| **exfiltrate** | Copy a secret out to the attacker.                                                |
+| **BFF**        | Backend-for-frontend: a server that holds tokens on behalf of a browser app.      |
+
+---
+
+## Options compared
+
+| Storage                 | Persistence              | Sent automatically           | XSS exposure                                                                               | CSRF exposure                |
+| :---------------------- | :----------------------- | :--------------------------- | :----------------------------------------------------------------------------------------- | :--------------------------- |
+| `HttpOnly` cookie       | Until expiry or cleared  | Yes (`SameSite` rules apply) | **No**: JS cannot read it                                                                  | **Yes**: needs CSRF defenses |
+| `localStorage`          | Until explicitly cleared | No: attached manually        | **Yes**: any injected script can read it                                                   | No                           |
+| `sessionStorage`        | Until the tab closes     | No                           | **Yes**, same as localStorage                                                              | No                           |
+| In memory (JS variable) | Lost on refresh          | No                           | Lower: harder to exfiltrate at rest, but readable by script running while the page is open | No                           |
+
+Note: even with `HttpOnly`, an XSS attacker can still _use_ the cookie by making requests from the victim's page. `HttpOnly` stops theft, not abuse during the session. XSS prevention remains the real fix.
+
+---
+
+## Recommended split
+
+- **Refresh tokens**: `HttpOnly`, `Secure`, `SameSite=Strict` (or `Lax`) cookie, with `Path` scoped to the refresh endpoint (`Path=/auth/refresh`). Keeping it out of JavaScript's reach is the priority: it is the long-lived, high-value credential.
+- **Access tokens**: in memory only (a JS variable, re-fetched on page load via the refresh cookie), minimising what an XSS attack can steal at rest. They are short-lived anyway.
+- **Avoid `localStorage` and `sessionStorage` for any token** where possible: they are directly readable by any script on the page, making them the most XSS-exposed option.
+- **Traditional web apps**: a single `HttpOnly` session cookie and no tokens in JS at all.
+
+This is a direct trade-off: cookies defend well against XSS theft but need CSRF protection; `localStorage` needs no CSRF protection but is wide open to XSS. Defenses must be layered (see [Attacks and Defenses](/fullstack/auth/attacks-and-defenses)).
+
+---
+
+## The BFF pattern
+
+For SPAs talking to OAuth providers, current guidance favours a **backend-for-frontend**: a small server on the same site performs the OAuth flow, stores tokens server-side, and gives the browser only an `HttpOnly` session cookie. The browser never handles tokens at all. Next.js and other full-stack frameworks fit this naturally.
+
+---
+
+## Mobile and desktop
+
+- iOS: Keychain. Android: Keystore-backed encrypted storage. In Expo: `expo-secure-store`.
+- Never plain `AsyncStorage` or shared preferences for tokens.
+- Electron and Tauri: OS credential stores (`safeStorage`, keyring plugins).

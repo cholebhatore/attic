@@ -1,0 +1,65 @@
+---
+title: Runtime Validation
+description: Why TypeScript types vanish at runtime, validating at trust boundaries with Zod, inferring types from schemas, sharing schemas, and alternatives.
+---
+
+An API is typed to return `{ price: number }`. A backend change starts sending `"19.99"` as a string, and the frontend computes `"19.99" + 5 = "19.995"`. TypeScript compiled cleanly because types do not exist at runtime; nothing checked the actual response.
+
+---
+
+## The plain-language version
+
+Types are erased when code is compiled. Data that comes from outside the program (HTTP bodies, query strings, env vars, `localStorage`, third-party APIs, LLM output) must be checked when it arrives. A **schema** library both checks the data and produces the TypeScript type, so they cannot drift apart.
+
+| Word                      | Plain meaning                                                            |
+| :------------------------ | :----------------------------------------------------------------------- |
+| **trust boundary**        | Where data enters from somewhere the code does not control.              |
+| **schema**                | A runtime description of valid data.                                     |
+| **parse, don't validate** | Turn unknown input into a typed value, or fail; never pass raw input on. |
+
+---
+
+## Zod
+
+```ts
+import { z } from 'zod';
+
+export const CreateOrder = z.object({
+  productId: z.number().int().positive(),
+  qty: z.number().int().min(1).max(10),
+  coupon: z.string().trim().optional(),
+});
+export type CreateOrder = z.infer<typeof CreateOrder>;
+
+// Server: reject bad input with 400/422
+const result = CreateOrder.safeParse(req.body);
+if (!result.success) return res.status(422).json(z.treeifyError(result.error));
+const order = result.data; // typed CreateOrder
+```
+
+```ts title="env.ts"
+const Env = z.object({
+  DATABASE_URL: z.url(),
+  PORT: z.coerce.number().default(3000),
+});
+export const env = Env.parse(process.env); // crash at startup, not at 3 a.m.
+```
+
+---
+
+## Sharing schemas
+
+In a [monorepo](/fullstack/tooling/monorepos), one schema package validates forms on the client (React Hook Form's Zod resolver), request bodies on the server, and generates OpenAPI docs. With tRPC or Next.js server actions, the same schema guards the function input.
+
+Python's equivalent is **Pydantic**, used throughout [FastAPI](/fullstack/python-backend/fastapi).
+
+---
+
+## Alternatives
+
+| Library         | Notes                                                                    |
+| :-------------- | :----------------------------------------------------------------------- |
+| Zod             | Most popular, wide ecosystem                                             |
+| Valibot         | Modular, very small bundles                                              |
+| ArkType         | TypeScript-like syntax, fast                                             |
+| Standard Schema | A shared interface many libraries implement, so tools accept any of them |

@@ -1,0 +1,76 @@
+---
+title: Modeling and Normalization
+description: Entities and relationships (one-to-one, one-to-many, many-to-many), normal forms 1NF to BCNF with examples, update anomalies, deliberate denormalization, IDs, data types for money and time, soft deletes, and JSON columns.
+---
+
+An `orders` table stores the customer's email on every order. The customer changes their email, half the orders get updated, and support now sees two addresses for one person. Normalization is the discipline of storing each fact once.
+
+---
+
+## The plain-language version
+
+Model the real-world **entities** (customer, order, product) and the **relationships** between them. **Normalize** so each fact lives in one place, then **denormalize** deliberately where reads need it, accepting the cost of keeping copies in sync.
+
+| Word                | Plain meaning                                           |
+| :------------------ | :------------------------------------------------------ |
+| **entity**          | A thing with an identity, usually a table.              |
+| **cardinality**     | How many of one relate to another: 1:1, 1:N, M:N.       |
+| **junction table**  | Table implementing many-to-many (`order_items`).        |
+| **normal form**     | A rule level that removes a kind of redundancy.         |
+| **anomaly**         | Update, insert, or delete problem caused by redundancy. |
+| **denormalization** | Intentional duplication for read speed.                 |
+
+---
+
+## Relationships
+
+<Mermaid
+  chart={`
+erDiagram
+    CUSTOMER ||--o{ ORDER : places
+    ORDER ||--|{ ORDER_ITEM : contains
+    PRODUCT ||--o{ ORDER_ITEM : "appears in"
+    CUSTOMER ||--o| PROFILE : has
+`}
+/>
+
+- **1:N**: foreign key on the "many" side (`orders.customer_id`).
+- **M:N**: a junction table (`order_items(order_id, product_id, qty, unit_price_cents)`), which can carry its own attributes.
+- **1:1**: foreign key with a `UNIQUE` constraint, often for optional or rarely read data.
+
+---
+
+## Normal forms
+
+| Form | Rule                                         | Violation example                                                                    |
+| :--- | :------------------------------------------- | :----------------------------------------------------------------------------------- |
+| 1NF  | Atomic values, no repeating groups           | `tags = 'red,blue,green'` in one column                                              |
+| 2NF  | No column depends on part of a composite key | `order_items(order_id, product_id, product_name)`: name depends only on `product_id` |
+| 3NF  | No column depends on another non-key column  | `orders(customer_id, customer_email)`: email depends on customer                     |
+| BCNF | Every determinant is a candidate key         | Rare edge cases beyond 3NF                                                           |
+
+Aim for 3NF by default.
+
+---
+
+## Deliberate denormalization
+
+| Pattern                                            | Why it is fine                                                                       |
+| :------------------------------------------------- | :----------------------------------------------------------------------------------- |
+| `order_items.unit_price_cents` copied from product | It is a historical fact: the price at purchase time, not a duplicate                 |
+| `posts.comment_count` counter                      | Avoids `count(*)` on every page view; update in the same transaction or via triggers |
+| Read models / materialized views                   | Precomputed reports; refreshed on a schedule or by events                            |
+| Search indexes                                     | Copies in a search engine, synced asynchronously                                     |
+
+---
+
+## Practical choices
+
+- **IDs**: `bigint` identity for internal keys; UUIDv7 (time-ordered, index-friendly) when IDs are generated client-side or exposed publicly. Avoid random UUIDv4 primary keys on very large tables because of index fragmentation.
+- **Money**: integer minor units or `numeric(12,2)`; never `float`.
+- **Time**: `timestamptz` (stored in UTC), convert to local time only for display. Dates without time (birthdays) as `date`.
+- **Enums**: a `CHECK` constraint or lookup table; database enum types are awkward to change.
+- **Soft delete** (`deleted_at`): keeps history but every query must filter it, and unique constraints need partial indexes. Consider an archive table instead.
+- **JSON columns** (`jsonb`): good for truly variable attributes; bad for data that is queried, joined, or constrained.
+
+Theory in depth: [data modeling levels](/db/foundations/core-concepts/data-modeling-levels) and [records, entities, relationships](/db/foundations/core-concepts/records-fields-entities-relationships).

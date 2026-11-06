@@ -1,0 +1,99 @@
+---
+title: Resilience Patterns
+description: Timeouts and deadline propagation, retries with exponential backoff and jitter, retry budgets, what to retry, circuit breakers and their states, bulkheads, fallbacks, cascading failures, and libraries for Node.js and Python.
+---
+
+The recommendations service slows from 50 ms to 30 seconds. The product page waits on it with no timeout. Every server's connection pool fills with stuck requests, and the whole site goes down because of a widget nobody needed. Resilience patterns stop one slow dependency from becoming a full outage.
+
+---
+
+## The plain-language version
+
+Assume every call over the network can be slow or fail. **Timeouts** stop waiting. **Retries** try again when failure is likely temporary. **Circuit breakers** stop calling something that is clearly broken. **Bulkheads** keep one failing part from using up shared resources. **Fallbacks** give a reduced answer instead of an error.
+
+| Word                  | Plain meaning                                                        |
+| :-------------------- | :------------------------------------------------------------------- |
+| **cascading failure** | One failure causing others, spreading through dependencies.          |
+| **deadline**          | An absolute time by which the whole request must finish.             |
+| **jitter**            | Randomness in retry delays so clients do not retry in sync.          |
+| **retry storm**       | Retries multiplying load on a struggling service.                    |
+| **circuit breaker**   | Switch that fails fast after repeated failures, then tests recovery. |
+| **bulkhead**          | Isolated resource pool per dependency, like ship compartments.       |
+
+---
+
+## Timeouts and deadlines
+
+Every outbound call needs a timeout: HTTP clients, DB queries (`statement_timeout`), Redis, queues. Set them from the latency budget: if the endpoint must answer in 1 second and calls two services, neither can have a 5-second timeout. Propagate a **deadline** (gRPC does this; for HTTP pass a header) so downstream services stop work the caller has already abandoned.
+
+```ts
+const res = await fetch(url, { signal: AbortSignal.timeout(800) });
+```
+
+---
+
+## Retries
+
+Retry only when the failure is likely transient **and** the operation is safe to repeat ([idempotent](/fullstack/building-for-scale/degradation-and-idempotency)).
+
+| Retry                                     | Do not retry                                     |
+| :---------------------------------------- | :----------------------------------------------- |
+| Connection reset, timeout (if idempotent) | 400, 401, 403, 404, 422                          |
+| 429 (honour `Retry-After`)                | Validation or business errors                    |
+| 502, 503, 504                             | Non-idempotent writes without an idempotency key |
+
+```ts
+async function withRetry<T>(fn: () => Promise<T>, attempts = 3, baseMs = 200): Promise<T> {
+  for (let i = 0; ; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i >= attempts - 1 || !isRetryable(err)) throw err;
+      const cap = baseMs * 2 ** i; // 200, 400, 800 ...
+      await new Promise((r) => setTimeout(r, Math.random() * cap)); // full jitter
+    }
+  }
+}
+```
+
+Retries at every layer multiply: three layers retrying three times each turn one failure into 27 calls. Retry at one layer, and use a **retry budget** (retries limited to a percentage of normal traffic) so retries cannot amplify an outage.
+
+---
+
+## Circuit breaker
+
+<Mermaid
+  chart={`
+stateDiagram-v2
+    [*] --> Closed
+    Closed --> Open: failure rate over threshold
+    Open --> HalfOpen: after cool-down
+    HalfOpen --> Closed: trial calls succeed
+    HalfOpen --> Open: trial call fails
+`}
+/>
+
+- **Closed**: calls pass through; failures are counted in a rolling window.
+- **Open**: calls fail immediately (or use a fallback) without touching the dependency, giving it room to recover and freeing the caller's resources.
+- **Half-open**: a few trial calls test recovery.
+
+Libraries: `opossum` (Node), `cockatiel` (Node: retry, circuit breaker, bulkhead, timeout policies), `pybreaker`, `tenacity` for Python retries, `aiobreaker`. Service meshes and Envoy provide outlier detection at the network level.
+
+---
+
+## Bulkheads
+
+Give each dependency its own limited pool: a separate connection pool, a concurrency limit, or a separate queue and worker set. If the recommendations service hangs, at most its 10 slots are stuck; checkout keeps its own capacity. Same idea at larger scale: separate deployments for critical and non-critical traffic, per-tenant limits.
+
+---
+
+## Fallbacks
+
+| Failure                 | Fallback                                                                         |
+| :---------------------- | :------------------------------------------------------------------------------- |
+| Recommendations down    | Show bestsellers from cache, or hide the widget                                  |
+| Pricing service slow    | Last cached price with a "may have changed" note, block checkout until confirmed |
+| Search down             | Category browsing                                                                |
+| LLM provider overloaded | Smaller model, cached answer, or "try again" message                             |
+
+Fallbacks must be tested; an untested fallback path fails at the worst time. Chaos testing (fault injection with Toxiproxy, AWS FIS, or Chaos Mesh) exercises them deliberately.

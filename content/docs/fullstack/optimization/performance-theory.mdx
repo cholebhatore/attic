@@ -1,0 +1,268 @@
+---
+title: Performance Theory
+description: The models that predict performance - latency vs throughput, percentiles and why averages lie, tail latency and fan-out amplification, Amdahl's law, Little's law, queueing theory and the utilisation-latency curve, the cost of round trips, the cost hierarchy of operations, and performance budgets - each with worked numbers.
+---
+
+A service averages 80 ms per request, yet one user in a hundred waits over 2 seconds, and pages that call it 20 times are slow for most users. A database at 70 percent CPU is fine; at 90 percent, latency triples although traffic only grew by a quarter. Rewriting a function to be twice as fast speeds up the request by 3 percent. Each of these surprises is predicted by a small set of models. Knowing them turns optimization from guessing into arithmetic.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first page of Optimization; the frontend and backend pages apply these models.
+
+Most performance behaviour follows from a few facts: the slowest part of a sequence dominates it; work queues up nonlinearly as a system gets busy; and the rare slow cases, not the average, determine what most users experience when many requests combine.
+
+Topics, in order:
+
+1. Latency, throughput, and utilisation
+2. Percentiles and why averages lie
+3. Tail latency and fan-out
+4. Amdahl's law
+5. Little's law
+6. Queueing and the utilisation curve
+7. The cost of round trips
+8. The cost hierarchy of operations
+9. Budgets
+
+| Word                 | Plain meaning                                           |
+| :------------------- | :------------------------------------------------------ |
+| **latency**          | Time for one operation, from start to finish.           |
+| **throughput**       | Operations completed per unit of time.                  |
+| **utilisation**      | Fraction of time a resource is busy.                    |
+| **percentile (p99)** | Value below which 99 percent of measurements fall.      |
+| **tail latency**     | The slow end of the distribution: p99, p99.9.           |
+| **fan-out**          | One request triggering many parallel sub-requests.      |
+| **bottleneck**       | The resource that limits overall throughput or latency. |
+| **saturation**       | Work waiting because a resource is fully busy.          |
+
+---
+
+## Latency, throughput, and utilisation
+
+Latency and throughput are related but different. A single checkout lane serving a customer every 2 minutes has latency 2 minutes and throughput 30 per hour; adding a second lane doubles throughput but leaves each customer's service time at 2 minutes. Conversely, batching improves throughput while increasing latency for individual items.
+
+| Change                            | Latency                                  | Throughput                  |
+| :-------------------------------- | :--------------------------------------- | :-------------------------- |
+| Add replicas (horizontal scaling) | Unchanged (or lower if queues were long) | Higher                      |
+| Make each operation faster        | Lower                                    | Higher                      |
+| Batch work                        | Higher per item                          | Higher                      |
+| Cache results                     | Lower for hits                           | Higher                      |
+| Add a queue in front of work      | Higher (waiting)                         | Smoother, protects capacity |
+
+---
+
+## Percentiles and why averages lie
+
+Latency distributions are skewed: most requests are fast, a few are very slow (garbage collection, cache misses, lock waits, retries, slow disks).
+
+Ten request latencies in ms: `20, 22, 21, 25, 23, 24, 22, 21, 23, 1900`.
+
+| Statistic      | Value                                                                           |
+| :------------- | :------------------------------------------------------------------------------ |
+| Mean           | 210 ms (describes no actual request)                                            |
+| Median (p50)   | 22.5 ms                                                                         |
+| p90            | ~25 ms by nearest rank (or ~212 ms with interpolation; small samples are noisy) |
+| Max / p99 here | 1,900 ms                                                                        |
+
+- The **mean** is pulled by outliers and hides both the typical case and the bad case.
+- Report **p50** (typical), **p95/p99** (bad experiences that many users still hit), and **max** or **p99.9** for critical paths.
+- **Percentiles cannot be averaged.** The average of per-server p99s is not the fleet's p99; aggregate raw data or histograms (Prometheus histograms, HDR histograms).
+- **Coordinated omission**: load generators that wait for each response before sending the next under-report latency during stalls, because they stop sending exactly when the system is slow. Use open-loop load generators (constant arrival rate), such as k6's arrival-rate executors or wrk2.
+
+---
+
+## Tail latency and fan-out
+
+When one user action depends on many requests, the slowest one decides the outcome.
+
+If each backend call has a 1 percent chance of exceeding 1 second (its p99 is 1 s), the chance that a page making **N** independent calls hits at least one slow call is:
+
+$$
+P(\text{at least one slow}) = 1 - 0.99^{N}
+$$
+
+| Calls per page (N) | Chance the page sees a p99-slow call |
+| :----------------- | :----------------------------------- |
+| 1                  | 1%                                   |
+| 10                 | ~10%                                 |
+| 50                 | ~39%                                 |
+| 100                | ~63%                                 |
+
+A backend's p99 becomes the **typical** experience of a page that fans out to 100 calls. This is the central point of "The Tail at Scale" (Dean and Barroso, 2013).
+
+Techniques for tail latency:
+
+- Reduce fan-out: batch, aggregate on the server, cache.
+- **Hedged requests**: if a request has not answered within, say, its p95, send a duplicate to another replica and use whichever answers first (a few percent of extra load for a large tail reduction). Only for idempotent reads.
+- Timeouts with fallbacks for non-critical parts ([Resilience Patterns](/fullstack/building-for-scale/resilience-patterns)).
+- Remove sources of variance: GC pauses, noisy neighbours, cold caches, lock contention, retries.
+
+---
+
+## Amdahl's law
+
+If a fraction **p** of total time is sped up by a factor **s**, the overall speedup is:
+
+$$
+S = \frac{1}{(1 - p) + \frac{p}{s}}
+$$
+
+Worked example: an API request takes 400 ms: 300 ms waiting on the database, 60 ms of serialisation and business logic, 40 ms of network.
+
+| Optimization                         | p    | s   | Overall speedup | New time |
+| :----------------------------------- | :--- | :-- | :-------------- | :------- |
+| Make business logic 2x faster        | 0.15 | 2   | 1.08x           | ~370 ms  |
+| Make business logic infinitely fast  | 0.15 | ∞   | 1.18x           | 340 ms   |
+| Make database part 3x faster (index) | 0.75 | 3   | 2.0x            | 200 ms   |
+
+The ceiling for any optimization is `1 / (1 − p)`: shaving a step that is 15 percent of the time can never yield more than 1.18x. Always profile to find the largest **p** first.
+
+The same law limits parallelism: if 10 percent of a job is inherently sequential, no number of cores makes it more than 10x faster.
+
+---
+
+## Little's law
+
+For any stable system, the average number of items in the system **L** equals the arrival rate **λ** multiplied by the average time each spends in it **W**:
+
+$$
+L = \lambda \times W
+$$
+
+It holds regardless of distributions, which makes it useful for capacity planning:
+
+| Question                                                                             | Calculation                                                         |
+| :----------------------------------------------------------------------------------- | :------------------------------------------------------------------ |
+| An API receives 500 req/s and requests take 200 ms. How many are in flight?          | L = 500 × 0.2 = **100 concurrent requests**                         |
+| Each Node process handles ~50 concurrent DB-bound requests well. How many processes? | 100 / 50 = **2**, plus headroom                                     |
+| A DB pool has 20 connections and queries take 10 ms. Max query throughput?           | λ = L / W = 20 / 0.01 = **2,000 queries/s**                         |
+| Latency doubles to 400 ms under load (same traffic). Concurrency?                    | L = 500 × 0.4 = **200**: twice the connections, memory, and threads |
+
+The last row explains cascading failures: when a dependency slows down, in-flight requests pile up in every caller, exhausting pools and memory even though traffic did not change. Timeouts cap **W**, which caps **L**.
+
+---
+
+## Queueing and the utilisation curve
+
+A resource that is busy a fraction **ρ** of the time (utilisation) makes arriving work wait. For the simplest queueing model (M/M/1: random arrivals, random service times, one server), the average time in the system is:
+
+$$
+W = \frac{S}{1 - \rho}
+$$
+
+where **S** is the service time. With S = 10 ms:
+
+| Utilisation ρ | Average time W | Relative to idle |
+| :------------ | :------------- | :--------------- |
+| 10%           | 11 ms          | 1.1x             |
+| 50%           | 20 ms          | 2x               |
+| 70%           | 33 ms          | 3.3x             |
+| 80%           | 50 ms          | 5x               |
+| 90%           | 100 ms         | 10x              |
+| 95%           | 200 ms         | 20x              |
+| 99%           | 1,000 ms       | 100x             |
+
+<Mermaid
+  chart={`
+xychart-beta
+    title "Latency vs utilisation (service time 10 ms, M/M/1)"
+    x-axis "Utilisation %" [10, 30, 50, 70, 80, 90, 95]
+    y-axis "Avg latency ms" 0 --> 220
+    line [11, 14, 20, 33, 50, 100, 200]
+`}
+/>
+
+Consequences:
+
+- Latency rises **nonlinearly**: going from 80 to 90 percent utilisation doubles latency. Systems should run with headroom; autoscaling targets of 50 to 70 percent CPU are common for latency-sensitive services.
+- Variability makes it worse: real services with variable service times queue more than the formula suggests at the same utilisation.
+- A small slowdown in service time at high utilisation causes a large latency jump, which is why a "slightly slower" deploy can look like an outage.
+- Separate queues (pools) per workload prevent one class of slow work from inflating everyone's wait ([bulkheads](/fullstack/building-for-scale/resilience-patterns)).
+
+---
+
+## The cost of round trips
+
+Much web latency is round trips, not computation:
+
+| Round trip                                  | Typical cost |
+| :------------------------------------------ | :----------- |
+| Function call in process                    | ~nanoseconds |
+| Redis on the same network                   | ~0.2–1 ms    |
+| Database query (indexed) in the same region | ~1–5 ms      |
+| Service-to-service call in a region         | ~1–10 ms     |
+| Browser to nearby CDN                       | ~10–30 ms    |
+| Browser to a server on another continent    | ~100–250 ms  |
+
+N sequential round trips multiply this cost: 30 sequential 3 ms queries (an N+1 pattern) cost 90 ms before any processing. The highest-leverage optimizations usually remove round trips (batching, joins, caching, parallelising, moving computation closer to the data or the user) rather than speeding up code.
+
+---
+
+## The cost hierarchy of operations
+
+Orders of magnitude, approximate, varying by hardware (adapted from the widely cited "latency numbers every programmer should know"):
+
+| Operation                           | Time         |
+| :---------------------------------- | :----------- |
+| L1 cache reference                  | ~1 ns        |
+| Branch mispredict                   | ~3 ns        |
+| Main memory reference               | ~100 ns      |
+| Compress 1 KB (fast compressor)     | ~2 µs        |
+| Read 1 MB sequentially from memory  | ~10–50 µs    |
+| SSD random read                     | ~16–100 µs   |
+| Round trip within a data centre     | ~500 µs      |
+| Read 1 MB sequentially from SSD     | ~200 µs–1 ms |
+| Disk (HDD) seek                     | ~2–10 ms     |
+| Round trip California ↔ Netherlands | ~150 ms      |
+
+Network and disk dominate memory and CPU by orders of magnitude. JSON serialisation of a large payload, however, can cost milliseconds of CPU, and on the browser's main thread, any millisecond counts against a 16 ms frame.
+
+---
+
+## Budgets
+
+A **performance budget** is a limit that fails the build or alerts when exceeded:
+
+| Budget type    | Example                                               |
+| :------------- | :---------------------------------------------------- |
+| User metric    | p75 LCP ≤ 2.5 s, INP ≤ 200 ms, CLS ≤ 0.1 (field data) |
+| Lab metric     | Lighthouse performance score ≥ 90 on a reference page |
+| Resource size  | Initial JS ≤ 170 KB compressed per route; CSS ≤ 50 KB |
+| Request count  | ≤ 50 requests on the landing page                     |
+| Server latency | p99 API latency ≤ 300 ms at target load               |
+| Query count    | ≤ 10 database queries per request                     |
+
+Budgets turn performance from a one-time project into a property maintained by every change. Tools: Lighthouse CI, `size-limit` and bundler budgets, SLO alerts, query-count assertions in integration tests.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why are averages misleading for latency?">
+    Latency distributions are skewed; a few very slow requests pull the mean far from the typical
+    value while hiding how bad the slow cases are. Percentiles (p50, p95, p99) describe both the
+    typical and the tail experience.
+  </Accordion>
+  <Accordion title="Explain tail latency amplification.">
+    When a request fans out to N backends, it is as slow as the slowest. With a 1 percent chance of
+    a slow response per call, a request making 100 calls sees at least one slow call about 63
+    percent of the time, so backend p99 becomes the user's typical latency.
+  </Accordion>
+  <Accordion title="What does Little's law say and how is it useful?">
+    Items in a system equal arrival rate times time in system. It sizes concurrency, pools, and
+    instances, and explains why a slowing dependency exhausts resources: same traffic, longer time
+    per request, more requests in flight.
+  </Accordion>
+  <Accordion title="Why shouldn't a latency-sensitive service run at 95 percent CPU?">
+    Queueing delay grows roughly as 1/(1 − utilisation). At 95 percent, average time in system is
+    about 20 times the service time, and small slowdowns cause huge latency spikes. Headroom keeps
+    queues short.
+  </Accordion>
+  <Accordion title="What is Amdahl's law's practical lesson?">
+    The overall gain from speeding up a part is capped by that part's share of total time. Profile
+    first and optimize the largest contributor; optimizing a 10 percent step can never make the
+    whole more than about 1.1 times faster.
+  </Accordion>
+</Accordions>

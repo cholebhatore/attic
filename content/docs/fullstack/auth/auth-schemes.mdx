@@ -1,0 +1,113 @@
+---
+title: Auth Schemes
+description: How credentials travel on HTTP requests - Basic, Digest, API keys, session cookies, token-based auth, the Bearer scheme, JWT as a format - and how API keys, opaque bearer tokens, and JWTs differ.
+---
+
+These are the mechanics of _how_ a credential rides on an HTTP request. This page stays at the "scheme" layer from [Auth Basics](/fullstack/auth/auth-basics): not frameworks, not token formats, except where the two are commonly confused.
+
+---
+
+## The plain-language version
+
+A scheme is the envelope the credential travels in. Some envelopes carry the password itself (Basic), some carry a reference the server must look up (session cookie, API key, opaque token), and some carry a signed pass the server can check on its own (a JWT inside a Bearer header).
+
+| Word             | Plain meaning                                                     |
+| :--------------- | :---------------------------------------------------------------- |
+| **Basic**        | Username and password, base64-encoded, on every request.          |
+| **Digest**       | Hash of the password with a server nonce instead of the password. |
+| **API key**      | Long random string identifying an application.                    |
+| **Bearer**       | "Whoever holds this token gets access" header scheme.             |
+| **opaque token** | Random string with no readable content; needs a lookup.           |
+| **base64**       | Encoding, not encryption; anyone can decode it.                   |
+
+Schemes in order: Basic, Digest, API keys, session cookies, token-based (Bearer and JWT), then a comparison.
+
+---
+
+## Basic authentication
+
+```http
+Authorization: Basic YWRhOnMzY3JldA==      (base64 of "ada:s3cret")
+```
+
+- Credentials sent on **every single request**, base64-encoded (not encrypted: base64 is trivially reversible).
+- No session, no token, no state: the simplest possible scheme.
+- **Must** run over TLS, or credentials are exposed in plaintext on the wire.
+- **Challenges**: no expiry, no revocation without changing the password, no scoping, credentials repeatedly exposed on every hop (proxies, logs). Rarely appropriate for anything user-facing today; still seen for service-to-service calls and internal tooling.
+
+---
+
+## Digest authentication
+
+- An evolution of Basic that avoids sending the raw password. The server sends a `nonce`; the client hashes `username:realm:password` combined with the nonce and sends the hash.
+- Solves plaintext exposure on the wire without TLS, but is largely obsolete now that TLS is everywhere.
+- **Challenges**: complex to implement correctly, weak against replay if nonces are not managed carefully, relies on old hash functions (MD5), and the server must store passwords in a recoverable form. Mentioned for completeness; avoid for new systems.
+
+---
+
+## API keys
+
+```http
+X-API-Key: sk_live_9f8a7c...
+```
+
+- A single long, high-entropy **random string** issued to a client (usually an application, not an end user), sent in a header or, poorly, a query parameter.
+- **Key fact**: an API key is **just a random opaque string**. It carries no embedded claims. The server's only way to know who it belongs to is a **database lookup** (key → owner). API keys are therefore inherently stateful, even though they look like a "token".
+- Used for machine-to-machine or third-party integration access (calling a public API), not for representing an interactively logged-in human.
+- **Challenges**: no built-in expiry (must be enforced manually), no built-in scoping (must be modelled in the DB), easy to leak (committed to repos, logged, hard-coded in client-side code), and revocation needs a DB write plus often cache invalidation.
+- **Good practice**: store only a hash of the key (like a password, but a fast hash such as SHA-256 is fine because keys are high-entropy), show it once at creation, use a recognisable prefix (`sk_live_`) so secret scanners can detect leaks, and support multiple active keys for rotation.
+
+---
+
+## Session-based authentication (cookie + session ID)
+
+- The classic **stateful** pattern from [Stateful vs Stateless](/fullstack/auth/stateful-vs-stateless). The client gets an opaque session ID in a cookie; the server holds the session record.
+- The browser attaches the cookie automatically on matching requests (subject to `SameSite` rules). No manual header wiring is needed on the client, which is a major usability and security advantage: the cookie can be `HttpOnly`, out of JavaScript's reach. The flip side is [CSRF](/fullstack/auth/attacks-and-defenses).
+
+---
+
+## Token-based authentication
+
+"Token-based" is a broad umbrella: it only means _some token is presented instead of raw credentials_. It splits into two separate questions:
+
+1. **What scheme delivers it?** Almost always **Bearer**.
+2. **What format is the token?** An **opaque random string** (functionally like a session ID or API key) **or a JWT**.
+
+### Bearer (the scheme, not the token format)
+
+```http
+Authorization: Bearer <token>
+```
+
+- "Bearer" describes **how the credential is transmitted and the trust model it implies**: whoever _bears_ (holds) the token is granted access, with no further proof of identity (such as a signature over the request). It says **nothing about the token's internal structure**.
+- A Bearer token can be:
+  - an **opaque string** validated via server-side lookup (stateful), or
+  - a **JWT** validated via signature check (stateless).
+- "Bearer" is the delivery mechanism (a header format plus a trust assumption); "JWT" is one possible _format_ of the token. They operate at different layers and are not substitutes: Bearer works without JWT, and a JWT can travel outside the Bearer scheme (for example in a cookie).
+- Sender-constrained alternatives (**DPoP**, mTLS-bound tokens) tie a token to a key the client holds, so a stolen token alone is not enough.
+
+### JWT: a format, not a method
+
+- A JWT is a self-contained, cryptographically **signed** (optionally encrypted) structure: `header.payload.signature`, each part base64url-encoded.
+  - **Header**: algorithm and token type.
+  - **Payload**: claims such as identity (`sub`), expiry (`exp`), issuer (`iss`), and custom data.
+  - **Signature**: proves the payload has not been tampered with, made with a server-held secret (HMAC) or private key (RSA, ECDSA, EdDSA).
+- The payload is only base64url-**encoded**, not encrypted, so **anyone can read a JWT's contents**. Signing guarantees integrity, not confidentiality. Never put secrets in a JWT payload.
+- This enables **stateless verification**: any server holding the secret or public key can check the signature and trust the claims without a DB call. Full detail in [JWT](/fullstack/auth/jwt).
+
+---
+
+## API key vs opaque bearer token vs JWT
+
+All three can appear as "a string in a header", but they differ fundamentally:
+
+|                | API key                              | Opaque bearer token                         | JWT (as Bearer token)                                      |
+| :------------- | :----------------------------------- | :------------------------------------------ | :--------------------------------------------------------- |
+| Structure      | Random string, no internal structure | Random string, no internal structure        | Structured, self-describing (header.payload.signature)     |
+| Validation     | DB/cache lookup required             | DB/cache lookup (or introspection endpoint) | Signature check, no lookup                                 |
+| Statefulness   | Stateful                             | Stateful                                    | Stateless by default                                       |
+| Typical holder | Application or service               | User session after login                    | User session or service, especially in distributed systems |
+| Expiry         | Usually none built in                | Set server-side on the record               | Built into the token (`exp` claim)                         |
+| Revocation     | DB delete                            | DB delete, instant                          | Hard: blocklist or short TTL + refresh flow                |
+
+The mental model: **API keys and opaque bearer tokens are the same shape** (random strings needing a lookup) **with different purposes** (service identity vs user session). **JWTs are structurally different** from both: they carry their own proof, which is exactly why they trade easy revocation for easy scaling.

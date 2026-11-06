@@ -1,0 +1,91 @@
+---
+title: Config, Logging, Errors
+description: Twelve-factor configuration, environment variables and validation, secrets, structured JSON logging with request IDs, log levels, error classes, and consistent error responses with Problem Details.
+---
+
+A production incident starts with a log line reading `Error: undefined`. No request ID, no user, no stack trace, no input. Good logging and error handling are what make the next incident a five-minute fix instead of a five-hour hunt.
+
+---
+
+## Configuration
+
+The [twelve-factor](https://12factor.net/config) rule: config that changes between environments (URLs, credentials, feature toggles) lives in environment variables, not in code. The same build artifact runs in staging and production.
+
+- Validate config at startup and crash early if it is wrong (see [Zod env parsing](/fullstack/typescript/runtime-validation); Python uses `pydantic-settings`).
+- `.env` files for local development only; commit a `.env.example`, never `.env`.
+- Secrets come from a secrets manager or the platform's encrypted variables. See [secrets](/fullstack/security/headers-secrets-supply-chain).
+
+---
+
+## Structured logging
+
+```json
+{
+  "level": "error",
+  "time": "2026-11-06T10:22:31Z",
+  "msg": "payment failed",
+  "requestId": "7f3a",
+  "userId": "u_19",
+  "orderId": 981,
+  "err": { "type": "CardDeclined", "stack": "..." }
+}
+```
+
+| Practice                                                | Why                                           |
+| :------------------------------------------------------ | :-------------------------------------------- |
+| JSON lines, one event per line                          | Log platforms can search and aggregate fields |
+| Request ID on every line (`X-Request-ID`)               | Follow one request across services            |
+| Levels: `debug`, `info`, `warn`, `error`                | Filter noise; alert on errors                 |
+| Context, not prose                                      | `{ orderId }` beats string interpolation      |
+| Never log secrets, tokens, passwords, full card numbers | Logs are widely readable and retained         |
+
+Libraries: **pino** for Node (fast JSON), **structlog** or the standard `logging` module with a JSON formatter for Python. Logs connect to traces and metrics in [observability](/fullstack/building-for-scale/observability).
+
+---
+
+## Error handling
+
+Two kinds of errors:
+
+- **Operational / expected**: invalid input, not found, conflict, upstream timeout. Map to a 4xx or 503 with a clear message.
+- **Programmer / unexpected**: bugs. Log with stack trace, return a generic 500, alert.
+
+```ts
+export class AppError extends Error {
+  constructor(
+    public status: number,
+    public code: string,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+export class NotFound extends AppError {
+  constructor(what: string) {
+    super(404, 'not_found', `${what} not found`);
+  }
+}
+
+// Express 5 error middleware (four arguments)
+app.use((err, req, res, next) => {
+  if (err instanceof AppError) {
+    return res
+      .status(err.status)
+      .type('application/problem+json')
+      .json({
+        type: `https://errors.example.com/${err.code}`,
+        title: err.message,
+        status: err.status,
+      });
+  }
+  req.log.error({ err }, 'unhandled');
+  res.status(500).json({ title: 'Internal Server Error', status: 500 });
+});
+```
+
+**Problem Details** (RFC 9457, `application/problem+json`) is a standard error body shape: `type`, `title`, `status`, `detail`, `instance`, plus extension fields such as a list of validation errors.
+
+<Callout type="warn">
+  Never send stack traces or raw database errors to clients. They leak table names, file paths, and
+  library versions to attackers.
+</Callout>

@@ -1,0 +1,98 @@
+---
+title: REST in Practice
+description: Offset vs cursor pagination, filtering and sorting, sparse fields, versioning strategies, error format, rate limit headers, idempotency keys, OpenAPI and code generation, and API documentation.
+---
+
+An infinite-scroll feed uses `?page=40&limit=20`. As new posts arrive, users see duplicates and miss items, and the query gets slower each page because the database still counts through the first 800 rows. Pagination, versioning, and error formats are where API design meets production.
+
+---
+
+## Pagination
+
+|                          | Offset (`?limit=20&offset=40`)                  | Cursor / keyset (`?limit=20&after=ord_981`) |
+| :----------------------- | :---------------------------------------------- | :------------------------------------------ |
+| Jump to page N           | Yes                                             | No                                          |
+| Stable when data changes | No: duplicates and gaps                         | Yes                                         |
+| Deep page cost           | Grows with offset (`OFFSET` scans skipped rows) | Constant with an index                      |
+| Use for                  | Small admin tables                              | Feeds, large lists, public APIs             |
+
+```sql
+-- keyset: next page after the last seen (created_at, id)
+SELECT * FROM orders
+WHERE (created_at, id) < ($1, $2)
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+```json
+{ "data": [...], "nextCursor": "eyJjIjoiMjAyNi0xMS0wNlQxMDoyMiIsImkiOjk4MX0" }
+```
+
+Cursors are opaque (base64 of the sort keys) so the format can change.
+
+---
+
+## Filtering, sorting, fields
+
+```text
+GET /orders?status=paid&createdAfter=2026-10-01&sort=-createdAt&fields=id,total
+```
+
+Whitelist filterable and sortable fields; never pass user input into `ORDER BY` directly.
+
+---
+
+## Versioning
+
+| Strategy   | Example                                | Notes                                           |
+| :--------- | :------------------------------------- | :---------------------------------------------- |
+| URL        | `/v1/orders`                           | Most common, visible, easy to route             |
+| Header     | `Accept: application/vnd.shop.v2+json` | Clean URLs, harder to test in a browser         |
+| Date-based | `Stripe-Version: 2026-10-01`           | Per-client pinning, transforms between versions |
+
+Additive changes (new optional fields, new endpoints) do not need a new version. Removing or renaming fields, changing types, or tightening validation does. Announce deprecations with the `Deprecation` and `Sunset` headers.
+
+---
+
+## Errors
+
+Use one format everywhere, such as Problem Details (RFC 9457):
+
+```json
+{
+  "type": "https://api.shop.example/errors/validation",
+  "title": "Invalid request",
+  "status": 422,
+  "errors": [{ "field": "qty", "message": "must be at least 1" }],
+  "requestId": "7f3a"
+}
+```
+
+---
+
+## Rate limits and idempotency
+
+```http
+HTTP/1.1 429 Too Many Requests
+RateLimit-Policy: 100;w=60
+RateLimit: limit=100, remaining=0, reset=17
+Retry-After: 17
+```
+
+```http
+POST /payments
+Idempotency-Key: 4f1c2d1e-...
+```
+
+The server stores the key with the first response; a retry with the same key returns the stored response instead of charging twice. See [traffic control](/fullstack/building-for-scale/traffic-control) and [idempotency](/fullstack/building-for-scale/degradation-and-idempotency).
+
+---
+
+## OpenAPI
+
+An OpenAPI document describes endpoints, parameters, schemas, and auth in YAML or JSON.
+
+- **Code-first**: generate the spec from code (FastAPI automatically; `zod-openapi`, NestJS Swagger, Hono OpenAPI in Node).
+- **Spec-first**: write the spec, generate server stubs and clients.
+- Generate typed clients (`openapi-typescript` + `openapi-fetch`, Orval, Hey API) so the frontend breaks at compile time when the API changes.
+- Docs UIs: Swagger UI, Scalar, Redoc. Lint specs with Spectral.

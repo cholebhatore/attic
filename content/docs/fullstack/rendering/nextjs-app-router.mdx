@@ -1,0 +1,361 @@
+---
+title: Next.js App Router
+description: How the Next.js App Router (version 16) maps the rendering theory onto conventions - file-system routing and special files, nested layouts and what they preserve, route groups, dynamic, parallel, and intercepting routes, the request pipeline, prerendering vs dynamic rendering with Cache Components, use cache and cacheLife, revalidation APIs, navigation and prefetching, route handlers, proxy.ts, Server Functions, metadata, images and fonts, and self-hosting.
+---
+
+Next.js turns the strategies from the previous pages into file and function conventions: a folder is a route, a `layout.tsx` is UI that survives navigation, `loading.tsx` is a Suspense boundary, `'use cache'` marks what may be shared and prerendered. This page follows **Next.js 16 with Cache Components**. Guides that mention `getServerSideProps`, `middleware.ts`, `export const revalidate`, or implicit `fetch` caching describe earlier models.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the concrete implementation of [Rendering Strategies](/fullstack/rendering/rendering-strategies), [Server Components](/fullstack/rendering/server-components), and [Data Fetching and Caching](/fullstack/rendering/data-fetching-and-caching).
+
+Folders under `app/` are URL segments. Each folder can contain special files that define its page, the layout wrapping it, and its loading, error, and not-found states. Components are Server Components unless marked `'use client'`. Everything is rendered per request **unless** it is marked cacheable with `'use cache'` or has no request-specific inputs; cacheable parts form a prerendered static shell, and uncached parts wrapped in Suspense stream in per request.
+
+Topics, in order:
+
+1. Routing and special files
+2. Layouts and what they preserve
+3. Route groups, dynamic, parallel, and intercepting routes
+4. The request pipeline
+5. Prerendering, dynamic rendering, and Cache Components
+6. Caching with use cache
+7. Revalidation
+8. Navigation and prefetching
+9. Route handlers
+10. proxy.ts
+11. Server Functions and forms
+12. Metadata, images, fonts
+13. Deployment and self-hosting
+
+| Word                  | Plain meaning                                                                        |
+| :-------------------- | :----------------------------------------------------------------------------------- |
+| **segment**           | One folder = one URL part.                                                           |
+| **layout**            | UI wrapping child segments; stays mounted across navigation between its children.    |
+| **template**          | Like a layout but remounted on every navigation.                                     |
+| **prerendering**      | Rendering at build time or revalidation; the result is cached.                       |
+| **dynamic rendering** | Rendering at request time.                                                           |
+| **runtime API**       | `cookies()`, `headers()`, `searchParams`, `params`: data only available per request. |
+| **static shell**      | The prerendered part of a route, sent instantly.                                     |
+
+---
+
+## Routing and special files
+
+<Files>
+  <Folder name="app" defaultOpen>
+    <File name="layout.tsx" />
+    <File name="page.tsx" />
+    <File name="not-found.tsx" />
+    <File name="global-error.tsx" />
+    <Folder name="(marketing)" defaultOpen>
+      <File name="layout.tsx" />
+      <Folder name="pricing">
+        <File name="page.tsx" />
+      </Folder>
+    </Folder>
+    <Folder name="shop" defaultOpen>
+      <File name="layout.tsx" />
+      <Folder name="[category]" defaultOpen>
+        <File name="page.tsx" />
+        <File name="loading.tsx" />
+        <File name="error.tsx" />
+        <Folder name="[productId]">
+          <File name="page.tsx" />
+        </Folder>
+      </Folder>
+    </Folder>
+    <Folder name="api">
+      <Folder name="webhooks">
+        <File name="route.ts" />
+      </Folder>
+    </Folder>
+  </Folder>
+  <File name="proxy.ts" />
+  <File name="instrumentation.ts" />
+  <File name="next.config.ts" />
+</Files>
+
+| File                                                   | Role                                                              | React equivalent                   |
+| :----------------------------------------------------- | :---------------------------------------------------------------- | :--------------------------------- |
+| `page.tsx`                                             | Makes the segment routable; the leaf UI                           | Component                          |
+| `layout.tsx`                                           | Wraps children; persists across child navigation                  | Component with `children`          |
+| `template.tsx`                                         | Wraps children; remounts on navigation                            | Component keyed by path            |
+| `loading.tsx`                                          | Fallback while the segment's page loads                           | `<Suspense fallback>` around page  |
+| `error.tsx`                                            | Fallback when the segment throws (Client Component, gets `reset`) | Error boundary                     |
+| `not-found.tsx` / `forbidden.tsx` / `unauthorized.tsx` | Rendered by `notFound()`, `forbidden()`, `unauthorized()`         | Error boundary for specific errors |
+| `route.ts`                                             | HTTP handlers (`GET`, `POST`, ...) instead of UI                  | API endpoint                       |
+| `default.tsx`                                          | Fallback for unmatched parallel route slots                       |                                    |
+
+The nesting for one URL, `/shop/lamps/p_42`:
+
+```tsx
+<RootLayout>
+  <ShopLayout>
+    <ErrorBoundary fallback={<CategoryError />}>
+      <Suspense fallback={<CategoryLoading />}>
+        <ProductPage params={{ category: 'lamps', productId: 'p_42' }} />
+      </Suspense>
+    </ErrorBoundary>
+  </ShopLayout>
+</RootLayout>
+```
+
+`params` and `searchParams` are **promises** in current versions (`const { id } = await params`), which lets the framework start rendering before they are resolved and makes their use an explicit dynamic signal.
+
+---
+
+## Layouts and what they preserve
+
+On navigation from `/shop/lamps` to `/shop/chairs`, `RootLayout` and `ShopLayout` are **not re-rendered or remounted**; only the changed segment below them is fetched and rendered. Client state inside layouts (an open sidebar, a search input, a playing audio player, scroll position) survives.
+
+Consequences:
+
+- Layouts cannot read the current pathname's `searchParams` (they would go stale as children change); read them in pages or in client components with hooks.
+- Data fetched in a layout is not refreshed on child navigations unless revalidated.
+- A slow `await` in a layout delays every page below it: keep layouts light and stream slow parts.
+
+---
+
+## Route groups, dynamic, parallel, and intercepting routes
+
+| Pattern             | Syntax                                  | Use                                                                                                             |
+| :------------------ | :-------------------------------------- | :-------------------------------------------------------------------------------------------------------------- |
+| Route group         | `(marketing)`                           | Organise or give different layouts without affecting the URL                                                    |
+| Dynamic segment     | `[id]`                                  | `/products/42`                                                                                                  |
+| Catch-all           | `[...slug]`, optional `[[...slug]]`     | Docs paths of any depth                                                                                         |
+| Parallel routes     | `@analytics`, `@team` slots in a layout | Independent sections with their own loading/error states (dashboards, split views)                              |
+| Intercepting routes | `(.)photo/[id]`, `(..)`, `(...)`        | Show a route in a modal during client navigation, as a full page on direct load (photo galleries, login modals) |
+| Private folders     | `_components`                           | Colocate files without creating routes                                                                          |
+
+`generateStaticParams` lists dynamic segment values to prerender at build time; others render on demand.
+
+---
+
+## The request pipeline
+
+<Mermaid
+  chart={`
+flowchart LR
+    R["Request"] --> P["proxy.ts (rewrites, redirects, headers, cheap checks)"]
+    P --> C{"Prerendered output cached?"}
+    C -- "fully static" --> S["Serve cached HTML / RSC payload"]
+    C -- "static shell + dynamic holes" --> SH["Send shell immediately"] --> D["Render dynamic holes, stream"]
+    C -- "fully dynamic" --> RD["Render route on request, streaming"]
+`}
+/>
+
+For a navigation inside the app, the client requests the **RSC payload** of the changed segments rather than HTML.
+
+---
+
+## Prerendering, dynamic rendering, and Cache Components
+
+With `cacheComponents: true` in `next.config.ts`, the model is:
+
+- At build (and revalidation), Next.js **prerenders** each route as far as it can.
+- Synchronous code and anything inside `'use cache'` becomes part of the **static shell**.
+- Reading runtime APIs (`cookies()`, `headers()`, `searchParams`, uncached `params`) or awaiting uncached I/O makes that component **dynamic**: it must be wrapped in `<Suspense>`, whose fallback joins the static shell, and it renders at request time.
+- Uncached async work outside Suspense is reported as a "blocking route" in development, because it would delay the whole response.
+
+```tsx title="app/shop/[category]/page.tsx"
+import { Suspense } from 'react';
+import { cookies } from 'next/headers';
+
+export default async function CategoryPage({ params }: { params: Promise<{ category: string }> }) {
+  const { category } = await params;
+  const products = await getProducts(category); // 'use cache' inside: part of the shell
+  return (
+    <>
+      <ProductGrid products={products} />
+      <Suspense fallback={<CartBadgeSkeleton />}>
+        <CartBadge /> {/* reads cookies: dynamic hole */}
+      </Suspense>
+    </>
+  );
+}
+
+async function CartBadge() {
+  const session = (await cookies()).get('session')?.value;
+  return <span>{await countCartItems(session)}</span>;
+}
+```
+
+This is [partial prerendering](/fullstack/rendering/rendering-strategies): one route, static shell, streamed holes.
+
+---
+
+## Caching with use cache
+
+```tsx title="app/lib/data.ts"
+import { cacheLife, cacheTag } from 'next/cache';
+
+export async function getProducts(category: string) {
+  'use cache';
+  cacheLife('hours');
+  cacheTag('products', `category:${category}`);
+  return db.product.findMany({ where: { category } });
+}
+```
+
+| Concept                                         | Behaviour                                                                                                                                                                                           |
+| :---------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `'use cache'` at the top of a function          | Caches its return value, keyed by its arguments and closed-over values                                                                                                                              |
+| `'use cache'` at the top of a component or page | Caches its rendered output                                                                                                                                                                          |
+| `'use cache'` at the top of a file              | All exported functions cached                                                                                                                                                                       |
+| Arguments                                       | Must be serialisable; they form the cache key                                                                                                                                                       |
+| `cacheLife(profile)`                            | `stale` (client may reuse without checking), `revalidate` (refresh in background after), `expire` (hard limit). Profiles: `seconds`, `minutes`, `hours`, `days`, `weeks`, `max`, or a custom object |
+| `cacheTag(...tags)`                             | Labels for on-demand invalidation                                                                                                                                                                   |
+| Runtime APIs inside `'use cache'`               | Not allowed: read cookies outside and pass values in as arguments                                                                                                                                   |
+| `'use cache: private'`                          | Per-user caching of results that depend on runtime data, kept out of shared caches                                                                                                                  |
+| `'use cache: remote'`                           | Store in a remote cache handler shared across instances                                                                                                                                             |
+
+A cache with a very short lifetime (the `seconds` profile, or expiry under five minutes) is excluded from prerendering and behaves as dynamic. Pair every `'use cache'` with an explicit `cacheLife` so the lifetime is a decision, not a default.
+
+---
+
+## Revalidation
+
+| API                           | Where                            | Effect                                                                                           |
+| :---------------------------- | :------------------------------- | :----------------------------------------------------------------------------------------------- |
+| `cacheLife(...)`              | Inside cached scope              | Time-based: stale-while-revalidate after `revalidate`                                            |
+| `revalidateTag(tag, profile)` | Server Functions, route handlers | Marks tagged entries stale; next request serves stale and refreshes in background                |
+| `updateTag(tag)`              | Server Functions only            | Expires tagged entries immediately so the user's next render reads fresh data (read-your-writes) |
+| `revalidatePath(path)`        | Server Functions, route handlers | Invalidates everything for a route                                                               |
+| `refresh()`                   | Server Functions                 | Refreshes the client router's current view without touching tagged caches                        |
+
+Typical flow: a CMS webhook hits a route handler that calls `revalidateTag('products', 'max')`; an admin edit in a Server Function calls `updateTag('product:42')` so the editor sees the change immediately.
+
+---
+
+## Navigation and prefetching
+
+- `<Link>` performs client-side navigation: fetch the RSC payload for changed segments, reconcile, keep layout state, update history.
+- Links are **prefetched** when they enter the viewport or are hovered. Static routes are prefetched fully; dynamic routes are skipped or prefetched up to their `loading.tsx` (partial prefetch), so navigation can show the loading state instantly while the rest streams.
+- Prefetched and visited segments are kept in a client-side cache for back/forward and repeated navigations, subject to the `stale` time of their cache profile.
+- `useRouter().push/replace/refresh/prefetch`, `usePathname`, `useSearchParams` in Client Components; `redirect()` and `permanentRedirect()` on the server.
+- Plain `<a>` tags cause full page loads (no prefetching, layouts remount).
+
+---
+
+## Route handlers
+
+```ts title="app/api/webhooks/stripe/route.ts"
+import { revalidateTag } from 'next/cache';
+
+export async function POST(request: Request) {
+  const raw = await request.text(); // raw body for signature verification
+  const event = verifyStripeSignature(raw, request.headers.get('stripe-signature'));
+  if (event.type === 'product.updated') revalidateTag(`product:${event.data.object.id}`, 'max');
+  return Response.json({ received: true });
+}
+```
+
+Route handlers use Web `Request` and `Response`. With Cache Components, `GET` handlers follow the same prerendering rules as pages. Use them for webhooks, public APIs, file downloads, and clients other than the app's own UI; within the app, Server Functions and Server Components usually replace internal API routes.
+
+---
+
+## proxy.ts
+
+`proxy.ts` (called `middleware.ts` before version 16) runs before routes, on the Node.js runtime by default:
+
+```ts title="proxy.ts"
+import { NextResponse, type NextRequest } from 'next/server';
+
+export function proxy(request: NextRequest) {
+  if (!request.cookies.has('session')) {
+    return NextResponse.redirect(new URL(`/login?next=${request.nextUrl.pathname}`, request.url));
+  }
+  const res = NextResponse.next();
+  res.headers.set('x-request-id', crypto.randomUUID());
+  return res;
+}
+
+export const config = { matcher: ['/dashboard/:path*', '/account/:path*'] };
+```
+
+Good for redirects, rewrites (A/B tests, multi-tenant hostnames), headers, and **optimistic** auth checks (is there a session cookie at all?). It is not for slow data fetching or full session validation: authoritative authentication and authorization belong in the page, the data access layer, and every Server Function. Static redirects belong in `next.config.ts`.
+
+---
+
+## Server Functions and forms
+
+```tsx title="app/account/page.tsx"
+import { updateName } from './actions';
+
+export default async function AccountPage() {
+  const user = await requireUser();
+  return (
+    <form action={updateName}>
+      <input name="name" defaultValue={user.name} />
+      <button>Save</button>
+    </form>
+  );
+}
+```
+
+The form works before hydration (progressive enhancement). `updateName` validates input, checks the user, writes, and calls `updateTag` or `refresh()` so the page re-renders with fresh data. Client-side pending and optimistic states use `useActionState`, `useFormStatus`, and `useOptimistic` ([React 19](/fullstack/react/react-19-and-patterns)); security rules are in [Server Components](/fullstack/rendering/server-components).
+
+---
+
+## Metadata, images, fonts
+
+```tsx
+export async function generateMetadata({ params }: { params: Promise<{ productId: string }> }) {
+  const product = await getProduct((await params).productId);
+  return {
+    title: `${product.name} · Shop`,
+    description: product.summary,
+    openGraph: { images: [product.imageUrl] },
+    alternates: { canonical: `/products/${product.id}` },
+  };
+}
+```
+
+- `sitemap.ts`, `robots.ts`, `manifest.ts`, `opengraph-image.tsx` (generated social images) as files.
+- `next/image`: responsive `srcset`, modern formats, lazy loading by default, `priority`/`fetchPriority` for the LCP image, required dimensions to prevent layout shift.
+- `next/font`: self-hosted fonts with `size-adjust` fallbacks, no request to Google at runtime, no layout shift.
+- `next/script`: third-party scripts with loading strategies.
+
+---
+
+## Deployment and self-hosting
+
+| Target                             | Notes                                                                                                              |
+| :--------------------------------- | :----------------------------------------------------------------------------------------------------------------- |
+| Vercel                             | Native support for all features, including caching and streaming at the edge                                       |
+| Node server (`next start`)         | Full feature support on any VM, container, or PaaS                                                                 |
+| Docker                             | `output: 'standalone'` produces a minimal server bundle for small images                                           |
+| Multiple instances                 | Configure a shared **cache handler** (Redis or similar) so caches and revalidation are consistent across instances |
+| Static export (`output: 'export'`) | Pure static files; no server features (no dynamic rendering, Server Functions, or proxy)                           |
+| Other platforms                    | Adapters (OpenNext for AWS and Cloudflare)                                                                         |
+
+Behind a CDN or reverse proxy, ensure streaming is not buffered and that `Cache-Control` headers set by Next.js are respected rather than overridden.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why do layouts persist across navigation, and what are the consequences?">
+    Only the segments that changed are re-rendered, so layouts above them keep their state and DOM.
+    Data loaded in layouts is not refreshed automatically, layouts cannot rely on the current page's
+    search params, and slow layouts delay every child page.
+  </Accordion>
+  <Accordion title="With Cache Components, what decides whether part of a page is static or dynamic?">
+    Code that is synchronous or inside 'use cache' becomes part of the prerendered static shell.
+    Components that read runtime APIs (cookies, headers, searchParams) or await uncached I/O are
+    dynamic and must be wrapped in Suspense so they stream at request time.
+  </Accordion>
+  <Accordion title="revalidateTag vs updateTag?">
+    revalidateTag marks entries stale and refreshes them in the background (stale-while-revalidate),
+    suitable for webhooks and other users. updateTag, available in Server Functions, expires entries
+    immediately so the user who made the change sees it on their next render.
+  </Accordion>
+  <Accordion title="Why shouldn't proxy.ts be the only authentication check?">
+    It only sees the incoming request and is meant for quick, optimistic checks and routing. Pages,
+    data access functions, and Server Functions are reachable in ways proxy matchers can miss, so
+    authoritative checks must live where data is read and changed.
+  </Accordion>
+</Accordions>

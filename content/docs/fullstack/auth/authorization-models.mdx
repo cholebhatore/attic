@@ -1,0 +1,84 @@
+---
+title: Authorization Models
+description: Where authorization checks belong, ownership checks and IDOR, RBAC, ABAC, ReBAC, scopes, multi-tenant isolation, row-level security, and policy engines.
+---
+
+`GET /api/invoices/1042` returns an invoice. A curious user changes the URL to `1043` and sees another company's invoice. Authentication worked perfectly; authorization was never checked. Broken object-level authorization is the top risk in the OWASP API Security Top 10.
+
+---
+
+## The plain-language version
+
+Authorization answers "may this user do this action on this specific thing?". The check must happen on the server, for every request, against the actual object, not just the route.
+
+| Word                | Plain meaning                                                                                                      |
+| :------------------ | :----------------------------------------------------------------------------------------------------------------- |
+| **IDOR / BOLA**     | Insecure direct object reference / broken object-level authorization: accessing others' objects by changing an ID. |
+| **RBAC**            | Role-based access control: permissions attached to roles.                                                          |
+| **ABAC**            | Attribute-based: rules over user, resource, and context attributes.                                                |
+| **ReBAC**           | Relationship-based: permissions derived from relationships (owner of, member of).                                  |
+| **least privilege** | Grant the minimum access needed.                                                                                   |
+| **RLS**             | Row-level security: database-enforced filters per user or tenant.                                                  |
+
+---
+
+## Where checks go
+
+1. **Route level**: is the user logged in, do they have the `admin` role? (Coarse.)
+2. **Object level**: does this order belong to this user or their organisation? (Essential.)
+3. **Field level**: may this user see `salary` or change `role`? (Also mass assignment: never bind request bodies directly to models.)
+
+```ts
+// Scope queries by owner instead of fetching then checking
+const invoice = await db.invoice.findFirst({ where: { id, orgId: req.user.orgId } });
+if (!invoice) throw new NotFound('Invoice'); // 404 hides existence
+```
+
+---
+
+## Models
+
+| Model          | Rule example                                                | Good for                                        | Weak at                                 |
+| :------------- | :---------------------------------------------------------- | :---------------------------------------------- | :-------------------------------------- |
+| RBAC           | `editor` can `article:update`                               | Most apps; easy to audit                        | Per-object rules lead to role explosion |
+| ABAC           | Allow if `user.dept == doc.dept` and time is business hours | Fine-grained, contextual rules                  | Harder to reason about and audit        |
+| ReBAC          | User can edit doc if member of a team that owns its folder  | Google Drive-like sharing, nested orgs          | Needs a relationship graph store        |
+| Scopes (OAuth) | Token has `orders:read`                                     | Limiting what a token or third-party app can do | Not a full permission model on its own  |
+
+Real systems combine them: RBAC within a tenant, ownership checks per object, scopes for API tokens.
+
+---
+
+## Multi-tenancy
+
+Every query in a multi-tenant SaaS must filter by tenant. Defense in depth:
+
+- Tenant ID taken from the session, never from the request body.
+- Repository helpers that always add the tenant filter.
+- PostgreSQL **row-level security** as a backstop:
+
+```sql
+ALTER TABLE invoices ENABLE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON invoices
+  USING (org_id = current_setting('app.org_id')::uuid);
+-- per request: SET LOCAL app.org_id = '...';
+```
+
+More in [Multi-tenancy](/fullstack/architecture/system-architecture).
+
+---
+
+## Policy engines
+
+When rules grow complex, move them out of handlers into a policy layer:
+
+| Tool                                  | Model                            |
+| :------------------------------------ | :------------------------------- |
+| CASL (JS), Oso                        | In-app RBAC/ABAC rules           |
+| Open Policy Agent (Rego), Cedar (AWS) | Policy-as-code, decision service |
+| OpenFGA, SpiceDB, Permify             | Zanzibar-style ReBAC             |
+
+<Callout type="warn">
+  Hiding a button in the UI is not authorization. Every API endpoint and Server Function must
+  enforce the rule itself, because attackers call APIs directly.
+</Callout>

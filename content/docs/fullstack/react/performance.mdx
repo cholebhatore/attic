@@ -1,0 +1,286 @@
+---
+title: Performance
+description: React performance from first principles - the cost model of a render, profiling with React DevTools, structural fixes (moving state down, children as props, splitting contexts), memo, useMemo, and useCallback and when they work, referential equality, the React Compiler, expensive computations, large lists and virtualisation, transitions for responsiveness, and bundle cost of components.
+---
+
+A settings page re-renders 3,000 components on every keystroke in one text field, and typing lags by 150 ms. Wrapping everything in `memo`, `useMemo`, and `useCallback` makes the code unreadable and fixes nothing, because one inline object prop breaks every memo. Moving the field's state into its own small component fixes it in five lines. React performance work starts with understanding where render time goes, not with memoisation.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after the core model and hooks pages. General page-load and runtime performance is in [Optimization](/fullstack/optimization); this page covers React-specific costs.
+
+React's cost has three parts: **how many components render**, **how much work each render does**, and **how much JavaScript ships** to make that possible. The cheapest fix is usually structural: arrange the tree so fewer components are affected by each change. Memoisation is a second tool, and the React Compiler increasingly applies it automatically.
+
+Topics, in order:
+
+1. The cost model
+2. Measure first: the Profiler
+3. Structural fixes
+4. memo, useMemo, useCallback
+5. Referential equality pitfalls
+6. The React Compiler
+7. Expensive computations
+8. Large lists
+9. Responsiveness: transitions and deferred values
+10. Component bundle cost
+
+| Word                     | Plain meaning                                               |
+| :----------------------- | :---------------------------------------------------------- |
+| **render cost**          | Time spent calling a component and reconciling its output.  |
+| **wasted render**        | A render whose output is identical to the previous one.     |
+| **memoisation**          | Caching a result and reusing it when inputs are unchanged.  |
+| **referential equality** | Two values are the same object in memory (`===`).           |
+| **virtualisation**       | Rendering only the list items visible in the viewport.      |
+| **commit cost**          | Time spent applying DOM changes and running layout effects. |
+
+---
+
+## The cost model
+
+For one update:
+
+$$
+T_{\text{update}} \approx \sum_{\text{rendered components}} t_{\text{render}} \; + \; t_{\text{reconcile}} \; + \; t_{\text{commit (DOM changes)}} \; + \; t_{\text{effects}}
+$$
+
+| Factor                        | Typical cause of high cost                                                                       |
+| :---------------------------- | :----------------------------------------------------------------------------------------------- |
+| Number of rendered components | State held too high; context with frequently changing value; parent re-rendering a large subtree |
+| Work per render               | Sorting, filtering, formatting large data during render; creating heavy objects                  |
+| DOM changes                   | Large lists fully re-created (bad keys), layout-triggering style changes                         |
+| Effects                       | Expensive or chained effects; layout effects doing heavy work                                    |
+
+For a smooth response to input, the whole update should fit well within the interaction budget: [INP](/fullstack/performance/core-web-vitals) is "good" under 200 ms, and frames are 16.7 ms at 60 Hz. On a mid-range phone, JavaScript runs several times slower than on a developer laptop.
+
+---
+
+## Measure first: the Profiler
+
+React DevTools Profiler:
+
+1. Record an interaction (type in the field, open the menu).
+2. The **flame graph** shows each commit; width is render time, grey components did not render.
+3. Click a component to see **why it rendered**: props changed (which), state changed, hooks changed, parent rendered, or context changed (enable "Record why each component rendered").
+4. The **ranked** view lists the slowest components.
+
+Also: "Highlight updates when components render" in DevTools settings, the `<Profiler>` component for programmatic timing in production builds, and the Chrome Performance panel, which shows React's scheduling tracks and long tasks. Profile **production builds**: development React includes extra checks and is several times slower.
+
+---
+
+## Structural fixes
+
+These remove renders without any memoisation.
+
+### Move state down
+
+```tsx
+// Before: typing in the filter re-renders the whole page
+function Page() {
+  const [filter, setFilter] = useState('');
+  return (
+    <>
+      <input value={filter} onChange={(e) => setFilter(e.target.value)} />
+      <ExpensiveChart />
+      <ExpensiveTable />
+    </>
+  );
+}
+
+// After: only FilterInput re-renders on keystrokes
+function FilterInput() {
+  const [filter, setFilter] = useState('');
+  return <input value={filter} onChange={(e) => setFilter(e.target.value)} />;
+}
+```
+
+### Lift content up: children as props
+
+```tsx
+function ScrollTracker({ children }: { children: React.ReactNode }) {
+  const [y, setY] = useState(0); // changes on every scroll
+  useEffect(() => {
+    const onScroll = () => setY(window.scrollY);
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+  return <div data-scrolled={y > 0}>{children}</div>; // children elements were created by the parent
+}
+
+<ScrollTracker>
+  <ExpensiveArticle /> {/* not re-rendered when y changes */}
+</ScrollTracker>;
+```
+
+When `ScrollTracker` re-renders, `children` is the same element object created by its parent's last render, so React bails out on that subtree.
+
+### Split contexts
+
+Separate rarely changing values (user, theme) from frequently changing ones (live cursor, form drafts), and state from dispatchers. Or use a store with selectors so components subscribe to slices ([State and Hooks](/fullstack/react/state-and-hooks)).
+
+### Keep keys stable
+
+Random or index keys in reordering lists cause unmount/remount, which is far more expensive than an update.
+
+---
+
+## memo, useMemo, useCallback
+
+| API                     | Caches                              | Skips                                                                      |
+| :---------------------- | :---------------------------------- | :------------------------------------------------------------------------- |
+| `memo(Component)`       | Last rendered output of a component | Re-rendering when all props are shallowly equal (`Object.is` per prop)     |
+| `useMemo(fn, deps)`     | A computed value                    | Recomputing when deps are unchanged                                        |
+| `useCallback(fn, deps)` | A function identity                 | Creating a new function identity (equivalent to `useMemo(() => fn, deps)`) |
+
+`useMemo` and `useCallback` mostly matter in two situations:
+
+1. **Expensive computation** during render.
+2. **Preserving identity** of objects and functions passed to `memo` components or used in dependency arrays.
+
+```tsx
+const Row = memo(function Row({ item, onSelect }: { item: Item; onSelect: (id: string) => void }) {
+  return <li onClick={() => onSelect(item.id)}>{item.name}</li>;
+});
+
+function List({ items }: { items: Item[] }) {
+  const [selected, setSelected] = useState<string | null>(null);
+  const onSelect = useCallback((id: string) => setSelected(id), []); // stable identity
+  return (
+    <ul>
+      {items.map((i) => (
+        <Row key={i.id} item={i} onSelect={onSelect} />
+      ))}
+    </ul>
+  );
+}
+```
+
+Without `useCallback`, `onSelect` is a new function every render of `List`, so every `Row`'s props differ and `memo` never skips.
+
+Memoisation has costs: memory for cached values, dependency comparisons on every render, and code complexity. Wrapping cheap components or values gains nothing.
+
+---
+
+## Referential equality pitfalls
+
+Each render creates new objects, arrays, and functions. Passing them as props defeats `memo` and changes effect dependencies every time:
+
+| Pattern                                          | Problem                   | Fix                                               |
+| :----------------------------------------------- | :------------------------ | :------------------------------------------------ |
+| `style={{ color: 'red' }}`                       | New object per render     | Hoist constants outside the component             |
+| `options={[1, 2, 3]}`                            | New array                 | Hoist or `useMemo`                                |
+| `onClick={() => select(id)}` to a memoised child | New function              | `useCallback`, or pass `id` and a stable callback |
+| `value={{ user, setUser }}` on a provider        | Re-renders all consumers  | `useMemo` the value or split it                   |
+| `items.filter(...)` passed down                  | New array every render    | `useMemo` with the right deps                     |
+| `children` JSX passed to a `memo` component      | New elements every render | `memo` rarely helps components that take children |
+
+---
+
+## The React Compiler
+
+The React Compiler (stable since React 19 era, as `babel-plugin-react-compiler` and in Vite, Next.js, and Expo integrations) analyses components at build time and inserts memoisation automatically at a fine granularity: individual JSX subtrees and values, not just whole components.
+
+```tsx
+// Source written plainly
+function Cart({ items, onCheckout }) {
+  const total = items.reduce((s, i) => s + i.price * i.qty, 0);
+  return <Summary total={total} onCheckout={onCheckout} />;
+}
+// The compiler caches `total` and the <Summary> element, reusing them while items and onCheckout are unchanged
+```
+
+Requirements: code must follow the rules of React (pure render, no mutation of props or state, hooks rules). The compiler skips components it cannot prove safe; the ESLint plugin reports violations. With the compiler, manual `useMemo`, `useCallback`, and `memo` become mostly unnecessary, but structural design (state placement, context splitting) still matters, since the compiler cannot reduce work that genuinely depends on changing data.
+
+---
+
+## Expensive computations
+
+Measure before memoising:
+
+```tsx
+console.time('filter');
+const visible = filterTodos(todos, tab);
+console.timeEnd('filter');
+```
+
+If a computation takes more than about 1 ms, consider:
+
+- `useMemo` keyed on its real inputs.
+- Moving it out of render entirely: precompute on the server, in a selector of a store, or once per data load.
+- Doing it in a **Web Worker** for very heavy work (parsing, large sorts, search indexes), keeping the main thread free.
+- Making it incremental (index by ID once, then look up).
+
+---
+
+## Large lists
+
+Rendering 10,000 rows creates 10,000 component instances and DOM nodes: slow to render, slow to lay out, and heavy in memory.
+
+| Technique                     | How                                                                                                                                      |
+| :---------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- |
+| **Virtualisation**            | Render only visible rows plus a small buffer, using absolute positioning inside a tall spacer (TanStack Virtual, react-window, Virtuoso) |
+| Pagination / infinite loading | Fetch and render pages on demand                                                                                                         |
+| `content-visibility: auto`    | Browser skips rendering offscreen sections (CSS, no JS)                                                                                  |
+| Stable keys + memoised rows   | Updates touch only changed rows                                                                                                          |
+
+Virtualisation trade-offs: find-in-page and accessibility need care (rows not in the DOM cannot be found or read), variable row heights need measurement, and scroll restoration needs handling.
+
+---
+
+## Responsiveness: transitions and deferred values
+
+When an update is inherently expensive (filtering a large dataset), make it **interruptible** so urgent updates such as typing stay instant:
+
+```tsx
+const [query, setQuery] = useState('');
+const deferredQuery = useDeferredValue(query);
+const results = useMemo(() => search(index, deferredQuery), [deferredQuery]);
+```
+
+The input re-renders immediately with `query`; the expensive results render with `deferredQuery` in a background, interruptible render. Mechanics are in [Fiber and Scheduling](/fullstack/react/fiber-and-scheduling). Debouncing is still useful when each change triggers network requests.
+
+---
+
+## Component bundle cost
+
+JavaScript shipped for components costs download, parse, compile, and hydration time on every page load ([JavaScript and Bundles](/fullstack/optimization/javascript-and-bundles)).
+
+- **Code-split** heavy, rarely used components:
+
+  ```tsx
+  const RichEditor = lazy(() => import('./RichEditor'));
+  <Suspense fallback={<EditorSkeleton />}>
+    <RichEditor />
+  </Suspense>;
+  ```
+
+- Prefer **Server Components** for anything that does not need interactivity; their code never ships to the browser ([Server Components](/fullstack/rendering/server-components)).
+- Watch large dependencies imported by small components (date libraries, icon packs imported whole, chart libraries).
+- Analyse bundles per route; a component used on one page should not load on all pages.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="When does memo fail to prevent a re-render?">
+    When any prop is a new reference each render (inline objects, arrays, functions, JSX children),
+    when the component reads a context whose value changed, or when its own state changes. memo only
+    compares props shallowly.
+  </Accordion>
+  <Accordion title="What is the first thing to try when a component tree re-renders too much?">
+    Profile to confirm, then fix structure: move state down to where it is used, pass expensive
+    subtrees as children, split contexts. Memoisation comes after.
+  </Accordion>
+  <Accordion title="What does the React Compiler do?">
+    It statically analyses components and inserts fine-grained memoisation of values and JSX
+    automatically, for code that follows the rules of React, making manual useMemo, useCallback, and
+    memo largely unnecessary.
+  </Accordion>
+  <Accordion title="How should a list of 50,000 items be rendered?">
+    Virtualise it so only visible rows are rendered, with stable keys and memoised rows, and fetch
+    or compute data incrementally. For filtering, use deferred values or transitions and possibly a
+    Web Worker.
+  </Accordion>
+</Accordions>

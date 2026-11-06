@@ -1,0 +1,195 @@
+---
+title: HTTP Versions
+description: How HTTP messages are carried on the wire - HTTP/1.0 and 1.1 (persistent connections, pipelining, the six-connection limit), HTTP/2 (binary framing, streams, multiplexing, HPACK, flow control, prioritisation, server push), and HTTP/3 (QUIC, QPACK, 0-RTT, discovery), with what each change means for web performance.
+---
+
+Many front-end performance habits from the 2010s (sprite sheets, domain sharding, concatenating every script into one bundle, inlining images as data URIs) were workarounds for limits in HTTP/1.1. On HTTP/2 and HTTP/3 several of them make pages slower. Knowing what each version changed explains which optimisations still matter.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after [HTTP](/fullstack/web-fundamentals/http) semantics. Methods, status codes, and headers mean the same thing in every version; only the **wire format** and **connection management** differ.
+
+Think of a connection as a road between browser and server. HTTP/1.1 is a single-lane road where each car must arrive before the next sets off. HTTP/2 lets many cars share one lane at once, chopped into interleaved pieces, but one broken-down car still blocks the lane (TCP head-of-line blocking). HTTP/3 gives each car its own lane on a new road (QUIC).
+
+Topics, in order:
+
+1. HTTP/1.0 and HTTP/1.1
+2. HTTP/2: framing, streams, HPACK, flow control, priorities, push
+3. HTTP/3: QUIC, QPACK, discovery, 0-RTT
+4. Comparison and consequences for performance
+
+| Word                      | Plain meaning                                                                       |
+| :------------------------ | :---------------------------------------------------------------------------------- |
+| **persistent connection** | Reusing one TCP connection for several requests.                                    |
+| **pipelining**            | Sending several requests without waiting for responses.                             |
+| **frame**                 | Smallest unit of HTTP/2 or HTTP/3 communication.                                    |
+| **stream**                | One request/response exchange within a connection.                                  |
+| **multiplexing**          | Interleaving frames of many streams on one connection.                              |
+| **HPACK / QPACK**         | Header compression for HTTP/2 / HTTP/3.                                             |
+| **ALPN**                  | TLS extension where client and server agree on the protocol (`h2`, `http/1.1`).     |
+| **Alt-Svc**               | Header advertising that the same origin is available via another protocol (HTTP/3). |
+
+---
+
+## HTTP/1.0 and HTTP/1.1
+
+**HTTP/1.0** (1996) opened a new TCP connection per request, paying a handshake (and slow start) for every image.
+
+**HTTP/1.1** (1997, now RFC 9112) added:
+
+- **Persistent connections** by default, and the mandatory `Host` header, which allows many sites on one IP (virtual hosting).
+- **Chunked transfer encoding** for bodies of unknown length.
+- **Pipelining**: sending requests back to back without waiting. Responses must return in order, so one slow response blocks all later ones (**HTTP-level head-of-line blocking**). Broken proxies made it unreliable; browsers never enabled it by default.
+
+So in practice one HTTP/1.1 connection carries **one request at a time**. Browsers compensate by opening up to **six connections per origin**. A page with 90 assets on one origin therefore loads in about 15 sequential "waves".
+
+### The workaround era
+
+| Workaround                                   | Purpose                                       | On HTTP/2+                                                                                         |
+| :------------------------------------------- | :-------------------------------------------- | :------------------------------------------------------------------------------------------------- |
+| Domain sharding (`img1.`, `img2.` hostnames) | More parallel connections                     | Harmful: extra DNS, TCP, TLS, slow starts; defeats multiplexing and prioritisation                 |
+| Concatenating all JS/CSS                     | Fewer requests                                | Partially harmful: one change invalidates the whole cached bundle; moderate chunking caches better |
+| Image sprites                                | Fewer requests                                | Unnecessary; individual images cache independently                                                 |
+| Inlining assets as data URIs                 | Fewer requests                                | Inflates HTML/CSS, not separately cacheable; keep only for tiny critical assets                    |
+| Cookie-free domains for static files         | Avoid sending large cookies with each request | Still somewhat useful; HPACK reduces the cost                                                      |
+
+---
+
+## HTTP/2
+
+HTTP/2 (2015, now RFC 9113) keeps semantics and changes everything about transport. Browsers only use it over TLS, negotiated during the TLS handshake via **ALPN** (`h2`).
+
+### Binary framing
+
+Messages are split into **frames** with a 9-byte header: length, type, flags, stream identifier.
+
+| Frame type       | Purpose                                                        |
+| :--------------- | :------------------------------------------------------------- |
+| `HEADERS`        | Compressed header block (starts a request or response)         |
+| `DATA`           | Body bytes                                                     |
+| `SETTINGS`       | Connection parameters (max concurrent streams, initial window) |
+| `WINDOW_UPDATE`  | Flow control credit                                            |
+| `RST_STREAM`     | Cancel one stream without closing the connection               |
+| `PING`, `GOAWAY` | Liveness; graceful shutdown with "last processed stream"       |
+| `PRIORITY`       | Stream prioritisation (deprecated scheme)                      |
+| `PUSH_PROMISE`   | Server push (deprecated)                                       |
+
+Pseudo-headers replace the start line: `:method`, `:scheme`, `:authority`, `:path`, and `:status`. Header names must be lowercase.
+
+### Streams and multiplexing
+
+Each request/response is a **stream** with an ID (client-initiated streams are odd-numbered). Frames from many streams interleave on one connection:
+
+```text
+TCP connection:  [H s1][H s3][D s3][D s1][H s5][D s3][D s5][D s1] ...
+```
+
+One connection per origin replaces six. A slow response no longer blocks others at the HTTP layer, and cancelling a request (`RST_STREAM`, for example when a user navigates away) does not cost a connection.
+
+**Connection coalescing**: if two hostnames resolve to the same IP and are covered by the same TLS certificate, the browser can reuse one HTTP/2 connection for both.
+
+### HPACK header compression
+
+HTTP headers are repetitive: the same `user-agent`, `cookie`, `accept` on every request, often 500 to 2,000 bytes each. HPACK uses:
+
+- A **static table** of 61 common header fields (`:method: GET` is a single byte, index 2).
+- A **dynamic table** of headers already sent on this connection, referenced by index on later requests.
+- **Huffman coding** for literal strings.
+
+After the first request, a repeated large cookie costs a byte or two instead of hundreds. HPACK avoids generic compression of headers because the **CRIME** attack showed that compressing secrets alongside attacker-controlled data leaks the secrets through compressed size. Sensitive fields can be marked never-indexed.
+
+### Flow control
+
+HTTP/2 adds per-stream and per-connection windows (default 65,535 bytes) on top of TCP's, so a receiver can stop one large download from starving other streams. Servers and clients tune these upward; small defaults can throttle large transfers on high-latency links.
+
+### Prioritisation
+
+The original dependency-tree priority scheme was complex and inconsistently implemented. It has been replaced by **Extensible Priorities** (RFC 9218): a `Priority` header with `u=` urgency (0 to 7) and `i` (incremental) parameters, used by both HTTP/2 and HTTP/3. Browsers mark CSS and fonts high, images in the viewport higher than offscreen images; `fetchpriority="high"` on an `img` or `link` influences it.
+
+### Server push (deprecated)
+
+Push let a server send resources before the client asked. In practice it often pushed assets the browser already had cached, wasting bandwidth, and measured gains were rare. Chrome removed support in 2022. **`103 Early Hints`** replaces it: the server sends `Link: </app.css>; rel=preload` headers while it is still generating the main response, and the browser decides whether to fetch.
+
+### The remaining problem
+
+All streams share one TCP connection, and TCP delivers bytes in order. One lost packet stalls every stream until it is retransmitted (**TCP-level head-of-line blocking**). At about 2 percent packet loss, HTTP/2's single connection can perform worse than HTTP/1.1's six independent connections.
+
+---
+
+## HTTP/3
+
+HTTP/3 (2022, RFC 9114) maps HTTP semantics onto **QUIC** ([details](/fullstack/web-fundamentals/tcp-udp-quic)) over UDP.
+
+- **Streams are a transport feature**: QUIC tracks loss per stream, so a lost packet only delays the streams whose data it carried.
+- **Handshake**: QUIC merges transport and TLS 1.3 setup. A new connection costs 1 RTT before the request (TCP + TLS 1.3 costs 2); a resumed one can send the request immediately with **0-RTT** (replayable, so only for idempotent requests).
+- **QPACK** replaces HPACK. HPACK relies on headers arriving in order, which QUIC streams no longer guarantee; QPACK uses separate encoder and decoder streams so a header block references only table entries the decoder is known to have.
+- **Connection migration**: switching from Wi-Fi to cellular keeps the connection alive via connection IDs.
+
+### Discovery
+
+Browsers cannot know in advance that a server speaks HTTP/3 (it is on UDP 443, which may be blocked). Two mechanisms:
+
+```http
+Alt-Svc: h3=":443"; ma=86400
+```
+
+The first visit uses HTTP/2 over TCP; the response advertises HTTP/3 and the browser tries QUIC for later requests, racing it against TCP. Alternatively, an **HTTPS DNS record** (type 65) can advertise `alpn=h3` before the first connection. If UDP is blocked, the browser falls back to TCP silently.
+
+### Measured impact
+
+Gains are largest on high-latency and lossy networks (mobile, emerging markets) and for the tail of the latency distribution; on fast, clean wired networks HTTP/2 and HTTP/3 perform similarly. Large CDNs (Cloudflare, Google, Fastly, Akamai) serve a large share of their traffic over HTTP/3.
+
+---
+
+## Comparison
+
+|                                          | HTTP/1.1            | HTTP/2               | HTTP/3                           |
+| :--------------------------------------- | :------------------ | :------------------- | :------------------------------- |
+| Year                                     | 1997                | 2015                 | 2022                             |
+| Format                                   | Text                | Binary frames        | Binary frames                    |
+| Transport                                | TCP (+TLS)          | TCP + TLS (browsers) | QUIC over UDP (TLS 1.3 built in) |
+| Concurrency per connection               | 1 request at a time | Many streams         | Many streams                     |
+| Connections per origin                   | ~6                  | 1                    | 1                                |
+| Header compression                       | None                | HPACK                | QPACK                            |
+| Head-of-line blocking                    | HTTP and TCP level  | TCP level            | None between streams             |
+| Setup RTTs before request (with TLS 1.3) | 2                   | 2                    | 1 (0 on resume)                  |
+| Connection migration                     | No                  | No                   | Yes                              |
+| Server push                              | No                  | Deprecated           | Rarely implemented               |
+
+---
+
+## Consequences for building sites
+
+1. **Many small files are fine** on HTTP/2+, and cache better than one giant bundle. Bundle moderately by route and change frequency.
+2. **Fewer origins**: each extra hostname costs DNS + TCP + TLS and cannot share multiplexing. Self-host fonts and critical third-party assets.
+3. **Priorities matter more than request count**: mark the LCP image `fetchpriority="high"`, preload late-discovered critical resources, lazy-load the rest.
+4. **Use `103 Early Hints`** for critical CSS and fonts while the server renders.
+5. **Enable HTTP/3** at the CDN or edge; it is typically a toggle.
+6. **Backends**: proxies and load balancers often speak HTTP/2 or HTTP/3 to clients and HTTP/1.1 to app servers; keep-alive pools between them avoid per-request handshakes. gRPC requires HTTP/2 end to end.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What problem does HTTP/2 solve and what problem remains?">
+    It removes HTTP-level head-of-line blocking and the six-connection limit by multiplexing streams
+    over one connection, and compresses headers. TCP-level head-of-line blocking remains: one lost
+    packet stalls all streams.
+  </Accordion>
+  <Accordion title="Why is domain sharding harmful on HTTP/2?">
+    Each extra hostname needs its own DNS lookup, TCP and TLS handshakes, and slow start, and splits
+    requests across connections so multiplexing and prioritisation cannot work across them.
+  </Accordion>
+  <Accordion title="Why was server push removed, and what replaced it?">
+    Servers could not know what the browser had cached, so push often wasted bandwidth and showed
+    little benefit. 103 Early Hints lets the server suggest preloads while the browser decides what
+    to fetch.
+  </Accordion>
+  <Accordion title="How does a browser discover that a server supports HTTP/3?">
+    Through an Alt-Svc response header on an earlier HTTP/1.1 or HTTP/2 response, or an HTTPS DNS
+    record advertising h3. It then races QUIC against TCP and falls back if UDP is blocked.
+  </Accordion>
+</Accordions>

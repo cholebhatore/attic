@@ -1,0 +1,284 @@
+---
+title: Runtime and Event Loop
+description: How Node.js works inside - V8, libuv, and the bindings layer, how non-blocking I/O is built on epoll, kqueue, and IOCP, the libuv thread pool and what uses it, the event loop phases in detail, process.nextTick vs promise microtasks vs setImmediate vs timers, what blocks the loop (sync APIs, JSON, regex, crypto), measuring loop lag, process lifecycle and signals, memory and the V8 heap, and modern built-in APIs.
+---
+
+A Node.js service's latency jumps from 20 ms to 2 seconds under load while CPU sits at 25 percent on a four-core machine. One core is pinned at 100 percent: a synchronous `JSON.parse` of a 40 MB payload blocks the only JavaScript thread, and every other request waits behind it. Another service slows down only when many users log in at once, because password hashing saturates a four-thread pool that file reads also need. Both are explained by how Node.js is built.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first Node.js page. General concurrency models (threads vs event loops) are compared in [Concurrency Models](/fullstack/backend-fundamentals/concurrency-models); the language-level event loop is in [Event Loop and Async](/fullstack/javascript/event-loop-and-async).
+
+Node.js is three things glued together: **V8** runs JavaScript; **libuv** talks to the operating system for networking, files, and timers without blocking; and a C++ binding layer connects them. JavaScript itself runs on **one thread**. Network I/O is waited on by the OS kernel, so one thread can juggle tens of thousands of connections. Work the OS cannot do asynchronously (most file operations, DNS lookups, some crypto) runs on a small **thread pool** in the background. Anything slow written in JavaScript itself blocks everything.
+
+Topics, in order:
+
+1. Architecture: V8, libuv, bindings
+2. How non-blocking I/O works
+3. The libuv thread pool
+4. Event loop phases
+5. nextTick, microtasks, setImmediate, timers
+6. What blocks the event loop
+7. Measuring loop health
+8. Process lifecycle and signals
+9. Memory and the V8 heap
+10. Modern built-ins
+
+| Word                      | Plain meaning                                                                             |
+| :------------------------ | :---------------------------------------------------------------------------------------- |
+| **V8**                    | Google's JavaScript engine (also in Chrome): parses, compiles, runs JS, manages the heap. |
+| **libuv**                 | C library providing the event loop, async I/O, thread pool, timers.                       |
+| **non-blocking I/O**      | Asking the OS to do I/O and notify when ready, without waiting.                           |
+| **epoll / kqueue / IOCP** | OS readiness notification mechanisms on Linux / macOS and BSD / Windows.                  |
+| **thread pool**           | Background threads (default 4) for operations without an async OS API.                    |
+| **event loop lag**        | Delay between when a callback should run and when it actually runs.                       |
+| **LTS**                   | Long-term support release line (even-numbered majors).                                    |
+
+---
+
+## Architecture
+
+<Mermaid
+  chart={`
+flowchart TB
+    APP["Application JavaScript"] --> NODEAPI["Node.js core modules (fs, net, http, crypto, stream)"]
+    NODEAPI --> BIND["C++ bindings"]
+    BIND --> V8["V8: JS execution, JIT, garbage collector"]
+    BIND --> UV["libuv: event loop, timers, async I/O"]
+    UV --> OS["OS kernel: epoll / kqueue / IOCP for sockets"]
+    UV --> TP["Thread pool (4 threads): fs, dns.lookup, crypto, zlib"]
+    BIND --> OTHER["Other C/C++ libs: OpenSSL, llhttp (HTTP parser), zlib, ICU"]
+`}
+/>
+
+Node ships with native libraries: OpenSSL for TLS and crypto, llhttp for HTTP parsing, zlib and Brotli for compression, ICU for internationalisation (`Intl`), and c-ares for some DNS work.
+
+---
+
+## How non-blocking I/O works
+
+Traditional servers dedicate a thread to each connection; the thread blocks in `read()` until data arrives. With 10,000 idle keep-alive connections, that is 10,000 threads, each with its own stack (often 1 to 8 MB reserved), plus context-switching overhead.
+
+Node instead puts sockets in **non-blocking mode** and asks the kernel: "tell me which of these thousands of sockets have data ready" (`epoll_wait` on Linux). The single loop thread then reads only from ready sockets, runs the JavaScript callbacks, and asks again. Idle connections cost only a small amount of memory, not a thread.
+
+This is why Node handles I/O-heavy workloads (APIs aggregating databases and services, proxies, real-time connections) efficiently, and why it struggles with CPU-heavy work: the same single thread does all JavaScript computation.
+
+---
+
+## The libuv thread pool
+
+Some operations have no portable asynchronous OS API, so libuv runs them on a pool of worker threads and posts the result back to the loop:
+
+| Uses the thread pool                                                | Does not (kernel async or loop-based)  |
+| :------------------------------------------------------------------ | :------------------------------------- |
+| `fs.*` file operations (except `fs.watch`)                          | TCP and UDP sockets, HTTP              |
+| `dns.lookup` (used by `http.get`, `fetch` for hostnames)            | `dns.resolve*` (c-ares, network-based) |
+| `crypto.pbkdf2`, `scrypt`, `randomBytes` (async), `generateKeyPair` | Pipes, TTYs (mostly)                   |
+| `zlib` async compression                                            | Timers                                 |
+| Some native add-ons (`bcrypt`, `sharp`)                             | Child process I/O                      |
+
+The default pool size is **4** (`UV_THREADPOOL_SIZE`, maximum 1,024, set before the pool is first used). Consequences:
+
+- Ten concurrent `scrypt` password hashes occupy all four threads; `fs.readFile` calls queue behind them, so static file serving slows during login spikes.
+- Slow DNS resolution through `dns.lookup` can block file I/O too.
+- Raising the pool size helps when the work is I/O-bound on the pool; for CPU-bound hashing, it competes with the main thread for cores.
+
+---
+
+## Event loop phases
+
+<Mermaid
+  chart={`
+flowchart TD
+    T["timers: callbacks of expired setTimeout / setInterval"] --> P["pending callbacks: some deferred system I/O errors"]
+    P --> I["idle, prepare: internal"]
+    I --> PO["poll: retrieve I/O events, run their callbacks; block here waiting for I/O if nothing else is scheduled"]
+    PO --> C["check: setImmediate callbacks"]
+    C --> CL["close callbacks: socket.on('close'), etc."]
+    CL --> T
+`}
+/>
+
+| Phase             | Runs                                                          | Notes                                                                                                             |
+| :---------------- | :------------------------------------------------------------ | :---------------------------------------------------------------------------------------------------------------- |
+| timers            | Callbacks whose threshold has passed                          | A timer's delay is a minimum, not a guarantee                                                                     |
+| pending callbacks | Some TCP error callbacks deferred from the previous iteration |                                                                                                                   |
+| poll              | I/O callbacks (incoming data, completed file reads)           | If no timers or immediates are pending, the loop **waits here** for I/O (this is how Node idles at 0 percent CPU) |
+| check             | `setImmediate` callbacks                                      | Always right after poll                                                                                           |
+| close             | Close event callbacks                                         |                                                                                                                   |
+
+Between **every callback** (not just every phase), Node drains `process.nextTick` callbacks, then promise microtasks.
+
+The loop exits when nothing keeps it alive: no active handles (servers, sockets, timers) and no pending requests. `timer.unref()` and `server.unref()` let a handle exist without keeping the process alive.
+
+---
+
+## nextTick, microtasks, setImmediate, timers
+
+```js
+setTimeout(() => console.log('timeout'), 0);
+setImmediate(() => console.log('immediate'));
+Promise.resolve().then(() => console.log('promise'));
+process.nextTick(() => console.log('nextTick'));
+console.log('sync');
+```
+
+Output from the main module: `sync`, `nextTick`, `promise`, then `timeout` and `immediate` in an order that **varies** between runs (it depends on whether the 1 ms minimum timer has expired when the loop first checks timers).
+
+Inside an I/O callback, the order is deterministic:
+
+```js
+const fs = require('node:fs');
+fs.readFile(__filename, () => {
+  setTimeout(() => console.log('timeout'), 0);
+  setImmediate(() => console.log('immediate'));
+});
+// immediate, then timeout: check phase comes right after poll
+```
+
+| Mechanism                                | When it runs                                                                         | Use                                                                                          |
+| :--------------------------------------- | :----------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------- |
+| `process.nextTick(fn)`                   | After the current operation, before promise microtasks and before the loop continues | Library internals that must run before any I/O (emitting events after a constructor returns) |
+| `queueMicrotask(fn)` / promise reactions | After nextTick queue, before the loop continues                                      | Standard async continuation                                                                  |
+| `setImmediate(fn)`                       | Check phase of the current or next loop iteration                                    | Yield to I/O, then continue                                                                  |
+| `setTimeout(fn, 0)`                      | Timers phase, at least ~1 ms later                                                   | Delays                                                                                       |
+
+Recursive `process.nextTick` (or endless microtasks) **starves** the event loop: I/O callbacks never run. To yield to I/O while doing chunked work, use `setImmediate`.
+
+---
+
+## What blocks the event loop
+
+Anything that runs a long time on the JavaScript thread:
+
+| Blocker                                                    | Example                                                                               | Alternative                                               |
+| :--------------------------------------------------------- | :------------------------------------------------------------------------------------ | :-------------------------------------------------------- |
+| Synchronous APIs                                           | `fs.readFileSync`, `execSync`, `crypto.pbkdf2Sync` in request handlers                | Async versions (startup-time sync is fine)                |
+| Large JSON                                                 | `JSON.parse` / `JSON.stringify` of multi-megabyte bodies                              | Limit body size, stream parsing (`stream-json`), paginate |
+| Regular expressions with catastrophic backtracking (ReDoS) | `/^(a+)+$/` against `'aaaa...!'` takes exponential time                               | Linear-time patterns, input length limits, `re2`          |
+| CPU-heavy computation                                      | Image resizing in JS, PDF generation, sorting huge arrays, compression with sync APIs | Worker threads, native libraries, separate services       |
+| Big synchronous loops                                      | Processing 1 million rows in one function                                             | Chunk with `setImmediate`, stream, or move to a worker    |
+| `require` of large modules at request time                 | Lazy loading heavy modules on first request                                           | Load at startup                                           |
+
+Rule of thumb from the Node.js docs: keep each callback short. At 1,000 requests per second, a 10 ms synchronous block per request already uses the whole thread.
+
+---
+
+## Measuring loop health
+
+```js
+import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
+
+const h = monitorEventLoopDelay({ resolution: 20 });
+h.enable();
+setInterval(() => {
+  console.log({
+    p50ms: h.percentile(50) / 1e6,
+    p99ms: h.percentile(99) / 1e6,
+    utilization: performance.eventLoopUtilization().utilization, // 0..1 fraction of time busy
+  });
+  h.reset();
+}, 10_000);
+```
+
+- **Event loop delay** above ~50 to 100 ms at p99 signals blocking work.
+- **Event loop utilisation (ELU)** near 1 means the process is CPU-saturated on its JS thread; scale out or move work off-thread. ELU is a better autoscaling and load-shedding signal for Node than OS CPU percentage, which counts all threads.
+- Diagnose with CPU profiles (`node --cpu-prof`, Clinic.js Flame, `--inspect` with Chrome DevTools).
+
+---
+
+## Process lifecycle and signals
+
+```js
+const server = app.listen(3000);
+
+function shutdown(signal) {
+  console.log(`${signal} received, draining`);
+  server.close(async () => {
+    // stop accepting; wait for in-flight requests
+    await db.end();
+    process.exit(0);
+  });
+  server.closeIdleConnections?.(); // close idle keep-alive sockets
+  setTimeout(() => process.exit(1), 10_000).unref(); // hard deadline
+}
+process.on('SIGTERM', shutdown); // sent by Docker, Kubernetes, PaaS on deploy
+process.on('SIGINT', shutdown); // Ctrl+C
+
+process.on('unhandledRejection', (reason) => {
+  logger.fatal({ reason });
+  process.exit(1);
+});
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err });
+  process.exit(1);
+});
+```
+
+- After an uncaught exception, the process state is unknown; log and exit, and let the supervisor (Kubernetes, systemd, PM2) restart it. Do not keep serving.
+- Node running as PID 1 in a container does not get default signal handling for `SIGTERM` unless the app installs a handler; use exec-form `CMD ["node", "server.js"]` (not `npm start`, which may not forward signals) or an init such as `tini`.
+- Exit codes matter to orchestrators: non-zero means failure.
+
+---
+
+## Memory and the V8 heap
+
+- V8 divides the heap into a young generation (frequent fast scavenges) and old generation (less frequent mark-compact). Major GCs pause JavaScript briefly; large heaps mean longer collections.
+- The default old-space limit depends on available memory and Node version; in containers set `--max-old-space-size` (in MB) to about 75 percent of the container limit so V8 collects before the kernel's OOM killer terminates the process.
+- `Buffer` memory (binary data) lives **outside** the V8 heap, so `process.memoryUsage().rss` can be much larger than `heapUsed`.
+- Leaks: growing module-level caches and maps, listeners added per request and never removed, closures held by long-lived timers, unbounded queues. Take heap snapshots (`--heapsnapshot-signal=SIGUSR2`, or DevTools via `--inspect`) and compare over time.
+
+---
+
+## Modern built-ins
+
+Recent Node.js versions removed the need for many dependencies:
+
+| Built-in                                                        | Replaces                                                       |
+| :-------------------------------------------------------------- | :------------------------------------------------------------- |
+| `fetch`, `Request`, `Response`, Web Streams (undici-based)      | `axios`, `node-fetch`                                          |
+| `WebSocket` client                                              | `ws` client side                                               |
+| `node:test` + `node --test`                                     | Basic Jest/Mocha usage                                         |
+| `node --watch`                                                  | `nodemon`                                                      |
+| `node --env-file=.env`                                          | `dotenv`                                                       |
+| TypeScript type stripping (`node app.ts`, erasable syntax only) | `ts-node` for many cases                                       |
+| `require()` of ES modules                                       | Interop workarounds ([Modules](/fullstack/javascript/modules)) |
+| `node:sqlite`                                                   | `better-sqlite3` for simple uses                               |
+| `AsyncLocalStorage`                                             | Manual context passing (request IDs in logs, tracing)          |
+| `util.parseArgs`, `util.styleText`                              | `yargs`/`chalk` for simple CLIs                                |
+| Permission model (`--permission`, `--allow-fs-read`)            | Sandboxing scripts                                             |
+
+Use an even-numbered **LTS** release in production; odd releases are short-lived.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="How does Node.js handle thousands of connections on one thread?">
+    Sockets are non-blocking and registered with the OS readiness API (epoll, kqueue, IOCP). The
+    event loop waits for readiness events and runs callbacks only for sockets with data, so idle
+    connections cost memory but no thread.
+  </Accordion>
+  <Accordion title="Which operations use the libuv thread pool?">
+    File system operations, dns.lookup, CPU-heavy crypto such as pbkdf2 and scrypt, async zlib, and
+    some native add-ons. Network sockets do not. The pool has four threads by default, so heavy use
+    of one category delays the others.
+  </Accordion>
+  <Accordion title="process.nextTick vs setImmediate?">
+    nextTick callbacks run immediately after the current operation, before promise microtasks and
+    before the event loop continues; recursive use starves I/O. setImmediate runs in the check phase
+    after I/O polling, making it the right way to yield to I/O.
+  </Accordion>
+  <Accordion title="How is a blocked event loop detected?">
+    Measure event loop delay with perf_hooks.monitorEventLoopDelay and event loop utilisation; high
+    p99 delay or utilisation near 1 indicates blocking or saturation. Then CPU-profile to find the
+    synchronous code.
+  </Accordion>
+  <Accordion title="What should a Node.js server do on SIGTERM?">
+    Stop accepting new connections, let in-flight requests finish within a deadline, close idle
+    keep-alive connections, close database pools and flush logs, then exit with code 0.
+  </Accordion>
+</Accordions>

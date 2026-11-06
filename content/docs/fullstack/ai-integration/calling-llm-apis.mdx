@@ -1,0 +1,124 @@
+---
+title: Calling LLM APIs
+description: Why model calls belong on the server, official SDKs, the messages format, system prompts and conversation history, choosing a model, max tokens and effort, stop reasons, errors, retries, and timeouts.
+---
+
+A frontend calls a model API directly with the key in a `VITE_` environment variable. Within a day the key is scraped from the bundle and someone runs up the bill. Model calls go through the backend, which holds the key, checks the user, applies limits, and logs usage.
+
+---
+
+## The plain-language version
+
+An LLM API takes a list of **messages** (alternating user and assistant turns) plus optional **system** instructions, and returns the next assistant message. The API is stateless: the app sends the relevant history on every request.
+
+| Word            | Plain meaning                                                               |
+| :-------------- | :-------------------------------------------------------------------------- |
+| **SDK**         | Official client library handling auth, retries, types, and streaming.       |
+| **max_tokens**  | Upper limit on output length for one response.                              |
+| **stop reason** | Why the response ended: finished, hit the limit, wants a tool, or declined. |
+| **effort**      | How much reasoning the model spends; trades quality for cost and latency.   |
+| **429 / 529**   | Rate limited / provider overloaded: retry with backoff.                     |
+
+---
+
+## A basic call
+
+<Tabs items={['TypeScript', 'Python']}>
+<Tab value="TypeScript">
+
+```ts
+import Anthropic from '@anthropic-ai/sdk';
+
+const client = new Anthropic(); // reads ANTHROPIC_API_KEY from the environment
+
+app.post('/api/summarise', requireUser, async (req, res) => {
+  const { text } = SummariseInput.parse(req.body);
+  const response = await client.messages.create({
+    model: 'claude-opus-5-5',
+    max_tokens: 16000,
+    system: 'Summarise support tickets in three bullet points for an engineer.',
+    messages: [{ role: 'user', content: text }],
+  });
+
+  if (response.stop_reason === 'refusal')
+    return res.status(422).json({ title: 'Request declined' });
+  const summary = response.content
+    .filter((b) => b.type === 'text')
+    .map((b) => b.text)
+    .join('');
+  res.json({ summary, usage: response.usage });
+});
+```
+
+</Tab>
+<Tab value="Python">
+
+```python
+from anthropic import AsyncAnthropic
+
+client = AsyncAnthropic()   # reads ANTHROPIC_API_KEY
+
+@app.post("/api/summarise")
+async def summarise(body: SummariseIn, user: CurrentUser):
+    response = await client.messages.create(
+        model="claude-opus-5-5",
+        max_tokens=16000,
+        system="Summarise support tickets in three bullet points for an engineer.",
+        messages=[{"role": "user", "content": body.text}],
+    )
+    if response.stop_reason == "refusal":
+        raise HTTPException(422, "Request declined")
+    summary = "".join(b.text for b in response.content if b.type == "text")
+    return {"summary": summary, "usage": response.usage}
+```
+
+</Tab>
+</Tabs>
+
+`response.content` is a list of typed blocks (text, tool use, thinking), not a single string. Check `stop_reason` before using it: `end_turn` (finished), `max_tokens` (cut off), `tool_use` (wants a tool), `refusal` (declined).
+
+---
+
+## Conversations
+
+```ts
+const messages: Anthropic.MessageParam[] = [
+  { role: 'user', content: 'Which plan includes SSO?' },
+  { role: 'assistant', content: 'The Business plan includes SAML SSO.' },
+  { role: 'user', content: 'How much is it per seat?' },
+];
+```
+
+Store conversations in the database (`conversations`, `messages` tables) and send history each turn. Long histories cost tokens on every request; trim, summarise, or use provider features such as prompt caching and compaction.
+
+---
+
+## Choosing a model
+
+Providers offer tiers: a most capable model, a balanced one, and a fast, cheap one. For Anthropic at the time of writing: `claude-opus-5-5` (default for most work), `claude-sonnet-5-5` (faster, cheaper), `claude-haiku-5-5` (high-volume classification and extraction). Model IDs and prices change; read them from the provider's models page or Models API rather than memory. Pick by measuring on real examples (see [evals](/fullstack/ai-integration/production-concerns)), not by benchmark headlines.
+
+Parameters that matter:
+
+- `max_tokens`: generous for open-ended output (truncated answers cost a retry), small for classification.
+- `output_config.effort` (`low` to `max`): lower for chat and simple extraction, higher for complex reasoning and coding.
+- Long outputs should be streamed, which avoids HTTP timeouts.
+
+---
+
+## Errors, retries, timeouts
+
+| Error     | Meaning                                        | Action                                      |
+| :-------- | :--------------------------------------------- | :------------------------------------------ |
+| 400       | Bad request (invalid params, context too long) | Fix; do not retry                           |
+| 401 / 403 | Key or permission problem                      | Alert; do not retry                         |
+| 429       | Rate limited                                   | Retry after `retry-after`, backoff          |
+| 500 / 529 | Provider error or overloaded                   | Retry with backoff; consider fallback model |
+| Timeout   | Slow response                                  | Stream long outputs; set a total deadline   |
+
+The SDKs retry 429 and 5xx twice by default with backoff and expose typed errors (`Anthropic.RateLimitError`, `anthropic.RateLimitError`). Put a per-user rate limit and a total deadline in front of every AI endpoint; a single user looping requests can exhaust the organisation's limit.
+
+<Callout type="info">
+  Provider-agnostic layers (Vercel AI SDK, LiteLLM, LangChain) make switching models easier at the
+  cost of lagging behind provider-specific features. Calling the official SDK directly is the
+  simplest starting point.
+</Callout>

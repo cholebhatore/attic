@@ -1,0 +1,83 @@
+---
+title: Backend Testing
+description: Testing API routes with Supertest and pytest with httpx, using real databases via Testcontainers, isolating tests with transactions, factories, and contract testing.
+---
+
+Backend tests that mock the ORM pass while the real query has a typo in a column name. Integration tests against a real database, started in a container, catch the bugs that actually reach production.
+
+---
+
+## The plain-language version
+
+Test the API the way clients use it: send HTTP requests to the app and check responses and database state. Use a real database of the same engine and version as production. Reset data between tests.
+
+| Word               | Plain meaning                                                      |
+| :----------------- | :----------------------------------------------------------------- |
+| **Testcontainers** | Library that starts Docker containers (Postgres, Redis) for tests. |
+| **factory**        | Helper that builds valid test records with overridable fields.     |
+| **contract test**  | Checks that provider and consumer agree on an API's shape.         |
+
+---
+
+## Node: Vitest + Supertest
+
+```ts title="orders.test.ts"
+import request from 'supertest';
+import { app } from '../src/app';
+
+it('creates an order', async () => {
+  const res = await request(app)
+    .post('/api/orders')
+    .set('Authorization', `Bearer ${await tokenFor(userFactory())}`)
+    .send({ productId: 42, qty: 1 })
+    .expect(201);
+
+  expect(res.body).toMatchObject({ productId: 42, status: 'pending' });
+});
+
+it('rejects invalid quantity', async () => {
+  await request(app).post('/api/orders').send({ productId: 42, qty: 0 }).expect(422);
+});
+```
+
+Export the Express `app` separately from the `listen()` call so tests can use it without opening a port.
+
+---
+
+## Python: pytest + httpx
+
+```python title="test_orders.py"
+import pytest
+from httpx import ASGITransport, AsyncClient
+from app.main import app
+
+@pytest.fixture
+async def client():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+
+async def test_create_order(client, auth_headers):
+    res = await client.post("/orders", json={"product_id": 42, "qty": 1}, headers=auth_headers)
+    assert res.status_code == 201
+    assert res.json()["status"] == "pending"
+```
+
+Fixtures (`@pytest.fixture`) provide setup and teardown; `conftest.py` shares them. `pytest-asyncio` or `anyio` runs async tests. FastAPI's `app.dependency_overrides` swaps dependencies such as the current user.
+
+---
+
+## Databases in tests
+
+```ts
+import { PostgreSqlContainer } from '@testcontainers/postgresql';
+const pg = await new PostgreSqlContainer('postgres:17').start();
+process.env.DATABASE_URL = pg.getConnectionUri();
+```
+
+Isolation options: wrap each test in a transaction and roll back (fast), truncate tables between tests, or a fresh schema per worker. Run migrations once at startup so tests also verify migrations.
+
+---
+
+## Contract tests
+
+When a frontend and backend (or two services) deploy separately, **consumer-driven contracts** (Pact) record what the consumer expects and verify the provider against it. Lighter option: validate responses against the OpenAPI spec in tests.

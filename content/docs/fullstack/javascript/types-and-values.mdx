@@ -1,0 +1,362 @@
+---
+title: Types and Values
+description: JavaScript's value model - the seven primitives and objects, value vs reference semantics, typeof and its quirks, numbers as IEEE 754 doubles (precision, safe integers, NaN, rounding, money), BigInt, strings as UTF-16 (code units, code points, grapheme clusters, normalisation), symbols, the coercion algorithms (ToPrimitive, ToNumber, ToString, ToBoolean), == vs ===, Object.is, and copying.
+---
+
+A checkout shows a total of `₹0.30000000000000004`. A username length check accepts an emoji-heavy name that later overflows a database column. A comparison `"10" > "9"` returns `false`. A deep-cloned object loses its dates. None of these are JavaScript being random; each follows exactly from how the language represents values and converts between them.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first JavaScript page. Everything else (closures, prototypes, async, React's immutability rules) builds on this value model.
+
+Every value in JavaScript is either a **primitive** (a simple, immutable value such as a number or string, copied when assigned) or an **object** (a mutable collection of properties, shared by reference). When an operator receives a type it does not expect, the language **coerces** the value using fixed algorithms rather than failing.
+
+Topics, in order:
+
+1. Primitives and objects
+2. Value vs reference
+3. typeof and type checks
+4. Numbers
+5. BigInt
+6. Strings and Unicode
+7. Symbols
+8. Coercion
+9. Equality
+10. Copying
+
+| Word                       | Plain meaning                                                                            |
+| :------------------------- | :--------------------------------------------------------------------------------------- |
+| **primitive**              | Immutable value: `undefined`, `null`, `boolean`, `number`, `bigint`, `string`, `symbol`. |
+| **object**                 | Mutable collection of properties; arrays, functions, dates, maps are objects.            |
+| **reference**              | What a variable holding an object actually stores: a pointer to it.                      |
+| **coercion**               | Automatic conversion between types.                                                      |
+| **IEEE 754**               | The binary floating-point standard JavaScript numbers follow.                            |
+| **code unit / code point** | A 16-bit unit of a UTF-16 string / one Unicode character number.                         |
+| **grapheme cluster**       | What a user perceives as one character (may be several code points).                     |
+
+---
+
+## Primitives and objects
+
+| Type        | Examples                                              | Notes                                                                               |
+| :---------- | :---------------------------------------------------- | :---------------------------------------------------------------------------------- |
+| `undefined` | `undefined`                                           | Absence of a value: unset variables, missing properties, functions without `return` |
+| `null`      | `null`                                                | Intentional "no value"                                                              |
+| `boolean`   | `true`, `false`                                       |                                                                                     |
+| `number`    | `42`, `3.14`, `NaN`, `Infinity`, `-0`                 | 64-bit IEEE 754 double                                                              |
+| `bigint`    | `42n`                                                 | Arbitrary-precision integers                                                        |
+| `string`    | `'hi'`                                                | Immutable sequence of UTF-16 code units                                             |
+| `symbol`    | `Symbol('id')`                                        | Unique, used as property keys                                                       |
+| `object`    | `{}`, `[]`, `function(){}`, `new Date()`, `new Map()` | Everything else                                                                     |
+
+Primitives are **immutable**: string methods return new strings; `s[0] = 'x'` does nothing. Primitives appear to have methods (`'abc'.toUpperCase()`) because the engine temporarily wraps them in an object (`String`), a process called autoboxing.
+
+---
+
+## Value vs reference
+
+```js
+let a = 5;
+let b = a; // copy of the value
+b++; // a is still 5
+
+const o1 = { n: 1 };
+const o2 = o1; // copy of the reference: both point at the same object
+o2.n = 2; // o1.n is 2 too
+
+function rename(user) {
+  user.name = 'Lin';
+} // mutates the caller's object
+function replace(user) {
+  user = { name: 'Lin' };
+} // rebinds the local parameter only
+```
+
+JavaScript is always **pass by value**; for objects, the value passed is a reference. A function can mutate the object it receives but cannot make the caller's variable point to a different object.
+
+`const` prevents rebinding the variable, not mutating the object it refers to. `Object.freeze` prevents mutation (shallowly).
+
+This is the basis of React's state rules: React detects change by comparing references ([State and Hooks](/fullstack/react/state-and-hooks)).
+
+---
+
+## typeof and type checks
+
+| Expression                 | Result        | Note                                                        |
+| :------------------------- | :------------ | :---------------------------------------------------------- |
+| `typeof undefined`         | `'undefined'` | Also for undeclared variables (no error)                    |
+| `typeof null`              | `'object'`    | A bug from the first implementation, kept for compatibility |
+| `typeof 42` / `typeof NaN` | `'number'`    | NaN is a number value                                       |
+| `typeof 42n`               | `'bigint'`    |                                                             |
+| `typeof 'x'`               | `'string'`    |                                                             |
+| `typeof Symbol()`          | `'symbol'`    |                                                             |
+| `typeof {}` / `typeof []`  | `'object'`    | Arrays are objects                                          |
+| `typeof function(){}`      | `'function'`  | Functions are callable objects                              |
+
+Reliable checks:
+
+```js
+value === null;
+Array.isArray(value);
+Number.isNaN(value); // global isNaN('abc') is true because it coerces first
+Number.isInteger(value);
+value instanceof Date; // fails across realms (iframes, workers); prefer duck typing or brand checks
+Object.prototype.toString.call(value); // '[object Date]', '[object Array]', ...
+```
+
+At trust boundaries (API responses, user input), validate with a schema rather than ad-hoc `typeof` checks ([Runtime Validation](/fullstack/typescript/runtime-validation)).
+
+---
+
+## Numbers
+
+All numbers are 64-bit binary floating point: 1 sign bit, 11 exponent bits, 52 fraction bits (53 bits of precision with the implicit leading 1).
+
+### Precision
+
+Decimal fractions such as 0.1 have no exact binary representation, just as 1/3 has none in decimal:
+
+```js
+0.1 + 0.2; // 0.30000000000000004
+0.1 + 0.2 === 0.3; // false
+Math.abs(0.1 + 0.2 - 0.3) <
+  Number
+    .EPSILON // true: compare with a tolerance
+    (1.005)
+    .toFixed(2); // '1.00', because 1.005 is stored as 1.00499999999999989...
+```
+
+### Safe integers
+
+Integers are exact up to 2^53 − 1 = `Number.MAX_SAFE_INTEGER` = 9,007,199,254,740,991. Beyond that, consecutive integers cannot all be represented:
+
+```js
+9007199254740992 === 9007199254740993; // true
+```
+
+64-bit database IDs (Twitter/Snowflake IDs, PostgreSQL `bigint`) exceed this. `JSON.parse` silently rounds them; transmit large IDs as **strings**.
+
+### Special values
+
+| Value                    | Arises from                                | Notes                                                                  |
+| :----------------------- | :----------------------------------------- | :--------------------------------------------------------------------- |
+| `NaN`                    | `0/0`, `Number('abc')`, `Math.sqrt(-1)`    | Not equal to itself; propagates through arithmetic                     |
+| `Infinity` / `-Infinity` | `1/0`, overflow                            |                                                                        |
+| `-0`                     | `-1 * 0`, rounding negative values to zero | `-0 === 0` is true; `Object.is(-0, 0)` is false; `1/-0` is `-Infinity` |
+
+### Money
+
+Never use floating point for money. Options:
+
+| Approach             | Example                                                                             |
+| :------------------- | :---------------------------------------------------------------------------------- |
+| Integer minor units  | `1999` paise for ₹19.99; format only for display                                    |
+| `BigInt` minor units | For very large amounts                                                              |
+| Decimal library      | `decimal.js`, `big.js` for rates, taxes, currency conversion with explicit rounding |
+| Database `numeric`   | Store exact values; return as strings                                               |
+
+Rounding rules (half-up, half-even "banker's rounding") must be explicit and match accounting requirements. Display with `Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' })`.
+
+### Parsing
+
+```js
+Number('12px'); // NaN: whole string must be numeric
+parseInt('12px'); // 12: parses a prefix
+parseInt('08'); // 8 (always pass a radix: parseInt(s, 10))
+Number(''); // 0  (surprising)
+Number(null) + // 0; Number(undefined) is NaN
+  '  42  '; // 42: whitespace trimmed
+```
+
+---
+
+## BigInt
+
+```js
+const big = 2n ** 64n; // 18446744073709551616n
+10n / 3n; // 3n: integer division truncates
+1n + 1; // TypeError: cannot mix BigInt and Number implicitly
+JSON.stringify({ id: 1n }); // TypeError: BigInt is not serialisable by default
+```
+
+Use for IDs, cryptography, and exact large-integer arithmetic. It is slower than `number` for ordinary math.
+
+---
+
+## Strings and Unicode
+
+Strings are sequences of **UTF-16 code units**. Characters outside the Basic Multilingual Plane (most emoji, some CJK) take two code units (a **surrogate pair**), and user-perceived characters can combine several code points.
+
+```js
+'é'.length                    // 1: 'é' as one precomposed code point
+'é'.length                   // 2: 'e' + combining acute accent, renders identically
+'😀'.length                        // 2 (surrogate pair)
+'👨‍👩‍👧'.length                       // 8 (three emoji joined by zero-width joiners)
+[...'👨‍👩‍👧'].length                  // 5 code points
+'😀'.split('')                     // two broken halves
+
+const seg = new Intl.Segmenter('en', { granularity: 'grapheme' });
+[...seg.segment('👨‍👩‍👧')].length     // 1 grapheme: what the user sees
+```
+
+| Level                          | Count of "👨‍👩‍👧" | API                                  |
+| :----------------------------- | :------------ | :----------------------------------- |
+| UTF-16 code units              | 8             | `.length`, indexing, `slice`         |
+| Code points                    | 5             | `for...of`, spread, `codePointAt`    |
+| Grapheme clusters              | 1             | `Intl.Segmenter`                     |
+| UTF-8 bytes (storage, network) | 18            | `new TextEncoder().encode(s).length` |
+
+Consequences:
+
+- `maxlength` and `.length` limits count code units, which matches neither what users see nor database byte limits (`varchar(n)` counts characters, MySQL `utf8mb4` columns count bytes for index limits).
+- Truncating with `slice` can split surrogate pairs or emoji sequences, producing garbage characters.
+- **Normalisation**: visually identical strings can differ in code points. Normalise (`s.normalize('NFC')`) before comparing or storing usernames and search keys.
+- Compare user-facing strings with `localeCompare` or `Intl.Collator`, not `<`, which compares code units: `'Z' < 'a'` is true and `'10' < '9'` is true.
+
+---
+
+## Symbols
+
+Symbols are unique primitive values used as property keys that cannot collide with string keys:
+
+```js
+const id = Symbol('id');
+const user = { name: 'Ada', [id]: 42 };
+Object.keys(user); // ['name']: symbol keys are not enumerated
+JSON.stringify(user); // '{"name":"Ada"}'
+```
+
+**Well-known symbols** customise language behaviour: `Symbol.iterator` (makes objects iterable), `Symbol.asyncIterator`, `Symbol.toPrimitive` (custom coercion), `Symbol.hasInstance`. React uses `Symbol.for('react.transitional.element')` to mark elements, which prevents JSON from an API being rendered as elements (an XSS vector).
+
+---
+
+## Coercion
+
+When an operator needs a particular type, the specification converts the operand with abstract operations.
+
+### ToPrimitive (objects to primitives)
+
+For an object, the engine calls `obj[Symbol.toPrimitive](hint)` if present; otherwise, with hint "number" it tries `valueOf()` then `toString()`; with hint "string" the reverse.
+
+```js
+[1, 2] + ''; // '1,2'   (Array toString joins)
+{
+}
++''; // '[object Object]'
+new Date(0) + 1; // 'Thu Jan 01 1970 ...1' (Date prefers string for +)
+new Date(0) - 1; // -1      (subtraction needs a number)
+```
+
+### ToNumber, ToString, ToBoolean
+
+| Value            | ToNumber | ToString              | ToBoolean |
+| :--------------- | :------- | :-------------------- | :-------- |
+| `undefined`      | `NaN`    | `'undefined'`         | false     |
+| `null`           | `0`      | `'null'`              | false     |
+| `true`           | `1`      | `'true'`              | true      |
+| `''`             | `0`      | `''`                  | false     |
+| `'  12  '`       | `12`     |                       | true      |
+| `'abc'`          | `NaN`    |                       | true      |
+| `0`, `-0`, `NaN` |          | `'0'`, `'0'`, `'NaN'` | false     |
+| `[]`             | `0`      | `''`                  | **true**  |
+| `[5]`            | `5`      | `'5'`                 | true      |
+| `{}`             | `NaN`    | `'[object Object]'`   | true      |
+
+**Falsy values**: `false`, `0`, `-0`, `0n`, `''`, `null`, `undefined`, `NaN` (and `document.all`). Everything else, including `[]`, `{}`, and `'0'`, is truthy.
+
+### The + operator
+
+If either operand (after ToPrimitive) is a string, `+` concatenates; otherwise it adds numbers:
+
+```js
+1 + '2'       // '12'
+'3' - 1       // 2   (- only does numbers)
+'3' * '4'     // 12
+true + 1      // 2
+[] + []       // ''
+[] + {}       // '[object Object]'
+```
+
+A form field value is always a string: `price + tax` concatenates unless converted first.
+
+### Nullish operators
+
+```js
+const port = config.port || 3000; // 0 would be replaced (falsy)
+const port2 = config.port ?? 3000; // only null/undefined replaced
+user?.address?.city; // undefined instead of TypeError
+```
+
+---
+
+## Equality
+
+| Comparison     | Coercion | `NaN === NaN` | `+0` vs `-0`  | Use                                           |
+| :------------- | :------- | :------------ | :------------ | :-------------------------------------------- |
+| `==` (loose)   | Yes      | false         | equal         | Only `x == null` (matches null and undefined) |
+| `===` (strict) | No       | false         | equal         | Default                                       |
+| `Object.is`    | No       | **true**      | **different** | React state comparison, exact identity        |
+| SameValueZero  | No       | true          | equal         | `includes`, `Map`/`Set` keys                  |
+
+The loose equality algorithm in brief: same type → strict comparison; `null == undefined` → true; number vs string → convert string to number; boolean vs anything → convert boolean to number first; object vs primitive → ToPrimitive the object.
+
+```js
+'' == 0            // true  ('' → 0)
+'0' == false       // true  (false → 0, '0' → 0)
+[] == false        // true  ([] → '' → 0)
+[] == ![]          // true  (![] is false; then as above)
+null == 0          // false (null only equals undefined)
+null >= 0          // true  (relational operators use ToNumber: 0 >= 0)
+```
+
+Objects compare by **identity**: `{} === {}` is false; two arrays with the same contents are not equal. Comparing structures requires a deep-equality function.
+
+---
+
+## Copying
+
+| Method                                       | Depth   | Handles                                         | Loses                                                                                           |
+| :------------------------------------------- | :------ | :---------------------------------------------- | :---------------------------------------------------------------------------------------------- |
+| Spread `{ ...o }`, `[...a]`, `Object.assign` | Shallow | Own enumerable properties                       | Nested objects shared                                                                           |
+| `JSON.parse(JSON.stringify(o))`              | Deep    | Plain data                                      | Dates (become strings), `undefined`, functions, `Map`/`Set`, `BigInt` (throws), cycles (throws) |
+| `structuredClone(o)`                         | Deep    | Dates, Maps, Sets, typed arrays, cycles, errors | Functions (throws), class prototypes (become plain objects), DOM nodes                          |
+
+```js
+const original = { when: new Date(), tags: new Set(['a']), nested: { n: 1 } };
+const shallow = { ...original };
+shallow.nested.n = 2; // original.nested.n is 2
+const deep = structuredClone(original); // independent copy, Date and Set preserved
+```
+
+`structuredClone` uses the same algorithm as `postMessage` to workers and IndexedDB storage.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why does 0.1 + 0.2 not equal 0.3, and how should money be handled?">
+    Numbers are binary IEEE 754 doubles; 0.1 and 0.2 have no exact binary representation, so their
+    sum is slightly off. Store money as integer minor units or use a decimal type, and round
+    explicitly.
+  </Accordion>
+  <Accordion title="Why does '😀'.length return 2?">
+    Strings are UTF-16 code units, and characters outside the Basic Multilingual Plane are encoded
+    as two code units (a surrogate pair). Use code-point iteration or Intl.Segmenter for
+    user-perceived characters.
+  </Accordion>
+  <Accordion title="Why is typeof null 'object'?">
+    A bug in the original implementation, where values were tagged with type bits and null shared
+    the object tag. It cannot be fixed without breaking existing code.
+  </Accordion>
+  <Accordion title="When is == acceptable?">
+    Mainly for x == null, which matches both null and undefined. Elsewhere, its coercion rules
+    produce surprising results, so === is the default.
+  </Accordion>
+  <Accordion title="Why do large IDs get corrupted after JSON.parse?">
+    JSON numbers become IEEE 754 doubles, which cannot represent all integers above 2^53 − 1, so
+    64-bit IDs are rounded. Send them as strings.
+  </Accordion>
+</Accordions>

@@ -1,0 +1,78 @@
+---
+title: Profiling
+description: Finding slow queries with pg_stat_statements and slow query logs, reading EXPLAIN ANALYZE output, common plan problems, auto_explain, and a repeatable tuning workflow.
+---
+
+Guessing which query is slow wastes days. The database already records which queries consume the most total time and can explain exactly how it runs each one.
+
+---
+
+## The plain-language version
+
+Find the queries that cost the most **in total** (frequency × duration), then ask the planner how it executes them with `EXPLAIN ANALYZE`, and fix what the plan shows: a missing index, a bad estimate, too many rows.
+
+| Word                   | Plain meaning                                                     |
+| :--------------------- | :---------------------------------------------------------------- |
+| **query plan**         | Tree of steps the database uses: scans, joins, sorts.             |
+| **cost**               | Planner's estimate, in arbitrary units.                           |
+| **actual time / rows** | Measured values from really running it.                           |
+| **estimate mismatch**  | Planner expected 10 rows, got 100,000: often leads to a bad plan. |
+
+---
+
+## Find the expensive queries
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+SELECT query, calls, round(total_exec_time) AS total_ms, round(mean_exec_time, 2) AS mean_ms, rows
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+```
+
+A 2 ms query called 3 million times a day costs more than a 4-second report run twice. MySQL: the slow query log and `performance_schema`. Managed tools: RDS Performance Insights, Cloud SQL Query Insights, pganalyze.
+
+---
+
+## Read the plan
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT * FROM orders WHERE customer_id = 42 ORDER BY created_at DESC LIMIT 20;
+```
+
+```text
+Limit  (actual time=812.4..812.5 rows=20 loops=1)
+  ->  Sort  (actual time=812.4..812.4 rows=20 loops=1)
+        Sort Key: created_at DESC
+        ->  Seq Scan on orders  (actual time=0.03..801.2 rows=1840 loops=1)
+              Filter: (customer_id = 42)
+              Rows Removed by Filter: 4998160
+```
+
+Reading bottom up: a sequential scan read 5 million rows to keep 1,840, then sorted them. An index on `(customer_id, created_at DESC)` turns this into an index scan reading 20 rows.
+
+| Plan smell                                     | Likely fix                                            |
+| :--------------------------------------------- | :---------------------------------------------------- |
+| `Seq Scan` with large "Rows Removed by Filter" | Index on the filter columns                           |
+| Estimated rows far from actual rows            | `ANALYZE`, extended statistics, rewrite the condition |
+| `Nested Loop` with huge inner loops            | Index on the join column, or a different join         |
+| `Sort` spilling to disk (`external merge`)     | Index matching `ORDER BY`, or more `work_mem`         |
+| High `Buffers: shared read`                    | Data not in cache; reduce rows touched                |
+
+Visualisers: explain.dalibo.com, explain.depesz.com.
+
+---
+
+## Workflow
+
+1. Pick the top query by total time.
+2. Reproduce with realistic parameters on production-sized data.
+3. `EXPLAIN (ANALYZE, BUFFERS)`.
+4. Change one thing (index, query rewrite, fewer columns, pagination).
+5. Compare plans and timings; deploy; confirm in `pg_stat_statements`.
+
+`auto_explain` logs plans of queries slower than a threshold automatically, which catches problems that only appear with real parameters.
+
+Query processing internals: [Databases](/db), starting with [the query lifecycle](/db/foundations/big-picture-flow/query-lifecycle).

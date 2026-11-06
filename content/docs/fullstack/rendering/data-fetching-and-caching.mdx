@@ -1,0 +1,279 @@
+---
+title: Data Fetching and Caching
+description: Framework-agnostic principles for loading data in server-rendered apps - waterfalls on server and client, parallel fetching and the start-early-await-late pattern, request deduplication and memoisation per request, caching layers from request scope to CDN, cache keys, lifetimes and stale-while-revalidate, invalidation by time, path, and tag, read-your-writes after mutations, personalised data and cache safety, and prefetching.
+---
+
+A server-rendered page awaits the user, then the user's orders, then each order's shipment status, sequentially. Each query takes 20 ms to the database, and the page has 30 orders: over 600 ms of TTFB from a page whose total data could load in 40 ms. Another page caches a "recommended products" component, and one user's personalised recommendations appear for everyone. Data fetching and caching decide most of a server-rendered page's speed and correctness.
+
+---
+
+## The plain-language version
+
+**Where this sits:** between [Server Components](/fullstack/rendering/server-components) (where data is loaded) and the [Next.js App Router](/fullstack/rendering/nextjs-app-router) (one concrete implementation). The ideas apply to any framework.
+
+Two rules carry most of the weight: **start every independent request as early as possible, and wait for it as late as possible**; and **cache only what is identical for everyone who will receive it, with a clear rule for when it expires**.
+
+Topics, in order:
+
+1. Waterfalls
+2. Parallel fetching patterns
+3. Deduplication and per-request memoisation
+4. Caching layers
+5. Cache keys and lifetimes
+6. Invalidation
+7. Read-your-writes after mutations
+8. Personalised data and cache safety
+9. Prefetching
+
+| Word                  | Plain meaning                                                                    |
+| :-------------------- | :------------------------------------------------------------------------------- |
+| **waterfall**         | A request that waits for an earlier one even though it does not need its result. |
+| **dependent request** | A request that genuinely needs another's result (orders need the user ID).       |
+| **memoisation**       | Reusing the result of a function call with the same arguments.                   |
+| **request scope**     | Lives only for the duration of one incoming request.                             |
+| **cache key**         | Everything the cached value depends on.                                          |
+| **tag**               | Label attached to cache entries so they can be invalidated as a group.           |
+| **read-your-writes**  | After writing, the same user immediately sees the new data.                      |
+
+---
+
+## Waterfalls
+
+A waterfall happens when code **waits before starting** independent work.
+
+```tsx
+// Waterfall: 3 sequential round trips
+const user = await getUser(id); // 20 ms
+const settings = await getSettings(id); // 20 ms (does not need user)
+const notifications = await getNotifs(id); // 20 ms (does not need user)
+```
+
+They also hide in component trees: a parent awaits its data, renders a child, the child awaits its data, renders a grandchild that awaits again. On the server each round trip is short (a few milliseconds to a nearby database), but N+1 patterns and chains still add up; on the client, each step costs a full network round trip ([Data and State Management](/fullstack/react/data-and-state-management)).
+
+<Mermaid
+  chart={`
+gantt
+    dateFormat X
+    axisFormat %L ms
+    section Sequential
+    getUser         :0, 20
+    getSettings     :20, 40
+    getNotifs       :40, 60
+    section Parallel
+    getUser         :0, 20
+    getSettings     :0, 20
+    getNotifs       :0, 20
+`}
+/>
+
+---
+
+## Parallel fetching patterns
+
+### Promise.all for independent data
+
+```ts
+const [user, settings, notifications] = await Promise.all([
+  getUser(id),
+  getSettings(id),
+  getNotifs(id),
+]);
+```
+
+`Promise.all` fails fast on the first rejection; use `Promise.allSettled` when partial data is acceptable, and per-section error boundaries in the UI.
+
+### Start early, await late
+
+```tsx
+export default async function Page({ params }: { params: Promise<{ id: string }> }) {
+  const { id } = await params;
+  const productP = getProduct(id); // all start now
+  const reviewsP = getReviews(id);
+  const relatedP = getRelated(id);
+
+  const product = await productP; // only what the shell needs is awaited here
+  return (
+    <>
+      <ProductHeader product={product} />
+      <Suspense fallback={<ReviewsSkeleton />}>
+        <Reviews promise={reviewsP} />
+      </Suspense>
+      <Suspense fallback={<RelatedSkeleton />}>
+        <Related promise={relatedP} />
+      </Suspense>
+    </>
+  );
+}
+```
+
+The slow parts stream in when ready ([Hydration and Streaming](/fullstack/rendering/hydration-and-streaming)), and nothing waits for anything it does not need.
+
+### The preload pattern
+
+When a child component fetches its own data, the parent can **kick off** the fetch before rendering the child, so the child's later call finds it already in flight (requires per-request deduplication, below):
+
+```ts
+export const preloadReviews = (id: string) => void getReviews(id);
+// parent: preloadReviews(id) at the top; child: await getReviews(id)
+```
+
+### Fix N+1 at the data layer
+
+Thirty components each fetching one order's shipment is 30 queries. Batch with a single `WHERE id IN (...)` query or a DataLoader, or fetch the joined data once at the top ([ORMs and N+1](/fullstack/databases/migrations-and-orms)).
+
+---
+
+## Deduplication and per-request memoisation
+
+In a component tree, several components often need the same data (the current user in the header, the sidebar, and the page). Passing it down as props works but couples components. Per-request memoisation lets each call `getUser()` while only one query runs:
+
+```ts
+import { cache } from 'react';
+
+export const getCurrentUser = cache(async () => {
+  const session = await getSession();
+  return session ? db.user.findUnique({ where: { id: session.userId } }) : null;
+});
+```
+
+- React's `cache()` memoises by arguments **for the duration of one server request** (one render); each new request starts empty, so user data never leaks between requests.
+- Arguments are compared by identity, so pass primitives, not freshly created objects.
+- This is memoisation, not a persistent cache: it saves duplicate work within a render, not across users.
+
+---
+
+## Caching layers
+
+<Mermaid
+  chart={`
+flowchart LR
+    B["Browser: HTTP cache, client router cache, data library cache"] --> CDN["CDN / edge cache: full responses"]
+    CDN --> FW["Framework cache: rendered pages, components, data function results"]
+    FW --> RQ["Per-request memoisation: cache()"]
+    RQ --> AC["Application cache: Redis"]
+    AC --> DB["Database"]
+`}
+/>
+
+| Layer                          | Scope                              | Lifetime                     | Holds                           | Invalidated by                           |
+| :----------------------------- | :--------------------------------- | :--------------------------- | :------------------------------ | :--------------------------------------- |
+| Per-request memoisation        | One request                        | That request                 | Function results                | Ends with request                        |
+| Framework data cache           | All users of a deployment (shared) | Configured lifetime          | Results of cached functions     | Time, tags, paths, redeploy              |
+| Framework page/component cache | Shared                             | Configured lifetime          | Rendered HTML or RSC payload    | Time, tags, paths                        |
+| Application cache (Redis)      | Shared across services             | TTL                          | Query results, computed objects | App code ([Caching](/fullstack/caching)) |
+| CDN                            | Shared across users near a PoP     | `Cache-Control` / `s-maxage` | Full HTTP responses             | Expiry, purge API                        |
+| Browser HTTP cache             | One user                           | `Cache-Control`              | Responses                       | Expiry, revalidation                     |
+| Client router / data cache     | One tab                            | Session or configured        | RSC payloads, query data        | Navigation refresh, invalidation         |
+
+Every layer is a copy that can be stale. When users report "my change does not show up", the question is which layer still holds the old copy.
+
+---
+
+## Cache keys and lifetimes
+
+A cache entry is correct only if its key includes **everything the value depends on**:
+
+| Value depends on           | Must be in the key                | Typical bug                      |
+| :------------------------- | :-------------------------------- | :------------------------------- |
+| Function arguments         | Yes                               | Two products sharing one entry   |
+| Locale, currency, region   | Yes                               | Prices in the wrong currency     |
+| User or tenant             | Yes, or do not use a shared cache | One user's data shown to another |
+| Feature flags, A/B variant | Yes                               | Variant leaking across groups    |
+| Code version               | Usually via deploy invalidation   | New code reading old-shaped data |
+
+Frameworks derive keys from function identity and arguments (and closed-over values); HTTP caches use URL plus `Vary` headers.
+
+**Lifetimes** are a trade-off between freshness and load:
+
+| Data                    | Reasonable approach                                                  |
+| :---------------------- | :------------------------------------------------------------------- |
+| Marketing content, docs | Long lifetime + on-demand invalidation on publish                    |
+| Product catalogue       | Minutes to hours + tag invalidation on edit                          |
+| Prices, stock           | Short or not cached; or cached with immediate invalidation on change |
+| Per-user dashboards     | Per-request, or a private per-user cache                             |
+| Payments, balances      | Never from a shared cache                                            |
+
+**Stale-while-revalidate** semantics (serve the old value while fetching a new one in the background) keep latency flat and are the default model for most framework caches, ISR, and CDN `stale-while-revalidate`. Their cost is that someone sees stale data briefly after each change.
+
+---
+
+## Invalidation
+
+| Method       | How                                                            | Use                                                                                 |
+| :----------- | :------------------------------------------------------------- | :---------------------------------------------------------------------------------- |
+| Time         | Entry expires after a lifetime                                 | Data where bounded staleness is fine                                                |
+| Path         | Invalidate everything rendered for `/products/42`              | Simple apps; coarse                                                                 |
+| Tag          | Entries labelled `product:42`, `products`; invalidate by label | Precise: one product edit invalidates its page, the listing, and the search results |
+| Deploy       | New build, new caches                                          | Code changes                                                                        |
+| Event-driven | DB change (CDC) or domain event triggers invalidation          | Systems with many writers                                                           |
+
+Tag design mirrors the data model: a product page might be tagged `product:42`, `category:7`, and `products`. Editing product 42 invalidates `product:42`; adding a product invalidates `products`.
+
+Distributed systems complicate invalidation: several app instances, regions, or CDN PoPs each hold copies. A framework running on many instances needs a **shared cache handler** (Redis, platform storage) so an invalidation reaches all of them.
+
+---
+
+## Read-your-writes after mutations
+
+A user edits their display name, the action succeeds, and the page re-renders with the old name from a cache. Patterns:
+
+| Pattern                                                      | Effect                                                                  |
+| :----------------------------------------------------------- | :---------------------------------------------------------------------- |
+| Invalidate the affected tags in the mutation, then re-render | Next render misses and refetches (immediate consistency for the writer) |
+| Return the new data from the mutation and render it          | No extra fetch                                                          |
+| Optimistic UI                                                | Shows the expected result before confirmation                           |
+| Background revalidation (stale-while-revalidate)             | Fine for other users; the writer may briefly see stale data             |
+
+Next.js distinguishes these: `updateTag` (in a Server Action, expire immediately so the writer's next render reads fresh data) and `revalidateTag` (mark stale and refresh in the background).
+
+---
+
+## Personalised data and cache safety
+
+The most damaging caching bug is a **shared cache storing personalised content**: a CDN or framework cache keyed only by URL serving one user's account page, or cart, to others.
+
+Rules:
+
+- Anything reading cookies, headers, or the session is **request-specific**. Do not put it in a shared cache unless the key includes the user, and even then prefer a private cache.
+- Split pages: cache the shared shell and shared data; render personalised parts per request (dynamic holes, client-side fetching, or private caches).
+- Responses with personal data: `Cache-Control: private, no-store` (or `private, max-age` for the browser only) so CDNs never store them ([HTTP Caching](/fullstack/performance/http-caching)).
+- Never cache responses that set cookies in shared caches.
+- Test caching with two different users in two browsers, behind the real CDN.
+
+---
+
+## Prefetching
+
+Prefetching moves work before the user acts:
+
+- **Link prefetching**: when a link enters the viewport or is hovered, fetch the next route's data or payload (Next.js `Link`, React Router `prefetch="intent"`). Prefetch only what is cheap: static routes fully, dynamic routes only up to their loading state.
+- **Speculation Rules API**: the browser prefetches or fully prerenders likely next pages for instant navigations in multi-page sites.
+- **Data prefetching** in client caches: `queryClient.prefetchQuery` on hover.
+
+Costs: wasted bandwidth and server load for navigations that never happen, and stale prefetched data if it sits too long. Prefetch on intent (hover, viewport), not everything at once.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="How are waterfalls avoided in server-rendered pages?">
+    Start independent requests at the same time (Promise.all, start-early-await-late), await only
+    what the shell needs, stream the rest with Suspense, preload data for child components, and
+    batch N+1 queries at the data layer.
+  </Accordion>
+  <Accordion title="What is the difference between React's cache() and a data cache?">
+    cache() memoises function results for a single server request so repeated calls in one render
+    share a result; it resets for every request. A data cache persists results across requests and
+    users until it expires or is invalidated.
+  </Accordion>
+  <Accordion title="Why is tag-based invalidation preferred over path-based?">
+    One data change usually affects many pages. Tags let a mutation invalidate exactly the entries
+    that depend on the changed data, wherever they are rendered, without knowing every path.
+  </Accordion>
+  <Accordion title="How can caching leak user data, and how is it prevented?">
+    A shared cache keyed without the user stores a personalised response and serves it to others.
+    Keep request-specific data out of shared caches, mark responses private or no-store, and cache
+    only the shared parts.
+  </Accordion>
+</Accordions>

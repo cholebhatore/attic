@@ -1,0 +1,83 @@
+---
+title: OWASP Top 10
+description: The OWASP Top 10 web risks with concrete examples and fixes - broken access control, cryptographic failures, injection (SQL, NoSQL, command), insecure design, misconfiguration, vulnerable components, auth failures, integrity failures, logging gaps, and SSRF - plus the API Security Top 10.
+---
+
+The OWASP Top 10 is a ranked list of the most common and damaging web application risks, built from real breach data. It is the shared vocabulary of security reviews and a checklist worth running against any app.
+
+---
+
+## The list (2021 edition, still the reference)
+
+| #   | Risk                                           | Example                                                                           | Defense                                                                                                                 |
+| :-- | :--------------------------------------------- | :-------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------- |
+| A01 | **Broken access control**                      | Changing `/invoices/1042` to `1043` shows another customer's invoice              | Object-level checks on every request; deny by default. See [Authorization Models](/fullstack/auth/authorization-models) |
+| A02 | **Cryptographic failures**                     | Passwords hashed with MD5; data over HTTP                                         | TLS everywhere, Argon2id, encrypt sensitive data at rest, managed keys                                                  |
+| A03 | **Injection**                                  | `"SELECT * FROM users WHERE email = '" + email + "'"`                             | Parameterised queries, ORMs, escaping per context                                                                       |
+| A04 | **Insecure design**                            | Password reset that reveals whether an email exists; unlimited coupon redemption  | Threat modelling, abuse cases, rate limits by design                                                                    |
+| A05 | **Security misconfiguration**                  | Debug mode in production, default credentials, open S3 bucket, verbose errors     | Hardened defaults, config review, infrastructure as code                                                                |
+| A06 | **Vulnerable and outdated components**         | An old library with a known RCE                                                   | Dependency scanning and updates. See [supply chain](/fullstack/security/headers-secrets-supply-chain)                   |
+| A07 | **Identification and authentication failures** | No rate limit on login, weak session handling                                     | See [Auth](/fullstack/auth)                                                                                             |
+| A08 | **Software and data integrity failures**       | Unsigned updates, unsafe deserialisation (`pickle.loads` of user input)           | Signed artifacts, safe formats (JSON), pinned CI actions                                                                |
+| A09 | **Security logging and monitoring failures**   | Breach discovered months later                                                    | Log auth events and access-control failures; alert on anomalies                                                         |
+| A10 | **Server-side request forgery (SSRF)**         | "Import from URL" fetches `http://169.254.169.254/` and returns cloud credentials | Allow-lists, block private IP ranges after DNS resolution, IMDSv2                                                       |
+
+A 2025 update reorganises some categories (adding software supply chain failures and mishandling of exceptional conditions); the defenses above still apply.
+
+---
+
+## Injection in detail
+
+```ts
+// Vulnerable
+await db.query(`SELECT * FROM users WHERE email = '${email}'`);
+// email = "' OR '1'='1" returns every user
+
+// Safe: the driver sends the value separately from the SQL text
+await db.query('SELECT * FROM users WHERE email = $1', [email]);
+```
+
+```python
+cur.execute("SELECT * FROM users WHERE email = %s", (email,))   # safe
+cur.execute(f"SELECT * FROM users WHERE email = '{email}'")       # vulnerable
+```
+
+Other forms:
+
+- **NoSQL injection**: `{ "email": { "$ne": null } }` in a MongoDB filter built from JSON input. Validate types with a schema.
+- **Command injection**: `exec("convert " + filename)`. Use argument arrays (`execFile`, `subprocess.run([...])`) and never a shell.
+- **Template injection** and **log injection**: never build templates from user input; strip newlines in logged values.
+- **Prompt injection** in LLM features: see [AI production concerns](/fullstack/ai-integration/production-concerns).
+
+---
+
+## SSRF in detail
+
+Any feature where the server fetches a user-supplied URL (webhooks, link previews, imports, image proxies) can be pointed at internal services.
+
+- Resolve the hostname, then reject private, loopback, link-local, and metadata addresses; connect to the resolved IP so DNS rebinding cannot switch it.
+- Allow-list schemes (`https` only) and, where possible, domains.
+- Disable redirects or re-check each hop.
+- Run fetchers in a network segment without access to internal services.
+
+---
+
+## OWASP API Security Top 10 (2023)
+
+| #     | Risk                                                                                  |
+| :---- | :------------------------------------------------------------------------------------ |
+| API1  | Broken object-level authorization (BOLA)                                              |
+| API2  | Broken authentication                                                                 |
+| API3  | Broken object property-level authorization (mass assignment, excessive data exposure) |
+| API4  | Unrestricted resource consumption (no rate limits, unbounded page sizes)              |
+| API5  | Broken function-level authorization (user calls admin endpoints)                      |
+| API6  | Unrestricted access to sensitive business flows (bots buying all stock)               |
+| API7  | Server-side request forgery                                                           |
+| API8  | Security misconfiguration                                                             |
+| API9  | Improper inventory management (forgotten old API versions)                            |
+| API10 | Unsafe consumption of third-party APIs                                                |
+
+<Callout type="info">
+  Tooling: Semgrep and CodeQL for static analysis, OWASP ZAP or Burp Suite for dynamic testing, and
+  GitHub's code scanning in CI.
+</Callout>

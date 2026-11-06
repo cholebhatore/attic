@@ -1,0 +1,265 @@
+---
+title: Domains and DNS
+description: Domain name structure, registries, registrars and the domain lifecycle, the DNS hierarchy and delegation, stub, recursive, and authoritative servers, a full resolution walk, record types including HTTPS/SVCB, glue records, caching and negative caching, TTL strategy, anycast and GeoDNS, DNSSEC, encrypted DNS, failure modes, and debugging.
+---
+
+A team moves a site to a new server, updates the record, and half the users still reach the old server a day later. Another team adds a `CNAME` at the root of their domain and email stops arriving. A third sees a ten-minute outage because a DNS provider went down. DNS is a globally distributed, heavily cached database, and most DNS incidents come from misunderstanding the caching or the delegation.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first network step of almost every request. Before connecting, a client must turn `shop.example.com` into an IP address.
+
+DNS is a phone book split across millions of servers, organised as a tree. No server knows every name. The root servers know who runs `.com`; the `.com` servers know who runs `example.com`; `example.com`'s own servers know the address of `shop.example.com`. A **recursive resolver** walks that tree on a client's behalf and caches every answer for as long as the answer's **TTL** allows.
+
+Topics, in order:
+
+1. Domain names and the domain business
+2. The hierarchy and delegation
+3. The servers involved
+4. A full resolution, step by step
+5. Record types
+6. Caching, TTLs, and negative caching
+7. Anycast, GeoDNS, and DNS-based load balancing
+8. DNSSEC and encrypted DNS
+9. Failure modes
+10. Debugging
+
+| Word                     | Plain meaning                                                                                            |
+| :----------------------- | :------------------------------------------------------------------------------------------------------- |
+| **FQDN**                 | Fully qualified domain name, ending at the root: `shop.example.com.`                                     |
+| **zone**                 | The part of the tree one set of servers is authoritative for.                                            |
+| **delegation**           | A parent zone pointing to the servers of a child zone (NS records).                                      |
+| **registry**             | Operator of a TLD's database (Verisign for `.com`, NIXI for `.in`).                                      |
+| **registrar**            | Company that sells domains and talks to the registry.                                                    |
+| **stub resolver**        | The small resolver in the OS or browser.                                                                 |
+| **recursive resolver**   | Server that performs full lookups and caches results (ISP, `1.1.1.1`, `8.8.8.8`).                        |
+| **authoritative server** | Server that holds a zone's actual records.                                                               |
+| **TTL**                  | How many seconds an answer may be cached.                                                                |
+| **glue record**          | IP address of a nameserver given by the parent, needed when the nameserver is inside the zone it serves. |
+
+---
+
+## Domain names and the domain business
+
+`api.shop.example.co.uk.` reads right to left: root (`.`), TLD `uk`, second level `co.uk` (a public suffix), registrable domain `example.co.uk`, then subdomains `shop` and `api`. Labels are up to 63 characters; whole names up to 253.
+
+| TLD type     | Examples                                                                                            |
+| :----------- | :-------------------------------------------------------------------------------------------------- |
+| Generic      | `.com`, `.org`, `.net`, `.dev`, `.app` (`.dev` and `.app` are on the HSTS preload list: HTTPS only) |
+| Country code | `.in`, `.uk`, `.de`, `.io`                                                                          |
+| Brand        | `.google`, `.apple`                                                                                 |
+
+The **Public Suffix List** records which suffixes anyone can register under (`co.uk`, `github.io`). Browsers use it to decide what counts as one **site** for cookies and `SameSite` ([Browser Security Model](/fullstack/web-fundamentals/browser-security-model)).
+
+### Registration
+
+- The registrar records the domain with the registry, including the **nameservers** that are authoritative for it.
+- Registration data is published via RDAP/WHOIS (often redacted for privacy).
+- Lifecycle: registered, expires, grace period, redemption period, deletion. An expired domain can be bought by anyone, and with it any email reset links, OAuth redirects, or CNAMEs pointing at it.
+- Protect domains with auto-renew, registrar lock, and MFA on the registrar account; domain hijacks start at the registrar.
+- Internationalised domain names use **punycode** (`xn--...`). Homograph attacks use look-alike Unicode characters (Cyrillic `а` vs Latin `a`).
+
+---
+
+## The hierarchy and delegation
+
+<Mermaid
+  chart={`
+flowchart TD
+    ROOT["Root zone (.) : 13 named server identities, operated via anycast at 1,000+ sites"] --> COM[".com TLD servers"]
+    ROOT --> IN[".in TLD servers"]
+    COM --> EX["example.com nameservers (ns1.dnsprovider.net)"]
+    EX --> A["shop.example.com A 203.0.113.10"]
+    EX --> SUB["dev.example.com : delegated to another team's nameservers"]
+`}
+/>
+
+A parent delegates a child zone by publishing **NS** records. For `example.com`, the `.com` zone holds:
+
+```text
+example.com.   172800  IN  NS  ns1.dnsprovider.net.
+example.com.   172800  IN  NS  ns2.dnsprovider.net.
+```
+
+If the nameserver is inside the zone itself (`ns1.example.com` for `example.com`), the resolver would need `example.com` to find `example.com`'s server: a loop. The parent breaks it with **glue**: an `A` record for `ns1.example.com` published in the `.com` zone.
+
+Subzones can be delegated to different providers or teams (`dev.example.com` on a different DNS service), which is how organisations split ownership.
+
+---
+
+## The servers involved
+
+| Server                | Role                                                                   | Caches?                                       |
+| :-------------------- | :--------------------------------------------------------------------- | :-------------------------------------------- |
+| Browser DNS cache     | Recent lookups per browser                                             | Yes, short                                    |
+| OS stub resolver      | Sends queries to the configured recursive resolver; reads `/etc/hosts` | Often (systemd-resolved, macOS mDNSResponder) |
+| Recursive resolver    | Walks the tree, validates DNSSEC, caches                               | Yes, by TTL                                   |
+| Root servers          | Point to TLD servers                                                   | n/a                                           |
+| TLD servers           | Point to a domain's nameservers                                        | n/a                                           |
+| Authoritative servers | Answer for their zone                                                  | n/a                                           |
+
+In Kubernetes and Docker, an internal DNS (CoreDNS) resolves service names first, and `ndots` and search domains can turn one lookup of `api.example.com` into several failed queries before the real one, a common source of DNS latency in clusters.
+
+---
+
+## A full resolution, step by step
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant B as Browser / OS
+    participant R as Recursive resolver
+    participant Root as Root server
+    participant TLD as .com server
+    participant Auth as example.com nameserver
+    B->>R: A? shop.example.com (recursive query)
+    Note over R: cache miss
+    R->>Root: A? shop.example.com
+    Root-->>R: referral: .com NS + glue
+    R->>TLD: A? shop.example.com
+    TLD-->>R: referral: example.com NS ns1.dnsprovider.net
+    R->>Auth: A? shop.example.com
+    Auth-->>R: answer: 203.0.113.10, TTL 300 (authoritative)
+    R-->>B: 203.0.113.10 (cached for 300 s)
+`}
+/>
+
+- The client asks the resolver a **recursive** query ("give me the final answer"); the resolver asks the hierarchy **iterative** queries and receives **referrals**.
+- The root and TLD referrals have long TTLs (two days for `.com` delegations), so in practice the resolver almost always starts at the domain's nameservers. A cold walk costs several RTTs; a cached answer costs one short RTT to a nearby resolver.
+- DNS uses UDP port 53 for most queries and TCP for large responses and zone transfers. Responses larger than about 1,232 bytes (EDNS buffer size recommended by DNS Flag Day 2020) fall back to TCP.
+- Resolvers use **QNAME minimisation** (asking the root only about `com.`, not the full name) for privacy.
+
+---
+
+## Record types
+
+| Type                           | Maps                                                                       | Example                                       | Notes                                                                                 |
+| :----------------------------- | :------------------------------------------------------------------------- | :-------------------------------------------- | :------------------------------------------------------------------------------------ |
+| `A`                            | Name → IPv4                                                                | `shop 300 IN A 203.0.113.10`                  | Several `A` records give round-robin                                                  |
+| `AAAA`                         | Name → IPv6                                                                | `shop IN AAAA 2001:db8::10`                   |                                                                                       |
+| `CNAME`                        | Name → another name (alias)                                                | `www IN CNAME shop.example.com.`              | Resolver then looks up the target. Cannot coexist with other records at the same name |
+| `ALIAS` / `ANAME` / flattening | Apex name → another name (provider feature)                                | `example.com ALIAS lb.provider.net.`          | Provider resolves and returns `A` records                                             |
+| `MX`                           | Mail servers with priority                                                 | `IN MX 10 mx1.mail.example.com.`              | Lower number preferred                                                                |
+| `TXT`                          | Text                                                                       | SPF, DKIM, DMARC, domain verification         |                                                                                       |
+| `NS`                           | Delegation                                                                 | `IN NS ns1.dnsprovider.net.`                  |                                                                                       |
+| `SOA`                          | Zone metadata: primary server, serial, timers, **negative TTL**            |                                               | One per zone                                                                          |
+| `CAA`                          | Which CAs may issue certificates                                           | `IN CAA 0 issue "letsencrypt.org"`            |                                                                                       |
+| `SRV`                          | Service host and port                                                      | `_sip._tcp IN SRV 10 5 5060 sip.example.com.` |                                                                                       |
+| `PTR`                          | IP → name (reverse DNS)                                                    |                                               | Mail servers check it                                                                 |
+| `HTTPS` / `SVCB`               | Connection hints: ALPN (`h3`), alternative endpoints, ECH config, IP hints | `example.com IN HTTPS 1 . alpn="h3,h2"`       | Lets browsers use HTTP/3 and ECH from the first connection; also works at the apex    |
+
+### Why no CNAME at the apex
+
+The apex (`example.com`) must have `SOA` and `NS` records, and a `CNAME` cannot coexist with any other record at the same name. Putting a `CNAME` there breaks the zone, including the `MX` records, which is why email stopped in the opening example. Use provider flattening (`ALIAS`), `HTTPS` records, or `A` records pointing at static or anycast IPs.
+
+### Email authentication
+
+| Record                                            | Purpose                                                              |
+| :------------------------------------------------ | :------------------------------------------------------------------- |
+| SPF (`TXT v=spf1 include:_spf.provider.com -all`) | Which servers may send mail for the domain (limit of 10 DNS lookups) |
+| DKIM (`TXT` at `selector._domainkey`)             | Public key verifying message signatures                              |
+| DMARC (`TXT` at `_dmarc`)                         | Policy for failures (`p=none/quarantine/reject`) and reporting       |
+
+Major mailbox providers require SPF, DKIM, and DMARC for bulk senders; transactional email lands in spam without them.
+
+---
+
+## Caching, TTLs, and negative caching
+
+Every answer carries a TTL; each cache counts it down. DNS has no push mechanism, so a change becomes visible only as caches expire. "Propagation" means **waiting for old answers to expire**.
+
+| Situation               | TTL strategy                                                                                 |
+| :---------------------- | :------------------------------------------------------------------------------------------- |
+| Stable records          | 1 hour to 1 day: fewer queries, faster lookups, resilience if the DNS provider has an outage |
+| Planned migration       | Lower to 60 s at least one old-TTL period before the change, switch, verify, raise again     |
+| Failover records        | 30–60 s, accepting more queries                                                              |
+| Delegation (NS) changes | Governed by the parent's TTL (often 2 days); plan days ahead                                 |
+
+Caveats: some resolvers and clients enforce minimum TTLs or keep stale answers; Java historically cached forever without configuration; long-running processes and connection pools keep using old IPs after DNS changes (connections must be recycled).
+
+**Negative caching**: a "no such name" (`NXDOMAIN`) answer is cached for the zone's SOA minimum/negative TTL. Querying a record before creating it (for example, a health check hitting `new.example.com` early) can cache its absence for an hour.
+
+---
+
+## Anycast, GeoDNS, and DNS load balancing
+
+- **Anycast DNS**: providers announce the same nameserver IPs from many locations, so queries reach a nearby site and DDoS traffic spreads out.
+- **GeoDNS / latency-based routing**: the authoritative server returns different answers depending on where the query came from (the resolver's location, refined by the **EDNS Client Subnet** extension). Used by CDNs and multi-region apps (Route 53 latency and geolocation routing).
+- **Health-checked DNS failover**: the provider stops returning unhealthy endpoints. Failover speed is limited by TTLs and client caching, so it is coarse compared with load balancers.
+- **Round-robin `A` records**: spreads clients but has no health awareness and clients may pin to one address.
+
+---
+
+## DNSSEC and encrypted DNS
+
+Two separate problems:
+
+| Problem                                                                                                          | Solution                                                  | How                                                                                                                                                                      |
+| :--------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Authenticity**: is this answer really from the zone owner? (Cache poisoning, such as the 2008 Kaminsky attack) | **DNSSEC**                                                | Zones sign record sets (`RRSIG`); keys (`DNSKEY`) are vouched for by the parent (`DS`), forming a chain of trust to the root. Validating resolvers reject forged answers |
+| **Privacy**: who can see which names are looked up?                                                              | **DoH** (DNS over HTTPS), **DoT** (DNS over TLS), **DoQ** | Encrypt the client-to-resolver hop                                                                                                                                       |
+
+DNSSEC does not encrypt anything, and misconfigured signatures (expired, wrong `DS` after changing providers) make a domain unresolvable for validating resolvers. Encrypted DNS hides queries from the local network but the chosen resolver still sees them.
+
+Without DNSSEC, resolvers defend against poisoning with random source ports and query IDs, and by ignoring unsolicited data.
+
+---
+
+## Failure modes
+
+| Failure                             | Effect                                                                                                    | Mitigation                                                         |
+| :---------------------------------- | :-------------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------- |
+| DNS provider outage (Dyn 2016 DDoS) | Domains unresolvable once caches expire                                                                   | Secondary DNS from a second provider; moderate TTLs                |
+| Expired domain                      | Everything stops; attacker may buy it                                                                     | Auto-renew, alerts                                                 |
+| Bad change with long TTL            | Wrong answer cached for hours                                                                             | Lower TTL before changes; peer review DNS changes, ideally as code |
+| Dangling CNAME                      | `blog.example.com` points at a deleted cloud resource that an attacker can claim (**subdomain takeover**) | Remove records when deprovisioning; scan for dangling records      |
+| Resolver latency in clusters        | Slow first requests                                                                                       | Node-local DNS caches, tune `ndots`                                |
+| Stale IPs in long-lived processes   | Traffic to old servers                                                                                    | Respect TTLs, recycle connections                                  |
+
+---
+
+## Debugging
+
+```bash
+dig shop.example.com                      # full answer with TTLs
+dig +short shop.example.com AAAA
+dig example.com NS                        # who is authoritative
+dig @ns1.dnsprovider.net shop.example.com # ask the authoritative server directly (bypass caches)
+dig @1.1.1.1 shop.example.com             # what a public resolver currently caches
+dig +trace shop.example.com               # walk from the root
+dig -x 203.0.113.10                       # reverse lookup
+dig example.com HTTPS                     # HTTP/3 and ECH hints
+nslookup shop.example.com                 # available on Windows
+```
+
+Comparing the authoritative answer with a resolver's cached answer (and its remaining TTL) tells whether a change is live and how long until caches catch up.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="A DNS change is not visible to some users. Why?">
+    Resolvers and clients cached the old answer and keep it until its TTL expires; DNS has no
+    invalidation. Lower the TTL well before planned changes.
+  </Accordion>
+  <Accordion title="What is the difference between a recursive and an authoritative server?">
+    A recursive resolver finds answers on behalf of clients by walking the hierarchy and caching. An
+    authoritative server holds the actual records for a zone and answers only for it.
+  </Accordion>
+  <Accordion title="Why can't the root domain have a CNAME?">
+    The apex must hold SOA and NS records, and a CNAME cannot coexist with other records at the same
+    name. Providers offer ALIAS/flattening instead.
+  </Accordion>
+  <Accordion title="What is a subdomain takeover?">
+    A DNS record (often a CNAME) still points to a third-party resource that was deleted. An
+    attacker registers that resource name on the provider and serves content on the victim's
+    subdomain.
+  </Accordion>
+  <Accordion title="What does DNSSEC protect and what doesn't it?">
+    It authenticates answers with signatures chained to the root, preventing forged or poisoned
+    responses. It does not encrypt queries; DoH, DoT, and DoQ address privacy.
+  </Accordion>
+</Accordions>

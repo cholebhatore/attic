@@ -1,0 +1,268 @@
+---
+title: Concurrency Models
+description: Concurrency vs parallelism, processes and threads and what each costs, context switches, I/O-bound vs CPU-bound work, the C10K problem, thread-per-request, event loops and async I/O, coroutines, green threads and virtual threads, the actor model, how Node.js, Python, Go, and Java servers handle load, race conditions, locks, deadlocks, and choosing a model.
+---
+
+A Node.js API handles 5,000 concurrent requests on one thread, until someone adds a synchronous image resize to one route; then every request waits behind it. A Python Flask app on four threads handles 4 slow upstream calls at a time and queues the fifth. A Java service handles 10,000 connections with 10,000 threads and runs out of memory. Each concurrency model has one kind of work it handles badly, and choosing a stack means choosing which weakness to live with.
+
+---
+
+## The plain-language version
+
+**Where this sits:** in Backend Fundamentals, before the language-specific pages ([Node.js runtime](/fullstack/nodejs/runtime-and-event-loop), [Async Python](/fullstack/python-backend/async-python)).
+
+**Concurrency** is making progress on many tasks over the same period, by switching between them. **Parallelism** is executing several tasks at the same instant on several CPU cores. A web server mostly **waits** (on databases, other services, the network), so concurrency matters more than parallelism for typical backends: the goal is to do something useful while waiting.
+
+Two kitchen staffing models illustrate it. **Thread-per-request** gives every customer a personal waiter who stands idle while the food cooks: simple, but expensive with many customers. An **event loop** has one waiter serving many tables, never waiting by the kitchen: efficient, but if one customer asks the waiter to cook (CPU work), every table waits.
+
+Topics, in order:
+
+1. Concurrency vs parallelism
+2. Processes and threads
+3. I/O-bound vs CPU-bound work
+4. Thread-per-request
+5. Event loops and async I/O
+6. Coroutines, green threads, virtual threads
+7. The actor model
+8. How popular stacks handle load
+9. Race conditions and synchronisation
+10. Deadlocks
+11. Choosing
+
+| Word                       | Plain meaning                                                                    |
+| :------------------------- | :------------------------------------------------------------------------------- |
+| **process**                | A running program with its own memory space.                                     |
+| **thread**                 | An execution path inside a process; threads share the process's memory.          |
+| **context switch**         | The OS saving one thread's state and loading another's.                          |
+| **blocking call**          | A call that stops the calling thread until it completes.                         |
+| **coroutine**              | A function that can suspend and resume, cooperatively yielding control.          |
+| **preemptive scheduling**  | The scheduler can interrupt a task at any time.                                  |
+| **cooperative scheduling** | Tasks yield control voluntarily (at `await`).                                    |
+| **race condition**         | Outcome depends on the timing of concurrent operations.                          |
+| **GIL**                    | Python's Global Interpreter Lock: one thread executes Python bytecode at a time. |
+
+---
+
+## Concurrency vs parallelism
+
+<Mermaid
+  chart={`
+gantt
+    dateFormat X
+    axisFormat %L
+    section Concurrency (1 core, interleaved)
+    Task A   :0, 2
+    Task B   :2, 4
+    Task A   :4, 6
+    Task B   :6, 8
+    section Parallelism (2 cores)
+    Task A (core 1)  :0, 4
+    Task B (core 2)  :0, 4
+`}
+/>
+
+A single-core machine can be highly concurrent and not parallel at all. A system can also be parallel without being concurrent in the useful sense (a batch job splitting one computation across cores).
+
+---
+
+## Processes and threads
+
+|                 | Process                                  | OS thread                                                                                                          |
+| :-------------- | :--------------------------------------- | :----------------------------------------------------------------------------------------------------------------- |
+| Memory          | Separate address space                   | Shared with other threads in the process                                                                           |
+| Creation cost   | Higher (fork, copy-on-write page tables) | Lower, still kernel work                                                                                           |
+| Default stack   | n/a                                      | Typically 1–8 MB reserved virtual memory (Linux default 8 MB for the main thread; thread defaults vary by runtime) |
+| Communication   | IPC: pipes, sockets, shared memory       | Shared variables (needs synchronisation)                                                                           |
+| Crash isolation | A crash kills only that process          | A crash in one thread kills the process                                                                            |
+| Context switch  | More expensive (address space change)    | Cheaper, still microseconds plus cache effects                                                                     |
+
+Context switches cost CPU time directly (a few microseconds) and indirectly (cold CPU caches and TLBs afterwards). With thousands of runnable threads, a measurable share of CPU goes to switching rather than work.
+
+---
+
+## I/O-bound vs CPU-bound work
+
+|               | I/O-bound                                                             | CPU-bound                                                                                     |
+| :------------ | :-------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------- |
+| Spends time   | Waiting on network, disk, databases                                   | Computing                                                                                     |
+| Examples      | API aggregating three services, CRUD endpoints, proxies, chat servers | Image and video processing, compression, encryption at scale, ML inference, report generation |
+| Benefits from | More concurrency (overlapping waits)                                  | More cores (parallelism)                                                                      |
+| Best models   | Event loops, async/await, many lightweight threads                    | Thread or process pools sized to cores, native code                                           |
+
+A typical API request might spend 95 percent of its time waiting on I/O. With 20 ms of total time and 1 ms of CPU, a single core could in principle serve about 1,000 such requests per second if it never sat idle while waiting; the concurrency model decides whether it does.
+
+---
+
+## Thread-per-request
+
+Each request gets a thread (from a pool) that runs the handler with ordinary **blocking** calls.
+
+```python
+# Synchronous Flask/Django style: simple, blocking calls
+@app.get("/orders/<int:user_id>")
+def orders(user_id):
+    user = db.get_user(user_id)            # thread blocks
+    orders = billing.get_orders(user_id)   # thread blocks
+    return render(user, orders)
+```
+
+| Strengths                                                 | Weaknesses                                                                                         |
+| :-------------------------------------------------------- | :------------------------------------------------------------------------------------------------- |
+| Straightforward sequential code                           | Concurrency limited by pool size: the 201st request waits when 200 threads are busy waiting on I/O |
+| Uses multiple cores naturally (except under Python's GIL) | Memory per thread; context-switch overhead at thousands of threads                                 |
+| Mature tooling, stack traces, debuggers                   | Shared mutable state requires locks                                                                |
+
+The **C10K problem** (handling ten thousand concurrent connections, posed by Dan Kegel in 1999) was largely about the cost of a thread or process per connection, and led to event-driven servers such as Nginx and Node.js.
+
+---
+
+## Event loops and async I/O
+
+One thread runs a loop: ask the OS which sockets are ready (epoll, kqueue, IOCP), run the callbacks for those, repeat. Handlers never block; they start I/O and register a continuation.
+
+```ts
+app.get('/orders/:userId', async (req, res) => {
+  const [user, orders] = await Promise.all([
+    db.getUser(req.params.userId),
+    billing.getOrders(req.params.userId),
+  ]);
+  res.json(render(user, orders));
+});
+```
+
+| Strengths                                                                  | Weaknesses                                                               |
+| :------------------------------------------------------------------------- | :----------------------------------------------------------------------- |
+| Tens of thousands of concurrent connections per process with little memory | **Any CPU-heavy or blocking call stalls every request** on that loop     |
+| No locks needed for data touched only between awaits on one thread         | One process uses one core: run several processes                         |
+| Natural fit for proxies, real-time, I/O fan-out                            | Async "colours" the code: async functions must be awaited all the way up |
+
+Examples: Node.js, Python asyncio servers (Uvicorn), Nginx, Redis (single-threaded command execution with an event loop), Netty and Vert.x on the JVM.
+
+---
+
+## Coroutines, green threads, virtual threads
+
+Several runtimes combine the simplicity of blocking-style code with the efficiency of event loops:
+
+| Model                                      | How                                                                                                                                              | Examples                             |
+| :----------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------- |
+| Stackless coroutines with explicit `await` | The compiler turns async functions into state machines; suspension points are visible                                                            | JavaScript, Python asyncio, Rust, C# |
+| Green threads / goroutines                 | Runtime schedules many lightweight threads (KB-sized growable stacks) onto a few OS threads; blocking I/O parks the goroutine, not the OS thread | Go, Erlang/Elixir processes          |
+| Virtual threads                            | JVM schedules millions of lightweight threads onto carrier OS threads; existing blocking APIs become non-blocking under the hood                 | Java 21+ (Project Loom)              |
+
+Go and virtual-thread Java let developers write sequential, blocking-looking code while the runtime multiplexes it like an event loop, and they also use all cores. The trade-off is preemption: goroutines can be interrupted anywhere, so shared memory needs synchronisation, as with OS threads.
+
+---
+
+## The actor model
+
+Actors are independent entities with private state that communicate only by sending messages to each other's mailboxes. Each actor processes one message at a time, so its state needs no locks. Erlang/Elixir (the BEAM VM, used by WhatsApp and Discord's real-time systems), Akka, and Orleans use it; supervisors restart failed actors ("let it crash"). Cloudflare Durable Objects apply a similar single-threaded-per-object model at the edge.
+
+---
+
+## How popular stacks handle load
+
+| Stack                                       | Model                                           | Parallelism                                                             | Watch out for                                                                                               |
+| :------------------------------------------ | :---------------------------------------------- | :---------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------- |
+| Node.js                                     | One event loop per process + libuv thread pool  | Multiple processes (cluster, replicas), worker threads                  | Blocking the loop with CPU work or sync APIs                                                                |
+| Python, sync (Django, Flask under Gunicorn) | Process pool × thread pool                      | Processes (GIL limits threads to one running Python thread per process) | Slow upstream calls tie up workers                                                                          |
+| Python, async (FastAPI under Uvicorn)       | Event loop per worker process                   | Multiple worker processes                                               | Blocking libraries inside `async def` stall the loop                                                        |
+| Go                                          | Goroutines on all cores                         | Automatic                                                               | Data races on shared state (use channels, mutexes, race detector)                                           |
+| Java / Kotlin (Spring)                      | Thread pool; virtual threads in modern versions | Automatic                                                               | Pool exhaustion with platform threads; pinning with virtual threads in synchronized blocks (older versions) |
+| Ruby (Puma)                                 | Processes × threads, GVL                        | Processes                                                               | Similar to Python                                                                                           |
+| Elixir (Phoenix)                            | BEAM processes (actors) on all cores            | Automatic                                                               | Different paradigm                                                                                          |
+
+Python's GIL: only one thread runs Python bytecode at a time per interpreter. Threads still overlap I/O (the GIL is released while waiting) but do not speed up CPU-bound Python. Free-threaded builds without the GIL exist from Python 3.13 onward but are not yet the default deployment.
+
+---
+
+## Race conditions and synchronisation
+
+A race condition occurs when the outcome depends on the interleaving of concurrent operations. Classic **read-modify-write**:
+
+| Time | Request 1                     | Request 2                     | Stock in DB              |
+| :--- | :---------------------------- | :---------------------------- | :----------------------- |
+| t1   | Read stock = 1                |                               | 1                        |
+| t2   |                               | Read stock = 1                | 1                        |
+| t3   | Write stock = 0, create order |                               | 0                        |
+| t4   |                               | Write stock = 0, create order | 0 (two orders, one item) |
+
+This happens with **any** concurrency model, including single-threaded event loops, because between two `await`s other requests run:
+
+```ts
+const product = await db.product.findUnique({ where: { id } }); // other requests run during this await
+if (product.stock > 0) {
+  await db.product.update({ where: { id }, data: { stock: product.stock - 1 } });
+}
+```
+
+Fixes, from the database outward:
+
+| Technique                 | Example                                                                                                     |
+| :------------------------ | :---------------------------------------------------------------------------------------------------------- |
+| Atomic conditional update | `UPDATE products SET stock = stock - 1 WHERE id = $1 AND stock > 0 RETURNING stock`                         |
+| Constraints               | `CHECK (stock >= 0)`, unique constraints                                                                    |
+| Row locks                 | `SELECT ... FOR UPDATE` in a transaction                                                                    |
+| Optimistic concurrency    | Version column checked on update; retry on conflict                                                         |
+| Serializable isolation    | Database detects conflicts; retry ([Transactions](/fullstack/databases/transactions))                       |
+| Distributed locks         | Redis lock with fencing tokens, for work outside one database ([Redis patterns](/fullstack/redis/patterns)) |
+| In-process locks          | Mutexes, semaphores; only protect a single process, so useless across replicas                              |
+
+In multi-threaded runtimes, shared in-memory data structures also need mutexes, atomic operations, or thread-safe collections; in event loops, data touched only synchronously between awaits is safe.
+
+---
+
+## Deadlocks
+
+A deadlock happens when two (or more) parties each hold a resource the other needs. The four Coffman conditions must all hold: mutual exclusion, hold and wait, no preemption, circular wait. Breaking any one prevents it; in practice:
+
+- **Lock ordering**: always acquire locks (or update rows) in a consistent order, such as by ascending ID.
+- **Timeouts**: lock acquisition and database `lock_timeout` turn deadlocks into retryable errors.
+- **Short critical sections**: hold locks for as little time as possible; never call external services while holding one.
+
+Databases detect deadlocks and abort one transaction; applications must retry. Connection pool deadlocks are a related failure: a request holding one pooled connection waits for a second from an exhausted pool held by other requests doing the same.
+
+---
+
+## Choosing
+
+| Workload                                      | Good fits                                                                      |
+| :-------------------------------------------- | :----------------------------------------------------------------------------- |
+| I/O-heavy APIs, BFFs, proxies                 | Node.js, async Python, Go, Java virtual threads                                |
+| Many long-lived connections (WebSockets, SSE) | Event loops, Go, Elixir                                                        |
+| CPU-heavy processing                          | Go, Java, Rust, or worker pools/processes in Node and Python; native libraries |
+| Simple CRUD with a small team                 | Whatever the team knows; sync frameworks with enough workers are fine          |
+| Massive concurrency with fault isolation      | Elixir/Erlang                                                                  |
+
+Whatever the model, the database is usually the shared bottleneck; concurrency in the app only helps until the database saturates ([Performance Theory](/fullstack/optimization/performance-theory)).
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between concurrency and parallelism?">
+    Concurrency is structuring work so many tasks make progress over the same period, often by
+    interleaving on one core. Parallelism is executing multiple tasks simultaneously on multiple
+    cores.
+  </Accordion>
+  <Accordion title="Why can one Node.js thread serve more concurrent requests than a 200-thread Java server with platform threads?">
+    For I/O-bound requests, Node never dedicates a thread to waiting; one loop multiplexes thousands
+    of sockets. A thread-per-request server can only have as many requests in progress as it has
+    threads, each costing memory.
+  </Accordion>
+  <Accordion title="Can a single-threaded server have race conditions?">
+    Yes. Each await is a point where other requests run, so a read, an await, and a write are not
+    atomic. Shared external state such as the database is also modified by other processes and
+    replicas.
+  </Accordion>
+  <Accordion title="What does Python's GIL prevent and what does it allow?">
+    It prevents more than one thread from executing Python bytecode simultaneously in one process,
+    so threads do not speed up CPU-bound Python. It is released during I/O and in many C extensions,
+    so threads still help I/O-bound work. Multiprocessing provides CPU parallelism.
+  </Accordion>
+  <Accordion title="How are deadlocks prevented?">
+    Acquire locks or update rows in a consistent order, keep critical sections short, use lock
+    timeouts, avoid external calls while holding locks, and retry transactions the database aborts.
+  </Accordion>
+</Accordions>

@@ -1,0 +1,79 @@
+---
+title: Caching Patterns
+description: Cache-aside (lazy loading), read-through, write-through, write-behind (write-back), write-around, refresh-ahead, negative caching, and how to pick one.
+---
+
+Each pattern answers two questions: who loads data into the cache on a miss, and what happens to the cache on a write.
+
+---
+
+## The patterns
+
+| Pattern                        | Read                                               | Write                                      | Pros                                                                     | Cons                                                      |
+| :----------------------------- | :------------------------------------------------- | :----------------------------------------- | :----------------------------------------------------------------------- | :-------------------------------------------------------- |
+| **Cache-aside** (lazy loading) | App checks cache; on miss reads DB and fills cache | App writes DB, then deletes the cache key  | Simple; cache holds only requested data; DB still works if cache is down | First request after a miss is slow; possible stale window |
+| **Read-through**               | Cache library loads from DB on miss                | (Combined with a write pattern)            | App code sees one interface                                              | Needs a loader-aware cache                                |
+| **Write-through**              | From cache                                         | Write cache and DB together, synchronously | Cache always fresh for written keys                                      | Slower writes; caches data that may never be read         |
+| **Write-behind** (write-back)  | From cache                                         | Write cache; flush to DB asynchronously    | Very fast writes; batching                                               | Data loss if cache dies before flush; complex             |
+| **Write-around**               | Cache-aside reads                                  | Write DB only; cache filled on later read  | Avoids caching write-once data                                           | First read after write misses                             |
+| **Refresh-ahead**              | From cache                                         | Background refresh before expiry           | No miss latency for hot keys                                             | Refreshes keys nobody reads anymore                       |
+
+---
+
+## Cache-aside in code
+
+<Tabs items={['Node.js', 'Python']}>
+<Tab value="Node.js">
+
+```ts
+async function cached<T>(key: string, ttlSec: number, load: () => Promise<T>): Promise<T> {
+  const hit = await redis.get(key);
+  if (hit !== null) return JSON.parse(hit) as T;
+  const value = await load();
+  await redis.set(key, JSON.stringify(value), { EX: ttlSec });
+  return value;
+}
+
+const product = await cached(`product:${id}`, 300, () => db.product.findUnique({ where: { id } }));
+
+async function updateProduct(id: string, data: ProductUpdate) {
+  await db.product.update({ where: { id }, data });
+  await redis.del(`product:${id}`); // delete, don't set: avoids writing a stale value in races
+}
+```
+
+</Tab>
+<Tab value="Python">
+
+```python
+import json
+
+async def cached(key: str, ttl: int, load):
+    if (hit := await redis.get(key)) is not None:
+        return json.loads(hit)
+    value = await load()
+    await redis.set(key, json.dumps(value), ex=ttl)
+    return value
+
+product = await cached(f"product:{pid}", 300, lambda: repo.get_product(pid))
+```
+
+</Tab>
+</Tabs>
+
+**Delete rather than update** the cache on writes. Two concurrent writers that each `SET` the cache can leave the older value last; deleting forces the next read to load the current value.
+
+---
+
+## Negative caching
+
+Cache "not found" results briefly (for example 30 seconds) so repeated lookups for missing IDs, including attacks probing random IDs, do not hit the database every time.
+
+---
+
+## Choosing
+
+- Default: **cache-aside** with TTL + delete on write.
+- Read-heavy, write-rare reference data: cache-aside with long TTL or refresh-ahead.
+- Counters and metrics with high write rates: **write-behind** (`INCR` in Redis, flush to the DB every few seconds), accepting small loss.
+- Session-like data whose truth lives in the cache: Redis as the store, not a cache (with persistence).

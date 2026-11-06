@@ -1,0 +1,74 @@
+---
+title: Scaling Redis
+description: Primary-replica replication and its asynchrony, read replicas, Sentinel for automatic failover, Redis Cluster with hash slots and hash tags, multi-key limits, memory sizing and fragmentation, monitoring, and managed offerings.
+---
+
+One Redis instance handles a remarkable load, often over 100,000 simple operations per second, but it is one machine with one main thread and limited RAM. Scaling it means answering two separate questions: how to survive the node failing (replication and failover) and how to hold more data or traffic than one node (sharding).
+
+---
+
+## The plain-language version
+
+**Replication** copies the primary's data to replicas. **Sentinel** watches the primary and promotes a replica if it dies. **Cluster** splits the keyspace into 16,384 **hash slots** spread across several primaries, each with its own replicas.
+
+| Word                  | Plain meaning                                             |
+| :-------------------- | :-------------------------------------------------------- |
+| **primary / replica** | Node taking writes / node copying it.                     |
+| **failover**          | Promoting a replica when the primary fails.               |
+| **quorum**            | Number of Sentinels that must agree a primary is down.    |
+| **hash slot**         | `CRC16(key) mod 16384`; each slot belongs to one primary. |
+| **hash tag**          | `{...}` in a key name; only that part is hashed.          |
+| **MOVED / ASK**       | Redirects telling a client which node owns a slot.        |
+
+---
+
+## Replication
+
+- Asynchronous by default: the primary acknowledges writes before replicas receive them. A failover can lose the last writes. `WAIT numreplicas timeout` blocks until N replicas confirm, reducing (not removing) that risk.
+- Replicas can serve reads, with possibly stale data.
+- A full resync (new replica or long disconnect) sends an RDB snapshot; size replication backlog to avoid repeated full syncs.
+
+---
+
+## Sentinel
+
+<Mermaid
+  chart={`
+flowchart TD
+    S1["Sentinel 1"] & S2["Sentinel 2"] & S3["Sentinel 3"] -. monitor .-> P["Primary"]
+    P --> R1["Replica 1"]
+    P --> R2["Replica 2"]
+    C["Clients"] -- "ask Sentinels: where is the primary?" --> S1
+`}
+/>
+
+Run at least three Sentinels on separate hosts. Clients connect through Sentinel-aware drivers, which discover the current primary after failover. Sentinel provides high availability, not more capacity.
+
+---
+
+## Cluster
+
+- Keys map to slots; slots map to primaries. Adding nodes moves slots (resharding) online.
+- Clients are cluster-aware: they cache the slot map and follow `MOVED` redirects.
+- **Multi-key commands, transactions, and Lua scripts** work only when all keys share a slot. Hash tags force that: `cart:{19}:items` and `cart:{19}:total` both hash `19`.
+- Hot keys still land on one node; Cluster spreads keys, not load on a single key.
+
+| Need                                          | Choose                                                |
+| :-------------------------------------------- | :---------------------------------------------------- |
+| Availability, data fits one node              | Primary + replicas + Sentinel (or managed equivalent) |
+| More memory or write throughput than one node | Cluster                                               |
+| Read-heavy                                    | Replicas for reads, accepting staleness               |
+
+---
+
+## Memory and monitoring
+
+- Size for data plus overhead (pointers, encodings), fragmentation, replication buffers, and fork copy-on-write during snapshots. Plan for peak usage at around 70 percent of RAM.
+- `INFO memory` (`used_memory`, `mem_fragmentation_ratio`), `INFO stats` (`evicted_keys`, `keyspace_hits/misses`), `SLOWLOG GET`, `LATENCY DOCTOR`.
+- Export to Prometheus with `redis_exporter`; alert on memory, evictions, replication lag, connected clients, and blocked clients.
+
+---
+
+## Managed options
+
+AWS ElastiCache and MemoryDB (MemoryDB adds a durable transaction log), Google Memorystore, Azure Cache for Redis / Azure Managed Redis, Redis Cloud, Upstash (serverless, per-request pricing, HTTP API usable from edge functions), Aiven for Valkey.

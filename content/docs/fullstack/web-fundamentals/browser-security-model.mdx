@@ -1,0 +1,255 @@
+---
+title: Browser Security Model
+description: Origins and sites, what the same-origin policy allows and blocks, cross-origin embedding vs reading, CORS in full (simple requests, preflight, credentials, caching, common errors), cookie attributes and SameSite in depth, third-party cookie restrictions, cross-origin isolation (COOP, COEP, CORP), iframes and postMessage, and mixed content.
+---
+
+A React app on `localhost:5173` calls an API on `localhost:3000` and gets "blocked by CORS policy". The API received the request, ran the handler, and returned 200; the browser then refused to hand the response to the page's script. Meanwhile an attacker's page can make the user's browser submit a form to the API with the user's cookies attached, and the browser allows it. Both behaviours come from the same rule, and getting web security right means knowing exactly what it does and does not block.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the browser's own security layer, sitting between pages from different websites. Application-level attacks such as XSS and CSRF are covered in [Auth: Attacks and Defenses](/fullstack/auth/attacks-and-defenses) and [OWASP Top 10](/fullstack/security/owasp-top-10).
+
+Think of a shared office building. Every company (origin) can send mail to any other company and hang pictures from anywhere on its own walls. What it cannot do is open another company's filing cabinets and read the contents. **CORS** is a company leaving a note saying "this visitor may read these files". **Cookies** are the access badges each company issued to an employee, and the browser automatically shows the right badge whenever mail goes to that company, which is exactly what attackers exploit.
+
+Topics, in order:
+
+1. Origins and sites
+2. The same-origin policy: what it allows and blocks
+3. CORS in depth
+4. Cookies: attributes and SameSite
+5. Third-party cookies and storage partitioning
+6. Cross-origin isolation: COOP, COEP, CORP
+7. Iframes and postMessage
+8. Mixed content and secure contexts
+
+| Word                         | Plain meaning                                                                             |
+| :--------------------------- | :---------------------------------------------------------------------------------------- |
+| **origin**                   | scheme + host + port: `https://app.example.com:443`                                       |
+| **site**                     | scheme + registrable domain (eTLD+1): `https://example.com`                               |
+| **same-origin policy (SOP)** | Scripts may only read data from their own origin.                                         |
+| **CORS**                     | Cross-Origin Resource Sharing: headers letting a server relax SOP for specific origins.   |
+| **preflight**                | An `OPTIONS` request asking permission before the real cross-origin request.              |
+| **credentialed request**     | A request carrying cookies, HTTP auth, or client certificates.                            |
+| **eTLD+1**                   | Effective top-level domain plus one label: `example.co.uk`, using the Public Suffix List. |
+| **secure context**           | A page served over HTTPS (or localhost), required for many powerful APIs.                 |
+
+---
+
+## Origins and sites
+
+| URL A                     | URL B                      | Same origin? | Same site?                              |
+| :------------------------ | :------------------------- | :----------- | :-------------------------------------- |
+| `https://example.com`     | `https://example.com/page` | Yes          | Yes                                     |
+| `https://example.com`     | `http://example.com`       | No (scheme)  | No (schemeful same-site)                |
+| `https://example.com`     | `https://example.com:8443` | No (port)    | Yes                                     |
+| `https://app.example.com` | `https://api.example.com`  | No (host)    | Yes                                     |
+| `https://a.github.io`     | `https://b.github.io`      | No           | **No** (`github.io` is a public suffix) |
+| `https://example.com`     | `https://example.org`      | No           | No                                      |
+
+**Origin** governs reading data (SOP, CORS, storage). **Site** governs cookies' `SameSite` behaviour and storage partitioning. A frontend on `app.example.com` and an API on `api.example.com` are cross-origin (CORS needed) but same-site (`SameSite=Lax` cookies flow).
+
+---
+
+## The same-origin policy
+
+The policy is often summarised wrongly as "cross-origin requests are blocked". The accurate version: **cross-origin writes and embeds are generally allowed; cross-origin reads are blocked**.
+
+| Action from a page on origin A to origin B                      | Allowed?                                                          |
+| :-------------------------------------------------------------- | :---------------------------------------------------------------- |
+| Navigate to B (link, redirect)                                  | Yes                                                               |
+| Submit a form to B (`GET` or `POST`) with B's cookies           | Yes: this is why **CSRF** exists                                  |
+| Embed B's image, script, stylesheet, video, iframe              | Yes (embedding executes or displays, but A cannot read the bytes) |
+| `fetch`/XHR to B and **read** the response                      | Only if B allows it with CORS                                     |
+| Read DOM of a B iframe, or a B window opened with `window.open` | No (`postMessage` instead)                                        |
+| Read B's cookies, `localStorage`, IndexedDB                     | No                                                                |
+| Read pixels of B's image drawn on a canvas                      | No (canvas becomes "tainted") unless CORS-enabled                 |
+
+Historic leaks shaped these rules. Embedding is allowed, so a `script` tag pointing at a JSON endpoint used to let attackers read some JSON responses (JSON hijacking); browsers now block cross-origin responses with sensitive content types from entering the page's process (CORB/ORB).
+
+---
+
+## CORS in depth
+
+CORS lets a server opt specific origins into reading its responses. The browser enforces it; servers, curl, and backend HTTP clients ignore it.
+
+### Simple requests
+
+A request is "simple" (no preflight) if it uses `GET`, `HEAD`, or `POST`, only CORS-safelisted headers (`Accept`, `Accept-Language`, `Content-Language`, `Content-Type` limited to `application/x-www-form-urlencoded`, `multipart/form-data`, or `text/plain`), and no `ReadableStream` body. These are requests an HTML form could already send, so allowing them adds no new capability.
+
+```http
+GET /api/products HTTP/1.1
+Origin: https://app.example.com
+
+HTTP/1.1 200 OK
+Access-Control-Allow-Origin: https://app.example.com
+Vary: Origin
+```
+
+The request is **sent and processed** regardless. The browser only decides whether the page may read the response. That is why CORS is not protection against state-changing requests: a simple `POST` still runs on the server.
+
+### Preflighted requests
+
+Anything else (JSON bodies, `Authorization` header, custom headers, `PUT`, `PATCH`, `DELETE`) triggers a preflight:
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant P as Page (app.example.com)
+    participant B as Browser
+    participant S as API (api.example.com)
+    P->>B: fetch(PUT /orders/9, JSON, Authorization)
+    B->>S: OPTIONS /orders/9 (Origin, Access-Control-Request-Method: PUT, Access-Control-Request-Headers: authorization, content-type)
+    S-->>B: 204 Allow-Origin, Allow-Methods: PUT, Allow-Headers: authorization, content-type, Max-Age: 600
+    B->>S: PUT /orders/9 (actual request)
+    S-->>B: 200 + Access-Control-Allow-Origin
+    B-->>P: response readable
+`}
+/>
+
+If the preflight response does not allow the method, headers, or origin, the actual request is **never sent**.
+
+### Response headers
+
+| Header                                   | Meaning                                                                                                              |
+| :--------------------------------------- | :------------------------------------------------------------------------------------------------------------------- |
+| `Access-Control-Allow-Origin`            | The allowed origin, or `*`                                                                                           |
+| `Access-Control-Allow-Credentials: true` | Response may be read when the request carried cookies (`credentials: 'include'`)                                     |
+| `Access-Control-Allow-Methods`           | Methods allowed (preflight)                                                                                          |
+| `Access-Control-Allow-Headers`           | Request headers allowed (preflight)                                                                                  |
+| `Access-Control-Expose-Headers`          | Response headers scripts may read beyond the safelisted ones (for example `Location`, `X-Request-Id`)                |
+| `Access-Control-Max-Age`                 | Seconds the browser may cache the preflight result (capped by browsers, about 2 hours in Chromium)                   |
+| `Vary: Origin`                           | Required when the allowed origin depends on the request, so caches do not serve one origin's CORS headers to another |
+
+### Credentials rules
+
+- With credentials, `Access-Control-Allow-Origin` cannot be `*`; it must echo the exact origin, and `Allow-Credentials: true` must be present.
+- **Reflecting any `Origin` with credentials enabled** lets every website read every logged-in user's data from the API. Use an explicit allow-list, and be careful with pattern matching (`endsWith('example.com')` also matches `evilexample.com`).
+- Allowing the `null` origin is dangerous: sandboxed iframes and `file://` pages send `Origin: null`.
+
+### Common CORS errors decoded
+
+| Console message (paraphrased)                        | Cause                                                                                                                             |
+| :--------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------- |
+| No `Access-Control-Allow-Origin` header present      | Server did not add CORS headers, often because an error path (500, auth middleware, proxy error page) skipped the CORS middleware |
+| Response to preflight does not pass access control   | `OPTIONS` route not handled or returns 401/404 (auth middleware ran before CORS)                                                  |
+| Wildcard cannot be used with credentials             | `*` with `credentials: 'include'`                                                                                                 |
+| Header not allowed by `Access-Control-Allow-Headers` | Missing `authorization` or `content-type` in the allowed list                                                                     |
+| Redirect not allowed for preflight                   | Preflight hit a redirect (often HTTP → HTTPS or a trailing slash)                                                                 |
+
+In development, a dev-server proxy (Vite `server.proxy`, Next.js rewrites) makes API calls same-origin and avoids CORS entirely. In production, serving frontend and API under one origin (`/api` path through the same reverse proxy) does the same.
+
+---
+
+## Cookies: attributes and SameSite
+
+| Attribute             | Effect                                                                                                                           |
+| :-------------------- | :------------------------------------------------------------------------------------------------------------------------------- |
+| `HttpOnly`            | Not readable by `document.cookie`; XSS cannot steal it (it can still use it by making requests from the page)                    |
+| `Secure`              | Sent only over HTTPS                                                                                                             |
+| `SameSite=Strict`     | Sent only on same-site requests; not even when following a link from another site                                                |
+| `SameSite=Lax`        | Also sent on top-level **navigations** with safe methods (clicking a link to the site); the default when unspecified in Chromium |
+| `SameSite=None`       | Sent on all requests, including cross-site; requires `Secure`                                                                    |
+| `Domain=example.com`  | Shared with all subdomains; omit to restrict to the exact host                                                                   |
+| `Path=/admin`         | Only for that path prefix (not a security boundary: same-origin pages can read it via iframes)                                   |
+| `Max-Age` / `Expires` | Lifetime; absent means session cookie                                                                                            |
+| `__Host-` prefix      | Requires `Secure`, `Path=/`, and no `Domain`: locked to one host                                                                 |
+| `__Secure-` prefix    | Requires `Secure`                                                                                                                |
+| `Partitioned`         | CHIPS: third-party cookie partitioned by top-level site                                                                          |
+
+### How SameSite decides
+
+| Request from a page on `evil.com` to `bank.com` | `Strict` | `Lax`    | `None` |
+| :---------------------------------------------- | :------- | :------- | :----- |
+| User clicks a link (top-level `GET` navigation) | Not sent | Sent     | Sent   |
+| Hidden form `POST`                              | Not sent | Not sent | Sent   |
+| `img`, `iframe`, `fetch`                        | Not sent | Not sent | Sent   |
+
+`Lax` blocks most CSRF but not attacks via top-level `GET` navigations, which is one more reason `GET` must never change state. "Same-site" also means a compromised or user-controlled subdomain (`uploads.example.com` serving user HTML) counts as same-site and can send `Lax` and `Strict` cookies to `example.com`. Isolate user-generated content on a separate registrable domain (`example-usercontent.com`).
+
+**Cookie tossing**: a subdomain can set a cookie with `Domain=example.com` that the main site will receive, potentially fixing sessions. The `__Host-` prefix prevents it.
+
+---
+
+## Third-party cookies and storage partitioning
+
+Third-party cookies (set by an embedded resource from another site) enabled cross-site tracking and also legitimate features: embedded widgets, cross-site SSO, payment iframes. Safari and Firefox block them by default; Chrome restricts them with user controls. Consequences for builders:
+
+- Login across sites relies on top-level redirects (OAuth/OIDC) and first-party cookies, not iframes with third-party cookies.
+- Embedded widgets that need state use **CHIPS** (`Partitioned` cookies: a separate cookie jar per top-level site) or the **Storage Access API** (a prompt asking the user to allow access).
+- `localStorage`, IndexedDB, caches, and service workers in third-party iframes are **partitioned** by top-level site.
+- Federated login in the browser is standardised by **FedCM**.
+
+---
+
+## Cross-origin isolation: COOP, COEP, CORP
+
+After Spectre, powerful features that enable precise timing (`SharedArrayBuffer`, high-resolution `performance.now()`, `performance.measureUserAgentSpecificMemory()`) require a page to prove that no cross-origin data can enter its process.
+
+| Header                                                                     | Set by          | Effect                                                                                                                                                           |
+| :------------------------------------------------------------------------- | :-------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Cross-Origin-Opener-Policy: same-origin`                                  | Top-level page  | Cross-origin windows opened by or opening this page get a separate browsing context group; `window.opener` is severed. Also defends against cross-window attacks |
+| `Cross-Origin-Embedder-Policy: require-corp` (or `credentialless`)         | Top-level page  | Every embedded resource must opt in (via CORS or CORP), or is loaded without credentials                                                                         |
+| `Cross-Origin-Resource-Policy: same-origin` / `same-site` / `cross-origin` | Resource server | Declares who may embed this resource; also protects resources from being pulled into other sites' processes                                                      |
+
+When both COOP and COEP are set, `self.crossOriginIsolated` is `true`. Apps running WASM threads (video editors, Figma-style tools, SQLite in the browser with threading) need this. `COOP: same-origin-allow-popups` keeps OAuth popups working.
+
+---
+
+## Iframes and postMessage
+
+- A page may embed other origins in iframes, but cannot read their DOM.
+- **Clickjacking**: a hostile site frames a victim page invisibly and tricks clicks. Pages opt out of being framed with CSP `frame-ancestors 'none'` (or `'self'`); `X-Frame-Options: DENY` is the older equivalent.
+- `sandbox` on an iframe removes capabilities (scripts, forms, same-origin access, top navigation) and re-enables them selectively with tokens (`allow-scripts`). Never combine `allow-scripts` and `allow-same-origin` for same-origin untrusted content: the frame can remove its own sandbox.
+- `allow` attribute delegates permissions (`allow="camera; payment"`).
+- Cross-origin windows communicate with **`postMessage`**:
+
+```js
+// sender
+iframe.contentWindow.postMessage({ type: 'resize', height: 480 }, 'https://widget.example');
+
+// receiver
+window.addEventListener('message', (event) => {
+  if (event.origin !== 'https://app.example.com') return; // always check origin
+  handle(event.data); // treat data as untrusted input
+});
+```
+
+Sending with `'*'` as the target origin can leak data to whatever page is now loaded in that window; receiving without checking `event.origin` lets any page send commands.
+
+---
+
+## Mixed content and secure contexts
+
+- **Mixed content**: an HTTPS page loading resources over HTTP. Scripts, stylesheets, iframes, and `fetch` requests ("active" content) are blocked; images, audio, and video are auto-upgraded to HTTPS or blocked. `Content-Security-Policy: upgrade-insecure-requests` rewrites HTTP subresource URLs during migrations.
+- **Secure contexts** (HTTPS or `localhost`) are required for service workers, geolocation, camera and microphone, clipboard write, Web Crypto's `subtle`, WebAuthn, push, and more. A site still on HTTP cannot use most modern platform features.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Does CORS protect the server from unwanted requests?">
+    No. CORS controls whether a browser lets a page read a cross-origin response. Simple requests
+    are sent and processed regardless, and non-browser clients ignore CORS. Servers still need
+    authentication, authorization, and CSRF defences.
+  </Accordion>
+  <Accordion title="Why does a fetch with a JSON body trigger a preflight?">
+    Content-Type application/json is not one of the form-compatible types, so the request is
+    something an HTML form could never send. The browser asks the server's permission first.
+  </Accordion>
+  <Accordion title="app.example.com calls api.example.com. Is that cross-origin? Cross-site?">
+    Cross-origin, because the host differs, so CORS is needed. Same-site, because the registrable
+    domain is the same, so SameSite=Lax and Strict cookies are sent.
+  </Accordion>
+  <Accordion title="Why is reflecting the Origin header with Allow-Credentials dangerous?">
+    It allows any website the user visits to make credentialed requests to the API and read the
+    responses, effectively disabling the same-origin policy for logged-in users.
+  </Accordion>
+  <Accordion title="What do COOP and COEP do?">
+    COOP isolates the page's browsing context from cross-origin windows; COEP requires all embedded
+    resources to opt in. Together they make the page cross-origin isolated, unlocking
+    SharedArrayBuffer and precise timers safely after Spectre.
+  </Accordion>
+</Accordions>

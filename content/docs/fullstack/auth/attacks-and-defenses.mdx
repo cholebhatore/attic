@@ -1,0 +1,79 @@
+---
+title: Attacks and Defenses
+description: XSS, CSRF, session fixation, replay, brute force and credential stuffing, account enumeration, DoS on auth endpoints, token leakage, JWT validation flaws, and long-lived tokens, each with mitigations.
+---
+
+Auth systems fail less often from broken cryptography and more often from a cookie without `SameSite`, a token in a URL, or a login endpoint with no rate limit. This page lists the common attacks against auth and the specific defenses for each.
+
+---
+
+## The plain-language version
+
+Attackers either **steal** a credential (XSS, leaks, phishing), **ride** a victim's existing credential (CSRF), **guess** one (brute force, stuffing), **reuse** a captured one (replay), or **overwhelm** the system (DoS). Each needs its own defense; none covers all.
+
+| Word                    | Plain meaning                                                                         |
+| :---------------------- | :------------------------------------------------------------------------------------ |
+| **XSS**                 | Cross-site scripting: attacker JS runs in the site's pages.                           |
+| **CSRF**                | Cross-site request forgery: another site triggers requests with the victim's cookies. |
+| **session fixation**    | Attacker sets a session ID before the victim logs in.                                 |
+| **replay**              | Resending a captured valid request or token.                                          |
+| **credential stuffing** | Trying leaked username/password pairs from other breaches.                            |
+| **CSP**                 | Content-Security-Policy header limiting which scripts may run.                        |
+
+---
+
+## XSS (cross-site scripting)
+
+- The attacker injects JS into a page (unsanitised user input, a vulnerable dependency, a compromised third-party script). It runs with the page's privileges: it can read anything in `localStorage` or `sessionStorage`, and make authenticated requests that carry cookies.
+- **Mitigations**: context-aware output encoding (frameworks escape by default), sanitising any HTML that must be rendered (DOMPurify), a strict **Content-Security-Policy**, `HttpOnly` cookies (removes the token from JS reach entirely), and avoiding `dangerouslySetInnerHTML` / `v-html` / `innerHTML` with untrusted data.
+
+---
+
+## CSRF (cross-site request forgery)
+
+- Because browsers attach cookies automatically, a malicious site can submit a request to the API using the victim's cookie, without ever reading it.
+- **Mitigations**:
+  - `SameSite=Lax` or `Strict` cookies (blocks most cross-site sends automatically; `Lax` is the browser default).
+  - **CSRF tokens**: a per-session secret the client must echo in a header or form field; a third-party site cannot read it.
+  - Checking `Origin` / `Referer` (or `Sec-Fetch-Site`) on state-changing requests.
+  - Never changing state on `GET`.
+- Pure Bearer-token-in-header schemes are naturally CSRF-immune, since a malicious site cannot make the browser attach a custom `Authorization` header. That is one real security advantage of moving API auth away from cookies, at the cost of reopening XSS exposure (see [Client-side Storage](/fullstack/auth/client-storage)).
+
+---
+
+## Session fixation and replay
+
+- **Fixation**: the attacker plants a known session ID on the victim before login, then uses the same ID after the victim authenticates. **Mitigation**: always issue a brand-new session ID on privilege change (login, role change), as `req.session.regenerate` does.
+- **Replay**: a captured valid token or request is resent later. **Mitigations**: short expiries, nonces and `jti` tracking for one-time operations, [rotating refresh tokens](/fullstack/auth/access-and-refresh-tokens), sender-constrained tokens (DPoP), and TLS everywhere to prevent capture in the first place.
+
+---
+
+## Brute force, credential stuffing, enumeration
+
+- Rate-limit per account **and** per IP; use exponential backoff on repeated failures; add a CAPTCHA or proof-of-work challenge after a threshold.
+- Check new passwords against breach lists; encourage MFA and passkeys.
+- Same message and similar timing for "no such user" and "wrong password"; same for sign-up and password reset flows.
+- Alert users on new-device logins.
+
+---
+
+## DoS against auth endpoints
+
+- Auth endpoints are high-value DoS targets: login and token endpoints do expensive work (password hashing, DB writes) per request, so cheap attacker requests can exhaust CPU.
+- **Mitigations**: rate limiting per IP and per account, exponential backoff on failures, CAPTCHA after thresholds, keeping session-store lookups fast (Redis over a DB), capping concurrent hash computations, and separating auth-server capacity from resource-server capacity so a login flood does not take down the whole API.
+
+---
+
+## Other common flaws
+
+- **Token leakage in logs and URLs**: never put tokens in query strings; they end up in server logs, browser history, and `Referer` headers. Redact `Authorization` and cookies in logs.
+- **Weak JWT validation**: accepting `alg: none`, letting the token choose the algorithm (HMAC/RSA confusion, where the public key is used as an HMAC secret), not checking `aud` or `iss`, or trusting keys from `jku` headers. Always pin accepted algorithms server-side. See the [JWT validation checklist](/fullstack/auth/jwt).
+- **Weak HMAC secrets**: short HS256 secrets can be brute-forced offline from a single token. Use at least 256 random bits, or asymmetric keys.
+- **Long-lived unrevocable tokens**: long-expiry JWTs with no denylist or refresh mechanism mean a single leak is exploitable for the token's whole lifetime.
+- **Open redirects** after login (`?next=https://evil.example`): allow only relative paths or known hosts.
+- **Missing object-level authorization**: see [Authorization Models](/fullstack/auth/authorization-models).
+
+<Callout type="info">
+  Defense in depth: assume one layer fails. `HttpOnly` limits XSS damage, CSP limits XSS itself,
+  `SameSite` limits CSRF, short tokens limit leaks, and monitoring catches what gets through.
+</Callout>

@@ -1,0 +1,90 @@
+---
+title: Event-driven
+description: Events vs commands, event notification vs event-carried state transfer, choreography vs orchestration, the saga pattern with compensations, CQRS, event sourcing, eventual consistency in the UI, and schema evolution.
+---
+
+Placing an order must reserve stock, charge the card, and schedule shipping, each owned by a different service. There is no transaction spanning all three. Event-driven patterns coordinate such work through messages, accepting that the system is briefly inconsistent between steps.
+
+---
+
+## Events and commands
+
+|                 | Command                  | Event                         |
+| :-------------- | :----------------------- | :---------------------------- |
+| Meaning         | "Do this"                | "This happened"               |
+| Naming          | Imperative: `ChargeCard` | Past tense: `PaymentCaptured` |
+| Receivers       | One handler              | Zero or many subscribers      |
+| Can be rejected | Yes                      | No: it already happened       |
+
+Event styles: **notification** (`OrderPlaced { orderId }`; subscribers fetch details) vs **event-carried state transfer** (the event contains the data subscribers need, reducing calls back but growing payloads and coupling to the schema).
+
+---
+
+## Choreography vs orchestration
+
+<Mermaid
+  chart={`
+flowchart TB
+    subgraph Choreography
+        O1["Orders: OrderPlaced"] --> I1["Inventory reserves: StockReserved"] --> P1["Payments charges: PaymentCaptured"] --> S1["Shipping schedules"]
+    end
+    subgraph Orchestration
+        OR["Order saga orchestrator"] --> I2["Inventory: reserve"]
+        OR --> P2["Payments: charge"]
+        OR --> S2["Shipping: schedule"]
+    end
+`}
+/>
+
+- **Choreography**: each service reacts to events. Loosely coupled, but the overall flow is implicit and hard to follow.
+- **Orchestration**: a coordinator tells each service what to do and tracks state. Explicit and easier to monitor; the orchestrator is a central piece. Workflow engines (Temporal, Step Functions) implement it durably.
+
+---
+
+## Sagas
+
+A saga is a sequence of local transactions where each step has a **compensating action** to undo it if a later step fails.
+
+| Step | Action                 | Compensation  |
+| :--- | :--------------------- | :------------ |
+| 1    | Create order (pending) | Cancel order  |
+| 2    | Reserve stock          | Release stock |
+| 3    | Charge card            | Refund        |
+| 4    | Schedule shipping      | (last step)   |
+
+If the charge fails, release stock and cancel the order. Compensations are business operations (a refund is not an un-charge), so they must be designed with the business. Each step publishes events reliably via the [outbox](/fullstack/message-brokers/job-queues-and-outbox) and handles duplicates idempotently.
+
+---
+
+## CQRS
+
+**Command Query Responsibility Segregation**: separate the model that handles writes from the models that serve reads. Writes go to a normalised store with full validation; events update one or more **read models** shaped for specific screens (a denormalised table, a search index, a cache).
+
+Fits when read and write needs differ sharply (complex dashboards over simple writes, very read-heavy feeds). The cost is eventual consistency between write and read sides and more moving parts.
+
+---
+
+## Event sourcing
+
+Instead of storing current state, store the sequence of events and derive state by replaying them.
+
+```text
+AccountOpened(id=7)
+MoneyDeposited(id=7, 5000)
+MoneyWithdrawn(id=7, 1200)
+→ balance = 3800
+```
+
+| Gains                                                           | Costs                                                |
+| :-------------------------------------------------------------- | :--------------------------------------------------- |
+| Complete audit trail, time travel ("state as of last Tuesday")  | Querying needs projections (CQRS)                    |
+| New read models built by replaying history                      | Event schemas live forever; versioning and upcasting |
+| Natural fit for domains already event-based (ledgers, bookings) | Snapshots needed for long streams; harder to learn   |
+
+Use it for domains where history is the point (finance, compliance, collaboration), not as a default persistence model. Stores: EventStoreDB, Postgres tables, Kafka with compaction for some cases.
+
+---
+
+## Eventual consistency in the UI
+
+After a write, the read model may lag. Techniques: return the new state from the command so the UI shows it immediately, optimistic UI, read-your-writes routing to the primary, and "processing" states for async results. Version events and use schema registries or contract tests so producers can evolve without breaking consumers.

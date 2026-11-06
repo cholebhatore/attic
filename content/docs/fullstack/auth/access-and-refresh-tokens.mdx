@@ -1,0 +1,97 @@
+---
+title: Access and Refresh Tokens
+description: Why access tokens are short-lived and refresh tokens are long-lived and stateful, the refresh flow, refresh token rotation, reuse detection with token families, logout, and lifetimes.
+---
+
+This pattern exists to soften the stateless revocation trade-off from [Stateful vs Stateless](/fullstack/auth/stateful-vs-stateless). It keeps most of the scaling benefit of stateless tokens while putting back a real, revocable point of control.
+
+---
+
+## The plain-language version
+
+Two tokens with two jobs. The **access token** is a day pass checked at every door: short-lived, cheap to verify, and not worth much if stolen. The **refresh token** is the membership card kept in a safe, shown only at the front desk to get a new day pass. Because the front desk checks its records, cancelling the membership stops new passes.
+
+| Word                | Plain meaning                                                         |
+| :------------------ | :-------------------------------------------------------------------- |
+| **access token**    | Short-lived credential sent to APIs on every request.                 |
+| **refresh token**   | Long-lived credential used only to get new access tokens.             |
+| **rotation**        | Each refresh returns a new refresh token and invalidates the old one. |
+| **token family**    | All refresh tokens descending from one login.                         |
+| **reuse detection** | An already-used refresh token appearing again signals theft.          |
+
+---
+
+## The two tokens
+
+- **Access token**: short-lived (minutes, for example 15), sent on every API request, usually a JWT for fast stateless verification. Because it is short-lived, a leaked access token has a small exploitation window.
+- **Refresh token**: long-lived (days or weeks), used _only_ to obtain a new access token from the auth server, never sent to resource or API servers. Stored server-side as a stateful record (or as a hash of a rotating opaque token), specifically so it **can** be revoked.
+
+---
+
+## Flow
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant A as Auth server
+    participant R as API
+    C->>A: login (credentials)
+    A-->>C: access token (15 min) + refresh token (httpOnly cookie)
+    C->>R: request + access token
+    R-->>C: 200
+    Note over C: access token expires
+    C->>R: request + expired token
+    R-->>C: 401
+    C->>A: POST /token/refresh (refresh cookie)
+    A->>A: valid, not revoked, not reused?
+    A-->>C: new access token + NEW refresh token
+    C->>R: retry with new access token
+`}
+/>
+
+1. Login: the server issues a short access token and a long refresh token.
+2. The client uses the access token for API calls until it expires.
+3. The client silently calls the token endpoint with the refresh token to get a new access token.
+4. If the refresh token was revoked (logout, ban, compromise detected), that call fails and the user must log in again.
+
+---
+
+## Rotation and reuse detection
+
+**Refresh token rotation**: issue a _new_ refresh token every time one is used, invalidating the old one. If an old, already-rotated refresh token is ever presented, that is a strong signal of theft (an attacker and the real user both hold copies). Revoke the **whole token family**, forcing a fresh login.
+
+```text
+login        -> RT1 (family F)
+refresh RT1  -> RT2, RT1 marked used
+refresh RT2  -> RT3, RT2 marked used
+attacker replays RT1 -> RT1 is already used -> revoke family F (RT3 dies too) -> everyone re-authenticates
+```
+
+Data model:
+
+| Column                                | Purpose                                    |
+| :------------------------------------ | :----------------------------------------- |
+| `id`, `token_hash`                    | Look up by hash; never store the raw token |
+| `user_id`, `family_id`                | Revoke per user or per login               |
+| `expires_at`, `used_at`, `revoked_at` | Lifecycle                                  |
+| `parent_id`                           | Chain for auditing                         |
+| `user_agent`, `ip`, `created_at`      | "Active devices" page                      |
+
+A short **grace period** (a few seconds) for the immediately previous token avoids false alarms when two browser tabs refresh at the same moment.
+
+---
+
+## Logout and lifetimes
+
+- **Logout**: revoke the refresh token (and family), clear the cookie, drop the access token from memory. The access token stays technically valid until expiry unless a denylist is used.
+- **Log out everywhere / ban / password change**: revoke all refresh tokens for the user and bump a token version if immediate effect is needed.
+- **Typical lifetimes**: access 5 to 15 minutes; refresh 7 to 30 days with an absolute maximum session length; sensitive apps (banking) much shorter with idle timeouts.
+
+<Callout type="info">
+  The refresh token is where "state" quietly comes back in. A system that claims to be fully
+  stateless but supports logout has state somewhere; making it explicit in the refresh layer keeps
+  the rest fast.
+</Callout>
+
+Code for this flow in Express and FastAPI: [Implementing Auth](/fullstack/auth/implementing-auth).

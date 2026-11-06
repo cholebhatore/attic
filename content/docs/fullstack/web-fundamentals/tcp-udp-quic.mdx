@@ -1,0 +1,293 @@
+---
+title: TCP, UDP, QUIC
+description: Ports and sockets, the TCP header and byte stream, the three-way handshake and teardown, connection states and TIME_WAIT, sequence numbers and acknowledgements, retransmission and RTO, flow control and window scaling, congestion control (slow start, AIMD, CUBIC, BBR), Nagle and delayed ACK, head-of-line blocking, UDP, and QUIC.
+---
+
+A new HTTPS connection to a server 100 ms away delivers its first 14 KB almost immediately, then waits a full round trip before sending more, and needs several round trips to reach full speed, even on a gigabit link. That is TCP slow start working as designed. Understanding TCP explains why small first responses, connection reuse, and HTTP/3 matter.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the transport layer, between IP (unreliable host-to-host packets) and applications. IP can lose, reorder, and duplicate packets. **TCP** turns that into a reliable, ordered stream of bytes between two programs. **UDP** adds almost nothing to IP, leaving reliability to the application. **QUIC** is a modern reliable transport built on UDP that HTTP/3 uses.
+
+TCP behaves like a careful courier with a numbered receipt for every page sent: it waits for receipts, resends anything unacknowledged, never sends faster than the receiver can file pages (flow control), and slows down when roads look congested (congestion control).
+
+Topics, in order:
+
+1. Ports and sockets
+2. TCP segments and the byte stream
+3. Connection setup and teardown, states, TIME_WAIT
+4. Reliability: sequence numbers, ACKs, retransmission
+5. Flow control and window scaling
+6. Congestion control
+7. Small-packet behaviour: Nagle and delayed ACK
+8. Head-of-line blocking
+9. UDP
+10. QUIC
+
+| Word                         | Plain meaning                                                                       |
+| :--------------------------- | :---------------------------------------------------------------------------------- |
+| **port**                     | 16-bit number identifying a process endpoint on a host.                             |
+| **socket**                   | OS handle for one endpoint of a connection.                                         |
+| **segment**                  | One TCP packet.                                                                     |
+| **sequence number**          | Byte offset of the segment's data in the stream.                                    |
+| **ACK**                      | Acknowledgement: "I have received everything up to byte N".                         |
+| **receive window (rwnd)**    | How much more data the receiver can buffer.                                         |
+| **congestion window (cwnd)** | How much unacknowledged data the sender allows itself, based on network conditions. |
+| **RTO**                      | Retransmission timeout.                                                             |
+| **slow start**               | Exponential window growth at the start of a connection.                             |
+| **head-of-line blocking**    | Later data stuck behind missing earlier data.                                       |
+
+---
+
+## Ports and sockets
+
+A TCP connection is identified by a **4-tuple**: source IP, source port, destination IP, destination port. A server listens on one port (443), and each client connection gets a distinct tuple because clients use different **ephemeral ports** (roughly 32768 to 60999 on Linux by default).
+
+```text
+client 198.51.100.7:52114  ->  server 203.0.113.10:443   (connection 1)
+client 198.51.100.7:52115  ->  server 203.0.113.10:443   (connection 2)
+```
+
+The server's listening socket `accept()`s each connection into a new socket. One server port can serve hundreds of thousands of connections; the limits are file descriptors and memory, not ports. Port exhaustion does happen on the **client** side when a proxy opens many outbound connections to one backend (only about 28,000 ephemeral ports per destination tuple), which is one reason connection pooling exists.
+
+| Port        | Service                                          |
+| :---------- | :----------------------------------------------- |
+| 22          | SSH                                              |
+| 53          | DNS                                              |
+| 80 / 443    | HTTP / HTTPS (443 is also used by QUIC over UDP) |
+| 5432 / 3306 | PostgreSQL / MySQL                               |
+| 6379        | Redis                                            |
+
+---
+
+## Segments and the byte stream
+
+TCP presents a **stream of bytes**, not messages. Two `write()` calls of 100 bytes may arrive as one 200-byte `read()`, or as 150 and 50. Application protocols must frame messages themselves: HTTP/1.1 uses headers and `Content-Length` or chunking; WebSocket and HTTP/2 use length-prefixed frames.
+
+Key header fields: source and destination ports, sequence number, acknowledgement number, flags (`SYN`, `ACK`, `FIN`, `RST`, `PSH`), window size, checksum, and options (MSS, window scale, selective ACK, timestamps).
+
+---
+
+## Connection setup and teardown
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    Note over C,S: Three-way handshake (1 RTT)
+    C->>S: SYN, seq=x, options (MSS, window scale, SACK)
+    S->>C: SYN-ACK, seq=y, ack=x+1
+    C->>S: ACK, ack=y+1 (data may follow immediately)
+    Note over C,S: Data transfer
+    Note over C,S: Teardown (each side closes its half)
+    C->>S: FIN
+    S->>C: ACK
+    S->>C: FIN
+    C->>S: ACK
+    Note over C: TIME_WAIT for 2 x MSL
+`}
+/>
+
+- Each side picks a random **initial sequence number** (ISN), which defends against old duplicate packets and off-path spoofing.
+- The client can send data with its final `ACK`, so the handshake costs one RTT before the request.
+- **TCP Fast Open** lets repeat clients send data in the `SYN` using a cookie, saving an RTT, but middlebox problems limited its adoption; TLS 1.3 and QUIC's 0-RTT took over that role.
+- `RST` aborts a connection immediately (connection refused, or a process crashed).
+
+### States and TIME_WAIT
+
+The side that closes first enters **TIME_WAIT** for twice the maximum segment lifetime (60 seconds on Linux) so late duplicate packets cannot corrupt a new connection with the same 4-tuple, and so the final ACK can be retransmitted if lost.
+
+A load-testing client or proxy that opens and closes many short connections to one server accumulates thousands of TIME_WAIT sockets and runs out of ephemeral ports. The fix is connection reuse (keep-alive, pooling), not kernel tweaks.
+
+Other states seen in `ss -tan` or `netstat`: `LISTEN`, `SYN-SENT`, `SYN-RECEIVED`, `ESTABLISHED`, `FIN-WAIT-1/2`, `CLOSE-WAIT` (the peer closed, but the local application has not; many sockets in `CLOSE-WAIT` usually means a leak in application code), `LAST-ACK`.
+
+### SYN floods
+
+An attacker sends many `SYN`s without completing handshakes, filling the server's half-open queue. **SYN cookies** encode the connection state in the server's ISN so no memory is allocated until the final ACK arrives.
+
+---
+
+## Reliability: sequence numbers, ACKs, retransmission
+
+- Every byte has a sequence number. ACKs are **cumulative**: `ack=5001` means "everything before byte 5001 arrived".
+- **SACK** (selective acknowledgement) reports blocks received beyond a gap, so only the missing segment is resent.
+- **Retransmission timeout (RTO)**: computed from smoothed RTT and its variance (RFC 6298), at least 1 second by that RFC (Linux uses 200 ms as its minimum). A timeout is expensive: the sender waits, then drastically reduces its window.
+- **Fast retransmit**: three duplicate ACKs (the receiver keeps acknowledging the same byte because a later segment arrived early) trigger a retransmit without waiting for the timeout.
+- **Tail loss** (the last packets of a response lost) cannot generate duplicate ACKs, so it would wait for the RTO; tail loss probes and RACK-TLP detection send a probe sooner.
+
+Worked example: segments 1 to 5 sent, segment 2 lost.
+
+| Receiver gets | Sends                       |
+| :------------ | :-------------------------- |
+| 1             | ACK 2                       |
+| 3             | ACK 2 (duplicate), SACK 3   |
+| 4             | ACK 2 (duplicate), SACK 3–4 |
+| 5             | ACK 2 (duplicate), SACK 3–5 |
+
+After the third duplicate ACK the sender retransmits segment 2; the receiver then ACKs 6. Segments 3 to 5 sat in the receiver's buffer, unusable by the application until 2 arrived: that is head-of-line blocking.
+
+---
+
+## Flow control
+
+The receiver advertises a **receive window** (rwnd): free buffer space. The sender never has more unacknowledged bytes in flight than rwnd. If the receiving application reads slowly, rwnd shrinks to zero and the sender pauses: this is TCP's built-in **backpressure**, the same idea used in [Node.js streams](/fullstack/nodejs/streams-and-workers).
+
+The original 16-bit window field caps at 65,535 bytes. **Window scaling** (an option in the SYN) multiplies it by up to 2^14, allowing windows of about 1 GB, required to fill high bandwidth-delay paths (see the [bandwidth-delay product](/fullstack/web-fundamentals/how-the-internet-works)). Modern OSes auto-tune buffer sizes.
+
+---
+
+## Congestion control
+
+Flow control protects the receiver; **congestion control** protects the network. Without it, senders overwhelm router queues, packets drop, everyone retransmits, and throughput collapses (the 1986 internet congestion collapse led to Van Jacobson's algorithms).
+
+The sender keeps a **congestion window** (cwnd). Data in flight is limited by the smaller of cwnd and rwnd.
+
+### Slow start
+
+A new connection starts with a small cwnd: **10 segments** in modern stacks (RFC 6928), about 14.6 KB. Each ACK grows cwnd by one segment, so cwnd **doubles every RTT** until loss or a threshold (`ssthresh`).
+
+Worked example, RTT 100 ms, MSS 1,460 bytes, no loss:
+
+| Round trip | cwnd (segments) | Data this RTT | Cumulative |
+| :--------- | :-------------- | :------------ | :--------- |
+| 1          | 10              | ~14 KB        | ~14 KB     |
+| 2          | 20              | ~29 KB        | ~43 KB     |
+| 3          | 40              | ~58 KB        | ~101 KB    |
+| 4          | 80              | ~117 KB       | ~218 KB    |
+| 5          | 160             | ~234 KB       | ~452 KB    |
+
+A 200 KB response takes about four round trips (400 ms) after the handshakes, however fast the link. Consequences:
+
+- Fit the critical HTML in the first ~14 KB so the browser can start parsing after one RTT.
+- Reused connections have already grown their window; new connections pay slow start again. Domain sharding (spreading assets over many hostnames) multiplied slow starts and is harmful on HTTP/2.
+- Linux can reset cwnd after an idle period (`tcp_slow_start_after_idle`), so long-lived but bursty connections may start slowly again; servers serving such traffic often disable it.
+
+### Congestion avoidance and AIMD
+
+After `ssthresh`, cwnd grows **additively** (about one segment per RTT). On loss it shrinks **multiplicatively** (Reno halves it). **AIMD** (additive increase, multiplicative decrease) makes competing flows converge on a fair share.
+
+### Modern algorithms
+
+| Algorithm        | Signal                                    | Behaviour                                                                                                                     |
+| :--------------- | :---------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------- |
+| Reno / NewReno   | Loss                                      | Classic AIMD                                                                                                                  |
+| CUBIC            | Loss                                      | Window grows as a cubic function of time since last loss; scales to high-BDP paths; Linux default                             |
+| BBR (v1, v2, v3) | Measured bottleneck bandwidth and min RTT | Models the path and paces sending to avoid filling queues; better on lossy long paths; used by Google, YouTube, and many CDNs |
+
+Loss-based algorithms fill router buffers until something drops, causing bufferbloat. BBR targets the bandwidth-delay product, keeping queues short.
+
+**ECN** (explicit congestion notification) lets routers mark packets instead of dropping them, signalling congestion without loss.
+
+---
+
+## Nagle's algorithm and delayed ACK
+
+- **Nagle** (on by default): while unacknowledged data is in flight, buffer small writes and send them together. Saves bandwidth for keystroke-style traffic.
+- **Delayed ACK**: the receiver waits up to about 40 ms (Linux) to piggyback the ACK on a response.
+- Together they can cause a stall: a client sends a request as two small writes; Nagle holds the second until the first is ACKed; the server delays its ACK waiting for the full request. Result: a 40 ms pause per request.
+- Latency-sensitive protocols set **`TCP_NODELAY`** to disable Nagle. Node.js sockets, most HTTP clients, database drivers, and Redis clients do this by default.
+
+---
+
+## Head-of-line blocking
+
+Because TCP delivers a single ordered stream, one lost segment blocks delivery of every later byte until it is retransmitted, even if those bytes belong to unrelated HTTP/2 streams multiplexed on the connection. On a lossy mobile link, HTTP/2's single connection can perform worse than HTTP/1.1's six parallel connections. Fixing this at the transport layer is the main motivation for QUIC.
+
+---
+
+## UDP
+
+UDP adds ports and a checksum to IP, nothing more: no connection, no ordering, no retransmission, no congestion control, and message boundaries are preserved (one send = one datagram).
+
+| Use                          | Why UDP                                                                       |
+| :--------------------------- | :---------------------------------------------------------------------------- |
+| DNS queries                  | One small request and response; a retry is cheaper than a handshake           |
+| Voice and video calls, games | Late data is useless; better to skip than wait                                |
+| QUIC (HTTP/3)                | Lets a new transport live in user space and pass through existing middleboxes |
+| Metrics (StatsD), syslog     | Fire and forget                                                               |
+| VPNs (WireGuard)             | Tunnelled TCP handles its own reliability                                     |
+
+Applications using UDP must handle loss and, to be good citizens, congestion control themselves. UDP's lack of handshake also enables **amplification** DDoS attacks (a small spoofed request to DNS or NTP triggers a large reply to the victim).
+
+---
+
+## QUIC
+
+QUIC (RFC 9000) is a reliable, encrypted, multiplexed transport running over UDP, standardised in 2021. HTTP/3 maps HTTP onto it.
+
+<Mermaid
+  chart={`
+flowchart TB
+    subgraph TCP_stack["HTTP/2 stack"]
+        H2["HTTP/2 framing + streams"] --> TLS["TLS 1.3"] --> T["TCP (in kernel)"] --> IP1["IP"]
+    end
+    subgraph QUIC_stack["HTTP/3 stack"]
+        H3["HTTP/3"] --> Q["QUIC: streams, reliability, congestion control, TLS 1.3 built in (user space)"] --> U["UDP"] --> IP2["IP"]
+    end
+`}
+/>
+
+| Property                           | How QUIC achieves it                                                         | Benefit                                                   |
+| :--------------------------------- | :--------------------------------------------------------------------------- | :-------------------------------------------------------- |
+| Fast setup                         | Transport and TLS 1.3 handshakes combined                                    | 1 RTT for new connections, 0-RTT for resumed ones         |
+| No transport head-of-line blocking | Independent streams; a lost packet only stalls streams whose data it carried | Better on lossy links                                     |
+| Connection migration               | Connections identified by connection IDs, not the 4-tuple                    | Survives Wi-Fi to cellular switches without reconnecting  |
+| Always encrypted                   | Even most packet headers are encrypted                                       | Privacy; middleboxes cannot ossify the protocol           |
+| Evolvable                          | Implemented in user space (browsers, libraries)                              | New congestion control and features ship with app updates |
+
+Costs and caveats:
+
+- UDP processing in user space uses more CPU than kernel TCP, though OS offloads (GSO, GRO) narrow the gap.
+- Some networks block or throttle UDP on port 443; clients fall back to TCP.
+- **0-RTT data can be replayed** by an attacker, so it must only carry idempotent requests (servers typically allow 0-RTT only for safe methods).
+- Discovery: a server advertises HTTP/3 with an `Alt-Svc` header or an `HTTPS` DNS record; the browser's first visit usually uses TCP.
+
+---
+
+## Comparison
+
+|                       | TCP                    | UDP  | QUIC                                 |
+| :-------------------- | :--------------------- | :--- | :----------------------------------- |
+| Connection setup      | 1 RTT (+1 for TLS 1.3) | None | 1 RTT including TLS; 0-RTT on resume |
+| Reliability           | Yes                    | No   | Yes                                  |
+| Ordering              | One ordered stream     | None | Per stream                           |
+| Message boundaries    | No (byte stream)       | Yes  | Per stream frames                    |
+| Congestion control    | Yes, in kernel         | No   | Yes, in user space                   |
+| Encryption            | Separate (TLS)         | None | Built in, mandatory                  |
+| Head-of-line blocking | Connection-wide        | No   | Per stream only                      |
+| Connection identity   | 4-tuple                | n/a  | Connection ID (migrates)             |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why does TCP need a three-way handshake rather than two?">
+    Both sides must agree on each other's initial sequence numbers. The client's SYN carries its
+    ISN, the server's SYN-ACK acknowledges it and carries the server's ISN, and the final ACK
+    confirms the server's ISN. Two messages would leave the server unsure the client received its
+    ISN, and would let stale duplicate SYNs open connections.
+  </Accordion>
+  <Accordion title="What is the difference between flow control and congestion control?">
+    Flow control (receive window) stops the sender from overrunning the receiver's buffer.
+    Congestion control (congestion window) stops the sender from overrunning the network. The sender
+    is limited by whichever window is smaller.
+  </Accordion>
+  <Accordion title="Why are many sockets stuck in CLOSE_WAIT?">
+    The remote side closed the connection but the local application never called close on its
+    socket. It is almost always a resource leak in the application, such as response bodies or
+    connections that are never released.
+  </Accordion>
+  <Accordion title="How does slow start affect web performance?">
+    A new connection can only send about 10 segments (~14 KB) in the first round trip, doubling each
+    RTT. Large first responses take several round trips, so keep critical HTML small and reuse warm
+    connections.
+  </Accordion>
+  <Accordion title="Why is 0-RTT in TLS 1.3 and QUIC risky?">
+    Early data is sent before the handshake proves freshness, so an attacker can capture and replay
+    it. Servers should accept 0-RTT only for idempotent requests or use anti-replay mechanisms.
+  </Accordion>
+</Accordions>

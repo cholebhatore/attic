@@ -1,0 +1,86 @@
+---
+title: Pipelining, Transactions, Lua
+description: Round-trip cost and pipelining, MULTI/EXEC transactions and what they do not guarantee, optimistic locking with WATCH, Lua scripts and Redis Functions for atomic logic, and avoiding long-running scripts.
+---
+
+A loop sends 10,000 `SET` commands one by one from an app server 1 ms away from Redis. Redis spends microseconds per command; the loop takes 10 seconds, almost all of it waiting on the network. Pipelining sends them in one batch. Separately, check-then-set logic in application code races with other clients; transactions and Lua make it atomic.
+
+---
+
+## The plain-language version
+
+**Pipelining** cuts round trips: send many commands, read all replies later. **MULTI/EXEC** queues commands and runs them back to back with nothing interleaved. **Lua scripts** run logic (reads, conditions, writes) inside Redis as one atomic step.
+
+| Word                | Plain meaning                                         |
+| :------------------ | :---------------------------------------------------- |
+| **RTT**             | Round-trip time between client and server.            |
+| **MULTI / EXEC**    | Start queuing / execute queued commands atomically.   |
+| **WATCH**           | Abort the transaction if a watched key changes first. |
+| **EVAL / EVALSHA**  | Run a Lua script / run a cached script by hash.       |
+| **Redis Functions** | Named Lua libraries stored in Redis (7.0+).           |
+
+---
+
+## Pipelining
+
+```ts
+const pipeline = redis.multi(); // node-redis: multi() batches; use .execAsPipeline() for non-transactional
+for (const p of products) pipeline.set(`product:${p.id}`, JSON.stringify(p), { EX: 300 });
+await pipeline.execAsPipeline();
+```
+
+```python
+async with redis.pipeline(transaction=False) as pipe:
+    for p in products:
+        pipe.set(f"product:{p.id}", p.model_dump_json(), ex=300)
+    await pipe.execute()
+```
+
+Pipelining is not atomic; other clients' commands can interleave. Batch in chunks (hundreds to a few thousand) to bound memory.
+
+---
+
+## MULTI / EXEC
+
+```text
+MULTI
+DECRBY stock:A1 1
+LPUSH orders:pending 981
+EXEC
+```
+
+Guarantees: queued commands run sequentially with nothing from other clients in between. Not guaranteed: rollback. If one command fails at runtime (wrong type), the others still apply. And commands cannot read a value and decide based on it inside `MULTI`, because results only arrive at `EXEC`.
+
+### WATCH for check-and-set
+
+```text
+WATCH stock:A1
+GET stock:A1             -> "1"
+MULTI
+DECR stock:A1
+EXEC                     -> nil if stock:A1 changed since WATCH; retry
+```
+
+---
+
+## Lua scripts
+
+Conditional logic that must be atomic belongs in a script. Redis runs the whole script without interleaving other commands.
+
+```lua
+-- reserve.lua: decrement stock only if enough remains
+local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
+local qty = tonumber(ARGV[1])
+if stock < qty then return -1 end
+return redis.call('DECRBY', KEYS[1], qty)
+```
+
+```ts
+const result = await redis.eval(reserveLua, { keys: ['stock:A1'], arguments: ['2'] });
+```
+
+- Pass all keys through `KEYS` so Cluster can route the script; all keys must be in the same hash slot.
+- Load once and call by SHA (`EVALSHA`), or define **Functions** (`FUNCTION LOAD`, `FCALL`) so scripts live in Redis with names.
+- Scripts block the server while running. Keep them short; `lua-time-limit` / `busy-reply-threshold` only lets the script be killed, not paused.
+
+Rate limiters and lock release are classic Lua use cases; see [Patterns](/fullstack/redis/patterns).

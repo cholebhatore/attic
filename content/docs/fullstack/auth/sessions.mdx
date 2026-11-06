@@ -1,0 +1,199 @@
+---
+title: Sessions
+description: The step-by-step server lifecycle of a request with cookie-based sessions, how many servers behind a load balancer share login state, why in-memory sessions fail, session stores, and implementations with Redis.
+---
+
+A team deploys a second app instance behind the load balancer, and users start getting logged out at random. Sessions were stored in a variable inside the process, so instance B never heard about logins handled by instance A.
+
+---
+
+## The plain-language version
+
+With cookie sessions, the browser holds only a random **session ID** in a cookie. The server keeps the real record (who the user is, when it expires) in a **session store**. Every request, the server reads the cookie, looks up the record, and attaches the user to the request.
+
+Topics: the request lifecycle, sessions across many servers, why not in-memory, preferred stores, implementation.
+
+| Word                 | Plain meaning                                                              |
+| :------------------- | :------------------------------------------------------------------------- |
+| **session store**    | Shared storage for session records (Redis, a database table).              |
+| **sticky sessions**  | Load balancer sends a user to the same server every time.                  |
+| **session rotation** | Issuing a new session ID at login or privilege change.                     |
+| **sliding expiry**   | Each request pushes the expiry later; absolute expiry caps total lifetime. |
+
+---
+
+## Lifecycle of a request with cookie sessions
+
+<Mermaid
+  chart={`
+flowchart TD
+    A["TCP connection accepted (TLS terminated)"] --> B["HTTP request line and headers parsed"]
+    B --> C["Read the Cookie header"]
+    C --> D["Extract the session ID (verify its signature if signed)"]
+    D --> E["Query the session store: does this ID map to a live session?"]
+    E -- "missing or expired" --> F["401 Unauthorized (API) or redirect to /login (web page)"]
+    E -- "exists" --> G["Attach user to the request, optionally refresh expiry"]
+    G --> H["Authorization checks"]
+    H --> I["Route handler runs"]
+    I --> J["Send HTTP response (Set-Cookie if session rotated)"]
+`}
+/>
+
+1. TCP (and TLS) handled by the server or proxy.
+2. HTTP headers are read.
+3. The `Cookie` header is read.
+4. The session ID is extracted from the cookie.
+5. The session store (Redis, a database) is queried: does the ID map to a user?
+6. If the session does not exist or has expired: respond **`401 Unauthorized`** for APIs, or redirect to the login page for server-rendered pages. Not `404`: the resource exists; the caller is not authenticated.
+7. If it exists: attach the user to the request, run authorization, execute the route handler, send the response.
+
+---
+
+## Five servers behind a load balancer
+
+A user logs in and the session is created on **server A**. The next request is routed to **server C**. How does server C know the user is logged in? Four options:
+
+### 1. Centralised session store (recommended)
+
+- **How it works**: all five servers connect to one fast shared store, such as Redis or Memcached.
+- **Process**: server A creates the session and saves it in Redis. When the next request hits server C, C reads the session from Redis using the session ID from the cookie.
+- **Benefit**: any server can handle any request, and if a server crashes no sessions are lost. The store itself must be highly available (replication, managed Redis).
+
+### 2. Client-side sessions (signed tokens)
+
+- **How it works**: the session data travels with the client, usually as a **signed** JWT (or an encrypted cookie). A standard JWT is signed, not encrypted: its contents are readable, only tamper-proof.
+- **Process**: server A issues a signed token; the browser sends it on every request; server C validates the signature with the shared secret or public key.
+- **Benefit**: servers share no database or session state. Cost: revocation, as covered in [Stateful vs Stateless](/fullstack/auth/stateful-vs-stateless).
+
+### 3. Session replication (clustering)
+
+- **How it works**: the servers copy session data to each other.
+- **Process**: when A creates a session it broadcasts it to B, C, D, and E, so C already has a local copy.
+- **Benefit**: redundant, but memory and network traffic grow with the cluster size. Seen in older Java application servers; rare in new systems.
+
+### 4. Sticky sessions (session affinity)
+
+- **How it works**: a load balancer setting, not a server change. The balancer uses a cookie or the client IP to route each user to the same server.
+- **Process**: every request from that user goes to server A; server C never sees it.
+- **Benefit**: simple to configure, but if A crashes or is replaced during a deploy, its users are logged out, and load spreads unevenly. Useful as an optimisation on top of a shared store, not as the only mechanism.
+
+---
+
+## Why not in-memory variables
+
+Storing sessions in a plain in-process map seems simplest but breaks down almost immediately:
+
+- **Not shared across instances**: with more than one process (horizontal scaling, or even a rolling deploy), a session created on instance A is invisible to instance B. Users get logged out depending on which instance answers.
+- **Lost on restart or crash**: every deploy silently logs out the entire user base.
+- **No eviction strategy**: memory grows without bound unless expiry and cleanup are built by hand, rebuilding a worse version of a real store.
+- **No cross-process revocation**: logging out or banning a user on one instance does not propagate to others.
+
+---
+
+## Preferred session stores
+
+- **Redis / Valkey / Memcached**: the standard choice. Fast in-memory key-value stores with native TTLs (sessions expire automatically), shared by all instances, and replicated or clustered for availability. See [Redis patterns](/fullstack/redis/patterns).
+- **Database table (Postgres, MySQL)**: slower than Redis but durable and easy to query and audit ("show all my active devices"). Reasonable when session volume is low or auditability matters most.
+- **Managed stores** (ElastiCache, Upstash, Memorystore, Azure Cache): operationally simplest; no self-hosted clustering.
+
+The common thread: a session store must be **centralised** (shared across instances), **support expiry natively**, and **survive individual server restarts**. A local variable provides none of these.
+
+---
+
+## Implementation
+
+<Tabs items={['Express', 'FastAPI']}>
+<Tab value="Express">
+
+```ts
+import session from 'express-session';
+import { RedisStore } from 'connect-redis';
+import { createClient } from 'redis';
+
+const redis = createClient({ url: process.env.REDIS_URL });
+await redis.connect();
+
+app.set('trust proxy', 1); // behind a load balancer, for Secure cookies
+app.use(
+  session({
+    store: new RedisStore({ client: redis, prefix: 'sess:' }),
+    secret: process.env.SESSION_SECRET!, // signs the session ID cookie
+    name: '__Host-sid',
+    resave: false,
+    saveUninitialized: false,
+    cookie: { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 1000 * 60 * 60 * 24 * 7 },
+  }),
+);
+
+app.post('/login', async (req, res, next) => {
+  const user = await verifyCredentials(req.body.email, req.body.password);
+  if (!user) return res.status(401).json({ title: 'Invalid credentials' });
+  req.session.regenerate((err) => {
+    // new ID at login: prevents session fixation
+    if (err) return next(err);
+    req.session.userId = user.id;
+    res.json({ id: user.id });
+  });
+});
+
+app.post('/logout', (req, res) =>
+  req.session.destroy(() => res.clearCookie('__Host-sid').sendStatus(204)),
+);
+```
+
+</Tab>
+<Tab value="FastAPI">
+
+```python
+import secrets
+from fastapi import Cookie, Depends, HTTPException, Response
+from redis.asyncio import Redis
+
+redis = Redis.from_url(settings.redis_url)
+SESSION_TTL = 60 * 60 * 24 * 7
+
+@app.post("/login")
+async def login(body: LoginIn, response: Response):
+    user = await verify_credentials(body.email, body.password)
+    if not user:
+        raise HTTPException(401, "Invalid credentials")
+    sid = secrets.token_urlsafe(32)                          # 256 bits of randomness
+    await redis.set(f"sess:{sid}", user.id, ex=SESSION_TTL)
+    response.set_cookie("__Host-sid", sid, httponly=True, secure=True, samesite="lax",
+                        max_age=SESSION_TTL, path="/")
+    return {"id": user.id}
+
+async def current_user(sid: str | None = Cookie(None, alias="__Host-sid")) -> User:
+    user_id = sid and await redis.get(f"sess:{sid}")
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    return await users.get(int(user_id))
+
+@app.post("/logout", status_code=204)
+async def logout(response: Response, sid: str | None = Cookie(None, alias="__Host-sid")):
+    if sid:
+        await redis.delete(f"sess:{sid}")
+    response.delete_cookie("__Host-sid", path="/")
+```
+
+</Tab>
+</Tabs>
+
+Track `sess:*` keys per user in a Redis set (`user_sessions:19`) to support "log out of all devices" and to list active sessions.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Walk through a request lifecycle with cookie sessions.">
+    Accept the connection, parse headers, read the Cookie header, extract the session ID, look it up
+    in the shared store, return 401 (or redirect) if missing or expired, otherwise attach the user,
+    authorize, run the handler, and respond.
+  </Accordion>
+  <Accordion title="Five servers behind a load balancer: how does server C know the user logged in on server A?">
+    Preferably a centralised session store such as Redis that all servers read. Alternatives:
+    self-contained signed tokens, session replication between servers, or sticky sessions, each with
+    trade-offs in revocation, overhead, or resilience.
+  </Accordion>
+</Accordions>

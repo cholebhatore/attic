@@ -1,0 +1,66 @@
+---
+title: Stateful vs Stateless
+description: Stateful session authentication and stateless token authentication, how each validates a request, the revocation trade-off, scaling, and why most production systems are hybrid.
+---
+
+This is the single biggest architectural decision in auth design. Most other choices (session vs token, storage location, scaling strategy) fall out of this one.
+
+---
+
+## The plain-language version
+
+**Stateful**: the server keeps a list of who is logged in, like a cloakroom that keeps the coats and hands out numbered tickets. The ticket means nothing without the cloakroom's records. **Stateless**: the server hands out a signed, tamper-proof pass that contains the details itself, like a stamped visa. Any border guard with the stamp's verification key can check it without phoning headquarters.
+
+| Word                     | Plain meaning                                                        |
+| :----------------------- | :------------------------------------------------------------------- |
+| **stateful auth**        | Server stores session records and looks them up per request.         |
+| **stateless auth**       | Server verifies a self-contained token cryptographically, no lookup. |
+| **revocation**           | Making a still-unexpired credential stop working.                    |
+| **blocklist / denylist** | Server-side list of revoked token IDs.                               |
+| **hybrid**               | Stateless access tokens plus stateful refresh tokens.                |
+
+---
+
+## Stateful authentication
+
+The server keeps a record of the session. On every request, the server looks up that record to confirm the identity is still valid.
+
+- **How it works**: on successful login, the server creates a session record (user ID, expiry, metadata) in a store (Redis or a database) and gives the client a **session ID**, usually in a cookie. Every request, the server takes that ID and looks up the record.
+- **The server holds the truth.** The client holds only a pointer (the session ID), meaningless without the server-side record.
+- **Revocation is trivial**: delete the session record, and the ID is instantly useless.
+- **Cost**: every request needs a lookup (a network hop to Redis or the database unless cached), and the store must be shared across all server instances in a horizontally scaled deployment.
+
+---
+
+## Stateless authentication
+
+The server verifies the credential using cryptography alone; no lookup against server-held state is needed.
+
+- **How it works**: the token itself carries enough signed (or encrypted) information (identity, expiry, claims) that any server instance holding the verification key can validate it without querying a shared store.
+- **The client holds the truth**, in a tamper-evident form; the server only verifies the signature.
+- **Scales horizontally with zero shared state**: any node with the public key or secret can validate independently.
+- **Cost: revocation is hard.** Since no server-side record is checked, a stolen but unexpired token stays valid until it naturally expires. This is the core trade-off of stateless auth, and the main reason short-lived access tokens with [refresh token rotation](/fullstack/auth/access-and-refresh-tokens) exist.
+
+---
+
+## Compared
+
+|                     | Stateful (session)                              | Stateless (self-contained token, such as JWT)                                |
+| :------------------ | :---------------------------------------------- | :--------------------------------------------------------------------------- |
+| Server-side storage | Required (session store)                        | Not required for validation                                                  |
+| Revocation          | Instant (delete the record)                     | Delayed until expiry, unless a blocklist is added (which reintroduces state) |
+| Horizontal scaling  | Needs a shared, centralised store               | Trivial: any node can verify                                                 |
+| Request cost        | Store lookup per request                        | CPU-only signature check per request                                         |
+| Payload size        | Small (opaque ID)                               | Larger (encodes claims)                                                      |
+| Data freshness      | Always current (role changes apply immediately) | Claims frozen until the token is reissued                                    |
+
+---
+
+## The hybrid
+
+Many production systems are **hybrid**: stateless access tokens for speed, paired with a stateful refresh-token record so revocation is still possible at the refresh layer. A revoked user keeps access only until the current access token expires (minutes), then fails to refresh. This is generally the sweet spot for APIs serving SPAs, mobile apps, and many services.
+
+<Callout type="info">
+  "Stateless" is about validation, not the whole system. Even a JWT setup usually keeps state
+  somewhere: refresh tokens, a revocation list, or a `tokenVersion` column on the user.
+</Callout>

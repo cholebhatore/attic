@@ -1,0 +1,80 @@
+---
+title: Design Principles
+description: Coupling and cohesion, SOLID with web examples, DRY and the wrong abstraction, YAGNI and KISS, composition over inheritance, dependency injection, and the design patterns that appear most in web code.
+---
+
+A change to the discount rules requires edits in the checkout controller, the invoice generator, the email template, and a cron job. That is high coupling with low cohesion: one concept scattered across many places. Most design principles are ways of saying "keep things that change together, together".
+
+---
+
+## Coupling and cohesion
+
+|              | Meaning                                              | Aim  |
+| :----------- | :--------------------------------------------------- | :--- |
+| **Coupling** | How much one module depends on another's internals   | Low  |
+| **Cohesion** | How closely related the things inside one module are | High |
+
+Signs of trouble: shotgun surgery (one change, many files), modules importing each other's private details, a `utils` file that everything imports.
+
+---
+
+## SOLID
+
+| Principle                 | Meaning                                       | Web example                                                                            |
+| :------------------------ | :-------------------------------------------- | :------------------------------------------------------------------------------------- |
+| **S**ingle responsibility | One reason to change                          | Route handler parses HTTP; service applies rules; repository talks to the DB           |
+| **O**pen/closed           | Extend without modifying                      | New payment provider = new adapter implementing `PaymentGateway`, no edits to checkout |
+| **L**iskov substitution   | Subtypes usable wherever the base type is     | Any `Storage` implementation (S3, local disk) works in tests and production            |
+| **I**nterface segregation | Small, focused interfaces                     | `Notifier.send()` instead of a 20-method `CommunicationService`                        |
+| **D**ependency inversion  | Depend on abstractions; inject concrete parts | Service receives a `UserRepo` interface; tests pass an in-memory version               |
+
+---
+
+## Pragmatic rules
+
+- **DRY** (don't repeat yourself) is about knowledge, not text. Two pieces of code that look alike but change for different reasons should stay separate. Duplication is cheaper than the wrong abstraction.
+- **YAGNI**: do not build for hypothetical requirements.
+- **KISS**: the simplest design that meets today's needs.
+- **Composition over inheritance**: assemble behaviour from small parts rather than deep class hierarchies.
+- **Make illegal states unrepresentable**: types and constraints that forbid invalid data ([discriminated unions](/fullstack/typescript/type-system), DB constraints).
+- **Functional core, imperative shell**: pure business logic in the middle, I/O at the edges. Easy to test.
+
+---
+
+## Dependency injection
+
+```ts
+// Constructor injection without a framework
+export function makeOrderService(deps: {
+  repo: OrderRepo;
+  payments: PaymentGateway;
+  clock: () => Date;
+}) {
+  return {
+    async place(input: PlaceOrder) {
+      const order = Order.create(input, deps.clock());
+      await deps.payments.charge(order.total);
+      return deps.repo.save(order);
+    },
+  };
+}
+```
+
+FastAPI's `Depends` and NestJS's container formalise the same idea.
+
+---
+
+## Patterns seen in web code
+
+| Pattern                              | Where it appears                                                         |
+| :----------------------------------- | :----------------------------------------------------------------------- |
+| Repository                           | Data access behind an interface                                          |
+| Adapter                              | Wrapping third-party APIs (Stripe, S3) behind the app's own interface    |
+| Strategy                             | Pluggable pricing, shipping, or auth strategies                          |
+| Factory                              | Building configured clients and objects                                  |
+| Middleware / chain of responsibility | Express and ASGI middleware                                              |
+| Observer / pub-sub                   | Event emitters, domain events                                            |
+| Decorator                            | Python decorators, caching or retry wrappers                             |
+| Singleton                            | Shared DB pool or client per process                                     |
+| Facade                               | A simple service API over several subsystems                             |
+| Circuit breaker, retry               | [Resilience patterns](/fullstack/building-for-scale/resilience-patterns) |

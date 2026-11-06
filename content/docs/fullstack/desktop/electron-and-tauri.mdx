@@ -1,0 +1,89 @@
+---
+title: Electron and Tauri
+description: Electron's main, preload, and renderer processes, secure IPC with contextBridge, Tauri commands and capabilities, packaging, code signing, auto-updates, and a comparison.
+---
+
+An Electron app enables `nodeIntegration` in the renderer for convenience. Later, a chat message renders unsanitised HTML, and a crafted message runs `require('child_process').exec(...)` on every recipient's machine. Desktop apps turn XSS into remote code execution, so the process boundary is a security boundary.
+
+---
+
+## Electron
+
+<Mermaid
+  chart={`
+flowchart LR
+    R["Renderer (web UI, no Node)"] -- "window.api.readFile()" --> P["Preload (contextBridge)"]
+    P -- "ipcRenderer.invoke" --> M["Main process (Node, OS access)"]
+    M -- result --> P --> R
+`}
+/>
+
+```ts title="main.ts"
+import { app, BrowserWindow, ipcMain, dialog } from 'electron';
+import { readFile } from 'node:fs/promises';
+
+app.whenReady().then(() => {
+  const win = new BrowserWindow({
+    webPreferences: { preload: `${__dirname}/preload.js`, contextIsolation: true, sandbox: true },
+  });
+  win.loadURL(process.env.VITE_DEV_SERVER_URL ?? `file://${__dirname}/index.html`);
+});
+
+ipcMain.handle('open-file', async () => {
+  const { filePaths } = await dialog.showOpenDialog({ properties: ['openFile'] });
+  return filePaths[0] ? readFile(filePaths[0], 'utf8') : null;
+});
+```
+
+```ts title="preload.ts"
+import { contextBridge, ipcRenderer } from 'electron';
+contextBridge.exposeInMainWorld('api', { openFile: () => ipcRenderer.invoke('open-file') });
+```
+
+Security defaults: `contextIsolation: true`, `sandbox: true`, `nodeIntegration: false`, a strict CSP, and narrow IPC handlers that validate arguments. Tooling: Electron Forge or electron-builder for packaging, `electron-updater` for updates.
+
+---
+
+## Tauri
+
+```rust title="src-tauri/src/lib.rs"
+#[tauri::command]
+fn greet(name: &str) -> String {
+    format!("Hello, {name}")
+}
+
+pub fn run() {
+    tauri::Builder::default()
+        .invoke_handler(tauri::generate_handler![greet])
+        .run(tauri::generate_context!())
+        .expect("error while running app");
+}
+```
+
+```ts
+import { invoke } from '@tauri-apps/api/core';
+const msg = await invoke<string>('greet', { name: 'Ada' });
+```
+
+Tauri 2 uses **capabilities** files to grant each window specific permissions (for example, read files only in the app data directory). Plugins cover the file system, dialogs, notifications, updater, and more.
+
+---
+
+## Compared
+
+|                  | Electron                 | Tauri                                    |
+| :--------------- | :----------------------- | :--------------------------------------- |
+| Rendering engine | Same Chromium everywhere | OS web view; rendering can differ per OS |
+| Installer size   | Roughly 80 to 150 MB     | Often a few MB                           |
+| Memory           | Higher                   | Lower                                    |
+| Backend          | Node.js                  | Rust (JS plugins for common tasks)       |
+| Mobile           | No                       | iOS and Android                          |
+| Ecosystem        | Very mature              | Growing                                  |
+
+---
+
+## Shipping
+
+- **Code signing**: Windows (Authenticode certificate or Azure Trusted Signing) and macOS (Developer ID + notarisation). Unsigned apps trigger scary warnings or are blocked.
+- **Auto-update**: check a release feed (GitHub Releases, S3), download, verify signature, restart.
+- **CI**: build per OS on matching runners (GitHub Actions matrix with `macos-latest`, `windows-latest`, `ubuntu-latest`).

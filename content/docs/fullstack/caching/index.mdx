@@ -1,0 +1,66 @@
+---
+title: Overview
+description: Cache layers from the browser to the database, what to cache, hit ratio, cache-aside, read-through, write-through, write-behind, invalidation strategies, and stampede protection.
+---
+
+Caching trades freshness for speed: keep a copy of an expensive result closer to where it is needed. Every layer of the stack has a cache, and most caching bugs are about one copy disagreeing with another.
+
+---
+
+## The plain-language version
+
+A cache is a notepad next to a slow encyclopaedia. Writing down answers saves trips, but if the encyclopaedia changes, the notepad is wrong until it is corrected or thrown away. The two hard questions are **what to cache** and **when the copy stops being valid**.
+
+| Word             | Plain meaning                                                          |
+| :--------------- | :--------------------------------------------------------------------- |
+| **hit / miss**   | Found in cache / not found.                                            |
+| **hit ratio**    | Hits ÷ total lookups.                                                  |
+| **TTL**          | How long an entry stays valid.                                         |
+| **invalidation** | Removing or updating stale entries.                                    |
+| **stampede**     | Many requests miss at once and all hit the backend.                    |
+| **cache key**    | Identifier for an entry; must include everything the value depends on. |
+
+---
+
+## Cache layers
+
+<Mermaid
+  chart={`
+flowchart LR
+    B["Browser cache + service worker"] --> CDN["CDN / edge cache"] --> RP["Reverse proxy cache (Nginx, Varnish)"]
+    RP --> APP["App: in-process memory"] --> DC["Distributed cache (Redis)"] --> DB["Database buffer cache + materialised views"]
+`}
+/>
+
+| Layer          | Holds                                        | Controlled by                                | Covered in                                                   |
+| :------------- | :------------------------------------------- | :------------------------------------------- | :----------------------------------------------------------- |
+| Browser        | Assets, API responses                        | `Cache-Control`, ETag                        | [HTTP Caching](/fullstack/performance/http-caching)          |
+| Service worker | App shell, offline data                      | Worker code                                  | [Service Workers](/fullstack/performance/service-workers)    |
+| CDN            | Static files, public pages and API responses | Headers, CDN rules, purge APIs               | [HTTP Caching](/fullstack/performance/http-caching)          |
+| Framework      | Rendered pages, data (`use cache`)           | Framework APIs                               | [Next.js App Router](/fullstack/rendering/nextjs-app-router) |
+| In-process     | Hot config, small lookups                    | LRU map with TTL (`lru-cache`, `cachetools`) | This section                                                 |
+| Distributed    | Query results, sessions, computed objects    | Redis / Valkey / Memcached                   | [Redis](/fullstack/redis)                                    |
+| Database       | Pages in memory, materialised views          | DB settings                                  | [Databases](/db)                                             |
+
+In-process caches are fastest (no network) but per instance and inconsistent across instances; distributed caches are shared but cost a network hop. A two-level cache (small in-process L1 with short TTL, Redis L2) combines them.
+
+---
+
+## What to cache
+
+Good candidates are read often, expensive to compute, and tolerant of slight staleness: product catalogues, rendered fragments, permission lookups, third-party API responses, aggregates. Poor candidates: data that changes on every request, highly personalised data with low reuse, and anything where staleness causes harm (account balances, inventory at checkout) unless invalidation is exact.
+
+Measure hit ratio and latency before and after. A cache with a 5 percent hit ratio adds a network hop to 95 percent of requests.
+
+<Cards>
+  <Card
+    title="Caching Patterns"
+    description="Cache-aside, read-through, write-through, write-behind, refresh-ahead, and negative caching."
+    href="/fullstack/caching/patterns"
+  />
+  <Card
+    title="Invalidation and Stampedes"
+    description="TTL vs event-based invalidation, versioned keys, tags, races, and stampede protection."
+    href="/fullstack/caching/invalidation-and-stampedes"
+  />
+</Cards>

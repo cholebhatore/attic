@@ -1,0 +1,68 @@
+---
+title: Replicas and Pooling
+description: Vertical scaling limits, server-side connection pooling with PgBouncer and its session, transaction, and statement modes, read replicas, replication lag, routing reads, read-your-writes, and failover.
+---
+
+Read traffic usually grows long before write traffic does, and connection counts become a problem long before CPU does. Pooling and replicas address those two limits without changing how data is split.
+
+---
+
+## Vertical scaling first
+
+A single modern database server with many cores, hundreds of GB of RAM, and NVMe storage handles far more than most apps ever send it. Scaling up is a configuration change; scaling out is an architecture change. Move up first, with headroom alerts so the ceiling is never a surprise.
+
+---
+
+## Server-side pooling with PgBouncer
+
+<Mermaid
+  chart={`
+flowchart LR
+    A1["App instance 1 (pool 20)"] --> PB["PgBouncer"]
+    A2["App instance 2 (pool 20)"] --> PB
+    F["Serverless functions (hundreds)"] --> PB
+    PB -- "~30 real connections" --> PG["PostgreSQL"]
+`}
+/>
+
+| Pool mode   | Connection returned to pool | Compatible with                                                                                                 |
+| :---------- | :-------------------------- | :-------------------------------------------------------------------------------------------------------------- |
+| Session     | When the client disconnects | Everything; little multiplexing                                                                                 |
+| Transaction | After each transaction      | Most apps; session state (`SET`, advisory locks, some prepared statements) does not persist across transactions |
+| Statement   | After each statement        | No multi-statement transactions; rare                                                                           |
+
+Transaction mode gives the biggest gain. Recent PgBouncer versions support protocol-level prepared statements in transaction mode. Alternatives: PgCat, Supavisor, Odyssey, RDS Proxy, and the built-in poolers of Neon and Supabase. MySQL equivalent: ProxySQL.
+
+---
+
+## Read replicas
+
+<Mermaid
+  chart={`
+flowchart LR
+    APP["App"] -- "writes + critical reads" --> P["Primary"]
+    APP -- "other reads" --> R1["Replica 1"]
+    APP -- "other reads" --> R2["Replica 2"]
+    P -- "WAL stream (async)" --> R1
+    P -- "WAL stream (async)" --> R2
+`}
+/>
+
+- Replicas take read load and serve analytics or reports without hurting the primary.
+- Replication is usually **asynchronous**: a replica may be milliseconds to seconds behind.
+- Routing: separate connection pools (`dbWrite`, `dbRead`), ORM support (Prisma read replicas extension, Django database routers, SQLAlchemy binds).
+
+### Lag and read-your-writes
+
+A user saves a setting and the next page, read from a replica, shows the old value. Fixes:
+
+- Read from the primary for a few seconds after that user writes (store a timestamp in the session).
+- Read from the primary for the user's own data; replicas for shared or public data.
+- Compare the replica's replay position with the write's position before reading (LSN-based routing).
+- Monitor lag (`pg_stat_replication`, `replay_lag`) and remove lagging replicas from rotation.
+
+---
+
+## Failover
+
+Managed databases promote a standby automatically (Multi-AZ). Applications see a short burst of connection errors and must reconnect and retry idempotent operations. Synchronous standbys avoid losing acknowledged writes at the cost of write latency. Test failover regularly; the first test should not be the real incident.

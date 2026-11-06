@@ -1,0 +1,103 @@
+---
+title: Ansible
+description: Ansible's agentless model over SSH, inventory, playbooks, tasks and modules, idempotency, handlers, variables and Jinja2 templates, roles and Galaxy, Ansible Vault for secrets, and a playbook that prepares a VPS for a Dockerised app.
+---
+
+Setting up a new VPS means creating a user, hardening SSH, enabling a firewall, installing Docker, configuring automatic security updates, and deploying the app. Done by hand it takes an hour and differs every time; as an Ansible playbook it takes one command and is the same on every server.
+
+---
+
+## The plain-language version
+
+Ansible connects to servers over **SSH** (no agent to install), and runs **tasks** from a **playbook**. Each task uses a **module** that checks the current state and changes it only if needed, so running the playbook twice is safe.
+
+| Word             | Plain meaning                                                      |
+| :--------------- | :----------------------------------------------------------------- |
+| **control node** | The machine running Ansible (a laptop or CI).                      |
+| **managed node** | A server Ansible configures.                                       |
+| **inventory**    | List of servers and groups.                                        |
+| **playbook**     | YAML file mapping groups of hosts to tasks.                        |
+| **module**       | Unit of work: `apt`, `user`, `copy`, `template`, `service`, `ufw`. |
+| **handler**      | Task that runs only when notified by a change (restart a service). |
+| **role**         | Reusable bundle of tasks, templates, and defaults.                 |
+
+---
+
+## Inventory and playbook
+
+```ini title="inventory.ini"
+[web]
+app1.example.com ansible_user=deploy
+app2.example.com ansible_user=deploy
+```
+
+```yaml title="site.yml"
+- name: Prepare web servers
+  hosts: web
+  become: true
+  vars:
+    app_dir: /srv/shop
+  tasks:
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: [ufw, fail2ban, unattended-upgrades, ca-certificates, curl]
+        state: present
+        update_cache: true
+
+    - name: Disable SSH password login
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+      notify: Restart ssh
+
+    - name: Allow SSH and HTTPS through the firewall
+      community.general.ufw:
+        rule: allow
+        port: '{{ item }}'
+        proto: tcp
+      loop: ['22', '80', '443']
+
+    - name: Enable firewall
+      community.general.ufw:
+        state: enabled
+        policy: deny
+
+    - name: Install Docker
+      ansible.builtin.shell: curl -fsSL https://get.docker.com | sh
+      args:
+        creates: /usr/bin/docker # skip if already installed (idempotent)
+
+    - name: Upload compose file
+      ansible.builtin.template:
+        src: compose.yaml.j2
+        dest: '{{ app_dir }}/compose.yaml'
+      notify: Restart app
+
+  handlers:
+    - name: Restart ssh
+      ansible.builtin.service: { name: ssh, state: restarted }
+    - name: Restart app
+      ansible.builtin.command: docker compose up -d
+      args: { chdir: '{{ app_dir }}' }
+```
+
+```bash
+ansible-playbook -i inventory.ini site.yml --check --diff   # dry run
+ansible-playbook -i inventory.ini site.yml
+ansible web -i inventory.ini -m ping                         # ad hoc command
+```
+
+---
+
+## Secrets and reuse
+
+- **Ansible Vault** encrypts variable files: `ansible-vault encrypt group_vars/web/secrets.yml`, then run with `--ask-vault-pass` or a vault password file from CI secrets.
+- **Roles** (`roles/docker/tasks/main.yml`) organise reusable pieces; **Ansible Galaxy** shares community roles and collections.
+- Templates use Jinja2: `{{ variable }}`, loops, and conditionals.
+
+---
+
+## Terraform and Ansible together
+
+Terraform creates the VM, firewall, and DNS record, then outputs the IP; Ansible configures the VM. With containers and immutable images (Packer), Ansible's role shrinks to building images or bootstrapping hosts; with a PaaS, it disappears.

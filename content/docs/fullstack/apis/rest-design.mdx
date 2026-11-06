@@ -1,0 +1,86 @@
+---
+title: REST Design
+description: REST constraints, resources and URL design, nested resources, methods and their semantics, status codes per operation, representations, and HATEOAS.
+---
+
+`POST /api/getUserOrdersAndCancelOldOnes` works, but every client has to read docs to learn what it does, retries are unsafe, and no cache understands it. REST's conventions make an API predictable: knowing one resource tells a client how all of them behave.
+
+---
+
+## The plain-language version
+
+REST treats the API as a set of **resources** (nouns) identified by URLs, manipulated with standard HTTP **methods** (verbs). The server is stateless; responses say whether they can be cached.
+
+| Word                          | Plain meaning                                                         |
+| :---------------------------- | :-------------------------------------------------------------------- |
+| **resource**                  | A thing with an identity: an order, a user, a collection of orders.   |
+| **representation**            | The format a resource is sent in (JSON).                              |
+| **collection**                | A list resource: `/orders`.                                           |
+| **HATEOAS**                   | Responses include links to related actions; rarely fully implemented. |
+| **Richardson maturity model** | Levels: one endpoint (0), resources (1), verbs (2), hypermedia (3).   |
+
+---
+
+## Constraints (Fielding)
+
+Client-server, stateless, cacheable, uniform interface, layered system, and optional code on demand. Most "REST" APIs are really level-2 HTTP APIs, which is fine.
+
+---
+
+## URL design
+
+```text
+GET    /orders                 list
+POST   /orders                 create
+GET    /orders/981             read one
+PATCH  /orders/981             partial update
+PUT    /orders/981             replace
+DELETE /orders/981             delete
+GET    /users/19/orders        orders of a user (nested, one level deep)
+POST   /orders/981/cancel      action that doesn't fit CRUD (a "controller" resource)
+```
+
+- Plural nouns, lowercase, hyphens (`/shipping-addresses`).
+- No verbs in paths except for genuine actions; consider modelling actions as state changes (`PATCH /orders/981 {"status":"cancelled"}`) or sub-resources.
+- Nest at most one level; beyond that, use filters (`/orders?userId=19`).
+- IDs: opaque strings (UUIDv7, ULID, prefixed `ord_...`) avoid leaking counts and enumeration.
+
+---
+
+## Status codes by operation
+
+| Operation          | Success                     | Common failures                                          |
+| :----------------- | :-------------------------- | :------------------------------------------------------- |
+| `GET` one          | `200`                       | `404`                                                    |
+| `GET` list         | `200` (empty list, not 404) | `400` bad filter                                         |
+| `POST` create      | `201` + `Location` header   | `400`, `409` duplicate, `422` invalid                    |
+| `POST` async job   | `202 Accepted` + status URL |                                                          |
+| `PUT` / `PATCH`    | `200` with body or `204`    | `404`, `409` version conflict, `412` precondition failed |
+| `DELETE`           | `204`                       | `404` (or `204` again, for idempotency)                  |
+| Any, not logged in |                             | `401`                                                    |
+| Any, not allowed   |                             | `403` (or `404` to hide existence)                       |
+
+---
+
+## Representations
+
+- JSON with consistent casing (`camelCase` or `snake_case`, never both).
+- Timestamps in ISO 8601 UTC (`2026-11-06T10:22:31Z`).
+- Money as integer minor units plus currency, or decimal strings, never floats.
+- Envelope only when needed (`{ "data": [...], "nextCursor": "..." }` for lists).
+- Optimistic concurrency with `ETag` + `If-Match` to prevent lost updates.
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="PUT vs PATCH?">
+    `PUT` replaces the whole resource with the body and must be idempotent. `PATCH` applies a
+    partial change (JSON Merge Patch or JSON Patch).
+  </Accordion>
+  <Accordion title="Which status for a validation error: 400 or 422?">
+    Both are used. A common split: `400` for malformed requests (bad JSON), `422` for well-formed
+    but semantically invalid input. Consistency across the API matters more than the choice.
+  </Accordion>
+</Accordions>

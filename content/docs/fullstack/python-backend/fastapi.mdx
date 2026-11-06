@@ -1,0 +1,129 @@
+---
+title: FastAPI
+description: Routes and path, query, and body parameters, Pydantic models for input and output, status codes, dependency injection, error handling, middleware, lifespan events, routers, and automatic OpenAPI docs.
+---
+
+FastAPI turns type hints into validation, serialisation, and interactive API docs. A function signature such as `def create(order: OrderIn) -> OrderOut` is enough for FastAPI to parse the JSON body, reject bad input with a clear 422, and filter the response to the output model's fields.
+
+---
+
+## The plain-language version
+
+Routes are decorated functions. Parameters declared in the function become path, query, or body inputs based on their types. **Pydantic** models describe and validate data. **Dependencies** (`Depends`) are reusable functions that provide things like a database session or the current user.
+
+| Word               | Plain meaning                                   |
+| :----------------- | :---------------------------------------------- |
+| **path operation** | A route: method + path + function.              |
+| **Pydantic model** | Class describing data shape with validation.    |
+| **dependency**     | Function whose result is injected into a route. |
+| **response_model** | Output schema; extra fields are filtered out.   |
+| **lifespan**       | Startup and shutdown code for the app.          |
+
+---
+
+## A first app
+
+```python title="src/app/main.py"
+from fastapi import FastAPI, HTTPException, Query, status
+from pydantic import BaseModel, Field
+
+app = FastAPI(title="Shop API")
+
+class OrderIn(BaseModel):
+    product_id: int
+    qty: int = Field(ge=1, le=10)
+
+class OrderOut(BaseModel):
+    id: int
+    product_id: int
+    qty: int
+    status: str
+
+ORDERS: dict[int, OrderOut] = {}
+
+@app.post("/orders", status_code=status.HTTP_201_CREATED)
+def create_order(body: OrderIn) -> OrderOut:                  # body from JSON
+    order = OrderOut(id=len(ORDERS) + 1, status="pending", **body.model_dump())
+    ORDERS[order.id] = order
+    return order
+
+@app.get("/orders/{order_id}")
+def get_order(order_id: int) -> OrderOut:                     # path param, converted to int
+    if order_id not in ORDERS:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return ORDERS[order_id]
+
+@app.get("/orders")
+def list_orders(limit: int = Query(20, le=100), offset: int = 0) -> list[OrderOut]:  # query params
+    return list(ORDERS.values())[offset : offset + limit]
+```
+
+```bash
+uv run fastapi dev src/app/main.py
+# open http://localhost:8000/docs for Swagger UI generated from the code
+```
+
+---
+
+## Dependency injection
+
+```python
+from typing import Annotated
+from fastapi import Depends, Header
+
+async def get_current_user(authorization: Annotated[str, Header()]) -> User:
+    token = authorization.removeprefix("Bearer ")
+    user = await verify_token(token)          # see the Auth section
+    if not user:
+        raise HTTPException(401, "Invalid token", headers={"WWW-Authenticate": "Bearer"})
+    return user
+
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+@app.get("/me")
+async def me(user: CurrentUser) -> UserOut:
+    return user
+```
+
+Dependencies can depend on other dependencies, are cached per request, and can `yield` for cleanup (database sessions). Tests swap them with `app.dependency_overrides[get_current_user] = fake_user`.
+
+---
+
+## Errors, middleware, lifespan, routers
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import APIRouter, Request
+from fastapi.responses import JSONResponse
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.connect()          # startup
+    yield
+    await db.disconnect()       # shutdown
+
+app = FastAPI(lifespan=lifespan)
+
+@app.exception_handler(NotFound)
+async def not_found(request: Request, exc: NotFound):
+    return JSONResponse({"title": str(exc), "status": 404}, status_code=404)
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request.headers.get("X-Request-ID", new_id())
+    return response
+
+orders = APIRouter(prefix="/orders", tags=["orders"])
+app.include_router(orders)
+```
+
+---
+
+## async def or def?
+
+- `async def` when the route awaits async libraries (async DB driver, `httpx.AsyncClient`).
+- `def` when using sync libraries; FastAPI runs it in a thread pool.
+- Never call blocking libraries inside `async def`. See [Async Python](/fullstack/python-backend/async-python).
+
+Pydantic in depth: [Schemas and models](/ai/python/database/schemas-and-models).

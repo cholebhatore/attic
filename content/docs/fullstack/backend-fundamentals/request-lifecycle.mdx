@@ -1,0 +1,83 @@
+---
+title: Request Lifecycle
+description: The path of a request through a reverse proxy, the app server, middleware, routing, validation, authentication, the handler, data access, and the response, plus statelessness and graceful shutdown.
+---
+
+A bug report says "the API sometimes returns HTML instead of JSON". The HTML is Nginx's 502 page, because the app crashed on an unhandled error. Knowing each hop a request passes through tells where to look.
+
+---
+
+## The plain-language version
+
+A request passes through layers, each with one job, before the handler runs: something terminates TLS, something routes it, middleware adds logging and auth, the handler does the work, and the response travels back through the same layers.
+
+| Word                        | Plain meaning                                                                       |
+| :-------------------------- | :---------------------------------------------------------------------------------- |
+| **reverse proxy**           | Server in front of the app: TLS, compression, static files, routing (Nginx, Caddy). |
+| **load balancer**           | Spreads requests across app instances.                                              |
+| **middleware**              | Function that runs before or after handlers for many routes.                        |
+| **handler / controller**    | The code for one route.                                                             |
+| **service layer**           | Business logic, independent of HTTP.                                                |
+| **repository / data layer** | Code that talks to the database.                                                    |
+| **stateless server**        | Keeps no per-user data in memory between requests.                                  |
+
+---
+
+## The path
+
+<Mermaid
+  chart={`
+flowchart LR
+    C["Client"] --> LB["Load balancer / reverse proxy: TLS, gzip"]
+    LB --> S["App server process"]
+    subgraph S2["Inside the app"]
+        M1["Request ID + logging"] --> M2["Body parsing, CORS"] --> M3["Auth: who is this?"] --> R["Router"] --> V["Validate input"] --> H["Handler"] --> SV["Service: business rules"] --> DB["Repository: DB, cache, other APIs"]
+    end
+    S --> M1
+`}
+/>
+
+1. **Proxy**: terminates TLS, applies limits (body size, timeouts), forwards with `X-Forwarded-For`.
+2. **Middleware** in order: request ID, logging, security headers, CORS, body parsing, rate limiting, authentication.
+3. **Routing**: match method + path to a handler.
+4. **Validation**: parse body, params, and query into typed values; reject with `400` or `422`.
+5. **Authorization**: may this user do this to this resource?
+6. **Handler → service → repository**: keep HTTP details in the handler and business rules in services so they can be tested without HTTP.
+7. **Response**: serialise, set status and headers. Errors are caught by an error handler and mapped to a consistent format.
+
+The cookie-session version of this lifecycle is walked through step by step in [Sessions](/fullstack/auth/sessions).
+
+---
+
+## Statelessness
+
+Any instance should be able to serve any request. Sessions, uploads, and caches go to shared stores (Redis, the database, object storage), not process memory or local disk. That is what makes horizontal scaling and rolling deploys work.
+
+---
+
+## Timeouts everywhere
+
+Set timeouts on the proxy, on the server, on every outbound HTTP call, and on database queries. One slow dependency without a timeout holds connections until the whole service stops responding. See [resilience patterns](/fullstack/building-for-scale/resilience-patterns).
+
+---
+
+## Graceful shutdown
+
+During a deploy the platform sends `SIGTERM`. The app should:
+
+1. Stop accepting new connections (and fail its readiness check).
+2. Finish in-flight requests, with a deadline.
+3. Close DB pools and flush logs.
+4. Exit.
+
+```ts
+process.on('SIGTERM', () => {
+  server.close(async () => {
+    await db.end();
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 10_000).unref(); // hard deadline
+});
+```
+
+Uvicorn and Gunicorn handle `SIGTERM` this way for Python apps, with FastAPI `lifespan` hooks for cleanup.

@@ -1,0 +1,286 @@
+---
+title: Rendering Pipeline
+description: From bytes to pixels - HTML tokenisation and tree construction, parser-blocking scripts and the preload scanner, CSS parsing and the CSSOM, style calculation, the layout tree and layout algorithm, paint records, layers and compositing, rasterisation, the frame lifecycle, invalidation costs, forced synchronous layout, and the critical rendering path.
+---
+
+A page with a 60 KB stylesheet in the `head` shows nothing until the stylesheet arrives, while a page with a 600 KB image shows its text immediately. A JavaScript animation of `left` stutters on a phone while the same motion with `transform` stays smooth. A loop that reads `offsetHeight` after each style change takes 400 ms instead of 4. Each behaviour follows directly from the steps a browser takes to turn bytes into pixels.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after [Browser Architecture](/fullstack/web-fundamentals/browser-architecture), which described the processes and threads. This page follows one page load through them.
+
+The browser does five things in order: **read** the HTML into a tree of elements (the DOM), **read** the CSS into rules (the CSSOM), work out each element's final **style**, work out where every box goes (**layout**), then draw (**paint**) and stack the drawings (**composite**). Later changes re-run only the steps they affect, and the cost of a change depends on how early in the pipeline it starts.
+
+Topics, in order:
+
+1. Parsing HTML into the DOM
+2. Scripts: blocking, `async`, `defer`, modules
+3. The preload scanner
+4. CSS: parsing, the CSSOM, render blocking
+5. Style calculation
+6. Layout
+7. Paint
+8. Layers, compositing, and rasterisation
+9. The frame lifecycle and invalidation
+10. Forced synchronous layout and layout thrashing
+11. The critical rendering path
+
+| Word                | Plain meaning                                                                         |
+| :------------------ | :------------------------------------------------------------------------------------ |
+| **DOM**             | Document Object Model: the tree of nodes built from HTML.                             |
+| **CSSOM**           | The parsed stylesheets as a structure of rules.                                       |
+| **computed style**  | Final value of every CSS property for an element.                                     |
+| **layout tree**     | Boxes that will be displayed, with sizes and positions (no `display: none` elements). |
+| **reflow**          | Another name for layout, especially re-layout after a change.                         |
+| **paint record**    | List of drawing operations (draw rect, draw text) in order.                           |
+| **layer**           | A separately drawn surface the compositor can move or fade independently.             |
+| **rasterisation**   | Turning drawing operations into pixels.                                               |
+| **render-blocking** | A resource that prevents the first paint until loaded.                                |
+| **parser-blocking** | A resource that pauses HTML parsing until loaded and executed.                        |
+
+---
+
+## The pipeline at a glance
+
+<Mermaid
+  chart={`
+flowchart LR
+    H["HTML bytes"] --> T["Tokenise"] --> DOM["DOM tree"]
+    C["CSS bytes"] --> CP["Parse"] --> CSSOM["CSSOM"]
+    DOM --> S["Style: computed styles"]
+    CSSOM --> S
+    S --> L["Layout: geometry"]
+    L --> P["Paint: draw records"]
+    P --> CO["Composite: layers to GPU"]
+    CO --> PX["Pixels"]
+    JS["JavaScript"] -. "can modify" .-> DOM
+    JS -. "can modify" .-> CSSOM
+`}
+/>
+
+---
+
+## Parsing HTML into the DOM
+
+1. **Decode** bytes to characters using the declared encoding (`Content-Type` charset, BOM, or `<meta charset>` within the first 1,024 bytes).
+2. **Tokenise**: a state machine emits start tags, end tags, text, and comments.
+3. **Tree construction**: tokens become DOM nodes. The HTML parser is famously **error-tolerant**: unclosed tags are closed, misnested tags are rearranged (a `div` inside a `p` closes the `p`), missing `html`, `head`, and `body` elements are inserted. This tolerance is why server-rendered markup and the DOM React expects can diverge, causing [hydration mismatches](/fullstack/rendering/hydration-and-streaming).
+4. Parsing is **incremental**: the browser builds the DOM as bytes stream in, which is why streaming HTML from the server lets rendering start early.
+
+---
+
+## Scripts: blocking, async, defer, modules
+
+A classic `script` in the HTML stops the parser: the script may call `document.write` or read the DOM built so far, so the parser must wait for it to download and run. A script after a stylesheet must also wait for that stylesheet, because the script might read computed styles.
+
+| Script                                              | Download                                         | Executes                                          | Order          | Blocks parsing       |
+| :-------------------------------------------------- | :----------------------------------------------- | :------------------------------------------------ | :------------- | :------------------- |
+| `<script src>`                                      | When reached (preload scanner may start earlier) | Immediately after download                        | Document order | Yes                  |
+| `<script async>`                                    | In parallel                                      | As soon as downloaded                             | Any order      | Only while executing |
+| `<script defer>`                                    | In parallel                                      | After parsing finishes, before `DOMContentLoaded` | Document order | No                   |
+| `<script type="module">`                            | In parallel, plus its import graph               | Like `defer` (or `async` if marked)               | Document order | No                   |
+| Inserted by JS (`document.createElement('script')`) | When inserted                                    | Like `async` by default                           | Any order      | No                   |
+
+<Mermaid
+  chart={`
+gantt
+    dateFormat X
+    axisFormat %L
+    section Plain script
+    Parse HTML        :0, 30
+    Fetch script      :30, 130
+    Execute           :130, 160
+    Parse HTML (resume) :160, 220
+    section defer
+    Parse HTML        :0, 150
+    Fetch script      :30, 130
+    Execute after parse :150, 180
+    section async
+    Parse HTML        :0, 130
+    Fetch script      :30, 130
+    Execute (parser paused) :130, 160
+    Parse HTML        :160, 210
+`}
+/>
+
+Use `defer` (or modules) for application code, `async` for independent scripts such as analytics, and avoid plain scripts in the `head`.
+
+---
+
+## The preload scanner
+
+While the main parser is blocked on a script, a lightweight **preload scanner** reads ahead in the raw HTML and starts downloading resources it finds in markup: stylesheets, scripts, images with `src` and `srcset`, preloads. This is one of the largest performance optimisations browsers ever shipped.
+
+It cannot see resources that are not in the initial HTML:
+
+- Images set as CSS `background-image` (discovered only after CSS is parsed and the element styled).
+- Fonts (discovered only when text using them is styled).
+- Anything injected by JavaScript, including client-rendered content and lazy-loaded images in a React SPA.
+- Resources referenced by `@import` inside CSS.
+
+Late discovery of the LCP image is one of the most common causes of poor [LCP](/fullstack/performance/core-web-vitals). Fix it by putting the image in HTML, using `<link rel="preload" as="image" fetchpriority="high">`, or rendering on the server.
+
+---
+
+## CSS: parsing, the CSSOM, and render blocking
+
+CSS is parsed into the CSSOM: style sheets containing rules, each with selectors and declarations.
+
+Stylesheets in the `head` are **render-blocking**: the browser will not paint until they are loaded and parsed, because painting with partial styles would show unstyled content and then jump (a flash of unstyled content). They are not parser-blocking by themselves, but they block scripts that follow them.
+
+- `media` attributes help: `<link rel="stylesheet" href="print.css" media="print">` is downloaded at low priority and does not block rendering.
+- `@import` inside CSS creates a serial chain: the imported file is discovered only after the importing file downloads.
+- Large CSS bundles block the first paint for all of their bytes, even if the page uses 10 percent of the rules; extracting and inlining the critical above-the-fold CSS lets the first paint happen after one round trip.
+
+---
+
+## Style calculation
+
+For each element, the browser determines which rules match and resolves the cascade ([CSS](/fullstack/css/cascade-and-specificity)) to a **computed style**: a value for every property.
+
+- **Selector matching runs right to left**: for `.nav ul li a`, the engine starts at each `a` element and walks up ancestors to check the rest. Rightmost selectors that match many elements (`div *`) cost more.
+- Engines use **bloom filters** of ancestors and share computed styles between siblings with identical styles to make this fast; in practice selector cost rarely matters except on very large DOMs with complex selectors.
+- **Style invalidation**: changing a class on `body` can force recalculating styles for every descendant. The number of elements affected matters more than selector complexity.
+- **Inheritance**: inherited properties (font, colour) flow to children; computed values for others come from initial values.
+
+---
+
+## Layout
+
+Layout builds the **layout tree** (elements with `display: none` are excluded; pseudo-elements like `::before` are included; `visibility: hidden` elements keep their space) and computes each box's size and position.
+
+- Layout is a mostly top-down recursive pass: a parent tells a child how much width is available, the child computes its height from its content, and the parent uses child heights to place siblings. Flexbox and Grid require more passes (measuring content, then distributing space).
+- Text layout is expensive: line breaking, font shaping (combining characters into glyphs, ligatures, right-to-left scripts), and measuring.
+- **Layout scope**: changing one element's width can change its parent's height, which moves all following siblings, so a small change can trigger layout for much of the page. `contain: layout` and `content-visibility: auto` limit how far changes propagate and let the browser skip off-screen subtrees.
+- Layout cost scales with the number of boxes. Very large DOMs (over about 1,400 nodes is Lighthouse's warning threshold) slow every layout.
+
+---
+
+## Paint
+
+Paint walks the layout tree and records drawing operations into **display lists**: draw this background, then this border, then this text, in **stacking order** (z-index and stacking contexts determine the order). Paint records operations; it does not yet produce pixels.
+
+Properties like `box-shadow` with large blur, `filter: blur()`, and complex gradients are more expensive to rasterise later. Paint is invalidated per region; DevTools "Paint flashing" shows which regions repaint.
+
+---
+
+## Layers, compositing, and rasterisation
+
+The page is split into **layers** (compositing layers), each painted separately. Elements get their own layer when they have, among other reasons:
+
+- An animated or `will-change`'d `transform` or `opacity`.
+- 3D transforms, `video`, `canvas`, iframes.
+- `position: fixed` (in some cases) and overflow scrollers.
+- Overlap with another composited layer (forced promotion to keep paint order correct).
+
+Then:
+
+1. **Rasterisation**: raster threads (usually using the GPU) turn each layer's display list into pixel tiles, prioritising tiles near the viewport.
+2. **Compositing**: the compositor thread positions layers (applying transforms, opacity, scroll offsets, clips) and sends a frame to the GPU process to draw.
+
+Because compositing works on already-rasterised layers, changes to **`transform` and `opacity` can be animated on the compositor thread alone**, without the main thread, style, layout, or paint. That is why those two properties animate smoothly even while JavaScript is busy.
+
+Layers cost GPU memory (a full-screen layer at 1080p is about 8 MB of pixels). Promoting hundreds of elements with `will-change` can exhaust memory on phones and slow things down; promote only what animates.
+
+---
+
+## The frame lifecycle and invalidation
+
+At 60 Hz, a frame lasts **16.7 ms**; at 120 Hz, 8.3 ms. The browser needs a few milliseconds of that for its own work, leaving roughly 10 ms for application code per frame during animations.
+
+| Change                                                                         | Style | Layout | Paint | Composite | Cost    |
+| :----------------------------------------------------------------------------- | :---- | :----- | :---- | :-------- | :------ |
+| `width`, `height`, `top`, `margin`, `font-size`, text content, adding elements | ✓     | ✓      | ✓     | ✓         | Highest |
+| `color`, `background-color`, `box-shadow`, `visibility`                        | ✓     |        | ✓     | ✓         | Medium  |
+| `transform`, `opacity` (on a composited layer)                                 | ✓     |        |       | ✓         | Lowest  |
+
+Which properties trigger which stages varies slightly between engines; csstriggers-style tables summarise it, and DevTools shows the actual work.
+
+<Mermaid
+  chart={`
+flowchart LR
+    I["Input events"] --> J["JS: event handlers, timers"] --> R["requestAnimationFrame"] --> S["Style"] --> L["Layout"] --> P["Paint"] --> C["Composite (compositor thread)"]
+`}
+/>
+
+Visual updates driven by JavaScript belong in `requestAnimationFrame`, which runs just before style and layout for the next frame, rather than `setTimeout`, which may run at an arbitrary point and cause extra or skipped frames.
+
+---
+
+## Forced synchronous layout and layout thrashing
+
+The browser normally batches layout until the end of the task. But reading a geometry property **after** changing styles forces it to run layout immediately, because the answer must be correct now:
+
+Reads that force layout include `offsetTop`/`offsetHeight`, `clientWidth`, `scrollTop`, `getBoundingClientRect()`, `getComputedStyle()` (for layout-dependent values), and `innerText`.
+
+```js
+// Layout thrashing: N forced layouts
+for (const el of items) {
+  el.style.width = box.offsetWidth + 'px'; // read (forces layout), then write (invalidates)
+}
+
+// Batched: one layout
+const width = box.offsetWidth; // read once
+for (const el of items) el.style.width = width + 'px'; // then write
+```
+
+With 500 items and a 1 ms layout, the first version costs about 500 ms of main-thread time; the second about 1 ms. Libraries such as FastDOM batch reads and writes; `ResizeObserver` and `IntersectionObserver` provide geometry without forcing layout in a loop.
+
+---
+
+## The critical rendering path
+
+The **critical rendering path** is the minimum sequence of work before the first meaningful paint: HTML → DOM, CSS → CSSOM, render-blocking scripts, style, layout, paint.
+
+Three numbers describe it:
+
+| Metric               | Meaning                                                                            | Reduce by                                                              |
+| :------------------- | :--------------------------------------------------------------------------------- | :--------------------------------------------------------------------- |
+| Critical resources   | Resources that block first render                                                  | Defer scripts, inline critical CSS, non-blocking `media` for other CSS |
+| Critical bytes       | Total bytes of those resources                                                     | Minify, compress, split CSS by route                                   |
+| Critical path length | Round trips needed to fetch them, including chains (HTML → CSS → `@import` → font) | Flatten chains, preload late-discovered resources, use fewer origins   |
+
+Worked example on a 100 ms RTT connection (connection already open): HTML (1 RTT) → CSS discovered in `head` (1 RTT) → CSS `@import`s a second file (1 RTT) → font referenced by that CSS (1 RTT). Text appears after about 400 ms of network time alone. Inlining the critical CSS and preloading the font cuts this to roughly 200 ms.
+
+Key milestones in a page load:
+
+| Event / metric            | When                                      |
+| :------------------------ | :---------------------------------------- |
+| TTFB                      | First byte of the HTML response           |
+| FCP                       | First text or image painted               |
+| `DOMContentLoaded`        | HTML parsed and deferred scripts run      |
+| LCP                       | Largest content element painted           |
+| `load`                    | All subresources (images, iframes) loaded |
+| Time to interactive / INP | Page responds quickly to input            |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why is CSS render-blocking but not parser-blocking?">
+    Painting before CSS arrives would show unstyled content that then jumps, so the browser waits
+    for CSS before the first paint. Parsing HTML can continue meanwhile, though scripts after the
+    stylesheet must wait because they may read styles.
+  </Accordion>
+  <Accordion title="What is the difference between async and defer?">
+    Both download in parallel with parsing. defer scripts run after parsing finishes, in document
+    order, before DOMContentLoaded. async scripts run as soon as they download, in any order,
+    pausing the parser while they execute.
+  </Accordion>
+  <Accordion title="Why are transform and opacity cheap to animate?">
+    On a composited layer they only affect compositing, which the compositor thread and GPU perform
+    on already-rasterised layers, skipping style recalculation, layout, and paint on the main
+    thread.
+  </Accordion>
+  <Accordion title="What is layout thrashing and how is it fixed?">
+    Alternating DOM writes and layout reads in a loop, which forces a synchronous layout on every
+    read. Batch all reads first, then all writes, or use observers and requestAnimationFrame.
+  </Accordion>
+  <Accordion title="Why might an LCP image load late even though it is in the page?">
+    It may not be visible to the preload scanner: set as a CSS background, injected by JavaScript,
+    or lazy-loaded. Put it in HTML, preload it with high fetch priority, and do not lazy-load it.
+  </Accordion>
+</Accordions>

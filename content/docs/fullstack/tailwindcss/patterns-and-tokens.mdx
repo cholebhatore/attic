@@ -1,0 +1,77 @@
+---
+title: Patterns and Tokens
+description: Extracting components, variant APIs with cva, merging classes with tailwind-merge, semantic tokens, dark mode, and common mistakes.
+---
+
+A `Button` is used in forty places, each with a slightly different class string. Tailwind projects stay maintainable by putting repeated combinations inside components with a small variant API.
+
+---
+
+## The plain-language version
+
+Repetition moves into components. Variants (`size="sm"`, `intent="danger"`) map to class sets. Semantic tokens (`bg-surface`, `text-muted`) sit between raw colours and components, so theming changes one place.
+
+| Word               | Plain meaning                                                     |
+| :----------------- | :---------------------------------------------------------------- |
+| **cva**            | class-variance-authority: maps variant props to classes.          |
+| **tailwind-merge** | Resolves conflicting classes (`p-2 p-4` becomes `p-4`).           |
+| **semantic token** | A name for a role (`surface`, `danger`), not a value (`red-600`). |
+
+---
+
+## Variants with cva
+
+```tsx
+import { cva, type VariantProps } from 'class-variance-authority';
+import { twMerge } from 'tailwind-merge';
+import clsx, { type ClassValue } from 'clsx';
+
+export const cn = (...inputs: ClassValue[]) => twMerge(clsx(inputs));
+
+const button = cva('inline-flex items-center rounded-md font-medium', {
+  variants: {
+    intent: { primary: 'bg-brand-500 text-white', ghost: 'hover:bg-muted' },
+    size: { sm: 'h-8 px-3 text-sm', md: 'h-10 px-4' },
+  },
+  defaultVariants: { intent: 'primary', size: 'md' },
+});
+
+type Props = React.ComponentProps<'button'> & VariantProps<typeof button>;
+export function Button({ intent, size, className, ...props }: Props) {
+  return <button className={cn(button({ intent, size }), className)} {...props} />;
+}
+```
+
+This is the pattern shadcn/ui uses; see [Design Systems](/fullstack/design-systems).
+
+---
+
+## Semantic tokens and dark mode
+
+```css
+@import 'tailwindcss';
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  --color-surface: var(--surface);
+  --color-fg: var(--fg);
+}
+:root {
+  --surface: oklch(99% 0 0);
+  --fg: oklch(20% 0 0);
+}
+.dark {
+  --surface: oklch(18% 0 0);
+  --fg: oklch(95% 0 0);
+}
+```
+
+Components use `bg-surface text-fg` and switch themes without `dark:` on every element.
+
+---
+
+## Mistakes
+
+- Building class names dynamically (`` `text-${color}-500` ``): the scanner cannot see them, so the CSS is never generated. Map props to full class strings.
+- Overusing `@apply` to recreate BEM classes; that brings back the problems Tailwind removes.
+- Arbitrary values everywhere instead of adding tokens to the theme.

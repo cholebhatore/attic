@@ -1,0 +1,85 @@
+---
+title: Async Python
+description: Coroutines and the asyncio event loop, await, running things concurrently with gather and TaskGroup, timeouts, blocking calls in async code, async libraries, and when to stay synchronous.
+---
+
+A FastAPI endpoint is declared `async def` and calls `requests.get()` to an API that takes 2 seconds. Under load, the whole server serves one request at a time, because `requests` blocks the event loop. Python's async model matches Node's, with one difference: blocking calls are everywhere in the ecosystem, and nothing warns about them.
+
+---
+
+## The plain-language version
+
+`async def` defines a **coroutine**: a function that can pause at `await` while waiting on I/O, letting other coroutines run. **asyncio** runs the event loop. Unlike Node, the loop is not always running; a program starts it with `asyncio.run()` (or the ASGI server starts it).
+
+| Word              | Plain meaning                                                          |
+| :---------------- | :--------------------------------------------------------------------- |
+| **coroutine**     | Result of calling an `async def` function; does nothing until awaited. |
+| **await**         | Pause until the awaited thing is done.                                 |
+| **task**          | A coroutine scheduled to run concurrently.                             |
+| **TaskGroup**     | Structured way to run tasks and wait for all, cancelling on error.     |
+| **blocking call** | Sync I/O or CPU work that stops the loop.                              |
+
+---
+
+## Basics
+
+```python
+import asyncio
+import httpx
+
+async def fetch_user(client: httpx.AsyncClient, uid: int) -> dict:
+    r = await client.get(f"https://api.example.com/users/{uid}")
+    r.raise_for_status()
+    return r.json()
+
+async def main():
+    async with httpx.AsyncClient(timeout=5) as client:
+        # sequential: ~3x the time
+        a = await fetch_user(client, 1)
+        # concurrent
+        users = await asyncio.gather(*(fetch_user(client, i) for i in range(1, 4)))
+        # structured concurrency (3.11+): cancels siblings if one fails
+        async with asyncio.TaskGroup() as tg:
+            t1 = tg.create_task(fetch_user(client, 4))
+            t2 = tg.create_task(fetch_user(client, 5))
+        print(t1.result(), t2.result())
+
+asyncio.run(main())
+```
+
+Forgetting `await` returns a coroutine object instead of the result and triggers a "coroutine was never awaited" warning.
+
+---
+
+## Timeouts and cancellation
+
+```python
+async with asyncio.timeout(3):           # 3.11+
+    data = await slow_call()
+# raises TimeoutError; the inner task is cancelled
+```
+
+---
+
+## Blocking calls
+
+| Blocking (avoid in `async def`) | Async alternative                                                    |
+| :------------------------------ | :------------------------------------------------------------------- |
+| `requests`                      | `httpx.AsyncClient`, `aiohttp`                                       |
+| `time.sleep`                    | `await asyncio.sleep`                                                |
+| `psycopg2`, sync SQLAlchemy     | `asyncpg`, `psycopg` async, SQLAlchemy `AsyncSession`                |
+| `redis` sync client             | `redis.asyncio`                                                      |
+| CPU-heavy code                  | `await asyncio.to_thread(fn)` for blocking I/O; process pool for CPU |
+
+FastAPI runs plain `def` endpoints in a thread pool, so a sync endpoint with sync libraries is fine. The mistake is mixing: `async def` with blocking calls inside.
+
+---
+
+## Sync or async?
+
+Async helps when a request spends most of its time waiting on many I/O calls, or when holding many open connections (WebSockets, streaming). For a CRUD API with one or two DB queries per request, sync code with enough workers performs well and is simpler. Pick one style per codebase.
+
+<Callout type="info">
+  Debug mode (`PYTHONASYNCIODEBUG=1` or `asyncio.run(main(), debug=True)`) logs callbacks that block
+  the loop for more than 100 ms.
+</Callout>

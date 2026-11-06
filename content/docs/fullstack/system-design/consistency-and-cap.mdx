@@ -1,0 +1,54 @@
+---
+title: Consistency and CAP
+description: The CAP theorem stated precisely, PACELC, consistency models from linearizable to eventual, read-your-writes and monotonic reads, leader-based and leaderless replication, quorums, conflict resolution, and consistent hashing.
+---
+
+A user updates their profile photo, refreshes, and sees the old one; refreshes again and sees the new one; refreshes a third time and sees the old one. Each read hit a different replica. Consistency models name exactly which of these behaviours a system allows.
+
+---
+
+## CAP
+
+During a **network partition** (P), a distributed data store must choose between:
+
+- **Consistency** (C): every read sees the latest write (linearizability), so some requests must fail or wait.
+- **Availability** (A): every request gets a response, possibly stale.
+
+CAP is about behaviour during partitions only. "CA" systems do not exist in a distributed setting, because partitions happen whether or not they are planned for.
+
+**PACELC** adds the normal case: if Partitioned, choose A or C; **Else**, choose **L**atency or **C**onsistency. Synchronous replication is consistent but slower; asynchronous is fast but can serve stale data.
+
+| System                               | Partition                 | Else                                 |
+| :----------------------------------- | :------------------------ | :----------------------------------- |
+| Postgres primary with async replicas | Consistent on the primary | Latency (replica reads may be stale) |
+| DynamoDB (default) / Cassandra       | Availability              | Latency (tunable)                    |
+| Spanner, CockroachDB                 | Consistency               | Consistency                          |
+
+---
+
+## Consistency models
+
+| Model                 | Guarantee                                                   | Example                                                   |
+| :-------------------- | :---------------------------------------------------------- | :-------------------------------------------------------- |
+| Linearizable (strong) | Behaves like one copy; reads see the latest completed write | Single primary reads, Spanner, etcd                       |
+| Sequential            | All see operations in the same order                        |                                                           |
+| Causal                | Cause-effect order preserved (a reply after its question)   | Some geo-replicated stores                                |
+| Read-your-writes      | A user sees their own writes                                | Route a user's reads to the primary briefly after writing |
+| Monotonic reads       | No going back in time                                       | Pin a session to one replica                              |
+| Eventual              | Replicas converge if writes stop                            | DNS, async replicas, caches                               |
+
+The profile-photo bug is a violation of read-your-writes and monotonic reads.
+
+---
+
+## Replication
+
+- **Single leader**: writes to one primary, replicated to followers. Simple, the norm for relational databases. Failover can lose unreplicated writes.
+- **Multi-leader**: writes in several regions; conflicts must be resolved (last write wins, merge, CRDTs).
+- **Leaderless** (Dynamo-style): write to W of N replicas, read from R. If **W + R > N**, read and write sets overlap, so reads see the latest write (in the absence of concurrent writes and failures). Example: N=3, W=2, R=2.
+
+---
+
+## Consistent hashing
+
+Sharding with `hash(key) mod N` remaps almost every key when N changes. **Consistent hashing** places nodes and keys on a ring; each key belongs to the next node clockwise, so adding a node moves only about 1/N of keys. **Virtual nodes** (many points per server) even out the load. Used by Cassandra, DynamoDB, CDNs, and cache clients; Redis Cluster uses a fixed slot table instead ([Scaling Redis](/fullstack/redis/scaling-redis)).

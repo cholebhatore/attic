@@ -1,0 +1,84 @@
+---
+title: HTTP Caching
+description: Cache-Control directives, freshness and revalidation with ETag and Last-Modified, immutable hashed assets, private vs shared caches, Vary, CDNs, and recipes per resource type.
+---
+
+A deploy ships a fix, yet users keep running the old JavaScript for a day. Another site caches nothing and every visit re-downloads 2 MB. Both come down to `Cache-Control` headers.
+
+---
+
+## The plain-language version
+
+Caches (the browser, CDNs, proxies) store responses and reuse them. A response is **fresh** for a set time and used without asking the server. After that it is **stale**, and the cache **revalidates**: it asks "has this changed?" and gets either a cheap `304 Not Modified` or the new version.
+
+| Word              | Plain meaning                                                      |
+| :---------------- | :----------------------------------------------------------------- |
+| **fresh / stale** | Within / past its allowed cache time.                              |
+| **revalidation**  | Asking the server whether a cached copy is still valid.            |
+| **validator**     | `ETag` (content fingerprint) or `Last-Modified` date.              |
+| **shared cache**  | A CDN or proxy serving many users.                                 |
+| **private cache** | The user's browser.                                                |
+| **cache busting** | Changing the URL (a hash in the filename) to force a new download. |
+
+---
+
+## Cache-Control directives
+
+| Directive                  | Meaning                                                      |
+| :------------------------- | :----------------------------------------------------------- |
+| `max-age=N`                | Fresh for N seconds                                          |
+| `s-maxage=N`               | Freshness for shared caches (CDN) only                       |
+| `no-cache`                 | Store, but revalidate before every use (not "do not cache")  |
+| `no-store`                 | Never store. For sensitive data                              |
+| `private`                  | Only the browser may store it                                |
+| `public`                   | Shared caches may store it, even with `Authorization`        |
+| `immutable`                | Never changes; skip revalidation even on reload              |
+| `must-revalidate`          | Once stale, must revalidate; never serve stale               |
+| `stale-while-revalidate=N` | Serve stale for N seconds while refreshing in the background |
+| `stale-if-error=N`         | Serve stale if the origin errors                             |
+
+---
+
+## Revalidation
+
+```http
+HTTP/1.1 200 OK
+Cache-Control: no-cache
+ETag: "a1b2c3"
+```
+
+```http
+GET /api/catalog
+If-None-Match: "a1b2c3"
+
+HTTP/1.1 304 Not Modified
+```
+
+A `304` has no body, saving bandwidth, but still costs a round trip.
+
+---
+
+## Recipes
+
+| Resource                               | Header                                                               | Why                                       |
+| :------------------------------------- | :------------------------------------------------------------------- | :---------------------------------------- |
+| Hashed assets (`app.3f9a1c.js`, fonts) | `public, max-age=31536000, immutable`                                | URL changes when content changes          |
+| HTML pages                             | `no-cache` (or short `s-maxage` + `stale-while-revalidate` on a CDN) | Must pick up new asset URLs after deploys |
+| Public API data                        | `public, s-maxage=60, stale-while-revalidate=300`                    | CDN absorbs load, data slightly stale     |
+| User-specific API data                 | `private, no-cache` or `no-store`                                    | Never in shared caches                    |
+| Login, payment, tokens                 | `no-store`                                                           | Sensitive                                 |
+
+The deploy bug above: HTML was cached for a day, so browsers kept requesting old asset filenames.
+
+---
+
+## Vary and CDNs
+
+`Vary: Accept-Encoding` tells caches to store separate copies per compression. `Vary: Cookie` effectively disables shared caching. CDNs add their own controls: purge by URL or tag, cache keys, and `CDN-Cache-Control` headers.
+
+<Callout type="warn">
+  A shared cache storing a personalised response serves one user's data to another. Mark anything
+  user-specific `private` and check CDN cache keys when cookies or auth headers are involved.
+</Callout>
+
+Application-level caching (Redis, memoisation) is covered in [Caching](/fullstack/caching).

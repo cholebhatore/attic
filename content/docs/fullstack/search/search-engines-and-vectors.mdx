@@ -1,0 +1,60 @@
+---
+title: Search Engines and Vectors
+description: Elasticsearch and OpenSearch architecture (shards, replicas, mappings), Meilisearch and Typesense, Algolia, keeping a search index in sync with the database, and vector, semantic, and hybrid search with reciprocal rank fusion.
+---
+
+A search index is a second copy of the data, shaped for queries. The engine choice matters less than how that copy stays in sync with the source of truth, and whether keyword and semantic matching are combined.
+
+---
+
+## Engines
+
+| Engine        | Model                                   | Strengths                                                       | Trade-offs                                                      |
+| :------------ | :-------------------------------------- | :-------------------------------------------------------------- | :-------------------------------------------------------------- |
+| Elasticsearch | Distributed, Lucene-based               | Powerful query DSL, aggregations, huge ecosystem (logs via ELK) | Operationally heavy; license changes (now includes AGPL option) |
+| OpenSearch    | Fork of Elasticsearch 7.10 (Apache 2.0) | AWS-managed option, similar features                            | Diverging APIs                                                  |
+| Meilisearch   | Single binary (Rust)                    | Typo tolerance and instant search out of the box, simple API    | Smaller scale and fewer analytics features                      |
+| Typesense     | Single binary (C++), clustered          | Fast, typo tolerance, vector support                            | Smaller ecosystem                                               |
+| Algolia       | Hosted SaaS                             | Excellent relevance and UI widgets, no ops                      | Cost at scale                                                   |
+| Vespa         | Distributed                             | Large-scale ranking and ML at query time                        | Complexity                                                      |
+
+### Elasticsearch concepts
+
+- **Index** split into **shards** (parallelism) with **replicas** (availability, read throughput).
+- **Mapping**: field types and analysers. `text` is analysed for full-text; `keyword` is exact for filters and aggregations.
+- Queries: `match`, `multi_match` with field boosts, `bool` (must/should/filter), `function_score` for popularity and recency.
+- Near real-time: documents become searchable after a refresh (default 1 second).
+
+---
+
+## Keeping the index in sync
+
+| Approach                                            | Notes                                                                                               |
+| :-------------------------------------------------- | :-------------------------------------------------------------------------------------------------- |
+| Dual write in application code                      | Simple; inconsistency when one write fails                                                          |
+| Outbox + worker                                     | Reliable; index lags by seconds. See [the outbox](/fullstack/message-brokers/job-queues-and-outbox) |
+| Change data capture (Debezium → Kafka → indexer)    | Reliable, decoupled, more infrastructure                                                            |
+| Periodic full reindex into a new index + alias swap | Recovery and mapping changes without downtime                                                       |
+
+Treat the search index as rebuildable from the database at any time.
+
+---
+
+## Vector and hybrid search
+
+Keyword search misses synonyms and paraphrases ("cheap flights" vs "low-cost airfare"). **Semantic search** embeds documents and queries into vectors with an embedding model and finds nearest neighbours by cosine similarity.
+
+```sql
+CREATE EXTENSION vector;
+ALTER TABLE docs ADD COLUMN embedding vector(1024);
+CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);
+
+SELECT id, title FROM docs ORDER BY embedding <=> $1 LIMIT 10;   -- $1 = query embedding
+```
+
+- **ANN indexes** (HNSW, IVF) trade exactness for speed.
+- Vector stores: pgvector, Qdrant, Weaviate, Milvus, Pinecone, plus vector support in Elasticsearch, OpenSearch, Typesense, and Redis.
+
+**Hybrid search** runs keyword (BM25) and vector queries and merges the lists, commonly with **reciprocal rank fusion**: each document scores the sum of `1 / (k + rank)` across lists (with `k` around 60). Hybrid beats either alone on most real datasets, especially for exact identifiers (SKUs, error codes) that embeddings handle poorly. A **reranker** model can reorder the top results further.
+
+Embeddings, chunking, and RAG are covered in [AI Integration](/fullstack/ai-integration/tools-rag-mcp) and in depth in [RAG](/ai/rag).

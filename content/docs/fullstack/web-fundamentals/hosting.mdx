@@ -1,0 +1,185 @@
+---
+title: Hosting
+description: What hosting models actually provide - bare metal, virtual machines and hypervisors, containers, platforms as a service, serverless functions and cold starts, edge runtimes with V8 isolates, static hosting and CDNs - and the responsibility, cost, latency, and scaling trade-offs between them.
+---
+
+Hosting answers two questions: which machine runs this code, and who is responsible for keeping that machine, its operating system, and the runtime healthy? Each model hands more responsibility to a provider in exchange for less control, different failure modes, and a different cost curve. Cloud-provider specifics live in [Cloud](/cloud); this page covers the underlying mechanics.
+
+---
+
+## The plain-language version
+
+**Where this sits:** after the network and protocol pages, which explain how requests reach a server; this page explains what "a server" is in each model.
+
+Think of housing. **Bare metal** is owning a house. A **VM** is renting an empty flat in a building: the structure is shared, but everything inside is the tenant's job. A **PaaS** is a serviced apartment: bring belongings (code), the provider handles maintenance. **Serverless** is a hotel billed by the minute, with check-in delays when no room is ready. **Static hosting with a CDN** is a set of noticeboards around the city: nothing is cooked to order, but everyone nearby can read instantly.
+
+Topics, in order:
+
+1. The responsibility stack
+2. Bare metal and virtual machines
+3. Containers
+4. Platforms as a service
+5. Serverless functions and cold starts
+6. Edge runtimes and isolates
+7. Static hosting and CDNs
+8. Choosing
+
+| Word                | Plain meaning                                                             |
+| :------------------ | :------------------------------------------------------------------------ |
+| **hypervisor**      | Software that runs several virtual machines on one physical machine.      |
+| **VM**              | Virtual machine: a full OS running on virtualised hardware.               |
+| **container**       | An isolated process sharing the host's kernel.                            |
+| **cold start**      | Delay creating a new execution environment before a request can run.      |
+| **isolate**         | A lightweight sandbox inside one JavaScript engine process.               |
+| **PoP**             | Point of presence: a CDN or edge location.                                |
+| **origin**          | The server a CDN fetches from on a cache miss.                            |
+| **noisy neighbour** | Another tenant on shared hardware consuming resources and slowing others. |
+
+---
+
+## The responsibility stack
+
+| Layer                          | Bare metal       | VM (IaaS)                 | Containers (managed orchestrator) | PaaS                      | Serverless functions   | Static + CDN |
+| :----------------------------- | :--------------- | :------------------------ | :-------------------------------- | :------------------------ | :--------------------- | :----------- |
+| Hardware, network, data centre | Provider or team | Provider                  | Provider                          | Provider                  | Provider               | Provider     |
+| Hypervisor                     | n/a              | Provider                  | Provider                          | Provider                  | Provider               | Provider     |
+| OS patching                    | Team             | Team                      | Provider (nodes) / team (images)  | Provider                  | Provider               | Provider     |
+| Runtime (Node, Python)         | Team             | Team                      | Team (in image)                   | Provider or team          | Provider               | n/a          |
+| Scaling                        | Team             | Team (autoscaling groups) | Orchestrator, team configures     | Provider, team configures | Automatic, per request | Automatic    |
+| Application code               | Team             | Team                      | Team                              | Team                      | Team                   | Build output |
+
+The further right, the less operational work and control, and the more the platform's limits shape the architecture.
+
+---
+
+## Bare metal and virtual machines
+
+A **hypervisor** (KVM, Xen, Hyper-V; AWS Nitro offloads much of it to dedicated hardware) divides a physical server into virtual machines, each with its own kernel. CPU virtualisation extensions (Intel VT-x, AMD-V) let guest code run directly on the CPU, so overhead is small for most workloads.
+
+- **Isolation** is strong: a separate kernel per tenant.
+- **Overcommit**: providers may sell more virtual CPUs than physical cores. "Burstable" instance types (AWS T-series) accrue CPU credits and are throttled when credits run out, a common surprise in benchmarks.
+- A VPS is a VM from a smaller provider. The team owns OS updates, firewall, SSH keys, backups, monitoring, and process supervision ([Deployment on a VPS](/fullstack/deployment/vps)).
+- **Bare metal** (dedicated servers) removes the hypervisor: predictable performance, no noisy neighbours, often cheaper at steady high load, slower to provision.
+
+---
+
+## Containers
+
+A container is an ordinary Linux process isolated with kernel **namespaces** (its own view of the filesystem, process IDs, network, users) and limited with **cgroups** (CPU, memory, I/O). It shares the host kernel, so it starts in milliseconds and adds almost no overhead, but the isolation boundary is weaker than a VM's. Multi-tenant platforms that run untrusted code wrap containers in lightweight VMs (Firecracker microVMs in AWS Lambda and Fargate) or user-space kernels (gVisor in Cloud Run).
+
+An **image** packages the app and its userland dependencies, which makes it portable between a laptop, CI, a VPS, a PaaS, and Kubernetes. Details: [Containers](/fullstack/containers).
+
+---
+
+## Platforms as a service
+
+A PaaS (Render, Railway, Fly.io, Heroku, Cloud Run, App Runner) builds code or an image, runs it as one or more long-lived processes behind a managed load balancer, provides TLS, logs, deploys, and rollbacks, and usually scales on CPU, memory, or request concurrency.
+
+The contract a PaaS expects is the [twelve-factor](https://12factor.net/) model: stateless processes, config in environment variables, logs to stdout, a port to bind, fast startup, and graceful shutdown on `SIGTERM`. Apps that store files on local disk or keep sessions in memory break when the platform restarts or scales them.
+
+---
+
+## Serverless functions and cold starts
+
+A function platform (AWS Lambda, Google Cloud Run functions, Azure Functions, Vercel Functions) runs code per event, scales from zero to many instances automatically, and bills per request and execution time.
+
+<Mermaid
+  chart={`
+sequenceDiagram
+    participant U as Request
+    participant P as Platform router
+    participant W as Warm instance
+    participant N as New instance
+    U->>P: request 1
+    P->>N: no warm instance: create sandbox, download code, start runtime, run init code
+    Note over N: cold start (~100 ms to several seconds)
+    N-->>U: response
+    U->>P: request 2 (shortly after)
+    P->>W: reuse warm instance
+    W-->>U: response (fast)
+`}
+/>
+
+How it works:
+
+- Each instance usually handles **one request at a time** (Lambda's classic model), so 100 concurrent requests need 100 instances. Cloud Run and some newer platforms allow concurrency within an instance.
+- **Cold start** = provisioning a sandbox + loading code + starting the runtime + running module-level initialisation. It grows with package size, heavy imports, and runtimes with slow startup (JVM). Code outside the handler runs once per instance and is reused, which is where DB clients belong.
+- Instances are frozen between requests and reclaimed after minutes of idleness. Background work after the response may never run unless the platform provides a hook (`waitUntil`).
+
+Consequences:
+
+| Issue                      | Why                                                                                              | Response                                                                                             |
+| :------------------------- | :----------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------- |
+| Database connection storms | Every instance opens its own connections; 500 instances × pool of 5 exceeds most database limits | Server-side poolers (PgBouncer, RDS Proxy), HTTP-based database drivers, pool size of 1 per instance |
+| Latency spikes             | Cold starts on traffic bursts or after idle periods                                              | Smaller bundles, lazy imports, provisioned/minimum instances                                         |
+| Time limits                | Executions are capped (Lambda: 15 minutes)                                                       | Long work goes to queues and workers                                                                 |
+| No long-lived connections  | Instances are not durable                                                                        | Managed WebSocket services, separate real-time servers                                               |
+| Cost at steady high load   | Per-request pricing exceeds always-on servers above some utilisation                             | Move steady workloads to containers                                                                  |
+
+---
+
+## Edge runtimes and isolates
+
+Edge platforms (Cloudflare Workers, Vercel Edge Functions, Deno Deploy, Fastly Compute) run code in hundreds of PoPs close to users.
+
+Instead of a container or VM per instance, many use **V8 isolates**: separate JavaScript heaps inside one engine process, the same mechanism that isolates browser tabs. Creating an isolate takes a few milliseconds rather than the hundreds needed for a container, so cold starts are nearly invisible, and thousands of tenants share one process. Fastly Compute uses WebAssembly sandboxes for a similar effect.
+
+Trade-offs:
+
+- Web-standard APIs (`fetch`, `Request`, `Response`, Web Crypto, streams) rather than full Node.js; native modules and some npm packages do not work.
+- Tight CPU-time limits per request.
+- **Data gravity**: an edge function in Singapore that queries a database in Virginia pays the intercontinental round trip on every query, often making it slower than a server next to the database. Edge compute shines for work that needs no central data (redirects, auth token checks, A/B assignment, personalising cached HTML) or when data is replicated to the edge (edge KV stores, read replicas, Durable Objects, replicated SQLite).
+
+---
+
+## Static hosting and CDNs
+
+Static hosting serves prebuilt files (HTML, CSS, JS, images) from object storage behind a CDN. There is no server code to crash, scale, or patch; pages generated at build time ([SSG](/fullstack/rendering/rendering-strategies)) fit naturally.
+
+A CDN is a network of caching reverse proxies:
+
+1. DNS (often anycast or GeoDNS) routes the user to a nearby PoP.
+2. On a **hit**, the PoP serves the response from its cache in a few milliseconds.
+3. On a **miss**, it fetches from the **origin** (sometimes through a regional "shield" tier to reduce origin load), stores the response according to `Cache-Control`, and serves it.
+
+CDNs also terminate TLS close to users (saving handshake round trips to a distant origin), keep warm connections to the origin, compress responses, absorb DDoS traffic, and increasingly run edge code. What they may cache is controlled by HTTP caching headers ([HTTP Caching](/fullstack/performance/http-caching)).
+
+---
+
+## Choosing
+
+| Workload                                                | Good fit                                               |
+| :------------------------------------------------------ | :----------------------------------------------------- |
+| Marketing site, docs, blog                              | Static hosting + CDN                                   |
+| Typical web app or API, small team                      | PaaS or managed containers (Cloud Run, Render, Fly.io) |
+| Spiky, event-driven glue (webhooks, image thumbnails)   | Serverless functions                                   |
+| Latency-critical logic that needs no central database   | Edge runtime                                           |
+| Steady, heavy load with cost pressure                   | VMs or bare metal, often with containers               |
+| Long-lived connections (WebSockets), background workers | Long-running processes: VMs, containers, PaaS workers  |
+| Many services and teams                                 | Kubernetes or a managed container platform             |
+
+<Callout type="info">
+  Containers keep the decision reversible: the same image runs on a VPS, a PaaS, Cloud Run, or
+  Kubernetes. Choosing a hosting model is rarely permanent if the app follows twelve-factor rules.
+</Callout>
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is the difference between a VM and a container?">
+    A VM virtualises hardware and runs its own kernel, giving strong isolation at the cost of
+    heavier startup and memory. A container is an isolated process sharing the host kernel via
+    namespaces and cgroups: lighter and faster, with a weaker isolation boundary.
+  </Accordion>
+  <Accordion title="What causes a serverless cold start and how can it be reduced?">
+    Creating a new sandbox, loading the code, starting the runtime, and running initialisation.
+    Reduce bundle size and heavy imports, initialise lazily, use faster runtimes, or keep
+    provisioned or minimum instances warm.
+  </Accordion>
+  <Accordion title="Why can an edge function be slower than a regional server?">
+    If it must query a central database, every query crosses the long distance between the edge
+    location and the database. Compute moved close to users while data stayed far away.
+  </Accordion>
+</Accordions>

@@ -1,0 +1,88 @@
+---
+title: PostgreSQL
+description: PostgreSQL's process architecture, MVCC and VACUUM, notable data types, JSONB, full-text search, extensions such as pgvector and PostGIS, roles, managed and serverless options, and day-to-day commands.
+---
+
+PostgreSQL has become the default relational database because it rarely forces a second system early: it handles relational data, JSON documents, full-text search, geospatial queries, queues (`SKIP LOCKED`), and vector search in one place.
+
+---
+
+## The plain-language version
+
+PostgreSQL runs one OS process per connection, keeps hot data in **shared buffers**, writes every change to the **WAL** (write-ahead log) before data files, and keeps old row versions around for concurrent readers (**MVCC**), cleaning them up with **VACUUM**.
+
+| Word                    | Plain meaning                                                                      |
+| :---------------------- | :--------------------------------------------------------------------------------- |
+| **WAL**                 | Write-ahead log: sequential record of changes, for crash recovery and replication. |
+| **MVCC**                | Readers see a consistent snapshot; updates write new row versions.                 |
+| **dead tuple**          | An old row version no transaction needs anymore.                                   |
+| **VACUUM / autovacuum** | Reclaims dead tuples and updates statistics.                                       |
+| **bloat**               | Space wasted by dead tuples not yet reclaimed.                                     |
+| **extension**           | Add-on installed with `CREATE EXTENSION`.                                          |
+
+---
+
+## Architecture in brief
+
+- Process per connection, which is why connection counts matter and [PgBouncer](/fullstack/scaling-databases/replicas-and-pooling) exists.
+- Updates do not overwrite in place; they create new versions. Long-running transactions stop vacuum from cleaning up, causing bloat.
+- Streaming replication ships WAL to replicas; logical replication sends row changes per table (used for upgrades and change data capture).
+
+---
+
+## Features worth knowing
+
+| Feature                                                 | Example                                                                                 |
+| :------------------------------------------------------ | :-------------------------------------------------------------------------------------- |
+| `jsonb` with GIN indexes                                | `WHERE attrs @> '{"color":"red"}'`                                                      |
+| Arrays, ranges, enums, `uuid`, `inet`                   | `tstzrange` with exclusion constraints prevents overlapping bookings                    |
+| Generated columns                                       | `total numeric GENERATED ALWAYS AS (qty * price) STORED`                                |
+| Full-text search                                        | `to_tsvector`, `websearch_to_tsquery`; see [Search](/fullstack/search/full-text-search) |
+| CTEs, window functions, `LATERAL`, `RETURNING`, `MERGE` | Rich SQL                                                                                |
+| `LISTEN` / `NOTIFY`                                     | Lightweight pub/sub                                                                     |
+| `SELECT ... FOR UPDATE SKIP LOCKED`                     | Job queues in Postgres (pg-boss, Graphile Worker, Procrastinate)                        |
+| Row-level security                                      | Multi-tenant isolation                                                                  |
+| Partitioning                                            | Declarative range/list/hash partitions                                                  |
+
+### Extensions
+
+| Extension            | Adds                                 |
+| :------------------- | :----------------------------------- |
+| `pg_stat_statements` | Query statistics                     |
+| `pgvector`           | Vector similarity search for RAG     |
+| `PostGIS`            | Geospatial types and queries         |
+| `pg_trgm`            | Fuzzy matching, `LIKE '%x%'` indexes |
+| `TimescaleDB`        | Time-series hypertables              |
+| `pg_cron`            | Scheduled jobs inside the database   |
+| `citus`              | Distributed tables (sharding)        |
+
+---
+
+## Hosting
+
+Managed: Amazon RDS / Aurora, Google Cloud SQL / AlloyDB, Azure Database for PostgreSQL. Developer-focused and serverless: Neon (branching, scale to zero), Supabase (Postgres plus auth, storage, APIs), Crunchy Bridge, Xata. Local: Docker `postgres:17` image.
+
+---
+
+## Everyday commands
+
+```bash
+psql "postgres://app:secret@localhost:5432/shop"
+```
+
+```sql
+\dt                        -- list tables
+\d orders                  -- describe table
+\x                         -- expanded output
+SELECT pid, state, now() - query_start AS runtime, query
+FROM pg_stat_activity WHERE state <> 'idle' ORDER BY runtime DESC;   -- what is running
+SELECT pg_cancel_backend(12345);                                      -- cancel a query
+SELECT pg_size_pretty(pg_total_relation_size('orders'));              -- table size
+```
+
+```bash
+pg_dump -Fc shop > shop.dump      # logical backup
+pg_restore -d shop_copy shop.dump
+```
+
+Major upgrades: `pg_upgrade` or logical replication to a new cluster for near-zero downtime.

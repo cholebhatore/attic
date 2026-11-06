@@ -1,0 +1,82 @@
+---
+title: Migrations and ORMs
+description: Versioned schema migrations, migration tools, zero-downtime changes with expand and contract, locking pitfalls, ORMs vs query builders vs raw SQL, the N+1 query problem and its fixes, and ORM pitfalls.
+---
+
+A deploy adds `NOT NULL` to a column on a 200-million-row table. The migration takes an exclusive lock, every query on the table waits, and the site is down for 40 minutes. Separately, a page lists 50 orders and issues 51 queries because each order lazily loads its customer. Migrations and ORMs are where application code most often hurts the database.
+
+---
+
+## Migrations
+
+A **migration** is a versioned, ordered script that changes the schema (and sometimes data). The database records which have run, so every environment reaches the same schema the same way.
+
+| Ecosystem        | Tools                                                     |
+| :--------------- | :-------------------------------------------------------- |
+| Node / TS        | Prisma Migrate, Drizzle Kit, Knex, node-pg-migrate, Atlas |
+| Python           | Alembic (SQLAlchemy), Django migrations                   |
+| Language-neutral | Flyway, Liquibase, Atlas, sqitch                          |
+
+Rules: migrations are committed with the code, never edited after they run in a shared environment, reviewed like code, and run as a deploy step (once), not by every app replica at startup.
+
+### Zero-downtime changes: expand and contract
+
+During a rolling deploy, old and new app versions run together, so every schema change must work with both.
+
+| Change                | Safe sequence                                                                                                                                    |
+| :-------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rename column         | Add new column → write to both → backfill → read from new → stop writing old → drop old                                                          |
+| Add `NOT NULL` column | Add nullable (or with a default, which is instant in modern Postgres) → backfill in batches → add constraint `NOT VALID` → `VALIDATE CONSTRAINT` |
+| Add index             | `CREATE INDEX CONCURRENTLY`                                                                                                                      |
+| Add foreign key       | `ADD CONSTRAINT ... NOT VALID`, then `VALIDATE`                                                                                                  |
+| Drop column           | Stop using it in code first, deploy, then drop                                                                                                   |
+
+Set `lock_timeout` (for example `5s`) in migrations so a blocked `ALTER TABLE` fails instead of queuing every other query behind it. Linters such as Squawk catch dangerous migrations in CI.
+
+---
+
+## ORMs, query builders, raw SQL
+
+|          | ORM                                         | Query builder                          | Raw SQL                                   |
+| :------- | :------------------------------------------ | :------------------------------------- | :---------------------------------------- |
+| Examples | Prisma, TypeORM, SQLAlchemy ORM, Django ORM | Drizzle, Kysely, Knex, SQLAlchemy Core | `pg`, `postgres.js`, `psycopg`, `asyncpg` |
+| Gives    | Objects, relations, change tracking         | Typed SQL composition                  | Full control                              |
+| Risk     | Hidden queries, N+1, over-fetching          | Little abstraction overhead            | Manual mapping, injection if done wrong   |
+
+Many teams mix: ORM for CRUD, SQL for reports. Typed SQL tools (sqlc, PgTyped) generate types from hand-written queries.
+
+---
+
+## The N+1 problem
+
+```ts
+const orders = await prisma.order.findMany({ take: 50 }); // 1 query
+for (const o of orders) {
+  o.customer = await prisma.customer.findUnique({ where: { id: o.customerId } }); // +50 queries
+}
+```
+
+Each query is fast, but 51 round trips at a few milliseconds each add up, and under load they exhaust the connection pool.
+
+Fixes:
+
+| Fix                          | Example                                                                       |
+| :--------------------------- | :---------------------------------------------------------------------------- |
+| Eager load with a join       | Prisma `include: { customer: true }`, Drizzle `with`, Django `select_related` |
+| Batch load in a second query | SQLAlchemy `selectinload`, Django `prefetch_related`: `WHERE id IN (...)`     |
+| DataLoader                   | Batch per request in GraphQL resolvers                                        |
+| Write the join               | One SQL query returning exactly the needed columns                            |
+
+Detect it: log query counts per request in development, use APM traces (a "staircase" of identical queries), or tools such as nplusone (Django) and Prisma query logging. Async SQLAlchemy raises on lazy loads, which surfaces N+1 early.
+
+---
+
+## Other ORM pitfalls
+
+- `SELECT *` by default: select needed fields for large tables.
+- Loading thousands of objects to count or sum: aggregate in SQL.
+- Implicit transactions and autoflush surprises.
+- Mass assignment: binding request bodies directly to models lets users set `role` or `owner_id`.
+- Migrations generated from models without review.
+
+Python specifics: [FastAPI with a Database](/fullstack/python-backend/fastapi-with-database). Deeper theory: [Databases](/db).

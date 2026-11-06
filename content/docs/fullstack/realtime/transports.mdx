@@ -1,0 +1,138 @@
+---
+title: Transports
+description: Short polling, long polling, Server-Sent Events with automatic reconnection, WebSockets and the upgrade handshake, WebRTC for peer-to-peer media and data, WebTransport, and a comparison table for choosing.
+---
+
+A live order-status page polls every two seconds: 30 requests a minute per open tab, almost all returning "no change". A single SSE connection would deliver the three status updates the order actually goes through. Matching the transport to the traffic pattern saves servers and battery.
+
+---
+
+## Polling and long polling
+
+```ts
+// Short polling: simple, wasteful, delayed by up to the interval
+setInterval(async () => render(await (await fetch('/api/orders/981')).json()), 5000);
+```
+
+**Long polling**: the server holds the request open until there is news (or a timeout around 30 seconds), then the client immediately asks again. Near real-time over plain HTTP; each message costs a full request.
+
+---
+
+## Server-Sent Events (SSE)
+
+One-way, server to client, over a normal HTTP response with `Content-Type: text/event-stream`.
+
+```text
+event: status
+id: 42
+data: {"orderId":981,"status":"shipped"}
+
+```
+
+<Tabs items={['Express', 'FastAPI', 'Browser']}>
+<Tab value="Express">
+
+```ts
+app.get('/api/orders/:id/events', (req, res) => {
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+  const unsubscribe = orderEvents.on(req.params.id, (e) =>
+    res.write(`id: ${e.id}\ndata: ${JSON.stringify(e)}\n\n`),
+  );
+  const ping = setInterval(() => res.write(': ping\n\n'), 15000); // keep proxies from closing it
+  req.on('close', () => {
+    clearInterval(ping);
+    unsubscribe();
+  });
+});
+```
+
+</Tab>
+<Tab value="FastAPI">
+
+```python
+from sse_starlette.sse import EventSourceResponse
+
+@app.get("/api/orders/{order_id}/events")
+async def order_events(order_id: int, request: Request):
+    async def stream():
+        async for event in subscribe(order_id):
+            if await request.is_disconnected():
+                break
+            yield {"event": "status", "id": str(event.id), "data": event.model_dump_json()}
+    return EventSourceResponse(stream(), ping=15)
+```
+
+</Tab>
+<Tab value="Browser">
+
+```ts
+const es = new EventSource('/api/orders/981/events', { withCredentials: true });
+es.addEventListener('status', (e) => render(JSON.parse(e.data)));
+// reconnects automatically and sends Last-Event-ID so the server can resume
+```
+
+</Tab>
+</Tabs>
+
+SSE is the natural fit for notifications, live feeds, progress, and **LLM token streaming**. Over HTTP/1.1 browsers limit a domain to about six connections, which HTTP/2 removes. `EventSource` cannot set custom headers; use cookies, or `fetch` with a streaming reader for `POST` and headers.
+
+---
+
+## WebSockets
+
+Full-duplex messages over one long-lived TCP connection, started with an HTTP upgrade:
+
+```http
+GET /ws HTTP/1.1
+Upgrade: websocket
+Connection: Upgrade
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+
+HTTP/1.1 101 Switching Protocols
+```
+
+```ts
+// server (ws library)
+import { WebSocketServer } from 'ws';
+const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+wss.on('connection', (socket, req) => {
+  socket.on('message', (raw) => {
+    const msg = JSON.parse(raw.toString());
+    for (const client of wss.clients)
+      client.send(JSON.stringify({ room: msg.room, text: msg.text }));
+  });
+});
+
+// browser
+const ws = new WebSocket('wss://chat.example.com/ws');
+ws.onmessage = (e) => addMessage(JSON.parse(e.data));
+ws.send(JSON.stringify({ room: 'general', text: 'hi' }));
+```
+
+No built-in reconnection, rooms, or acknowledgements: libraries such as **Socket.IO** add those (plus fallbacks). Python: FastAPI/Starlette `WebSocket`, Django Channels.
+
+---
+
+## WebRTC
+
+Peer-to-peer audio, video, and data channels between browsers, encrypted end to end. Peers exchange connection details through a **signalling** server (often WebSockets), discover routes with **STUN**, and fall back to relaying through a **TURN** server when direct connection fails (common behind strict NATs). Group calls usually go through an **SFU** (selective forwarding unit) such as LiveKit, mediasoup, or Janus rather than full mesh.
+
+**WebTransport** (over HTTP/3) offers multiple streams and unreliable datagrams between client and server, useful for games and media; support is still maturing.
+
+---
+
+## Choosing
+
+|                                            | Polling      | Long polling                  | SSE                                | WebSocket                  | WebRTC                  |
+| :----------------------------------------- | :----------- | :---------------------------- | :--------------------------------- | :------------------------- | :---------------------- |
+| Direction                                  | Client pulls | Server → client (per request) | Server → client                    | Both                       | Peer ↔ peer             |
+| Latency                                    | Interval     | Low                           | Low                                | Lowest                     | Lowest                  |
+| Overhead per message                       | Full request | Full request                  | Tiny                               | Tiny                       | Tiny                    |
+| Works with HTTP infra (proxies, auth, CDN) | Yes          | Yes                           | Yes                                | Needs upgrade support      | Separate                |
+| Auto reconnect                             | n/a          | Manual                        | Built in                           | Manual / library           | Manual                  |
+| Best for                                   | Rare updates | Legacy constraints            | Feeds, notifications, AI streaming | Chat, games, collaboration | Calls, media, P2P files |

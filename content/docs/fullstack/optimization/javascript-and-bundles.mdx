@@ -1,0 +1,214 @@
+---
+title: JavaScript and Bundles
+description: Why JavaScript is the most expensive resource byte for byte (download, parse, compile, execute, hydrate, memory), measuring bundles, code splitting by route, component, and interaction, tree shaking and why it fails, dependency choices and duplicates, modern targets and polyfills, compression, caching strategy for chunks, and third-party scripts.
+---
+
+A 300 KB JPEG and a 300 KB JavaScript bundle take the same time to download, but the image is decoded off the main thread in a few milliseconds, while the script must be parsed, compiled, and executed on the main thread before the page responds: on a mid-range phone, possibly a second or more. JavaScript is the most expensive resource on the web byte for byte, and the main lever for both load time and responsiveness.
+
+---
+
+## The plain-language version
+
+**Where this sits:** the first frontend optimization page. [Loading and Network](/fullstack/optimization/loading-and-network) covers other resources; [Runtime and Rendering](/fullstack/optimization/runtime-and-rendering) covers what code does after it loads.
+
+Every kilobyte of JavaScript is paid for several times: downloading it, the engine reading and compiling it, running it, and (for frameworks) re-rendering the page during hydration. The cheapest JavaScript is the code never sent; the next cheapest is code sent only when needed.
+
+Topics, in order:
+
+1. The full cost of JavaScript
+2. Measuring bundles
+3. Code splitting
+4. Tree shaking and why it fails
+5. Dependencies
+6. Targets and polyfills
+7. Compression and chunk caching
+8. Third-party scripts
+
+| Word                                | Plain meaning                                                                                |
+| :---------------------------------- | :------------------------------------------------------------------------------------------- |
+| **bundle / chunk**                  | A JavaScript file produced by the bundler; a chunk is one piece of a split bundle.           |
+| **code splitting**                  | Breaking code into chunks loaded on demand.                                                  |
+| **tree shaking**                    | Removing unused exports during bundling.                                                     |
+| **side effect**                     | Code that runs on import (modifying globals, registering polyfills), which prevents removal. |
+| **polyfill**                        | Code implementing a missing browser feature.                                                 |
+| **compressed vs uncompressed size** | Transfer size (gzip/Brotli) vs size the engine must parse.                                   |
+
+---
+
+## The full cost of JavaScript
+
+| Stage                       | Where                                                   | Cost scales with                                                   |
+| :-------------------------- | :------------------------------------------------------ | :----------------------------------------------------------------- |
+| Download                    | Network                                                 | Compressed size, number of round trips                             |
+| Decompress                  | Network thread                                          | Compressed size                                                    |
+| Parse and compile           | Main thread (partly off-thread for scripts streamed in) | **Uncompressed** size                                              |
+| Execute (module evaluation) | Main thread                                             | What the code does at load: framework boot, store setup, rendering |
+| Hydrate                     | Main thread                                             | Size of the component tree                                         |
+| Memory                      | Heap                                                    | Code, closures, data structures; GC pressure on low-memory devices |
+
+Device spread matters more than network spread. The same JavaScript can take several times longer to parse and execute on a budget Android phone than on a recent laptop, which is why lab tests on developer machines under-report the problem. A useful mental figure from real-world audits: 1 MB of uncompressed JavaScript often costs on the order of a second of main-thread time on mid-range mobile devices.
+
+Compressed size understates parse cost: a 100 KB Brotli bundle may be 400 KB of source to parse.
+
+---
+
+## Measuring bundles
+
+| Tool                                                                                           | Shows                                           |
+| :--------------------------------------------------------------------------------------------- | :---------------------------------------------- |
+| Bundle analyser (`vite-bundle-visualizer`, `@next/bundle-analyzer`, `webpack-bundle-analyzer`) | Treemap of every module in every chunk, by size |
+| `source-map-explorer`                                                                          | Size attribution from source maps               |
+| DevTools Coverage panel                                                                        | Bytes loaded but not executed on a page         |
+| DevTools Performance panel                                                                     | Parse, compile, and evaluation time per script  |
+| Lighthouse "Reduce unused JavaScript", "Minimize main-thread work"                             | Per-script waste and time                       |
+| `size-limit`, bundler budgets                                                                  | CI failure when chunks grow past limits         |
+| bundlephobia.com, pkg-size.dev                                                                 | Cost of a dependency before adding it           |
+
+Track **per-route** initial JavaScript, not total app size: what matters is what a user downloads to see the page in front of them.
+
+---
+
+## Code splitting
+
+Bundlers create a new chunk at every dynamic `import()`.
+
+### By route
+
+Each route loads only its own code plus shared chunks. Frameworks with file-system routing (Next.js, React Router, TanStack Router) do this automatically.
+
+### By component
+
+Heavy components that are not visible initially:
+
+```tsx
+const ChartPanel = lazy(() => import('./ChartPanel')); // charting library loads only here
+
+function Dashboard() {
+  const [showChart, setShowChart] = useState(false);
+  return (
+    <>
+      <button onClick={() => setShowChart(true)}>Show chart</button>
+      {showChart && (
+        <Suspense fallback={<ChartSkeleton />}>
+          <ChartPanel />
+        </Suspense>
+      )}
+    </>
+  );
+}
+```
+
+Good candidates: rich text editors, charts, maps, video players, date pickers with locales, admin-only features, modals, and anything below the fold.
+
+### By interaction
+
+Load code when the user signals intent, not when the page loads:
+
+```ts
+let pdfLib: Promise<typeof import('pdf-lib')> | null = null;
+button.addEventListener('pointerenter', () => {
+  pdfLib ??= import('pdf-lib');
+}); // warm on hover
+button.addEventListener('click', async () => {
+  const { PDFDocument } = await (pdfLib ??= import('pdf-lib')); /* ... */
+});
+```
+
+### Trade-offs
+
+Too many tiny chunks add request overhead and can create **waterfalls** (chunk A loads, then discovers it needs chunk B). Frameworks preload a route's chunks together; for manual splits, `<link rel="modulepreload">` fetches known dependencies in parallel. Split along boundaries that are genuinely optional, not mechanically.
+
+---
+
+## Tree shaking and why it fails
+
+Tree shaking removes exports that nothing imports. It relies on the static structure of ES modules. It fails when:
+
+| Cause                                             | Example                                                                                        | Fix                                                                                      |
+| :------------------------------------------------ | :--------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------- |
+| CommonJS modules                                  | `const _ = require('lodash')`                                                                  | Use ESM builds (`lodash-es`) or per-function imports                                     |
+| Whole-namespace imports used dynamically          | `import * as icons from 'icons'; icons[name]`                                                  | Import specific icons                                                                    |
+| Side effects on import                            | Module patches globals or registers things at top level                                        | Libraries declare `"sideEffects": false` in `package.json`; avoid side-effectful barrels |
+| Barrel files (`index.ts` re-exporting everything) | `import { Button } from '@/components'` pulls in every component's dependencies in some setups | Import from the specific file; configure `optimizePackageImports`                        |
+| Class with unused methods                         | Whole class kept                                                                               | Prefer standalone functions for large APIs                                               |
+| Dev-only code not stripped                        | `if (process.env.NODE_ENV !== 'production')` without replacement                               | Bundler define/replace in production builds                                              |
+
+Verify with the bundle analyser: if a single icon import brings in an entire icon set, tree shaking failed.
+
+---
+
+## Dependencies
+
+- **Duplicates**: two versions of the same library (via different dependents) both ship. `npm ls <pkg>`, `pnpm why`, and the analyser reveal them; dedupe or align versions.
+- **Heavy libraries for light use**: a full date library for one formatting call (use `Intl.DateTimeFormat`), lodash for `debounce` (a 10-line function), moment with all locales, an entire UI kit for one component.
+- **Platform features first**: `fetch`, `Intl`, `structuredClone`, `URL`, `crypto.randomUUID`, CSS for animations and layout, native `dialog` and `details`, `IntersectionObserver` instead of scroll libraries.
+- **Server-only work** stays on the server: markdown rendering, syntax highlighting, data transformation, and validation-heavy logic can run in Server Components or at build time.
+
+---
+
+## Targets and polyfills
+
+Transpiling modern syntax down to ES5 inflates code (classes, async/await, and spread become verbose helpers) and polyfilling everything adds tens of kilobytes. Modern bundlers target browsers that support ES modules by default.
+
+- Set a **browserslist** target that reflects actual users (from analytics), and let the bundler output modern syntax.
+- Polyfill only what is used and missing, ideally conditionally.
+- Avoid polyfill services that ship code based on user-agent sniffing unless needed.
+- Baseline (on MDN and web.dev) indicates which features are safe across current browsers.
+
+---
+
+## Compression and chunk caching
+
+| Technique                                                                        | Effect                                                                                                 |
+| :------------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------- |
+| Minification (Terser, esbuild, SWC, oxc)                                         | Removes whitespace, shortens names, eliminates dead code                                               |
+| Brotli (`br`)                                                                    | Typically 15–25 percent smaller than gzip for JS; precompress static assets at max level at build time |
+| Zstandard (`zstd`)                                                               | Supported by recent Chromium and Firefox; fast at high ratios                                          |
+| Content-hashed file names + `Cache-Control: public, max-age=31536000, immutable` | Returning visitors download nothing unchanged                                                          |
+| Stable chunking                                                                  | Vendor code in separate chunks changes rarely, so app deploys do not invalidate it                     |
+
+Every deploy that changes a shared chunk's hash forces all users to re-download it. Splitting rarely changing dependencies from frequently changing app code keeps cache hit rates high across deploys.
+
+---
+
+## Third-party scripts
+
+Analytics, tag managers, chat widgets, A/B testing tools, ads, and embeds are frequently the largest JavaScript on a page and a leading cause of poor INP, and they are outside the team's code review.
+
+| Practice                                                                                         | Why                                                               |
+| :----------------------------------------------------------------------------------------------- | :---------------------------------------------------------------- |
+| Inventory every third party and its owner; remove what nobody uses                               | Each one costs every visitor                                      |
+| Load with `async`/`defer`, after the page is interactive, or on interaction                      | Keeps them off the critical path                                  |
+| **Facades** for embeds: a static thumbnail that loads the YouTube player or chat widget on click | Saves hundreds of KB until needed                                 |
+| Self-host where licences allow                                                                   | Avoids extra DNS, TCP, and TLS; same cache partition anyway       |
+| Server-side tagging / analytics                                                                  | Moves collection work off the client                              |
+| Partytown (run in a Web Worker)                                                                  | Moves some scripts off the main thread, with compatibility limits |
+| Content-Security-Policy allow-list and Subresource Integrity                                     | Limits what third parties can load and detects tampering          |
+| A/B testing that hides the page until scripts load                                               | Directly delays LCP; prefer server-side experiments               |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why is JavaScript more expensive than an image of the same size?">
+    Both cost download time, but JavaScript must also be parsed, compiled, and executed on the main
+    thread (and often hydrate the page), blocking interactivity. Images are decoded off the main
+    thread.
+  </Accordion>
+  <Accordion title="How can the JavaScript a page ships be reduced?">
+    Measure per route with a bundle analyser, split by route and by heavy optional components, load
+    on interaction, fix tree shaking failures, replace heavy dependencies with platform features,
+    move non-interactive work to the server, target modern browsers, and defer or remove third-party
+    scripts.
+  </Accordion>
+  <Accordion title="Why might tree shaking not remove unused code?">
+    The code is CommonJS, imported dynamically or as a whole namespace, has top-level side effects
+    (or the package does not declare sideEffects false), or is pulled in through barrel files that
+    re-export everything.
+  </Accordion>
+  <Accordion title="Can code splitting make things slower?">
+    Yes. Too many small chunks add request overhead, and chunks discovered sequentially create
+    waterfalls. Preload chunks needed together and split only genuinely optional code.
+  </Accordion>
+</Accordions>
