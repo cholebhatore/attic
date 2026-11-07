@@ -1,0 +1,227 @@
+---
+title: Overfitting and Regularization
+description: 'How to make a network work on data it has never seen: generalization, training, validation and test splits, underfitting and overfitting shown with polynomial fits, the bias-variance trade-off, reading learning curves, why huge networks can still generalize, and the regularization toolkit worked by hand: more data and augmentation, weight decay, L1, dropout, early stopping, and label smoothing.'
+---
+
+The purpose of training is not to do well on the training data. It is to do well on **new** data the model has never seen. That ability is called **generalization**, and its failure, **overfitting**, is when a model learns the training examples so specifically — including their noise and accidents — that it performs worse on anything else. **Regularization** is the collective name for techniques that reduce overfitting, usually by limiting how freely the model can fit the training data.
+
+This page shows overfitting on a small example where every number is visible, explains how to detect it, and then covers each regularization technique and why it works.
+
+**Builds on:** [Gradient Descent](/ai/neural-networks/gradient-descent) and [Loss Functions](/ai/neural-networks/loss-functions).
+
+---
+
+## Training, validation, and test sets
+
+Measuring generalization requires data the model was not trained on. Available labelled data is split three ways:
+
+| Split          | Typical share | Used for                                                          |
+| :------------- | :------------ | :---------------------------------------------------------------- |
+| **Training**   | 70–90%        | Computing gradients and updating weights                          |
+| **Validation** | 5–15%         | Choosing hyperparameters, comparing models, deciding when to stop |
+| **Test**       | 5–15%         | One final, unbiased estimate of performance, used once at the end |
+
+Why three and not two: every decision made by looking at validation results — this learning rate, that architecture, stop at epoch 40 — fits the model a little to the validation set. After dozens of such decisions, validation performance is optimistic. The test set, never consulted during development, gives an honest final number. Using it to make decisions turns it into a second validation set.
+
+The splits must be **independent**. Duplicate or near-duplicate examples across splits, the same patient's scans in both training and test, or (for time series) future data in the training set, all **leak** information and inflate results.
+
+---
+
+## Underfitting and overfitting, shown
+
+Twelve training points sampled from $y = \sin(2\pi x)$ plus noise, fitted with polynomials of increasing degree. Error is mean squared error, measured on the 12 training points and on 200 fresh validation points from the same distribution:
+
+| Polynomial degree | Parameters | Training error | Validation error | Largest coefficient | Diagnosis          |
+| ----------------: | ---------: | -------------: | ---------------: | ------------------: | :----------------- |
+|                 1 |          2 |          0.142 |            0.415 |                 0.8 | Underfitting       |
+|                 3 |          4 |          0.017 |            0.061 |                31.4 | Good fit           |
+|                 9 |         10 |          0.004 |            0.880 |             302,344 | Overfitting        |
+|                11 |         12 |          0.000 |            8,839 |         744 million | Severe overfitting |
+
+- **Underfitting (degree 1).** A straight line cannot represent a sine wave. Training and validation error are both high. The model is too simple: more training will not help; more capacity will.
+- **Good fit (degree 3).** Both errors are low and close together.
+- **Overfitting (degrees 9 and 11).** Training error keeps falling — degree 11, with as many parameters as data points, passes exactly through every point — while validation error explodes. The curve swings wildly between the points to hit each one, including its noise. Note the coefficients: overfitted models fit by using **huge, finely balanced weights**, a clue that the next section exploits.
+
+The signature of overfitting is the **gap**: training error much lower than validation error.
+
+### Bias and variance
+
+The two failure modes have names. A model's expected error on new data decomposes into three parts:
+
+$$
+\text{expected error} = \text{bias}^2 + \text{variance} + \text{irreducible noise}
+$$
+
+- **Bias** is error from wrong assumptions: the straight line is systematically wrong, however much data it gets.
+- **Variance** is error from sensitivity to the particular training sample: retrain degree 9 on twelve different points and it produces a completely different curve.
+- **Noise** is randomness in the labels that no model can predict.
+
+Simple models have high bias and low variance; complex models have low bias and high variance. Regularization reduces variance, at the cost of a little bias.
+
+---
+
+## Reading learning curves
+
+Plot training and validation loss against training steps. The shapes diagnose the problem:
+
+| What the curves show                                 | Diagnosis                                 | What to do                                                                     |
+| :--------------------------------------------------- | :---------------------------------------- | :----------------------------------------------------------------------------- |
+| Both high and flat                                   | Underfitting                              | Bigger model, train longer, lower regularization, check the learning rate      |
+| Both falling, close together                         | Still learning                            | Keep training                                                                  |
+| Training falling, validation falling then **rising** | Overfitting begins where validation turns | Regularize, get more data, or stop at the turning point                        |
+| Training far below validation from the start         | Large variance, or a data problem         | Regularize; check for distribution differences between splits                  |
+| Validation **below** training                        | Usually regularization at work            | Dropout and augmentation are active during training but not validation; normal |
+
+---
+
+## Why huge networks still generalize
+
+Classical intuition says a model with more parameters than training examples will overfit. Modern networks routinely have far more parameters than examples and generalize well anyway. Zhang et al. (2017) showed the puzzle sharply: standard CNNs reach zero training error even on CIFAR-10 with **randomly shuffled labels**, so they have the capacity to memorize anything — yet on real labels, the same networks generalize.
+
+Part of the explanation is that gradient descent itself acts as a regularizer. Started from small random weights and taking small steps, it tends to find simple, smooth solutions among the many that fit the data, and mini-batch noise favours flat minima. Belkin et al. (2019) documented **double descent**: as model size grows past the point where it can exactly fit the training data, test error first rises (the classical overfitting peak) and then falls again. In practice, deep learning favours a large model plus regularization over a small model, and the techniques below are what make the large model generalize.
+
+---
+
+## The regularization toolkit
+
+### More data and data augmentation
+
+The most effective regularizer is more training data: the more examples, the harder it is to memorize them all, and the more the true pattern dominates the noise. When real data is limited, **data augmentation** creates new examples by applying label-preserving transformations — flips, crops, colour changes for images; synonym replacement or back-translation for text. Each transformation teaches an invariance the model should have. [CNN Architectures](/ai/classical-deep-learning/vision-architectures#data-augmentation) covers image augmentation.
+
+### Weight decay (L2 regularization)
+
+The overfitted polynomials used enormous coefficients. **L2 regularization** discourages large weights by adding their squared size to the loss:
+
+$$
+L_{\text{total}} = L_{\text{data}} + \frac{\lambda}{2}\sum_j w_j^2
+$$
+
+The extra gradient is $\lambda w$, so each gradient descent step becomes:
+
+$$
+w \leftarrow w - \eta\,(\nabla L_{\text{data}} + \lambda w) = (1 - \eta\lambda)\,w - \eta\,\nabla L_{\text{data}}
+$$
+
+Every step first **shrinks** each weight by the factor $1 - \eta\lambda$, hence the name **weight decay**. With $\eta = 0.1$ and $\lambda = 0.01$, the factor is 0.999; after 1,000 steps with no data gradient pushing back, a weight retains $0.999^{1000} = 37\%$ of its value. Only weights that the data consistently needs survive.
+
+Applied to the degree-9 polynomial with increasing $\lambda$:
+
+| $\lambda$ | Training error | Validation error | Largest coefficient |
+| --------: | -------------: | ---------------: | ------------------: |
+|         0 |          0.004 |            0.880 |             302,445 |
+| $10^{-4}$ |          0.016 |            0.063 |                19.5 |
+| $10^{-2}$ |          0.066 |            0.210 |                 3.0 |
+|         1 |          0.140 |            0.419 |                 0.3 |
+
+A tiny penalty, $10^{-4}$, cuts validation error by 14× — matching the well-chosen degree-3 model — while keeping all ten parameters. Too much penalty ($\lambda = 1$) forces the weights toward zero and the model underfits, back to the straight-line error. $\lambda$ is a hyperparameter tuned on validation data; typical values are $10^{-4}$ to $5 \times 10^{-4}$ for CNNs trained with SGD and about 0.1 for transformers trained with AdamW. With Adam, weight decay must be decoupled from the gradient, as [Optimizers](/ai/neural-networks/optimizers#weight-decay-and-why-adamw-exists) explains.
+
+### L1 regularization
+
+**L1 regularization** penalizes the absolute value, $\lambda\sum_j \lvert w_j \rvert$. Its gradient is a constant $\pm\lambda$ regardless of the weight's size, so it pushes small weights all the way to exactly zero, producing **sparse** models in which many weights are zero. It is common in linear models for feature selection and rare in deep networks.
+
+### Dropout
+
+**Dropout** (Srivastava et al., 2014) randomly sets each activation in a layer to zero with probability $p$ on every training step. A layer of 4 activations $[2.0, 1.0, 3.0, 0.5]$ with $p = 0.5$ might become $[0, 1.0, 3.0, 0]$ on one step and $[2.0, 0, 0, 0.5]$ on the next.
+
+**Scaling.** Zeroing half the activations halves the expected input to the next layer. To keep the scale consistent, the surviving activations are multiplied by $1/(1 - p)$ during training — **inverted dropout** — so the example step gives $[0, 2.0, 6.0, 0]$. Its expected value equals the original activation. At evaluation, dropout is switched off and nothing is scaled. This is another reason `model.eval()` matters.
+
+**Why it works.**
+
+- **No co-adaptation.** Since any unit can vanish, no unit can rely on a specific partner being present. Each must learn features that are useful on their own, which makes the representation more robust and redundant.
+- **An implicit ensemble.** Each step trains a different random sub-network, and they all share weights. A network with $n$ droppable units contains $2^n$ sub-networks; evaluating without dropout approximately averages all of them, and [ensembles](/ai/classical-deep-learning/transfer-and-ensembles#ensembles) generalize better than individual models.
+
+Typical rates: 0.5 in the large dense layers of older CNNs such as AlexNet and VGG, 0.1 in transformers, and often 0 in large language model pretraining, where the huge dataset makes overfitting less of a concern. Dropout is used less in convolutional layers, where neighbouring activations are strongly correlated and dropping single values removes little information.
+
+### Early stopping
+
+Validation error usually falls, bottoms out, and then rises as the network begins to overfit. **Early stopping** evaluates validation loss periodically, saves a checkpoint whenever it improves, and stops when it has not improved for a set number of evaluations (the **patience**), then restores the best checkpoint. It is nearly free and limits how far the weights can travel from their small initial values, an effect similar to weight decay.
+
+### Label smoothing
+
+Cross-entropy with one-hot targets keeps rewarding the model for pushing the correct class's probability ever closer to 1, which requires ever larger logits and produces overconfident models. **Label smoothing** (Szegedy et al., 2016) replaces the one-hot target with a softened one: with smoothing $\epsilon$ and $C$ classes, the correct class gets $1 - \epsilon + \epsilon/C$ and every other class gets $\epsilon/C$. With $\epsilon = 0.1$ and 10 classes, the target becomes 0.91 for the correct class and 0.01 for each other. The model can no longer reduce the loss by growing its logits without bound, which improves calibration and often accuracy. In PyTorch: `nn.CrossEntropyLoss(label_smoothing=0.1)`.
+
+### Other regularizers
+
+- **Smaller models** reduce capacity directly, though in deep learning a larger regularized model usually wins.
+- **Batch normalization** adds noise, because each example's normalization depends on random batch-mates, which regularizes mildly.
+- **Mixup and CutMix** blend pairs of training examples and their labels.
+- **Stochastic depth** randomly skips entire residual blocks during training, as used in deep vision transformers.
+
+---
+
+## Choosing regularization
+
+| Situation                       | Start with                                                                                                                    |
+| :------------------------------ | :---------------------------------------------------------------------------------------------------------------------------- |
+| Underfitting (both errors high) | Remove or reduce regularization; increase model size or training time                                                         |
+| Image models                    | Data augmentation + weight decay; label smoothing for classification                                                          |
+| Transformers                    | AdamW weight decay ≈ 0.1; dropout ≈ 0.1; more data where possible                                                             |
+| Small dataset, any model        | Augmentation, a pretrained backbone ([transfer learning](/ai/classical-deep-learning/transfer-and-ensembles)), early stopping |
+| Large dense layers              | Dropout 0.3–0.5                                                                                                               |
+
+Regularization should follow diagnosis: first get the model to fit the training data well (it is easier to regularize a model that fits than to fix one that underfits), then add regularization until the validation gap closes.
+
+---
+
+## Key terms
+
+| Term                           | Meaning                                                                                     |
+| :----------------------------- | :------------------------------------------------------------------------------------------ |
+| **generalization**             | Performing well on data not seen during training                                            |
+| **overfitting / underfitting** | Fitting training data's noise so validation suffers / failing to fit even the training data |
+| **validation set**             | Held-out data used for decisions during development                                         |
+| **test set**                   | Held-out data used once for a final unbiased estimate                                       |
+| **data leakage**               | Information from validation or test data reaching training                                  |
+| **bias / variance**            | Error from wrong assumptions / from sensitivity to the specific training sample             |
+| **regularization**             | Any technique that reduces overfitting                                                      |
+| **weight decay (L2)**          | Penalizing squared weights, equivalent to shrinking them each step                          |
+| **dropout**                    | Randomly zeroing activations during training, with rescaling by $1/(1-p)$                   |
+| **early stopping**             | Stopping when validation loss stops improving and keeping the best checkpoint               |
+| **label smoothing**            | Replacing one-hot targets with slightly softened distributions                              |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why are separate validation and test sets needed?">
+
+    Every hyperparameter and architecture choice made by looking at validation results fits the model slightly to the validation set, so after many choices validation performance is optimistic. A test set consulted only once at the end gives an unbiased estimate. Using it for decisions makes it a second validation set.
+
+  </Accordion>
+  <Accordion title="How do overfitting and underfitting show up in training and validation error?">
+
+    Underfitting: both errors high and similar; the model cannot represent the pattern. Overfitting: training error low, validation error much higher, often rising while training error keeps falling. In the polynomial example, degree 1 had errors of 0.14 and 0.42, while degree 9 had 0.004 and 0.88.
+
+  </Accordion>
+  <Accordion title="Explain the bias-variance trade-off.">
+
+    Expected error on new data equals bias squared plus variance plus irreducible noise. Bias comes from a model too simple to represent the true function; variance comes from a model so flexible that it changes greatly with the particular training sample. Increasing capacity lowers bias and raises variance; regularization reduces variance at the cost of some bias.
+
+  </Accordion>
+  <Accordion title="Why is L2 regularization called weight decay?">
+
+    Adding $\frac{\lambda}{2}\lVert\mathbf{w}\rVert^2$ to the loss adds $\lambda\mathbf{w}$ to the gradient, so the update becomes $\mathbf{w} \leftarrow (1 - \eta\lambda)\mathbf{w} - \eta\nabla L$. Each step multiplies every weight by $1 - \eta\lambda$ before applying the data gradient, a constant exponential decay that only the data's consistent gradients counteract.
+
+  </Accordion>
+  <Accordion title="How does dropout work, and why are activations scaled by 1/(1 − p)?">
+
+    During training, each activation is zeroed with probability $p$, so every step trains a random sub-network and units cannot rely on specific partners. Zeroing reduces the expected input to the next layer by a factor of $1 - p$, so surviving activations are multiplied by $1/(1 - p)$ to keep the expected value unchanged. At evaluation dropout is off and no scaling is applied, approximating an average over all sub-networks.
+
+  </Accordion>
+  <Accordion title="Why can validation loss be lower than training loss?">
+
+    Regularizers such as dropout and data augmentation are active when the training loss is computed but not during validation, so the model is effectively handicapped on training batches. Training loss is also often averaged over an epoch while the weights were still improving. It is not a sign of a bug on its own.
+
+  </Accordion>
+  <Accordion title="What does label smoothing do with ε = 0.1 and 10 classes?">
+
+    It changes the target for the correct class from 1 to $1 - 0.1 + 0.1/10 = 0.91$ and for each other class from 0 to 0.01. The model cannot drive the loss to zero by growing its logits without bound, which reduces overconfidence, improves calibration, and often improves accuracy.
+
+  </Accordion>
+  <Accordion title="Networks with more parameters than training examples generalize well. Why does this not contradict classical overfitting theory?">
+
+    Such networks can memorize even random labels, so capacity alone does not explain generalization. Gradient descent from small initial weights is biased toward simple solutions, mini-batch noise favours flat minima, and explicit regularization and augmentation help further. Empirically, test error can fall again as models grow past the point of exactly fitting the data, the double descent phenomenon.
+
+  </Accordion>
+</Accordions>

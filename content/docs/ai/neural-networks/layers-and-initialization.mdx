@@ -1,635 +1,220 @@
 ---
-title: Layers and Initialization
-description: 'Vectorized dense layers, the variance-propagation derivation, Xavier and He initialization, and what nn.Linear does by default.'
+title: Weight Initialization
+description: 'Why the starting weights decide whether a deep network can train at all: the symmetry problem with equal weights, how one layer scales its input variance, why gains multiply across depth, Xavier and He initialization derived, the forward and backward passes measured over forty layers, what PyTorch nn.Linear actually initializes to, and what to use for each architecture.'
 ---
 
-A dense layer is a matmul plus a bias, and you already know how to write it. The interesting part is the number you multiply the random weights by before training starts. That single scalar decides whether a forty-layer network produces a usable signal or underflows to zero, and it is decided before the first gradient step ever happens.
+**Weight initialization** is the choice of the random values every weight starts from before training. It sounds like a detail, but in a deep network it decides whether training works at all. A network is a long chain of multiplications. If each layer slightly shrinks the signal passing through it, forty layers shrink it to nothing; if each slightly enlarges it, forty layers overflow. Gradients suffer the same fate on the way back. Good initialization sets the scale of the weights so that every layer passes its input on at roughly the same size.
 
-This page derives the two standard answers, shows what PyTorch ships instead, and measures all of them on a real forty-layer stack. The next section is the whole argument in eight numbers and one multiplication; read that first and everything after it is detail.
+This page explains the two things an initialization must get right — breaking symmetry and setting the scale — and derives the two standard answers, **Xavier** and **He** initialization.
 
----
-
-## The plain-language version
-
-A **layer** is many neurons side by side, all reading the same inputs. Written as math it is one matrix multiply plus a bias: `y = x @ W.T + b`. A **dense** (or **fully connected**) layer connects every input to every output.
-
-Before training starts, every weight needs a starting value. This is **initialization**. You cannot start at all zeros: every neuron in a layer would compute the same thing, receive the same gradient, and stay identical forever. So weights start as small random numbers. The hard question is **how small**.
-
-Think of a message passed through forty people, each of whom repeats it slightly louder or slightly quieter. If each one is 10% louder, by the end it is a scream; 10% quieter, a whisper. Each layer does the same to the size of its signal. Initialization picks the random scale so that, on average, each layer passes the signal on at the same size.
-
-| Word                                         | Plain meaning                                                                                                                                                |
-| :------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **dense / fully connected / linear layer**   | Every input connects to every output through its own weight. `nn.Linear` in PyTorch.                                                                         |
-| **initialization**                           | Choosing the weights' starting values before the first training step.                                                                                        |
-| **symmetry breaking**                        | Starting weights differently (randomly) so neurons in the same layer learn different things.                                                                 |
-| **fan-in / fan-out**                         | Fan-in is the number of inputs a neuron reads; fan-out is the number of outputs a layer writes. `fan_in` decides how large a sum of random products gets.    |
-| **mean**                                     | The average value.                                                                                                                                           |
-| **variance / standard deviation**            | Variance is the average squared distance from the mean: how spread out numbers are. Standard deviation is its square root, in the same units as the numbers. |
-| **uniform / normal (Gaussian) distribution** | Two ways to draw random numbers. Uniform: every value in a range equally likely. Normal: the bell curve, values near the mean most likely.                   |
-| **signal propagation**                       | How the size of activations (forward) and gradients (backward) changes as they pass through many layers.                                                     |
-| **vanishing / exploding**                    | The signal shrinks toward zero or grows toward infinity across layers. Either way, training fails.                                                           |
-| **Xavier (Glorot) init**                     | A scale chosen for `tanh`-like activations: variance `2 / (fan_in + fan_out)`.                                                                               |
-| **He (Kaiming) init**                        | A scale chosen for ReLU, which zeroes half its inputs, so it doubles the variance to make up for the loss: variance `2 / fan_in`.                            |
-| **gain**                                     | An extra multiplier on the init scale that depends on the activation function.                                                                               |
+**Builds on:** [Backpropagation](/ai/neural-networks/mlp-from-scratch) and [Neurons and Activations](/ai/neural-networks/neurons-and-activations). Basic facts about **variance**, the average squared distance from the mean, are in [Descriptive Statistics](/ai/math-foundations/descriptive-statistics).
 
 ---
 
-## Start here
+## Requirement 1: break the symmetry
 
-A dense layer multiplies. A deep network is a stack of multiplications. Stack enough of them and the signal either grows out of range or shrinks out of existence, and which one you get is decided by one number you choose before training: how large the random starting weights are.
+Suppose every weight in a hidden layer starts at the same value — zero, or 0.5. Then every hidden neuron computes the same function of the input, produces the same output, and, by the backpropagation rules, receives the same gradient. After the update, all the weights are still equal to each other. They stay equal forever. A layer of 256 identical neurons is no more expressive than a layer of one.
 
-### Eight numbers you can hold in your head
+Starting with all weights at exactly zero is worse still for ReLU networks: every pre-activation is 0, every output is 0, and with weights of 0 above them no gradient flows back at all.
 
-One input row, eight numbers long:
+**Random** initialization breaks the symmetry: each neuron starts at a different point and so learns a different feature. That settles that weights must be random. Biases do not need to be: they are usually initialized to 0, because the random weights already make neurons differ.
 
-```text
-x = [1, 2, 3, 4, -1, -2, -3, -4]
-```
-
-How big is that signal? Square every entry and average: `1, 4, 9, 16, 1, 4, 9, 16` sum to `60`, and `60 / 8 = 7.5`. That `7.5` is the <Tip term="variance">For a list whose mean is zero, the average of the squares: one number standing for "how big are these values, typically". Squaring makes negatives positive, so a list that alternates `4` and `-4` has variance `16`, and one that alternates `0.1` and `-0.1` has variance `0.01`.</Tip> of the input, and "how big, typically" is the only quantity this page is about.
-
-Now push `x` through one layer with <Tip term="fan_in">How many numbers feed into one output unit: the length of one row of `W`, which is how many terms the layer adds up.</Tip> equal to 8 and <Tip term="fan_out">How many output units the layer has, so how many rows `W` has. A gradient flowing backward sums over this many terms.</Tip> equal to 256, at four different weight scales and nothing else changed:
-
-```python title="one_layer_three_scales.py"
-import numpy as np
-
-x = np.array([1., 2., 3., 4., -1., -2., -3., -4.])   # fan_in = 8, mean-square 7.5
-
-for std in (0.1, 0.353553, 0.5, 1.0):
-    rng = np.random.default_rng(0)
-    W = rng.standard_normal((256, 8)) * std           # 256 units, 8 weights each
-    y = x @ W.T                                       # the linear layer
-    z = np.maximum(y, 0.0)                            # ... and the ReLU after it
-    print(f"std={std:.6f}  linear {(y ** 2).mean():8.4f}  relu {(z ** 2).mean():8.4f}")
-```
-
-The prediction rule is one line: `out = fan_in * Var(W) * in`, where `Var(W)` is the variance of the weights and `in` is the mean-square going in, `7.5`. The loop above sets that variance by multiplying standard-normal draws by `std`, the <Tip term="standard deviation">Written `std`, the square root of the variance, so `Var(W) = std^2`. It is in the same units as the numbers themselves, which is why you scale random draws by a `std` and reason about the result with a variance.</Tip>, once per row of the table below.
-
-| weight `std` | `Var(W) = std^2` | gain, linear `8 * Var(W)` | gain, with ReLU, half that | measured out, linear | measured out, with ReLU |
-| :----------- | :--------------- | :------------------------ | :------------------------- | :------------------- | :---------------------- |
-| `0.1`        | `0.01`           | `0.08`                    | `0.04`                     | `0.6061`             | `0.3181`                |
-| `0.353553`   | `0.125`          | `1.0`                     | `0.5`                      | `7.5762`             | `3.9756`                |
-| `0.5`        | `0.25`           | `2.0`                     | `1.0`                      | `15.1523`            | `7.9513`                |
-| `1.0`        | `1.0`            | `8.0`                     | `4.0`                      | `60.6094`            | `31.8052`               |
-
-Check any cell in your head: `0.08 * 7.5 = 0.6`, and the measured `0.6061`; `1.0 * 7.5 = 7.5`, and the measured `7.5762`; `8.0 * 7.5 = 60`, and the measured `60.6094`. The measured linear values are all `1.0102` times their prediction, the same factor in every row, because the code draws those `256` weight rows once and simply rescales them: `std` decides the gain, and the one finite draw decides the shared constant. The ReLU column runs a little further above its prediction, `1.0602` times, for one more reason: in this draw the `49.6%` of units that survived the ReLU carry `52.5%` of the energy instead of the expected `50%`. "Half" is a statement about symmetric distributions, and `256` units drift from it by a few percent.
-
-Four rows, four lessons:
-
-- **`std = 0.1` is "start small", and it is a disaster.** `7.5` going in, `0.6061` coming out: a gain of `0.08`, so this layer keeps eight percent of what it was given. A deep stack charges that discount at every layer.
-- **`std = 0.353553` is `1 / sqrt(fan_in)`.** The gain is exactly `1`: `7.5` in, `7.5762` out. The signal is unchanged. This is the number a stack of plain linear layers needs, and it is Xavier's number for a square layer.
-- **`std = 0.5` is `sqrt(2 / fan_in)`, and it exists because of the ReLU column.** The previous row lost half its mean-square crossing the ReLU (`7.5762` to `3.9756`). This row starts the ReLU with double the variance, so the ReLU's halving lands it back at `7.9513`. That extra factor of two is the entire difference between Xavier and He.
-- **`std = 1.0` is the naive "just use standard normal".** Gain `8` per layer, so forty layers multiply the signal by `8^40`, about `1.3e36`. That is the same explosion the `std = 1.0` row of the forty-layer table measures, except there the gain is `128` per layer because `fan_in` is `256` instead of `8`.
-
-### Why the square root and not something else
-
-A single output unit is a dot product: `fan_in` products added together. Add numbers with random signs and they partly cancel, so the sum grows like `sqrt(n)`, not like `n`. Measured, with `n` terms each drawn from a standard normal, and the root-mean-square of the sum taken over 200000 draws:
-
-```python title="why_sqrt.py"
-import numpy as np
-
-for n in (4, 8, 64, 256):
-    rng = np.random.default_rng(0)
-    terms = rng.standard_normal((200000, n))   # n independent random-signed terms
-    print(f"n={n:4d}  rms of the sum {terms.sum(axis=1).std():7.3f}   sqrt(n) {np.sqrt(n):7.3f}")
-```
-
-| `fan_in` | root-mean-square of the sum | `sqrt(n)` |
-| :------- | :-------------------------- | :-------- |
-| 4        | `2.001`                     | `2.000`   |
-| 8        | `2.823`                     | `2.828`   |
-| 64       | `7.979`                     | `8.000`   |
-| 256      | `15.979`                    | `16.000`  |
-
-So a wider layer produces a larger sum for the same weight size, and it grows as the square root of the width. To hold the output size fixed as `fan_in` grows, each weight has to shrink by the same square root. Read `std = 1 / sqrt(fan_in)` out loud as: **shrink every weight like the square root of how many of them you have to add up.** Widening a layer from `64` to `256` quadruples the inputs and only halves the needed scale.
-
-### What the rest of this page settles
-
-- **What a dense layer is**, and why PyTorch and Keras store the same matrix transposed.
-- **The derivation** the walk above guessed at: where `Var(y) = n * Var(W) * Var(x)` comes from, and why gains multiply across depth.
-- **Xavier and He**, which are just that formula solved once for a linear layer and once for a linear layer plus ReLU.
-- **What `nn.Linear` ships**, which is neither, and the variance it implies.
-- **Measurements** on a forty-layer stack, forward and backward, including the one place where theory is off by 9% and why.
-- **The bounds for a real MLP**, and a short table of what to use where.
+The remaining question is: random with what spread?
 
 ---
 
-## What a dense layer is
+## Requirement 2: get the scale right
 
-For an input batch `X` of shape `(batch, in_features)` and a weight matrix `W` of shape `(out_features, in_features)`:
+### One layer
 
-```text
-Y = X @ W.T + b
-```
+Consider one output of a linear layer with $n$ inputs, $y = \sum_{i=1}^{n} w_i x_i$, where the weights are random with mean 0 and variance $\text{Var}(w)$, independent of the inputs. Variances of independent terms add, so:
 
-Read it as: every output is a dot product between the input row and one row of `W`, plus one number per output unit.
+$$
+\text{Var}(y) = n \cdot \text{Var}(w) \cdot \text{Var}(x)
+$$
 
-The `.T` is a storage convention, not a mathematical necessity. PyTorch stores `W` as `(out_features, in_features)` so that each row is one neuron's weight vector, which makes `W[i]` the weights of output unit `i`. The math wants `(in_features, out_features)` to multiply on the right, hence the transpose. Keras stores it the other way round, which is why converting between the two means transposing every dense kernel.
+$n$, the number of inputs feeding each output, is called the **fan-in**. The factor $n\,\text{Var}(w)$ is the layer's **gain**: how much it multiplies the variance passing through.
 
-| Framework | Stored shape of `W`  | What `W[0]` holds                         | Forward expression |
-| :-------- | :------------------- | :---------------------------------------- | :----------------- |
-| PyTorch   | `(out_features, in)` | one output unit's `in` weights            | `X @ W.T + b`      |
-| Keras     | `(in, out_features)` | one input feature's weights to every unit | `X @ W + b`        |
+This explains why the spread of the weights has to depend on the layer's width. Adding $n$ random-signed numbers gives a sum whose typical size grows like $\sqrt{n}$, because positive and negative terms partly cancel:
 
-```python title="dense.py"
-import numpy as np
+| Number of terms $n$ | Typical size (standard deviation) of the sum of $n$ standard-normal terms | $\sqrt{n}$ |
+| ------------------: | ------------------------------------------------------------------------: | ---------: |
+|                   4 |                                                                      2.00 |       2.00 |
+|                  64 |                                                                      7.98 |       8.00 |
+|                 256 |                                                                     15.98 |      16.00 |
 
-class Dense:
-    def __init__(self, in_features, out_features, std):
-        rng = np.random.default_rng(0)
-        self.W = rng.standard_normal((out_features, in_features)) * std
-        self.b = np.zeros(out_features)
-        self.cache = None
+To keep the output the same size as the input, the gain must be 1, so $\text{Var}(w) = 1/n$: each weight's standard deviation must shrink as $1/\sqrt{n}$. A wider layer needs smaller weights.
 
-    def forward(self, x):
-        self.cache = x
-        return x @ self.W.T + self.b
+**Worked example.** A layer with fan-in 8, input variance 7.5, and 256 outputs:
 
-layer = Dense(784, 256, std=0.0357)
-x = np.random.default_rng(1).standard_normal((32, 784))
-y = layer.forward(x)
+| Weight std              | $\text{Var}(w)$ | Gain $8 \cdot \text{Var}(w)$ | Predicted output variance | Measured |
+| :---------------------- | --------------: | ---------------------------: | ------------------------: | -------: |
+| 0.1 ("start small")     |           0.010 |                         0.08 |                      0.60 |     0.61 |
+| $1/\sqrt{8} = 0.354$    |           0.125 |                         1.00 |                      7.50 |     7.58 |
+| 1.0 ("standard normal") |           1.000 |                         8.00 |                     60.00 |    60.61 |
 
-print(y.shape)                  # (32, 256)
-print(layer.W.shape)            # (256, 784)
-print(layer.W.size)             # 200704
-```
+Only $1/\sqrt{\text{fan-in}}$ leaves the signal's size unchanged.
 
-Those three prints are the same fact three ways: `y` has one row per input in the batch and one column per output unit, `W` has `256` rows of `784` numbers, and `200704` is `256 * 784`, the number of weights. `layer.W[0]` is a length-`784` vector: all the weights of output unit 0.
+### Many layers: gains multiply
 
-Note the `std` in that constructor: `0.0357`. It is not an arbitrary small number. `784 = 28 * 28`, so `1 / sqrt(784) = 1 / 28 = 0.03571` exactly, and `1 / sqrt(fan_in)` is the number `nn.Linear` uses as its uniform bound for a `784`-input layer. The default scale for the first layer of an image classifier is a clean fraction you can do in your head. One caution while reading the example: it draws that number as a _normal standard deviation_, whereas the default uses the same number as a _uniform bound_, and a uniform spread on `(-a, a)` carries only `a^2 / 3`. Same numeral, three times less variance, and the section on the default works both conversions through.
+Stack $L$ layers and the variance at the output is the input variance times the product of every layer's gain. With a constant gain $g$:
 
-The bias is initialized to zero everywhere. There is no symmetry argument against it, because the weights are already random and break the symmetry that would make identical units learn identical things. Zero bias means the pre-activation starts centered on whatever the weighted sum gives, which is what the initialization schemes below are designed to control. The <Tip term="pre-activation">The value a layer produces before the nonlinearity is applied to it: `X @ W.T + b` for a dense layer. ReLU and friends then act on it element by element.</Tip> is the thing whose size the rest of this page is trying to keep near one.
+$$
+\text{Var}(\text{output}) = g^{L} \cdot \text{Var}(\text{input})
+$$
 
----
-
-## Why the scale decides everything
-
-Consider one linear layer with `n = fan_in` inputs, zero-mean independent weights with variance `Var(W)`, and a zero-mean input `x` with variance `Var(x)`. One output unit computes:
-
-```text
-y = sum over i of ( W_i * x_i )
-```
-
-The terms are independent and zero-mean, so the variance of the sum is the sum of the variances:
-
-```text
-Var(y) = n * Var(W) * Var(x)
-```
-
-Read that out loud as: **the variance leaving a layer equals the variance entering it, times how many inputs each unit adds up, times the variance of the weights.** Those two qualifiers are load-bearing: <Tip term="independent and zero-mean">Independent means knowing one term tells you nothing about another, which is what lets variances add instead of covariances. Zero-mean means the terms are not all sitting off to one side, which is what makes variance an honest size measure.</Tip>, and random draws from a centered distribution give you both. "The terms are independent" is the step doing all the work, and it is exactly what the sqrt experiment in Start here showed you: independent random-signed terms cancel, so a sum of `n` of them has variance `n` times one term's variance.
-
-That is the whole derivation. The mean-square signal coming out of the layer is the signal going in, multiplied by `n * Var(W)`. Call that product the **gain**. For the signal to survive `L` layers, the gain has to be `1`, because gains multiply: after `L` layers the signal is `gain^L` times what it started as.
-
-Read `gain^L` out loud as: **whatever a single layer does to the scale, the stack does that many times over again.** Gains do not add across depth, they compound. A gain of `1/6` for three layers is `(1/6)^3 = 1/216`, already two orders of magnitude gone before you have written down anything interesting; a gain of `2` for forty layers is `2^40`, about a trillion.
-
-A ReLU in between changes the arithmetic. For a zero-mean symmetric pre-activation, `E[ReLU(z)^2] = E[z^2] / 2`, because the negative half contributes nothing and the positive half passes through unchanged. So a ReLU multiplies the mean-square by `1/2`.
-
-Six numbers make that checkable without any probability:
-
-```python title="relu_halves.py"
-import numpy as np
-
-z = np.array([-3., -2., -1., 1., 2., 3.])
-print((z ** 2).mean())        # 4.666666666666667   = (9+4+1+1+4+9)/6 = 28/6
-
-r = np.maximum(z, 0.0)        # [0. 0. 0. 1. 2. 3.]
-print((r ** 2).mean())        # 2.3333333333333335  = (1+4+9)/6 = 14/6
-```
-
-`28 / 6` becomes `14 / 6`. The negatives went to zero, the positives were untouched, and the mean-square is exactly halved. Read `E[ReLU(z)^2] = E[z^2] / 2` as: **a ReLU throws away half of a symmetric signal's energy.**
-
-Two rules follow:
-
-| Activation | Required `Var(W)` for unit gain | Scheme       |
-| :--------- | :------------------------------ | :----------- |
-| Linear     | `1 / n`                         | Xavier       |
-| ReLU       | `2 / n`                         | He (Kaiming) |
-
-Xavier preserves variance through a linear layer. He preserves it through a linear layer followed by ReLU, by doubling the variance first so that ReLU's halving brings it back. Neither is right for both cases, which is why you have to know which activation you are using.
-
-Put the two rules next to the two activations and the choice stops being a formula to memorize. At `fan_in = fan_out = n`, using `gain = n * Var(W)`, and halving for the ReLU:
-
-| Scheme              | `Var(W)`   | gain, linear stack | gain, ReLU stack | verdict                     |
-| :------------------ | :--------- | :----------------- | :--------------- | :-------------------------- |
-| Xavier              | `1 / n`    | `1`                | `1/2`            | right linear, dies ReLU     |
-| He                  | `2 / n`    | `2`                | `1`              | explodes linear, right ReLU |
-| `nn.Linear` default | `1 / (3n)` | `1/3`              | `1/6`            | too small for both          |
-
-This is the grid the walk in Start here measured at `n = 8`: the `0.353553` row is Xavier's scale, gaining `1` through a linear layer and `0.5` through a ReLU, and the `0.5` row is He's scale, gaining `2` linearly and `1` through a ReLU. Read a gain below `1` as the layer eating the signal, and a gain above `1` as the layer inflating it toward overflow. Each activation chooses which column of that grid you live in, which is why the choice of initialization is a choice of activation, not a choice of taste.
-
-### Solving for the scale
-
-Every scheme on this page is the same equation, `gain = 1`, solved for the standard deviation. For a plain linear layer:
-
-```text
-n * Var(W) = 1   ->   Var(W) = 1 / n   ->   std = 1 / sqrt(n)
-```
-
-and for a linear layer feeding a ReLU, the extra `1/2` moves to the left side:
-
-```text
-n * Var(W) * 1/2 = 1   ->   Var(W) = 2 / n   ->   std = sqrt(2 / n)
-```
-
-Read `std = 1 / sqrt(fan_in)` as: **one over the square root of how many numbers each unit adds up.** The only thing that changes between schemes is the number above the `n`. Because the width sits under a square root, the scale moves slowly: quadruple the width and the scale halves.
-
-| `fan_in` | linear-layer `std = 1 / sqrt(n)` | ReLU-layer `std = sqrt(2 / n)` |
-| :------- | :------------------------------- | :----------------------------- |
-| 8        | `0.353553`                       | `0.500000`                     |
-| 32       | `0.176777`                       | `0.250000`                     |
-| 256      | `0.062500`                       | `0.088388`                     |
-| 784      | `0.035714`                       | `0.050508`                     |
-| 4096     | `0.015625`                       | `0.022097`                     |
-
-Two rows here recur later: `0.062500` and `0.088388` are the `fc2` entries in the bounds table near the end of the page, and `0.035714` is the `1/28` bound the `dense.py` example above used.
+Any gain other than 1 is compounded exponentially. Over 40 layers, $g = 0.5$ gives $10^{-12}$ and $g = 2$ gives $10^{12}$. The signal arriving at the last layer is either indistinguishable from zero or overflowing — and the gradients flowing backward are multiplied by the same kind of factors, so they [vanish or explode](/ai/classical-deep-learning/vanishing-gradients) in the same way. Training cannot recover from either.
 
 ---
 
 ## Xavier initialization
 
-Glorot and Bengio (2010) derived this by asking for the variance to be preserved in both directions, forward and backward, which gives a compromise between `fan_in` and `fan_out`:
+Glorot and Bengio (2010) applied this analysis to both directions. In the forward pass, keeping activations stable needs $n_{\text{in}}\text{Var}(w) = 1$. In the backward pass, each input's gradient is a sum over the layer's $n_{\text{out}}$ outputs, so keeping gradients stable needs $n_{\text{out}}\text{Var}(w) = 1$. Both cannot hold unless the layer is square, so **Xavier** (or **Glorot**) initialization takes the compromise:
 
-```text
-Var(W) = 2 / (fan_in + fan_out)
-```
+$$
+\text{Var}(w) = \frac{2}{n_{\text{in}} + n_{\text{out}}}
+$$
 
-Read it as: **two over the total wiring on both sides.** A forward pass sums over `fan_in` weights per unit; a backward pass sums the same weights over the `fan_out` units that used them. Preserving variance going forward wants `1 / fan_in`, preserving it going backward wants `1 / fan_out`, and the compromise is to average the two widths and put `(fan_in + fan_out) / 2` in the denominator, which is the same line as `2 / (fan_in + fan_out)`. For a square layer, where `fan_in = fan_out = n`, that collapses to `1 / n`: exactly the linear-layer answer, and exactly the `0.353553` row of the walk.
-
-Two distributions achieve that variance:
-
-```text
-Xavier normal  :  W ~ N(0, 2 / (fan_in + fan_out))       std = sqrt(2 / (fan_in + fan_out))
-Xavier uniform :  W ~ U(-a, a),  a = sqrt(6 / (fan_in + fan_out))
-```
-
-The uniform bound is `sqrt(6/...)` rather than `sqrt(2/...)` because a uniform distribution on `(-a, a)` has variance `a^2 / 3`. To get variance `v` you need `a = sqrt(3v)`, and `3 * 2 = 6`. The <Tip term="uniform distribution">Written `U(-a, a)`: every value between `-a` and `a` is equally likely, and nothing outside that range ever appears. The normal alternative, written `N(0, v)`, has no hard edge but puts most of its mass near zero.</Tip> in that sentence is the flat, hard-edged shape.
-
-Read the rule out loud as: **a flat spread of half-width `a` carries a third of `a` squared.** That factor of `1/3` is the entire difference between the two lines above, because it makes a uniform bound `sqrt(3)` times the standard deviation that reaches the same variance, and `sqrt(6)` over `sqrt(2)` is exactly `sqrt(3)`. Checked by drawing a million weights:
-
-```python title="uniform_variance.py"
-import numpy as np
-
-a = np.sqrt(6 / 1040)          # Xavier's uniform bound for a 784 -> 256 layer
-w = np.random.default_rng(0).uniform(-a, a, size=1_000_000)
-
-print(a)          # 0.075955452531275
-print(w.var())    # 0.001924646167304149   the drawn variance
-print(a ** 2 / 3) # 0.0019230769230769234  the predicted variance
-print(2 / 1040)   # 0.0019230769230769232  the target 2 / (fan_in + fan_out)
-```
-
-The drawn variance matches the prediction, and `2 / 1040` is Xavier's formula for a `784 -> 256` layer, where `fan_in + fan_out = 1040`. The same `a`, `0.075955`, is the `fc1` entry of the bounds table.
-
-In PyTorch:
-
-```python
-torch.nn.init.xavier_normal_(layer.weight)
-torch.nn.init.xavier_uniform_(layer.weight)
-```
-
-Xavier is the right choice for `tanh` and `sigmoid` activations, which are roughly linear near zero and do not halve the variance. "Roughly linear near zero" is a hand-checkable claim: `tanh(0.1) = 0.09966799462495582`, a `0.33`% change to the input, so a properly scaled `tanh` stack passes the signal through almost unchanged and keeps the linear-layer gain of `1`. The halving is a ReLU-specific fact, and applying ReLU's correction to a `tanh` network would grow the signal by `2` per layer instead.
+For a square layer this is exactly $1/n$. The derivation assumes the activation is roughly linear and symmetric around zero, which holds for `tanh` near its centre. Xavier is the right choice for `tanh` and sigmoid networks and for linear layers.
 
 ---
 
 ## He initialization
 
-He et al. (2015) redo the derivation accounting for ReLU's halving:
+ReLU breaks Xavier's assumption. It zeroes every negative pre-activation, so for symmetric, zero-centred pre-activations it removes half the variance (more precisely, half the mean square) at every layer. Xavier's gain of 1 becomes $\tfrac{1}{2}$ per ReLU layer, and 40 layers lose a factor of $10^{12}$.
 
-```text
-Var(W) = 2 / fan_in
-```
+He et al. (2015) fixed it by doubling the variance to cancel the ReLU's halving:
 
-Read it as: **two over how many numbers each unit adds up.** The `2` is not a tuning knob and not a fudge factor. It is the `1/2` from the ReLU, moved to the other side of the equation, and the walk in Start here measured it: the `std = 0.5` row enters the ReLU at `15.1523` and leaves it at `7.9513`, back at the input's `7.5`.
+$$
+\text{Var}(w) = \frac{2}{n_{\text{in}}}
+$$
 
-```text
-He normal  :  W ~ N(0, 2 / fan_in)       std = sqrt(2 / fan_in)
-He uniform :  W ~ U(-a, a),  a = sqrt(6 / fan_in)
-```
+This **He** (or **Kaiming**) initialization is the standard for ReLU-family networks, including GELU and SiLU, which behave similarly enough. It was what made training very deep plain CNNs from scratch possible.
 
-Same `sqrt(3)` conversion as Xavier: the bound divided by the standard deviation is `sqrt(6 / fan_in)` over `sqrt(2 / fan_in)`, which is `sqrt(3)` exactly.
+### Measured: forty layers deep
 
-In PyTorch:
+A 40-layer network of width 256 with ReLU, input variance 1. The variance (mean square) of the activations leaving selected layers:
+
+| Initialization | Gain per layer | Layer 1 |             Layer 10 |             Layer 20 |              Layer 40 |
+| :------------- | -------------: | ------: | -------------------: | -------------------: | --------------------: |
+| He ($2/n$)     |              1 |    1.00 |                 1.03 |                 1.33 |                  1.38 |
+| Xavier ($1/n$) |            1/2 |    0.50 | $1.0 \times 10^{-3}$ | $1.3 \times 10^{-6}$ | $1.3 \times 10^{-12}$ |
+| Std 0.01       |         0.0128 |   0.013 |           $10^{-19}$ |           $10^{-38}$ |            $10^{-76}$ |
+| Std 1.0        |            128 |     128 |            $10^{21}$ |            $10^{42}$ |             $10^{84}$ |
+
+Every row follows its predicted gain. Only He keeps the signal within a factor of two of its starting size. "Start small" (std 0.01) is catastrophic: the values fall below what `float32` can represent. The backward pass shows the same pattern, gradients at layer 1 relative to layer 40 shrinking by the same per-layer factors. (He's backward gain measures about 1.09 per layer rather than exactly 1, because the derivation assumes the ReLU mask is independent of the gradient, which is only approximately true. Over 40 layers that compounds to a harmless 30× growth.)
+
+---
+
+## Uniform or normal
+
+Each scheme comes in a normal and a uniform version with the same variance. A uniform distribution on $[-a, a]$ has variance $a^2 / 3$, so a target standard deviation $\sigma$ corresponds to the bound $a = \sqrt{3}\,\sigma$:
+
+| Scheme | Normal: standard deviation                    | Uniform: bound $a$                            |
+| :----- | :-------------------------------------------- | :-------------------------------------------- |
+| Xavier | $\sqrt{2 / (n_{\text{in}} + n_{\text{out}})}$ | $\sqrt{6 / (n_{\text{in}} + n_{\text{out}})}$ |
+| He     | $\sqrt{2 / n_{\text{in}}}$                    | $\sqrt{6 / n_{\text{in}}}$                    |
+
+Worked for the first layer of a $784 \to 256$ classifier: He normal uses std $\sqrt{2/784} = 0.0505$; Xavier uniform uses bound $\sqrt{6/1040} = 0.0760$. The choice between normal and uniform makes no practical difference.
+
+---
+
+## What PyTorch actually does
+
+`nn.Linear` and `nn.Conv2d` use neither scheme by default. They call `kaiming_uniform_(weight, a=sqrt(5))`, which works out to a uniform distribution on $[-1/\sqrt{n}, 1/\sqrt{n}]$:
+
+$$
+\text{Var}(w) = \frac{(1/\sqrt{n})^2}{3} = \frac{1}{3n}
+$$
+
+That is a third of Xavier and a sixth of He. With ReLU, each layer's gain is $n \cdot \frac{1}{3n} \cdot \frac{1}{2} = \frac{1}{6}$. A 40-layer plain ReLU stack with default initialization shrinks its activations to about $10^{-31}$ of the input.
+
+It works anyway in most real models, for two reasons. Shallow networks of two or three layers lose only a factor of 36 to 200, which training easily absorbs. And most deep architectures include [normalization layers](/ai/neural-networks/normalization), which rescale activations at every block, and [residual connections](/ai/classical-deep-learning/vision-architectures#resnet-the-residual-connection), which give the signal a path around the multiplications. Together these make the initial scale far less critical, which is why transformers train fine with the default.
+
+To use He initialization explicitly:
 
 ```python
-torch.nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
-torch.nn.init.kaiming_uniform_(layer.weight, nonlinearity="relu")
+import torch.nn as nn
+
+layer = nn.Linear(256, 256)
+nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")   # std = sqrt(2 / 256)
+nn.init.zeros_(layer.bias)
 ```
-
-The general form is `Var(W) = 2 / ((1 + a^2) * fan_in)` where `a` is the negative slope of a leaky ReLU. At `a = 0` that is He. At `a = 1` it reduces to `1 / fan_in`, which is Xavier for a square layer.
-
-Read the general form as: **the leakier the negative slope, the less of the signal the activation throws away, so the smaller a weight variance you need.** The two endpoints are worth checking by substitution: `a = 0` gives `2 / ((1 + 0) * n) = 2 / n`, plain He, and `a = 1` gives `2 / (2 * n) = 1 / n`, plain Xavier for a square layer. `a` here is the negative slope, not the same `a` used as the uniform bound above.
-
-| Scheme              | Depends on          | Direction it protects  | Its `std` for a square layer |
-| :------------------ | :------------------ | :--------------------- | :--------------------------- |
-| Xavier              | `fan_in`, `fan_out` | forward and backward   | `sqrt(1 / n)`                |
-| He                  | `fan_in` only       | forward                | `sqrt(2 / n)`                |
-| `nn.Linear` default | `fan_in` only       | neither, as it happens | `1 / sqrt(3 * n)`            |
 
 ---
 
-## What `nn.Linear` does by default
+## Diagnosing a scale problem
 
-Neither of the above. PyTorch's `nn.Linear.reset_parameters` calls:
+If a deep network without normalization will not train, measure the activation scale at each layer with forward hooks before tuning anything else:
 
-```python
-init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-```
+| Mean square across layers            | Meaning               | Fix                                              |
+| :----------------------------------- | :-------------------- | :----------------------------------------------- |
+| Roughly flat (within a factor of 2)  | Gain about 1; healthy | None                                             |
+| Falls by a constant factor per layer | Gain below 1          | Increase the std toward $\sqrt{2/n}$ for ReLU    |
+| Grows by a constant factor per layer | Gain above 1          | Decrease the std; check for a missing activation |
 
-which is He uniform with a leaky-ReLU slope of `sqrt(5)`. That is not a design choice about activation functions. Working through the formula:
-
-```text
-a^2   = 5
-gain  = sqrt(2 / (1 + 5)) = sqrt(1/3) = 0.577350
-std   = gain / sqrt(fan_in)
-bound = sqrt(3) * std     = sqrt(3) * 0.577350 / sqrt(fan_in)
-                          = 1.000000 / sqrt(fan_in)
-```
-
-Read those lines as: `a^2 = 5` feeds the leaky-ReLU form, whose `1 + a^2` becomes `6`, and `sqrt(2/6)` is `sqrt(1/3)`. The `sqrt(3)` on the `bound` line is the uniform-versus-standard-deviation conversion from the previous section, and here it cancels the `sqrt(1/3)` exactly, leaving `1 / sqrt(fan_in)`.
-
-So the default is `W ~ U(-1/sqrt(fan_in), 1/sqrt(fan_in))`, with variance:
-
-```text
-Var(W) = bound^2 / 3 = 1 / (3 * fan_in)
-```
-
-`1/(3n)` sits between Xavier's `1/n` and He's `2/n`, but on the wrong side of both. The bias is initialized to `U(-1/sqrt(fan_in), 1/sqrt(fan_in))` as well.
-
-The implied weight variance at `fan_in = fan_out = 256`:
-
-| Scheme              | Bound or std         | `Var(W)`    | Form     |
-| :------------------ | :------------------- | :---------- | :------- |
-| PyTorch `nn.Linear` | `1/sqrt(n)` uniform  | `1.302e-03` | `1/(3n)` |
-| Xavier uniform      | `sqrt(6/2n)` uniform | `3.906e-03` | `1/n`    |
-| Xavier normal       | `sqrt(2/2n)` std     | `3.906e-03` | `1/n`    |
-| He uniform          | `sqrt(6/n)` uniform  | `7.812e-03` | `2/n`    |
-| He normal           | `sqrt(2/n)` std      | `7.812e-03` | `2/n`    |
-
-The default is three times smaller in variance than Xavier and six times smaller than He. Per layer with ReLU, that means a gain of `n * 1/(3n) * 1/2 = 1/6` instead of `1`. Over forty layers, `6^-40 = 7.5e-32`.
-
-The two ratios are visible in the middle column of the table above: `3.906e-03` is three times `1.302e-03`, and `7.812e-03` is six times it. Per-layer gain follows the same ratios, because the gain is just `n` times that variance and a ReLU's half: `1/6` for the default against `1` for He.
-
-<Callout type="warn">
-  ### The default works fine for shallow networks
-
-For a two or three layer MLP, `1/6` per layer costs you two orders of magnitude, which a learning
-rate absorbs without complaint. This becomes a real problem at depth. It is also why so many "deep
-MLP" tutorials silently include normalization layers: normalization resets the scale every block
-and hides whatever the initialization got wrong.
-
-</Callout>
-
----
-
-## Measuring the forward pass
-
-The quantity tracked below is the <Tip term="mean-square">The average of the squares of every number in a tensor. For a tensor whose mean is zero this is exactly its variance, and these measurement networks have zero-initialized biases, so the two words describe the same number.</Tip> of the activations: the average of the squares of every number leaving that layer. It is the same measurement that gave `7.5` for `x` in Start here, run on a network big enough that finite-sample noise disappears.
-
-### Six layers first
-
-Before the forty-layer run, the same arithmetic on a stack short enough to read as one row per scheme. Width `256`, ReLU after every layer, input normalized to mean-square `1.0`:
-
-```python title="six_layers.py"
-import numpy as np
-
-n = 256
-rng_in = np.random.default_rng(7)
-x = rng_in.standard_normal((512, n)).astype(np.float32)
-x /= np.sqrt((x ** 2).mean())          # input mean-square 1.0
-
-scales = [("nn.Linear default", np.sqrt(1 / (3 * n))),
-          ("xavier normal", np.sqrt(2 / (2 * n))),
-          ("he normal", np.sqrt(2 / n)),
-          ("std = 0.01", 0.01)]
-
-for label, std in scales:
-    rng = np.random.default_rng(0)
-    h = x
-    out = []
-    for layer in range(6):
-        W = rng.standard_normal((n, n)).astype(np.float32) * std
-        h = np.maximum(h @ W.T, 0.0).astype(np.float32)
-        out.append(f"{(h ** 2).mean():.3e}")
-    print(f"{label:16s} gain {n * std ** 2 / 2:.4f}  " + "  ".join(out))
-```
-
-```text
-layer 0 (input)   mean-square 1.000e+00
-nn.Linear default gain 0.1667  1.676e-01  2.629e-02  4.637e-03  7.014e-04  1.124e-04  1.802e-05
-xavier normal    gain 0.5000  5.028e-01  2.366e-01  1.252e-01  5.681e-02  2.732e-02  1.314e-02
-he normal        gain 1.0000  1.006e+00  9.465e-01  1.002e+00  9.090e-01  8.741e-01  8.409e-01
-std = 0.01       gain 0.0128  1.287e-02  1.551e-04  2.100e-06  2.440e-08  3.003e-10  3.698e-12
-```
-
-Every row is its own gain applied once per layer: `1.676e-01 * 0.1667 = 0.0279` against the measured `2.629e-02`, and `5.028e-01 * 0.5 = 0.2514` against the measured `2.366e-01`. Only the `he normal` row keeps the input's scale, drifting between `0.84` and `1.0` across six layers. `xavier normal` is right for a stack of plain linear layers and wrong for this one, and six layers of being wrong leave `1.3e-02` of the signal behind.
-
-### Forty layers
-
-Forty layers, width 256, batch 1024, input normalized to mean-square 1.0. Each cell is the mean-square of the activations leaving that layer:
-
-| Init            | Activation | L1          | L10         | L20         | L40         | Theory per layer |
-| :-------------- | :--------- | :---------- | :---------- | :---------- | :---------- | :--------------- |
-| PyTorch default | ReLU       | `1.678e-01` | `2.527e-08` | `4.416e-16` | `7.988e-32` | `1/6 = 0.1667`   |
-| PyTorch default | linear     | `3.346e-01` | `1.663e-05` | `2.577e-10` | `6.541e-20` | `1/3 = 0.3333`   |
-| He normal       | ReLU       | `9.976e-01` | `1.029e+00` | `1.325e+00` | `1.375e+00` | `1.0` stable     |
-| He normal       | linear     | `2.006e+00` | `9.904e+02` | `1.028e+06` | `1.039e+12` | `2.0` explodes   |
-| He uniform      | ReLU       | `1.007e+00` | `1.528e+00` | `1.615e+00` | `1.068e+00` | `1.0` stable     |
-| Xavier normal   | ReLU       | `4.988e-01` | `1.005e-03` | `1.263e-06` | `1.250e-12` | `1/2 = 0.5`      |
-| Xavier normal   | linear     | `1.003e+00` | `9.672e-01` | `9.804e-01` | `9.449e-01` | `1.0` stable     |
-| `std = 0.01`    | ReLU       | `1.277e-02` | `1.215e-19` | `1.846e-38` | `2.670e-76` | `0.0128`         |
-| `std = 1.0`     | ReLU       | `1.277e+02` | `1.215e+21` | `1.846e+42` | `2.670e+84` | `128`            |
-
-Every row matches its predicted per-layer gain. The two rows to internalize are the He-ReLU row, which stays within a factor of two of the input scale for forty layers, and the PyTorch-default-ReLU row, which loses six times per layer and reaches `8e-32`. That value is not zero only because `float32` bottoms out around `1e-38`. In `bfloat16` it would already be gone.
-
-The `std = 0.01` row is the initialization people reach for when they want to "start small". It is catastrophic here: `256 * 0.0001 * 0.5 = 0.0128` per layer, so forty layers give `2.7e-76`. Starting small is not the same as starting right.
-
-The word for a stack that behaves like the `he normal` row is that it is <Tip term="well-conditioned">A network is well-conditioned when the numbers flowing through it neither collapse toward zero nor blow up toward overflow, so a small change in the input produces a proportionate change in the output instead of an enormous one. Getting the initialization scale right is the cheapest way to get one.</Tip>: the activations at every depth stay in a range the rest of the model can actually use. The `PyTorch default` and `std = 0.01` rows are the same network badly conditioned in the downward direction, and `std = 1.0` is it in the upward one.
-
----
-
-## Measuring the backward pass
-
-Same network, but now tracking the mean-square of the gradient reaching each layer. `L40` is nearest the loss, `L1` is nearest the input:
-
-| Init            | L40         | L30         | L20         | L10         | L1          | Gain per layer |
-| :-------------- | :---------- | :---------- | :---------- | :---------- | :---------- | :------------- |
-| PyTorch default | `2.362e-01` | `2.362e-08` | `5.952e-16` | `1.522e-23` | `1.979e-30` | `0.180`        |
-| He normal       | `1.206e+00` | `7.768e+00` | `1.305e+01` | `2.301e+01` | `3.821e+01` | `1.093`        |
-| He uniform      | `1.417e+00` | `8.568e+00` | `1.306e+01` | `2.019e+01` | `2.646e+01` | `1.078`        |
-| Xavier normal   | `6.029e-01` | `3.793e-03` | `6.224e-06` | `1.071e-08` | `3.475e-11` | `0.546`        |
-| `std = 0.01`    | `1.543e-02` | `1.174e-20` | `2.329e-39` | `4.846e-58` | `7.423e-75` | `0.014`        |
-| `std = 1.0`     | `1.543e+02` | `1.174e+24` | `2.329e+45` | `4.846e+66` | `7.423e+85` | `139.9`        |
-
-The last column is the geometric mean of the thirty-nine hops from `L40` to `L1`, so you can rebuild any row from the two end columns alone. For `He normal`: `3.821e+01 / 1.206e+00 = 31.68`, and `31.68^(1/39) = 1.0927`, which is the reported `1.093`. For `Xavier normal`: `3.475e-11 / 6.029e-01 = 5.764e-11`, raised to `1/39`, gives `0.5463`. For the default, the same arithmetic gives `0.1797` against the reported `0.180`.
-
-Compare the last column against the forward table. Every gain is slightly higher going backward than going forward: `1.093` against `1.000` for He, `0.546` against `0.500` for Xavier, `0.180` against `0.167` for the default. That gap is the gap between the <Tip term="forward and backward scale">The size of the activations leaving a layer and the size of the gradients arriving at it. The same weights govern both, but the forward pass sums over `fan_in` of them per unit and the backward pass sums over `fan_out` of them per input, so in a non-square layer the two scales can even move in opposite directions.</Tip>, and a badly scaled initialization can wreck one direction while the other looks healthy.
-
-That gap is not noise, and it is not caused by the mask density drifting away from 0.5. It is caused by the ReLU mask being correlated with the gradient flowing back through it. Three backward passes over the same He-initialized network isolate it:
-
-| Mask applied to `g`                        | L40         | L1          | Gain per layer | Theory |
-| :----------------------------------------- | :---------- | :---------- | :------------- | :----- |
-| None, `g` passes through untouched         | `2.023e+00` | `9.274e+11` | `1.991`        | `2.0`  |
-| Independent random 50% mask                | `1.003e+00` | `1.034e+00` | `1.001`        | `1.0`  |
-| The real ReLU mask, `(pre_activation > 0)` | `1.206e+00` | `3.821e+01` | `1.093`        | `1.0`  |
-
-The independent mask reproduces He's prediction to within a tenth of a percent. The real mask lets through 9% more gradient per layer. He's derivation assumes the mask is independent of the gradient; in a real network the two are coupled through the same weights, and units that fired in the forward pass are somewhat more likely to carry gradient on the way back.
-
-The first row of that table is the no-ReLU control: with no mask at all, the gradient sees the plain linear gain of He's variance, `2.0` predicted and `1.991` measured, which is the same `2` the walk in Start here produced for a linear layer at `std = 0.5`.
-
-The practical consequence is mild. Over forty layers that 9% compounds into a `32x` gradient growth toward the input, which gradient clipping handles without complaint. It does mean that if you measure the gradient norm per layer and find it growing slowly in a He-initialized ReLU network, the network is not broken.
-
----
-
-## The bounds for a real MLP
-
-For a `784 -> 256 -> 256 -> 10` classifier, the bound each scheme would use:
-
-| Layer | `fan_in` | `fan_out` | Xavier uniform | Xavier normal | He uniform | He normal | `nn.Linear` default |
-| :---- | :------- | :-------- | :------------- | :------------ | :--------- | :-------- | :------------------ |
-| `fc1` | 784      | 256       | `0.07596`      | `0.04385`     | `0.08748`  | `0.05051` | `0.03571`           |
-| `fc2` | 256      | 256       | `0.10825`      | `0.06250`     | `0.15309`  | `0.08839` | `0.06250`           |
-| `fc3` | 256      | 10        | `0.15019`      | `0.08671`     | `0.15309`  | `0.08839` | `0.06250`           |
-
-Five of those columns are scales, and they are not all the same kind of number: three are bounds for uniform draws, including the `nn.Linear` default, and two are standard deviations for normal draws. That is why each uniform column is the larger number next to its normal partner: the conversion is `bound = sqrt(3) * std`, and `sqrt(3) = 1.732`.
-
-Each entry is one square root you can do by hand for `fc1`:
-
-| Column         | Expression       | Value                 |
-| :------------- | :--------------- | :-------------------- |
-| Xavier uniform | `sqrt(6 / 1040)` | `0.075955452531275`   |
-| Xavier normal  | `sqrt(2 / 1040)` | `0.04385`             |
-| He uniform     | `sqrt(6 / 784)`  | `0.08748`             |
-| He normal      | `sqrt(2 / 784)`  | `0.05051`             |
-| `nn.Linear`    | `1 / sqrt(784)`  | `0.03571428571428571` |
-
-`1040` is `784 + 256`. The default column is the neatest: `784 = 28 * 28`, so `1 / sqrt(784) = 1 / 28 = 0.03571` exactly, the number the `dense.py` example at the top of this page used.
-
-The He columns do not change between `fc2` and `fc3` because He depends only on `fan_in`. Xavier's does, because it splits the difference between the two.
-
-`fc3` is the extreme case for Xavier: `fan_in = 256` feeding `fan_out = 10`, a <Tip term="bottleneck">A layer that squeezes many inputs into few outputs, like a classifier's last layer going from 256 features to 10 class scores. The information is not destroyed, it is just carried by far fewer numbers from there on.</Tip> Let `fan_out` shrink toward zero and `2 / (fan_in + fan_out)` drifts toward `2 / fan_in`, which is He's answer, and you can see it in the table: `fc3`'s Xavier bound `0.15019` is nearly `fc3`'s He bound `0.15309`, and both are far above `fc2`'s `0.10825`. Narrower output, larger weights.
-
-What the compromise actually spends is also checkable. At `Var(W) = 2 / 266`, the forward gain is `256 * 2/266 = 1.925` and the backward gain is `10 * 2/266 = 0.075`, and the two add to exactly `2` by construction, because `fan_in + fan_out` cancels when you add the two products. A square layer splits that budget into `1` and `1`, which is the whole point of the formula. A bottleneck spends nearly all of it on the forward pass and leaves the gradient starved at the last layer.
+A constant ratio between consecutive layers is a gain that is not 1, and no learning rate can fix that.
 
 ---
 
 ## What to use
 
-| Situation                                                   | Use                                                                      |
-| :---------------------------------------------------------- | :----------------------------------------------------------------------- |
-| MLP or CNN with ReLU, GELU, or SiLU                         | `kaiming_normal_` with `nonlinearity="relu"`                             |
-| Transformer, which uses a residual stream and pre-norm      | `nn.Linear` default, or Xavier. Normalization fixes the scale either way |
-| Network with `tanh` activations                             | `xavier_normal_`                                                         |
-| Fine-tuning a new head onto a frozen backbone               | Xavier on the head, leave the backbone alone                             |
-| Anything deeper than about ten layers with no normalization | Re-derive the gain and set `std` explicitly                              |
+| Network                                    | Initialization                                            |
+| :----------------------------------------- | :-------------------------------------------------------- |
+| MLP or CNN with ReLU, GELU, or SiLU        | He (`kaiming_normal_` with `nonlinearity="relu"`)         |
+| Network with `tanh` or sigmoid activations | Xavier (`xavier_normal_`)                                 |
+| Transformers (residual + normalization)    | PyTorch default or a small normal (std 0.02, as in GPT-2) |
+| Biases                                     | Zero                                                      |
+| A new head on a pretrained backbone        | Default or Xavier on the head; backbone keeps its weights |
 
-For transformers the answer is genuinely the default. A residual connection adds the block output to its input, so the signal path never passes through forty multiplications, and a pre-norm layer rescales before every block. The initialization scale stops mattering. Most transformer codebases still set it explicitly, usually `std = 0.02`, because the GPT-2 paper did and the number stuck.
+Two architecture-specific adjustments are common. GPT-2 scales the initialization of each residual block's output projection by $1/\sqrt{2L}$ for $L$ layers, so the sum of many residual branches does not grow with depth. And LSTMs initialize the forget-gate bias to 1 or 2 so memory is kept by default (see [LSTM and GRU](/ai/classical-deep-learning/lstm-and-gru#practical-details)).
 
-For an MLP or a CNN, use He. If you are writing a deep network without normalization layers and the loss is not moving, print the mean-square activation at each layer before you touch the learning rate. A single forward pass with hooks tells you whether the signal is collapsing, which is a much cheaper diagnosis than a learning rate sweep.
+---
 
-```python title="check_scale.py"
-import torch
-from torch import nn
+## Key terms
 
-blocks = []
-for _ in range(40):
-    blocks.append(nn.Linear(256, 256))
-    blocks.append(nn.ReLU())
-model = nn.Sequential(*blocks)
-
-scales = {}
-
-def record(index):
-    def hook(module, inputs, output):
-        scales[index] = output.pow(2).mean().item()
-    return hook
-
-for i, module in enumerate(model):
-    if isinstance(module, nn.Linear):
-        module.register_forward_hook(record(i))
-
-model.eval()
-with torch.no_grad():
-    model(torch.randn(1024, 256))
-
-order = sorted(scales)
-for i in order[:3] + order[-3:]:
-    print(f"layer {i:>2}  mean-square {scales[i]:.3e}")
-```
-
-If those numbers fall by an order of magnitude per layer, the initialization is the problem and no amount of learning rate tuning will fix it.
-
-| What the printout looks like          | What it says about the gain                                         | Fix                                               |
-| :------------------------------------ | :------------------------------------------------------------------ | :------------------------------------------------ |
-| Flat, drifting within a factor of two | `1` per layer, which is the target                                  | Nothing; leave it alone                           |
-| Falls by a fixed factor per layer     | A gain below `1`, e.g. `1/6`, `1/2`                                 | Raise `std` toward `sqrt(2 / fan_in)` for ReLU    |
-| Grows by a fixed factor per layer     | A gain above `1`, e.g. `2` or `128`                                 | Lower `std`; check for a missing ReLU             |
-| Turns into zeros on a shorter dtype   | Far below what the dtype can represent, the `std = 0.01` row's fate | Raise the scale before touching the learning rate |
-
-The middle two columns are just the "Theory per layer" column of the forward table read in the other direction: a constant ratio between consecutive layers is a constant gain, and a gain that is not `1` is an initialization problem, not an optimization problem.
+| Term                                  | Meaning                                                                             |
+| :------------------------------------ | :---------------------------------------------------------------------------------- |
+| **symmetry breaking**                 | Random initialization so neurons start different and learn different features       |
+| **fan-in / fan-out**                  | Number of inputs to / outputs from a unit in a layer                                |
+| **gain**                              | The factor $n\,\text{Var}(w)$ by which a layer multiplies the variance of its input |
+| **Xavier (Glorot)**                   | $\text{Var}(w) = 2/(n_{\text{in}} + n_{\text{out}})$, for `tanh` and linear layers  |
+| **He (Kaiming)**                      | $\text{Var}(w) = 2/n_{\text{in}}$, compensating for ReLU halving the variance       |
+| **vanishing / exploding activations** | Signal variance shrinking or growing exponentially with depth                       |
 
 ---
 
 ## Interview questions
 
 <Accordions>
-  <Accordion title="Derive He initialization.">
+  <Accordion title="Why can all weights not be initialized to the same value?">
 
-    One output is a sum of `n` independent zero-mean terms, so `Var(y) = n * Var(W) * Var(x)`. ReLU then halves the mean-square of a symmetric input. For unit gain end to end you need `n * Var(W) * 1/2 = 1`, giving `Var(W) = 2/n`.
-
-  </Accordion>
-  <Accordion title={<>Where does <code>1 / sqrt(fan_in)</code> come from?</>}>
-
-    The gain of a linear layer is `n * Var(W)`, because a sum of `n` independent zero-mean terms has a variance `n` times one term's variance. Setting the gain to `1` gives `Var(W) = 1/n`, and taking the square root turns it into the scale you actually draw with: `std = 1 / sqrt(n)`. The square root is the cancellation: adding more random-signed terms grows the sum like `sqrt(n)`, so weights must shrink like `1 / sqrt(n)` to keep the output size fixed.
+    Every neuron in a layer would compute the same output and receive the same gradient, so after every update the weights would remain equal and the layer would behave like a single neuron. Random initialization breaks this symmetry. With all-zero weights in a ReLU network, no gradient flows at all.
 
   </Accordion>
-  <Accordion title="What single number predicts a layer's output size, and what does it have to equal?">
+  <Accordion title="Derive the variance of a linear layer's output.">
 
-    The gain, `fan_in * Var(W)`, halved again if a ReLU follows. Gains multiply across depth, so a stack of `L` layers scales the signal by `gain^L`, and the only gain that survives forty layers unchanged is `1`.
-
-  </Accordion>
-  <Accordion title={<>Why does Xavier use <code>fan_in + fan_out</code>?</>}>
-
-    Glorot and Bengio required the variance to be preserved in the forward pass and the backward pass simultaneously. The forward depends on `fan_in` and the backward on `fan_out`, so they took the compromise `2/(fan_in + fan_out)`. He only cares about the forward direction.
+    For $y = \sum_{i=1}^{n} w_i x_i$ with independent, zero-mean weights and inputs, the variance of each product is $\text{Var}(w)\text{Var}(x)$, and variances of independent terms add, so $\text{Var}(y) = n\,\text{Var}(w)\,\text{Var}(x)$. Keeping $\text{Var}(y) = \text{Var}(x)$ requires $\text{Var}(w) = 1/n$.
 
   </Accordion>
-  <Accordion title={<>Why is the Xavier uniform bound <code>sqrt(6/...)</code> and not <code>sqrt(2/...)</code>?</>}>
+  <Accordion title="What is the difference between Xavier and He initialization, and where does the factor of 2 come from?">
 
-    A uniform distribution on `(-a, a)` has variance `a^2/3`. To reach variance `v` you need `a = sqrt(3v)`, and Xavier's `v = 2/(fan_in + fan_out)` gives `a = sqrt(6/(fan_in + fan_out))`.
-
-  </Accordion>
-  <Accordion title={<>What does <code>nn.Linear</code> initialize to by default, and is it Xavier or He?</>}>
-
-    Neither. It calls `kaiming_uniform_(a=sqrt(5))`, which works out to `U(-1/sqrt(fan_in), 1/sqrt(fan_in))` with variance `1/(3 * fan_in)`. That is three times smaller than Xavier and six times smaller than He.
+    Xavier sets $\text{Var}(w) = 2/(n_{\text{in}} + n_{\text{out}})$, balancing forward and backward variance for roughly linear activations such as `tanh`. He sets $\text{Var}(w) = 2/n_{\text{in}}$. ReLU zeroes the negative half of symmetric pre-activations, halving their mean square at every layer; doubling the weight variance restores a gain of 1.
 
   </Accordion>
-  <Accordion title="What happens to a deep ReLU MLP with the default initialization?">
+  <Accordion title="What happens to a 40-layer ReLU network initialized with standard deviation 0.01 at width 256?">
 
-    The mean-square activation falls by a factor of six per layer. Measured on forty layers of width 256, it goes from `1.0` at the input to `8e-32` at the output, and the gradient reaching the first layer is `2e-30`. The network cannot learn.
-
-  </Accordion>
-  <Accordion title={<>Why is <code>std = 0.01</code> a bad initialization for a wide network?</>}>
-
-    It looks conservative but the gain becomes `n * std^2 / 2`, which at `n = 256` is `0.0128` per layer. Forty layers give `2.7e-76`. "Small" and "correct" are different properties.
+    The per-layer gain is $256 \times 10^{-4} \times 0.5 = 0.0128$, so after 40 layers the activation variance is about $10^{-76}$ of the input, far below what `float32` represents. Gradients vanish the same way. "Starting small" is not the same as starting at the right scale.
 
   </Accordion>
-  <Accordion title="Why does the measured backward gain exceed the forward gain for the same weights?">
+  <Accordion title="What does nn.Linear initialize to by default, and why does it usually work?">
 
-    The ReLU mask is correlated with the gradient passing through it, and He's derivation assumes independence. Controlling for it, an independent 50% mask gives a gain of `1.001` against theory `1.0`, while the real mask gives `1.093`.
-
-  </Accordion>
-  <Accordion title="Why do transformers not need careful initialization?">
-
-    Residual connections give the signal an additive path that bypasses the multiplications, and pre-normalization rescales before each block. Neither lets variance compound across depth.
+    Uniform on $[-1/\sqrt{n}, 1/\sqrt{n}]$, variance $1/(3n)$: a ReLU gain of $1/6$ per layer. Shallow networks lose only a small factor that training absorbs, and deep modern architectures use normalization and residual connections, which rescale and bypass the multiplications so the initial scale matters much less.
 
   </Accordion>
-  <Accordion title="Should the bias be initialized to zero?">
+  <Accordion title="Why do biases not need random initialization?">
 
-    Yes. The symmetry that would make identical units learn identical things is already broken by the random weights, so a zero bias costs nothing and keeps the pre-activation centered where the derivation assumes it is.
-
-  </Accordion>
-  <Accordion title={<>For a <code>784 -&gt; 256 -&gt; 10</code> stack, which scheme's bound changes at the last layer and why?</>}>
-
-    Xavier's, because its denominator is `fan_in + fan_out` and `fan_out` drops from 256 to 10, pushing the bound up. He depends only on `fan_in`, so `fc2` and `fc3` share a bound, and the `nn.Linear` default does too.
+    Symmetry is already broken by the random weights, so neurons differ even with equal biases. Zero biases also keep pre-activations centred at initialization. Exceptions exist where a particular starting behaviour is wanted, such as an LSTM's forget-gate bias set to 1 so memory is retained by default.
 
   </Accordion>
 </Accordions>

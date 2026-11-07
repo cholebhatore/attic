@@ -1,0 +1,249 @@
+---
+title: Loss Functions
+description: 'What a loss function is and why training needs one: loss versus metric, mean squared error, mean absolute error and Huber loss with the effect of an outlier worked by hand, why classification uses cross-entropy instead of squared error, binary and categorical cross-entropy with their p − y gradients, logits and numerical stability, class imbalance, and which output activation pairs with which loss.'
+---
+
+A **loss function** turns the gap between a network's predictions and the correct answers into a single number: zero when the predictions are perfect, larger the worse they are. Training a neural network means adjusting its weights to make that number as small as possible. The loss is the only thing gradient descent ever sees, so it is the precise, mathematical statement of what the network is being asked to do.
+
+This page covers the losses for the two basic kinds of prediction — numbers (regression) and categories (classification) — and why each has the form it does.
+
+**Builds on:** [Neurons and Activations](/ai/neural-networks/neurons-and-activations#activations-on-the-output-layer) for output activations, and [Information Theory and Loss](/ai/math-foundations/information-the-and-loss) for the information-theoretic view of cross-entropy.
+
+---
+
+## Loss versus metric
+
+For one example with correct answer $y$ and prediction $\hat{y}$, the loss is $\ell(\hat{y}, y)$. Over a batch of $N$ examples, the training loss is the average:
+
+$$
+L = \frac{1}{N}\sum_{i=1}^{N} \ell(\hat{y}_i, y_i)
+$$
+
+A loss needs two properties a general score does not:
+
+1. **It must be differentiable** with respect to the prediction, so gradients exist.
+2. **Small improvements must show.** A slightly better prediction must give a slightly lower loss, so each small step of gradient descent gets a signal.
+
+This is why the **metric** that is reported (accuracy, F1, BLEU) is usually not the loss that is trained. Accuracy is a step function of the prediction: nudging a predicted probability from 0.30 to 0.31 does not change whether the answer is right, so its gradient is zero almost everywhere. Cross-entropy, below, does change, so it is trained in accuracy's place, and accuracy is measured on the side.
+
+---
+
+## Regression losses
+
+In **regression**, the network predicts a real number: a price, a temperature, a duration. The output layer has no activation.
+
+### Mean squared error
+
+$$
+\text{MSE} = \frac{1}{N}\sum_{i} (\hat{y}_i - y_i)^2
+$$
+
+Squaring makes every error positive and penalizes large errors much more than small ones: an error of 2 costs 4, an error of 10 costs 100. The gradient with respect to a prediction is $2(\hat{y} - y)$, proportional to the error, so badly wrong predictions get large corrections.
+
+MSE is the loss for which the best constant prediction is the **mean** of the targets. It also has a probabilistic reading: minimizing MSE is the same as maximizing the likelihood of the data under the assumption that targets are the prediction plus Gaussian noise.
+
+### Mean absolute error
+
+$$
+\text{MAE} = \frac{1}{N}\sum_{i} \lvert \hat{y}_i - y_i \rvert
+$$
+
+Every unit of error costs the same. The gradient is $\pm 1$ whatever the error size. The best constant prediction under MAE is the **median** of the targets.
+
+### The difference, worked: one outlier
+
+Four targets $y = [3, 5, 4, 10]$ and predictions $\hat{y} = [2.5, 5, 4.5, 4]$. The fourth example is an outlier the model misses by 6:
+
+| Loss | First three examples only | All four, including the outlier |
+| :--- | ------------------------: | ------------------------------: |
+| MSE  |                     0.167 |                           9.125 |
+| MAE  |                     0.333 |                           1.750 |
+
+Adding the outlier multiplies MSE by 55 and MAE by about 5. Under MSE, that single example's squared error of 36 makes up 99% of the loss, so training spends most of its effort on it. When data contains outliers or corrupted labels, MSE lets them dominate; MAE is **robust** to them.
+
+### Huber loss
+
+**Huber loss** is quadratic for small errors and linear for large ones, with a threshold $\delta$:
+
+$$
+\ell_\delta(e) = \begin{cases} \tfrac{1}{2}e^2 & \lvert e \rvert \le \delta \\ \delta\left(\lvert e \rvert - \tfrac{1}{2}\delta\right) & \lvert e \rvert > \delta \end{cases}
+$$
+
+It behaves like MSE near the target, where the smooth quadratic gives precise convergence, and like MAE far from it, where outliers should not dominate. PyTorch's `SmoothL1Loss` is Huber with $\delta = 1$. It is the standard loss for bounding-box regression in object detection.
+
+---
+
+## Classification losses
+
+In **classification**, the network predicts a category. Its output is a probability for each class, produced by a sigmoid (two classes) or softmax (many classes) on the final layer.
+
+### Why not squared error on probabilities?
+
+Squared error can be computed between a predicted probability and a 0/1 label, but it gives a weak signal exactly when the model is most wrong. Suppose the true label is 1 and a sigmoid output predicts $p = 0.01$: confidently wrong. The gradient of $(p - y)^2$ with respect to the logit $z$ (the input to the sigmoid) is $2(p - y)\,p(1 - p) = -0.0196$. The factor $p(1-p)$ from the sigmoid's derivative is tiny when the sigmoid is saturated, so the confidently wrong model barely learns. The loss that fixes this is cross-entropy.
+
+### Binary cross-entropy
+
+For a true label $y \in \{0, 1\}$ and predicted probability $p$ of class 1:
+
+$$
+\text{BCE} = -\left[\,y \log p + (1 - y)\log(1 - p)\,\right]
+$$
+
+Only one term is active: $-\log p$ when $y = 1$, and $-\log(1-p)$ when $y = 0$. The loss is the **negative log-probability assigned to the correct answer**:
+
+| Probability given to the correct class |  0.99 |   0.9 |   0.5 |   0.1 |  0.01 |
+| :------------------------------------- | ----: | ----: | ----: | ----: | ----: |
+| Loss $-\ln p$                          | 0.010 | 0.105 | 0.693 | 2.303 | 4.605 |
+
+The penalty grows without bound as the probability given to the truth goes to 0, so confident wrong answers are punished hardest. And when the probability comes from a sigmoid on a logit $z$, the gradient simplifies to:
+
+$$
+\frac{\partial\,\text{BCE}}{\partial z} = p - y
+$$
+
+In the example above ($y = 1$, $p = 0.01$), the gradient is $-0.99$ instead of $-0.0196$: fifty times stronger, and the sigmoid's saturation has cancelled out of the formula. This clean gradient is why sigmoid and cross-entropy are always used together.
+
+### Categorical cross-entropy
+
+For $C$ classes, the network outputs $C$ logits $\mathbf{z}$, softmax turns them into probabilities $\mathbf{p}$, and the loss is again the negative log-probability of the correct class $c$:
+
+$$
+\text{CE} = -\log p_c = -\log \frac{e^{z_c}}{\sum_{j} e^{z_j}}
+$$
+
+**Worked example.** Three classes, logits $\mathbf{z} = [2.0, 1.0, 0.1]$:
+
+| Class | Logit | $e^{z}$ | Softmax $p$ |
+| ----: | ----: | ------: | ----------: |
+|     0 |   2.0 |   7.389 |       0.659 |
+|     1 |   1.0 |   2.718 |       0.242 |
+|     2 |   0.1 |   1.105 |       0.099 |
+
+If the true class is 0, the loss is $-\ln 0.659 = 0.417$. If it is 2, the loss is $-\ln 0.099 = 2.317$. The gradient with respect to the logits has the same clean form as the binary case:
+
+$$
+\frac{\partial\,\text{CE}}{\partial \mathbf{z}} = \mathbf{p} - \mathbf{y}
+$$
+
+where $\mathbf{y}$ is the **one-hot** label (1 for the true class, 0 elsewhere). For true class 0: $[0.659 - 1,\ 0.242,\ 0.099] = [-0.341,\ 0.242,\ 0.099]$. Gradient descent moves opposite to the gradient, so it raises the correct logit and lowers the others, each in proportion to how much probability it wrongly holds.
+
+Cross-entropy is the negative log-likelihood of the labels under the model, so minimizing it is maximum-likelihood estimation. [Information Theory and Loss](/ai/math-foundations/information-the-and-loss) derives it as the extra bits needed when the model's distribution is used in place of the true one.
+
+### A built-in sanity check
+
+An untrained network with small random weights gives nearly equal logits, so its softmax is close to uniform, $p_c \approx 1/C$, and its loss starts at about $\ln C$: 2.303 for 10 classes, 6.908 for 1,000. A first-step loss far from $\ln C$ points to a bug in the data or the output layer before any training has happened. [Training and Debugging](/ai/neural-networks/training-and-debugging) collects checks like this one.
+
+### Multi-label classification
+
+When an example can belong to several classes at once (a photo containing both a dog and a car), each class gets its own sigmoid and its own binary cross-entropy, and the losses are averaged. Softmax would be wrong here, because it forces the probabilities to compete and sum to 1.
+
+---
+
+## Logits and numerical stability
+
+Computing softmax and then the logarithm separately is numerically fragile. With a logit of 1,000, $e^{1000}$ overflows to infinity; with a very negative logit, the probability underflows to 0 and $\log 0 = -\infty$. The fix is to compute the log-softmax directly with the **log-sum-exp trick**, subtracting the maximum logit first so the largest exponent is $e^0 = 1$ (see [Softmax and Logits](/ai/math-foundations/softmax-and-logits#numerical-stability-and-log-sum-exp)).
+
+For this reason PyTorch's classification losses take raw **logits**, not probabilities, and apply the activation internally in a stable form:
+
+```python
+import torch
+import torch.nn as nn
+
+logits = torch.tensor([[2.0, 1.0, 0.1]])        # model output, no softmax applied
+target = torch.tensor([0])                      # class index, not one-hot
+print(nn.CrossEntropyLoss()(logits, target))    # tensor(0.4170)
+
+binary_logit = torch.tensor([-4.6])             # sigmoid(-4.6) ≈ 0.01
+print(nn.BCEWithLogitsLoss()(binary_logit, torch.tensor([1.0])))   # ≈ 4.61
+```
+
+Two frequent mistakes follow from this: applying `softmax` in the model **and** using `CrossEntropyLoss` (the softmax is applied twice, which flattens the probabilities and slows learning without any error message), and passing one-hot vectors where class indices are expected.
+
+---
+
+## Class imbalance
+
+When one class is rare — fraud in 1% of transactions — a model that always predicts "not fraud" reaches 99% accuracy and a low average loss. The loss is dominated by the common class. Two standard adjustments:
+
+- **Class weights.** Multiply each example's loss by a weight inversely related to its class frequency, so errors on the rare class count more. `nn.CrossEntropyLoss(weight=...)` and `pos_weight` in `BCEWithLogitsLoss` implement this.
+- **Focal loss** (Lin et al., 2017) multiplies cross-entropy by $(1 - p_c)^\gamma$, typically with $\gamma = 2$. Examples the model already gets right with high confidence contribute almost nothing, so training concentrates on the hard ones. With $p_c = 0.9$ the weight is $0.01$; with $p_c = 0.5$ it is $0.25$.
+
+Metrics for imbalanced data, such as precision, recall, and PR-AUC, are covered in [Imbalance, Drift, and Metrics](/ai/math-foundations/imbalance-drift-and-metrics).
+
+---
+
+## Choosing a loss
+
+| Task                                    | Output layer                         | Loss                              | PyTorch                        |
+| :-------------------------------------- | :----------------------------------- | :-------------------------------- | :----------------------------- |
+| Regression                              | Linear (no activation)               | MSE                               | `nn.MSELoss`                   |
+| Regression with outliers                | Linear                               | MAE or Huber                      | `nn.L1Loss`, `nn.SmoothL1Loss` |
+| Binary classification                   | 1 logit (sigmoid inside the loss)    | Binary cross-entropy              | `nn.BCEWithLogitsLoss`         |
+| Multi-class, one label per example      | $C$ logits (softmax inside the loss) | Cross-entropy                     | `nn.CrossEntropyLoss`          |
+| Multi-label                             | $C$ logits, sigmoid each             | Binary cross-entropy per label    | `nn.BCEWithLogitsLoss`         |
+| Next-token prediction (language models) | Vocabulary-size logits               | Cross-entropy over the vocabulary | `nn.CrossEntropyLoss`          |
+
+The loss decides what "best" means. MSE asks for the mean, MAE for the median, cross-entropy for calibrated probabilities. Choosing a loss is choosing which mistakes matter.
+
+---
+
+## Key terms
+
+| Term                           | Meaning                                                                           |
+| :----------------------------- | :-------------------------------------------------------------------------------- |
+| **loss function**              | A differentiable measure of prediction error that training minimizes              |
+| **metric**                     | A score reported for humans (accuracy, F1), often not differentiable              |
+| **MSE / MAE**                  | Mean squared / absolute error; optimal constant predictions are the mean / median |
+| **Huber loss**                 | Quadratic for small errors, linear for large ones                                 |
+| **cross-entropy**              | Negative log-probability assigned to the correct class                            |
+| **logits**                     | Raw output scores before sigmoid or softmax                                       |
+| **one-hot label**              | A vector with 1 at the true class and 0 elsewhere                                 |
+| **log-sum-exp trick**          | Subtracting the maximum logit to compute log-softmax without overflow             |
+| **class weights / focal loss** | Adjustments that make rare classes or hard examples count more                    |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why is accuracy not used as the training loss?">
+
+    Accuracy is a step function of the model's outputs: small changes to a predicted probability usually do not change whether the prediction is right, so its gradient is zero almost everywhere and gradient descent gets no signal. Cross-entropy changes smoothly with every probability, so it is trained instead and accuracy is reported.
+
+  </Accordion>
+  <Accordion title="When is MAE preferred over MSE?">
+
+    When the data contains outliers or noisy labels. MSE squares errors, so one large error can dominate the loss: in a four-example case, a single error of 6 made MSE 55 times larger but MAE only about 5 times larger. MSE's optimal constant prediction is the mean; MAE's is the median, which outliers barely move. Huber loss combines MSE's smoothness near zero with MAE's robustness far away.
+
+  </Accordion>
+  <Accordion title="Why does classification use cross-entropy instead of squared error on probabilities?">
+
+    With a sigmoid output, the squared-error gradient with respect to the logit contains the sigmoid's derivative $p(1-p)$, which vanishes when the model is confidently wrong; with $y = 1$ and $p = 0.01$ the gradient is about $-0.02$. Cross-entropy's gradient with respect to the logit is exactly $p - y = -0.99$, so the most wrong predictions receive the strongest correction.
+
+  </Accordion>
+  <Accordion title="Derive the gradient of softmax cross-entropy with respect to the logits.">
+
+    $\text{CE} = -z_c + \log\sum_j e^{z_j}$. Differentiating, $\partial\text{CE}/\partial z_k = -[k = c] + e^{z_k}/\sum_j e^{z_j} = p_k - y_k$. So the gradient is $\mathbf{p} - \mathbf{y}$: the predicted distribution minus the one-hot target.
+
+  </Accordion>
+  <Accordion title="What loss should an untrained 10-class classifier show, and why is that useful?">
+
+    About $\ln 10 = 2.303$. Small random weights give nearly equal logits, so softmax is near uniform and the correct class gets probability about $1/10$. A first loss far from that value indicates a bug in the labels, the output layer, or the loss setup before any training has happened.
+
+  </Accordion>
+  <Accordion title="Why do PyTorch's CrossEntropyLoss and BCEWithLogitsLoss take logits?">
+
+    Computing softmax or sigmoid and then a logarithm separately overflows for large logits and produces $\log 0$ for very negative ones. Taking logits lets the loss compute log-softmax with the log-sum-exp trick in one stable step. Applying softmax in the model as well would apply it twice.
+
+  </Accordion>
+  <Accordion title="When should sigmoid with BCE be used instead of softmax with cross-entropy for many classes?">
+
+    When the classes are not mutually exclusive, so an example can carry several labels at once. Softmax forces the probabilities to sum to 1 and compete, which is wrong for multi-label data; an independent sigmoid per class with binary cross-entropy treats each label as its own yes-or-no question.
+
+  </Accordion>
+  <Accordion title="How does focal loss handle class imbalance?">
+
+    It multiplies cross-entropy by $(1 - p_c)^\gamma$, where $p_c$ is the probability given to the correct class. Easy examples the model already gets right with high confidence contribute almost nothing ($p_c = 0.9$ and $\gamma = 2$ give a weight of 0.01), so the loss is dominated by hard and rare examples instead of the many easy negatives.
+
+  </Accordion>
+</Accordions>

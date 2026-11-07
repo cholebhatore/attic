@@ -1,0 +1,261 @@
+---
+title: Gradient Descent
+description: 'How a network learns: training as minimizing the loss over the parameters, the loss landscape, the gradient as the direction of steepest increase, the update rule worked by hand in one dimension and on a tiny linear regression, how the learning rate decides between crawling, converging, oscillating and diverging, batch versus mini-batch versus stochastic gradient descent, epochs and iterations, and the shape of real loss landscapes.'
+---
+
+**Gradient descent** is the algorithm that trains neural networks. It starts from some setting of the weights, measures which direction of change would increase the loss fastest, takes a small step the **opposite** way, and repeats — thousands or millions of times — until the loss stops falling. Every optimizer in deep learning, from plain SGD to Adam, is a refinement of this one idea.
+
+This page builds gradient descent from a one-parameter example, then a two-parameter model fitted by hand, then the mini-batch version used in practice. How the gradient of a large network is actually computed is the next page, [Backpropagation](/ai/neural-networks/mlp-from-scratch).
+
+**Builds on:** [Loss Functions](/ai/neural-networks/loss-functions) for what is being minimized, and [Derivatives and Gradients](/ai/math-foundations/derivatives-and-gradients) for the derivative and the gradient vector.
+
+---
+
+## Training is minimization
+
+Collect every weight and bias of a network into one long vector $\boldsymbol{\theta}$, the **parameters**. For fixed training data, the loss is a function of the parameters alone:
+
+$$
+L(\boldsymbol{\theta}) = \frac{1}{N}\sum_{i=1}^{N} \ell\big(f_{\boldsymbol{\theta}}(\mathbf{x}_i),\ y_i\big)
+$$
+
+Training means finding $\boldsymbol{\theta}$ that makes $L$ small. The **loss landscape** is a useful picture: for a network with two parameters, plot $L$ as the height of a surface above the plane of parameter values. Training is walking downhill on that surface. A real network has millions of parameters, so the surface lives in millions of dimensions, but the walking rule is the same.
+
+There is no formula that jumps straight to the bottom for a neural network. Linear regression has one (the normal equations), but as soon as there is a nonlinearity, the minimum can only be found by searching iteratively.
+
+---
+
+## The gradient points uphill
+
+For one parameter, the derivative $dL/dw$ is the slope of the loss: positive means the loss rises as $w$ increases, negative means it falls. For many parameters, the **gradient** $\nabla L$ is the vector of partial derivatives, one per parameter:
+
+$$
+\nabla L(\boldsymbol{\theta}) = \left[\frac{\partial L}{\partial \theta_1},\ \frac{\partial L}{\partial \theta_2},\ \dots,\ \frac{\partial L}{\partial \theta_P}\right]
+$$
+
+The gradient points in the direction in which the loss increases fastest, and its length says how steep that increase is. So the direction of steepest **decrease** is $-\nabla L$. Each partial derivative also answers a local question: "if this one weight were nudged up slightly, how much would the loss change?" — which is exactly the information needed to decide how to adjust it.
+
+---
+
+## The update rule
+
+Gradient descent repeats one step:
+
+$$
+\boldsymbol{\theta} \leftarrow \boldsymbol{\theta} - \eta\, \nabla L(\boldsymbol{\theta})
+$$
+
+$\eta$ (eta) is the **learning rate**: how far to move along the downhill direction per step. Each parameter moves opposite to its own partial derivative, in proportion to it. Parameters that strongly affect the loss move a lot; parameters with zero gradient do not move.
+
+### Worked example in one dimension
+
+Take $L(w) = (w - 3)^2$, a parabola with its minimum at $w = 3$. Its derivative is $2(w - 3)$. Start at $w = 0$ with $\eta = 0.1$:
+
+| Step |   $w$ | Gradient $2(w - 3)$ | Update $-\eta \cdot$ gradient | New $w$ |
+| ---: | ----: | ------------------: | ----------------------------: | ------: |
+|    1 | 0.000 |              −6.000 |                        +0.600 |   0.600 |
+|    2 | 0.600 |              −4.800 |                        +0.480 |   1.080 |
+|    3 | 1.080 |              −3.840 |                        +0.384 |   1.464 |
+|    4 | 1.464 |              −3.072 |                        +0.307 |   1.771 |
+|    5 | 1.771 |              −2.458 |                        +0.246 |   2.017 |
+
+The steps get smaller automatically, because the slope flattens near the minimum. Each step multiplies the distance to the minimum by $1 - 2\eta = 0.8$, so after $k$ steps the error is $3 \times 0.8^k$: 0.03 after about 20 steps.
+
+### The learning rate decides everything
+
+Run the same problem with different learning rates, five steps each from $w = 0$:
+
+| $\eta$ | $w$ after steps 1–5             | Behaviour                                          |
+| -----: | :------------------------------ | :------------------------------------------------- |
+|    0.1 | 0.60, 1.08, 1.46, 1.77, 2.02    | Converges steadily                                 |
+|    0.5 | 3.00, 3.00, 3.00, 3.00, 3.00    | Lands exactly on the minimum in one step           |
+|    0.9 | 5.40, 1.08, 4.54, 1.77, 3.98    | Overshoots each time, oscillates, converges slowly |
+|    1.1 | 6.60, −1.32, 8.18, −3.22, 10.47 | Overshoots by more each time: **diverges**         |
+
+The distance to the minimum is multiplied by $1 - 2\eta$ each step. Convergence requires that factor to have magnitude below 1, so $0 < \eta < 1$. In general, for a loss that curves with second derivative $a$ near its minimum, the step is stable only if $\eta < 2/a$: **sharply curved directions need small learning rates**.
+
+This creates the central difficulty of training real networks. The landscape curves sharply in some directions and gently in others. A learning rate small enough to be stable in the sharp directions is far too small to make progress in the flat ones, so plain gradient descent zig-zags across a narrow valley while crawling along its floor. [Optimizers](/ai/neural-networks/optimizers) such as momentum and Adam exist to fix exactly this, and [Learning Rate Schedules](/ai/neural-networks/lr-schedules) vary $\eta$ over training.
+
+Too small a learning rate wastes compute; too large makes the loss explode to `NaN`. In practice $\eta$ is the most important hyperparameter of all.
+
+---
+
+## Worked example: fitting a line
+
+Fit $\hat{y} = wx + b$ to three points $(1, 2), (2, 4), (3, 6)$ with MSE, starting from $w = b = 0$ and $\eta = 0.05$.
+
+**Loss at the start.** Every prediction is 0, so errors are $-2, -4, -6$, and $L = (4 + 16 + 36)/3 = 18.67$.
+
+**Gradients.** For MSE, $\frac{\partial L}{\partial w} = \frac{2}{N}\sum (\hat{y}_i - y_i)\,x_i$ and $\frac{\partial L}{\partial b} = \frac{2}{N}\sum (\hat{y}_i - y_i)$:
+
+$$
+\frac{\partial L}{\partial w} = \tfrac{2}{3}\big(-2 \cdot 1 - 4 \cdot 2 - 6 \cdot 3\big) = -18.67, \qquad
+\frac{\partial L}{\partial b} = \tfrac{2}{3}(-2 - 4 - 6) = -8.0
+$$
+
+**Update.** $w \leftarrow 0 - 0.05 \times (-18.67) = 0.933$ and $b \leftarrow 0 - 0.05 \times (-8.0) = 0.400$.
+
+**Loss after one step.** Predictions are $1.33, 2.27, 3.20$, and $L = 3.76$ — down from 18.67. After 200 steps, $w = 1.97$, $b = 0.06$, and $L = 0.0006$, approaching the true line $y = 2x$.
+
+The gradient for $w$ was larger than for $b$ because errors were multiplied by $x$, and the largest errors occurred at the largest $x$. Each parameter is adjusted according to how much responsibility it bears for the error. A neural network is trained the same way, with millions of parameters instead of two.
+
+```python title="fit_line.py"
+import torch
+
+x = torch.tensor([1.0, 2.0, 3.0]); y = torch.tensor([2.0, 4.0, 6.0])
+w = torch.zeros(1, requires_grad=True); b = torch.zeros(1, requires_grad=True)
+
+for step in range(200):
+    loss = ((w * x + b - y) ** 2).mean()
+    loss.backward()                       # computes dL/dw and dL/db
+    with torch.no_grad():
+        w -= 0.05 * w.grad; b -= 0.05 * b.grad
+        w.grad.zero_(); b.grad.zero_()    # gradients accumulate unless cleared
+print(w.item(), b.item(), loss.item())    # ≈ 1.97, 0.06, 0.0006
+```
+
+---
+
+## Batch, mini-batch, and stochastic gradient descent
+
+The loss is an average over all $N$ training examples, so its exact gradient requires a pass over the whole dataset. With $N$ in the millions, one step would take far too long. There are three choices:
+
+| Variant                 | Gradient computed from        | Cost per step | Gradient quality           |
+| :---------------------- | :---------------------------- | :------------ | :------------------------- |
+| **Batch (full) GD**     | All $N$ examples              | Very high     | Exact                      |
+| **Stochastic GD (SGD)** | 1 random example              | Very low      | Very noisy                 |
+| **Mini-batch GD**       | $B$ random examples (32–4096) | Moderate      | Noisy, but a good estimate |
+
+Mini-batch gradient descent is what is used in practice, and in deep learning it is usually just called SGD. The mini-batch gradient is an **unbiased estimate** of the full gradient: on average it points the same way. Its noise shrinks as $1/\sqrt{B}$, so quadrupling the batch halves the noise.
+
+Three properties make mini-batches the right choice:
+
+1. **Hardware efficiency.** A GPU processes 256 examples in nearly the same time as 1, because the work becomes one large matrix multiply.
+2. **Many more steps.** A full pass over the data gives one exact step; mini-batches give thousands of approximate ones, and many approximate steps beat one exact step.
+3. **Noise helps.** Random fluctuations in the gradient knock the parameters out of sharp, narrow minima and saddle points. Solutions found with noisier gradients tend to lie in flatter regions of the landscape, which are associated with better generalization.
+
+### Epochs, iterations, and batch size
+
+- An **iteration** (or step) is one parameter update from one mini-batch.
+- An **epoch** is one full pass through the training data.
+- With $N$ examples and batch size $B$, an epoch has $\lceil N/B \rceil$ iterations. CIFAR-10's 50,000 training images at $B = 128$ give 391 iterations per epoch.
+
+Data is **shuffled** at the start of every epoch so that each mini-batch is a random sample and consecutive batches are not correlated.
+
+Batch size and learning rate interact. A larger batch gives a less noisy gradient, which tolerates a larger step. The **linear scaling rule** (Goyal et al., 2017) — multiply the learning rate by $k$ when the batch size is multiplied by $k$, with a warmup period — trained ResNet-50 on ImageNet with batches of 8,192 in one hour without losing accuracy. The rule breaks down at very large batches.
+
+---
+
+## What real loss landscapes look like
+
+The parabola has one minimum and no traps. A neural network's landscape is **non-convex**: it has many minima, ridges, and flat regions. Three features matter:
+
+- **Local minima.** Points lower than everything nearby but not the lowest overall. In low dimensions they are a serious trap. In networks with millions of parameters, empirical and theoretical work finds that most local minima have loss close to the global minimum, so landing in one is rarely the problem.
+- **Saddle points.** Points where the gradient is zero but the loss curves up in some directions and down in others, like a mountain pass. In high dimensions they vastly outnumber local minima, because a critical point is a minimum only if the loss curves upward in **every** one of millions of directions. Gradient descent slows near them; gradient noise and momentum help escape.
+- **Plateaus.** Large, nearly flat regions where the gradient is tiny and progress is slow. Saturated activations and poor initialization create them.
+
+Two practical consequences: the loss curve of a real network rarely decreases smoothly — it falls fast, flattens, sometimes drops again — and the starting point matters, which is why [initialization](/ai/neural-networks/layers-and-initialization) gets its own page.
+
+---
+
+## The training loop
+
+Every training run in deep learning is this loop:
+
+<Steps>
+<Step>
+
+**Sample a mini-batch** of examples and their labels.
+
+</Step>
+<Step>
+
+**Forward pass.** Run the batch through the network to get predictions.
+
+</Step>
+<Step>
+
+**Compute the loss** between predictions and labels.
+
+</Step>
+<Step>
+
+**Backward pass.** Compute the gradient of the loss with respect to every parameter — this is [backpropagation](/ai/neural-networks/mlp-from-scratch).
+
+</Step>
+<Step>
+
+**Update.** Move every parameter against its gradient, scaled by the learning rate. Clear the gradients, and repeat.
+
+</Step>
+</Steps>
+
+```python
+for epoch in range(num_epochs):
+    for x, y in loader:                  # shuffled mini-batches
+        loss = loss_fn(model(x), y)      # forward pass and loss
+        optimizer.zero_grad()            # clear old gradients
+        loss.backward()                  # backward pass
+        optimizer.step()                 # update
+```
+
+The rest of this section of the docs refines individual steps: backpropagation computes step 4, [initialization](/ai/neural-networks/layers-and-initialization) and [normalization](/ai/neural-networks/normalization) make steps 2 and 4 well-behaved in deep networks, [optimizers](/ai/neural-networks/optimizers) and [schedules](/ai/neural-networks/lr-schedules) improve step 5, and [regularization](/ai/neural-networks/regularization) makes sure the result works on data it has not seen. The PyTorch mechanics are in [Training Loop](/ai/pytorch/training-loop).
+
+---
+
+## Key terms
+
+| Term                                 | Meaning                                                                         |
+| :----------------------------------- | :------------------------------------------------------------------------------ |
+| **parameters $\boldsymbol{\theta}$** | All weights and biases, viewed as one vector                                    |
+| **loss landscape**                   | The loss as a function of the parameters, pictured as a surface                 |
+| **gradient**                         | The vector of partial derivatives; points in the direction of steepest increase |
+| **learning rate $\eta$**             | The step size multiplying the gradient in each update                           |
+| **divergence**                       | Steps that overshoot by more each time, so the loss grows without bound         |
+| **mini-batch**                       | A random subset of $B$ examples used to estimate the gradient for one step      |
+| **SGD**                              | Stochastic gradient descent; in practice, mini-batch gradient descent           |
+| **iteration / epoch**                | One update / one full pass over the training data                               |
+| **non-convex**                       | A landscape with many minima and saddle points                                  |
+| **saddle point**                     | Zero gradient, but curving up in some directions and down in others             |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Write the gradient descent update and explain each symbol.">
+
+    $\boldsymbol{\theta} \leftarrow \boldsymbol{\theta} - \eta\nabla L(\boldsymbol{\theta})$. $\boldsymbol{\theta}$ is the vector of all parameters, $\nabla L$ is the gradient of the loss with respect to them, pointing in the direction of steepest increase, and $\eta$ is the learning rate. Subtracting moves every parameter downhill in proportion to its own partial derivative.
+
+  </Accordion>
+  <Accordion title="On L(w) = (w − 3)², which learning rates converge and why?">
+
+    The update gives $w_{k+1} - 3 = (1 - 2\eta)(w_k - 3)$, so the error is multiplied by $1 - 2\eta$ each step. It converges when $\lvert 1 - 2\eta \rvert < 1$, so $0 < \eta < 1$: $\eta = 0.5$ lands on the minimum in one step, $\eta = 0.9$ oscillates but converges, and $\eta = 1.1$ diverges. In general stability needs $\eta < 2/a$, where $a$ is the curvature.
+
+  </Accordion>
+  <Accordion title="Why does plain gradient descent zig-zag in a narrow valley?">
+
+    The valley curves sharply across its width and gently along its floor. The learning rate must be small enough to be stable in the sharp direction, which makes it far too small in the flat one, so the parameters bounce across the valley while creeping along it. Momentum averages out the oscillation and adaptive methods like Adam scale each direction separately.
+
+  </Accordion>
+  <Accordion title="Why is mini-batch gradient descent used instead of full-batch gradient descent?">
+
+    The mini-batch gradient is an unbiased estimate of the full gradient at a tiny fraction of the cost, so the same compute buys thousands of updates instead of one. GPUs process a batch of hundreds almost as fast as one example. And the gradient noise helps escape saddle points and sharp minima, which tends to improve generalization.
+
+  </Accordion>
+  <Accordion title="How many iterations are in an epoch?">
+
+    $\lceil N/B \rceil$ for $N$ training examples and batch size $B$. With 50,000 examples and $B = 128$, that is 391 iterations per epoch.
+
+  </Accordion>
+  <Accordion title="How should the learning rate change when the batch size grows?">
+
+    Roughly in proportion, by the linear scaling rule: multiply the batch by $k$, multiply the learning rate by $k$, and add a warmup period at the start. A larger batch gives a less noisy gradient that tolerates a larger step. The rule worked up to batches of about 8,000 for ResNet-50 on ImageNet and breaks down beyond some critical batch size.
+
+  </Accordion>
+  <Accordion title="Are local minima the main obstacle in training large networks?">
+
+    Usually not. In very high dimensions, most critical points are saddle points, because a minimum requires upward curvature in every direction, and the local minima that do exist tend to have loss close to the global minimum. Saddle points and flat plateaus slow training down more often than bad minima trap it.
+
+  </Accordion>
+</Accordions>

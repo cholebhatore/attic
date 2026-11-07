@@ -1,39 +1,20 @@
 ---
 title: Overview
-description: 'What a neural network is, then build neurons, vectorized layers, and MLPs from raw math, then normalization, learning rate schedules, Adam and AdamW, and hyperparameter search.'
+description: 'Neural networks from the ground up, in the order the ideas are needed: what a network is, neurons and activations, loss functions, gradient descent, backpropagation, initialization and normalization for deep networks, optimizers and learning-rate schedules, overfitting and regularization, hyperparameter search, and a practical training and debugging procedure.'
 ---
 
-Phase 2 gave you tensors, an autograd engine, and a training harness. This phase takes the harness apart. Every layer you have used so far was a call into `torch.nn`, and every optimizer was a call into `torch.optim`. Here you write them yourself, so that the defaults those libraries ship stop being magic numbers and start being consequences of the math.
+The earlier sections supplied the mathematics (vectors, derivatives, probability) and the machinery (PyTorch tensors, autograd, a training loop). This section builds neural networks themselves, from a single neuron to a deep network that trains reliably and generalizes to new data.
 
-New to neural networks? Start with [Neural Network Basics](/ai/neural-networks/neural-network-basics). It explains what a network is, the perceptron and why it cannot learn XOR, how layers are named and counted, and which problem each later page solves, before any page goes deep.
+Every network, however large, is the same pattern repeated: a layer mixes its inputs with a matrix multiply, bends the result with a nonlinear activation, and hands it to the next layer. Training adjusts the matrices by gradient descent. The pages are ordered so that each one answers the question the previous one leaves open:
 
----
+1. **What is computed?** A neuron, a layer, a network.
+2. **How does it learn?** A loss to measure error, gradient descent to reduce it, backpropagation to compute the gradients.
+3. **Why does it stop working when deep, and how is that fixed?** Initialization and normalization keep signals at a usable scale.
+4. **How can each step be better?** Optimizers and learning-rate schedules.
+5. **How does it work on new data?** Regularization, and choosing hyperparameters.
+6. **How is it done in practice?** A training and debugging procedure.
 
-## What this chapter is for
-
-Every network in this chapter is the same three lines, repeated:
-
-```text
-z = x @ W.T + b     # mix the inputs with a matrix multiply
-a = f(z)            # bend the result with a non-linearity
-x = a               # hand it to the next layer
-```
-
-Repeat that four times and you have an MLP. Repeat it with the mixing done across positions in a sequence and you have a transformer. Nothing structurally different is going on.
-
-What changes with depth is that the things which were harmless at two layers stop working at forty. Each page in this chapter is about one of those failures, in the order a reader actually meets them:
-
-| Page                      | The question it answers                                                                                                                                    | What goes wrong if you skip it                                                                                               |
-| :------------------------ | :--------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------- |
-| Neurons and Activations   | What does one neuron compute, and why does the choice of non-linearity change what the network can represent?                                              | Two stacked linear layers are algebraically one layer, so a wide linear model can fit nothing an affine function could not   |
-| Layers and Initialization | What must be true about the starting weights for a signal to survive forty layers of multiplication?                                                       | Activations that shrink to zero or explode on the first forward pass, and a loss that will not move however long you train   |
-| MLP from Scratch          | Where does each gradient come from, and how do you know your backward pass is right?                                                                       | A model that trains slowly toward the wrong answer while the loss curve looks completely healthy                             |
-| Normalization             | Which axis do you average over, and what does that choice cost you?                                                                                        | BatchNorm that quietly fails at batch size 2, or a train-versus-eval mismatch that only appears in production                |
-| Learning Rate Schedules   | Why can the learning rate not stay constant for a whole run?                                                                                               | Divergence inside the first hundred steps, or a loss that plateaus with most of the compute budget unspent                   |
-| Optimizers                | What does an optimizer actually do to one parameter on one step, such that Adam moves it by roughly the learning rate no matter how large the gradient is? | Weight decay that behaves nothing like regularization, and a schedule tuned around a number that was never the learning rate |
-| Hyperparameter Search     | How do you choose the numbers that nothing derives?                                                                                                        | A grid over three axes that spends 1,000 trials and only ever tests ten learning rates                                       |
-
-The first three pages are construction: one neuron, one layer, one network, each written twice, once by hand and once with autograd, so you can watch the two agree. The last four are the training dynamics that decide whether the construction learns anything.
+Each page defines its terms where they first appear, works at least one example by hand with real numbers, and ends with a table of key terms and interview questions.
 
 ---
 
@@ -42,29 +23,22 @@ The first three pages are construction: one neuron, one layer, one network, each
 <Mermaid
   chart={`
 flowchart TD
-    Z["Neural Network Basics"] --> A["Neurons and Activations"]
-    A --> B["Layers and Initialization"]
-    B --> C["MLP from Scratch"]
-    C --> D["Normalization"]
-    D --> E["Learning Rate Schedules"]
-    E --> F["Optimizers"]
-    F --> G["Hyperparameter Search"]
+    A["What Is a Neural Network"] --> B["Neurons and Activations"]
+    B --> C["Loss Functions"]
+    C --> D["Gradient Descent"]
+    D --> E["Backpropagation"]
+    E --> F["Weight Initialization"]
+    F --> G["Normalization"]
+    E --> H["Optimizers"]
+    H --> I["Learning Rate Schedules"]
+    G --> J["Overfitting and Regularization"]
+    I --> J
+    J --> K["Hyperparameter Search"]
+    K --> L["Training and Debugging"]
 `}
 />
 
-The order is a chain rather than a tree, because each page assumes the previous page's results. The MLP page needs the initialization scale from page two and the activation derivatives from page one; the schedule and optimizer pages only make sense once you have a working backward pass of your own to distrust. Normalization sits in the middle because it changes what initialization you need, which is why it comes after construction and before tuning.
-
----
-
-## How to read these pages
-
-Three habits carry the chapter, and they matter more than the order you read in:
-
-- **Run every code block.** Almost nothing on these pages is asserted in prose alone; it is asserted by a printed number. Forty layers of activation variance, a gradient-check error of `1e-6`, a learning rate at step 500 — the snippet is the argument, and the paragraph is its caption.
-- **Name the axis before you name the formula.** Nearly every bug in this chapter is a shape bug: which axis a normalization layer reduces over, whether a weight matrix needs `.T`, whether a gradient is `(N, C)` or `(C, N)`. When a line surprises you, write the shape of each operand above it and re-read the line.
-- **Do not trust a derived gradient until something independent agrees with it.** That is the whole method of [MLP from Scratch](/ai/neural-networks/mlp-from-scratch): perturb a parameter by a tiny amount, watch what the loss does, and compare. Carry that habit into every page after it, because a wrong backward pass still produces a loss curve that looks healthy.
-
-Each page opens with a **plain-language version** that defines every term the page uses, then a **Start here** section that gives one instance you can check in your head. Read both first, then the formalism, and treat the rest as unpacking.
+The first five pages are a chain: each needs the one before. After Backpropagation, the two middle groups — Training deep networks and Optimization — can be read in either order. Generalization and the practical page come last because they use everything before them.
 
 ---
 
@@ -73,218 +47,189 @@ Each page opens with a **plain-language version** that defines every term the pa
 <Cards>
   <Card
     icon={<BookOpen />}
-    title="Neural Network Basics"
-    description="What a neural network is, the perceptron and the XOR problem, input, hidden, and output layers, counting parameters, universal approximation, and what goes wrong with depth."
+    title="What Is a Neural Network"
+    description="The perceptron and XOR, layers, counting parameters, why non-linearity matters, universal approximation, and the map of this section."
     href="/ai/neural-networks/neural-network-basics"
   />
   <Card
     icon={<Zap />}
     title="Neurons and Activations"
-    description="The affine transform, ReLU and its dead-unit problem, GELU, SiLU, and how SwiGLU becomes a transformer feed-forward block."
+    description="One neuron worked by hand, a layer as a matrix multiply, sigmoid and tanh saturation, ReLU and dead units, GELU, SiLU, SwiGLU, and output activations."
     href="/ai/neural-networks/neurons-and-activations"
   />
   <Card
-    icon={<Layers />}
-    title="Layers and Initialization"
-    description="Vectorized dense layers, Xavier and He initialization, and what PyTorch's default really initializes to."
-    href="/ai/neural-networks/layers-and-initialization"
+    icon={<Calculator />}
+    title="Loss Functions"
+    description="MSE, MAE, and Huber with an outlier worked by hand, why classification uses cross-entropy, the p − y gradient, logits, and class imbalance."
+    href="/ai/neural-networks/loss-functions"
+  />
+  <Card
+    icon={<RefreshCw />}
+    title="Gradient Descent"
+    description="The update rule worked in one dimension and on a line fit, how the learning rate decides convergence, mini-batches, epochs, and real loss landscapes."
+    href="/ai/neural-networks/gradient-descent"
   />
   <Card
     icon={<Code />}
-    title="MLP from Scratch"
-    description="Cached forward pass, analytical backward gradients, gradient checking against autograd, and where each gradient's shape comes from."
+    title="Backpropagation"
+    description="The chain rule on two neurons by hand, the four local rules, a complete MLP trained in NumPy, gradient checking, and the shape contract."
     href="/ai/neural-networks/mlp-from-scratch"
+  />
+  <Card
+    icon={<Layers />}
+    title="Weight Initialization"
+    description="Breaking symmetry, how layers scale variance, Xavier and He derived, forty layers measured, and what PyTorch does by default."
+    href="/ai/neural-networks/layers-and-initialization"
   />
   <Card
     icon={<ShieldCheck />}
     title="Normalization"
-    description="BatchNorm, LayerNorm, RMSNorm, and GroupNorm, which axis each one reduces over, and why sequence models settled on LayerNorm."
+    description="Normalization by hand, BatchNorm and its running statistics, LayerNorm, RMSNorm, GroupNorm, and pre-norm against post-norm."
     href="/ai/neural-networks/normalization"
-  />
-  <Card
-    icon={<Calculator />}
-    title="Learning Rate Schedules"
-    description="Warmup, step decay, cosine annealing, the Noam schedule, warmup-stable-decay, and SGDR restarts."
-    href="/ai/neural-networks/lr-schedules"
   />
   <Card
     icon={<Workflow />}
     title="Optimizers"
-    description="SGD with and without momentum, RMSprop, Adam, AdamW's decoupled decay, Lion, Adafactor, and what each costs in memory."
+    description="SGD's two weaknesses, momentum worked step by step, RMSprop, Adam with bias correction by hand, AdamW, Lion, and memory cost."
     href="/ai/neural-networks/optimizers"
+  />
+  <Card
+    icon={<ListOrdered />}
+    title="Learning Rate Schedules"
+    description="Warmup, a cosine schedule computed by hand, step and linear decay, Noam, warmup-stable-decay, SGDR, and implementing them."
+    href="/ai/neural-networks/lr-schedules"
+  />
+  <Card
+    icon={<ShieldAlert />}
+    title="Overfitting and Regularization"
+    description="Train, validation, and test splits, overfitting shown with polynomials, bias and variance, weight decay, dropout, early stopping, and label smoothing."
+    href="/ai/neural-networks/regularization"
   />
   <Card
     icon={<GitBranch />}
     title="Hyperparameter Search"
-    description="Why random beats grid, log-uniform spaces, successive halving, Hyperband and ASHA, TPE, and Optuna and Ray Tune in practice."
+    description="Random versus grid search, log-scale sampling, successive halving and Hyperband, TPE, population-based training, and Optuna."
     href="/ai/neural-networks/hyperparameter-search"
+  />
+  <Card
+    icon={<Terminal />}
+    title="Training and Debugging"
+    description="A step-by-step training recipe, the initial-loss and overfit-one-batch checks, reading loss curves, silent bugs, and NaN debugging."
+    href="/ai/neural-networks/training-and-debugging"
   />
 </Cards>
 
 ---
 
-## The whole chapter, topic by topic
-
-Every heading in this chapter, in reading order, with the one detail that makes each worth remembering. Read it before the pages to see where you are going, or after them as a revision sheet. Each accordion is one page, and the formulas are the ones you should be able to reproduce from memory.
+## The whole section, topic by topic
 
 <Accordions>
-  <Accordion title="0. Neural Network Basics">
+  <Accordion title="What Is a Neural Network">
 
-    - **What a neural network is** — a function built from many simple adjustable units, with weights set by training rather than by hand
-    - **The brain analogy, and where it stops** — weights and firing rules borrowed from biology; the learning is plain gradient descent
-    - **The perceptron and the XOR problem** — one neuron draws one straight line; a two-neuron hidden layer solves XOR exactly
-    - **Anatomy of a network** — input, hidden, and output layers; width, depth, fully connected, feed-forward, MLP
-    - **Counting parameters** — `n_in * n_out + n_out` per layer; a 784-128-10 network has 101,770
-    - **Why the activation function matters** — without it, any number of layers collapses into one
-    - **Universal approximation** — one hidden layer can represent any continuous function; that does not make it trainable
-    - **How a network learns** — forward, loss, backward, update
-    - **What goes wrong with depth** — the failure each later page fixes
+    - **The perceptron and XOR** — one neuron draws one straight line; two hidden ReLU units solve XOR exactly
+    - **Anatomy** — input, hidden, and output layers; width and depth
+    - **Counting parameters** — a 784-128-10 network has 101,770
+    - **Universal approximation** — possible is not the same as trainable
 
   </Accordion>
-  <Accordion title="1. Neurons and Activations">
+  <Accordion title="Neurons and Activations">
 
-    - **The plain-language version** — a neuron weighs, adds, and bends; perceptron, MLP, hidden layer, activation, saturation, and dead neuron defined
-    - **Start here** — a neuron is two operations: a weighted sum, then a bend; everything interesting comes from the derivative of the bend
-    - **What one neuron computes** — $z = \mathbf{w} \cdot \mathbf{x} + b$, where the dot product is a projection onto $\mathbf{w}$ and $b$ slides the boundary off the origin
-    - **A layer is `m` neurons sharing one input** — one `x @ W.T + b`, and the transpose is there because PyTorch stores `(out_features, in_features)`
-    - **Why the nonlinearity is the whole point** — drop $f$ and two layers collapse to one, $\mathbf{W}' = \mathbf{W}_2 \mathbf{W}_1$, with rank capped by the narrowest layer
-    - **ReLU** — $\max(0, z)$: one comparison, no saturation on the positive side, and the reason deep networks became trainable
-    - **The dead unit problem** — a unit negative for every input receives zero gradient forever, so its weights never move again
-    - **GELU** — $z \cdot \Phi(z)$, a smooth gate that keeps a fraction of everything below zero, plus the $\tanh$ approximation you actually run
-    - **SiLU** — $z \cdot \sigma(z)$, the same shape as GELU from operations the hardware already has fast
-    - **All four, side by side** — the same nine input points through each function, so the differences are visible instead of described
-    - **Derivatives** — the slope table that shows ReLU's discontinuity against GELU and SiLU's smooth undershoot
-    - **Gated units and SwiGLU** — split into two paths, activate one, multiply element-wise; this is a transformer feed-forward block
-    - **Choosing one** — ReLU for CNNs and MLPs, GELU for encoders, SiLU inside SwiGLU for decoders, and why the choice is worth less than the learning rate
-    - **Interview questions** — the collapse proof, dead units, and which activation caps its own gradient at `0.25`
+    - **One neuron** — $z = \mathbf{w}\cdot\mathbf{x} + b$, then $a = f(z)$; a decision boundary
+    - **A layer** — $\mathbf{W}\mathbf{x} + \mathbf{b}$, one matrix multiply for a whole batch
+    - **Why activations matter** — two linear layers collapse into one
+    - **Sigmoid and tanh** — saturation: $\tanh'(3) = 0.0099$
+    - **ReLU** — derivative 1 when active; dead units; Leaky ReLU and ELU
+    - **GELU, SiLU, SwiGLU** — smooth gates, used in transformers
+    - **Output activations** — identity, sigmoid, softmax, matched to the task
 
   </Accordion>
-<Accordion title="2. Layers and Initialization">
+  <Accordion title="Loss Functions">
 
-    - **The plain-language version** — a layer is many neurons in one matmul; random starting weights must be scaled so the signal keeps its size; fan-in, variance, Xavier, He
-    - **Start here** — the starting numbers decide whether training happens at all, before any gradient step is taken, and it ends with the table of what the rest of the page settles
-    - **Eight numbers you can hold in your head** — one input row, `1 2 3 4 -1 -2 -3 -4`, carried through every scheme on the page
-    - **Why the square root and not something else** — `fan_in` products with random signs partly cancel, so what adds up across a layer is variance, not magnitude
-    - **What a dense layer is** — `Y = X @ W.T + b` with `W` of shape `(out_features, in_features)`, one row of `W` per output unit
-    - **Why the scale decides everything** — `Var(y) = n * Var(W) * Var(x)`, so a layer's fan-in multiplies the signal's size at every depth
-    - **Solving for the scale** — every scheme is the same equation, `gain = 1`, rearranged to `std = 1 / sqrt(fan_in)`
-    - **Xavier initialization** — `Var(W) = 2 / (fan_in + fan_out)`, the compromise that asks forward and backward variance to both be preserved
-    - **He initialization** — `Var(W) = 2 / fan_in`, the same derivation with ReLU's halving accounted for
-    - **What `nn.Linear` does by default** — neither of the above: `U(-1/sqrt(fan_in), 1/sqrt(fan_in))`, which is close to Xavier and wrong for ReLU
-    - **Measuring the forward pass** — the mean-square activation leaving each layer under three schemes
-    - **Six layers first** — the forty-layer result on a stack short enough to read as one row per scheme, so the trend is visible before it is extreme
-    - **Forty layers** — width 256, batch 1024, input normalized to mean-square 1.0: where small, Xavier, and He each end up
-    - **Measuring the backward pass** — the same run tracking gradient mean-square from `L40` down to `L1`, which is where the explosion shows up
-    - **The bounds for a real MLP** — the number each scheme would use for a `784 to 256 to 256 to 10` classifier
-    - **What to use** — He for ReLU nets, Xavier for tanh, and why normalization lets you be lazy
-    - **Interview questions** — the variance arithmetic, symmetry breaking, and why zeros never work
+    - **Loss versus metric** — accuracy has zero gradient almost everywhere
+    - **MSE, MAE, Huber** — one outlier multiplies MSE by 55 and MAE by 5
+    - **Cross-entropy** — the gradient with respect to the logits is $\mathbf{p} - \mathbf{y}$
+    - **Initial loss** — about $\ln C$ for an untrained classifier
+    - **Logits and stability**, **class imbalance**, **choosing a loss**
 
   </Accordion>
-<Accordion title="3. MLP from Scratch">
+  <Accordion title="Gradient Descent">
 
-    - **The plain-language version** — an MLP is stacked dense layers; forward caches values, backward applies the chain rule to matrices; logits, one-hot, cross-entropy, gradient checking
-    - **Start here** — write the backward pass twice, once by hand and once with autograd, and let them argue
-    - **The network** — `x (N, D)` to `z1` to `a1` to `z2` to `a2` to `logits (N, C)`, with every shape declared
-    - **The forward pass, cached** — every gradient is a function of something computed on the way in, so the cache is not an optimization
-    - **The backward pass** — five gradients in one chain, each shape forced by the incoming gradient; a table of in-shape, out-shape, and the one-line reason sits at the head of the section
-    - **Gradient at the logits** — `dz = p - onehot(y)`: the softmax Jacobian and the log cancel exactly, which is why no matrix survives
-    - **Gradients of the second layer** — `dW2 = a1.T @ dz2` and `db2 = dz2.sum(axis=0)`, each shape forced by the operand that matches the parameter
-    - **Pushing through to the hidden layer** — `da1 = dz2 @ W2.T`, the transpose that made the shape agree
-    - **Through the ReLU** — an element-wise mask of `1`s and `0`s, not a function of the activation value
-    - **Gradients of the first layer** — the same three products one step earlier
-    - **Implementing it** — the whole backward pass in one function, against the cached forward values
-    - **Gradient checking** — central difference with `h = 1e-6`: perturb each parameter, measure the loss, compare to your analytic answer
-    - **The shape contract** — every intermediate's shape at `N = 300`, `D = 4`, `H = 16`, `C = 3`
-    - **The one bug everyone writes** — dropping the `/N` from the logit gradient: the model still trains, just toward the wrong thing
-    - **What autograd is doing for you** — the same network in a dozen lines, and exactly which bookkeeping it took over
-    - **Interview questions** — the five derivations on paper, and what a healthy loss curve fails to prove
+    - **The update** — $\boldsymbol\theta \leftarrow \boldsymbol\theta - \eta\nabla L$
+    - **One dimension by hand** — learning rates 0.1, 0.5, 0.9, 1.1: converge, jump, oscillate, diverge
+    - **Fitting a line by hand** — loss 18.67 to 3.76 in one step
+    - **Mini-batches** — unbiased, cheap, and noisy in a useful way; epochs and iterations
+    - **Landscapes** — saddle points outnumber local minima
 
   </Accordion>
-<Accordion title="4. Normalization">
+  <Accordion title="Backpropagation">
 
-    - **The plain-language version** — grading on a curve: center each group at 0 with spread 1, then learn the scale back; the variants differ only in which group
-    - **Start here** — take a batch, subtract its mean, divide by its spread, then learn the scale back; `1, 2, 3` walked through all five steps
-    - **The general form** — every normalization layer in PyTorch is `(x - mean) / sqrt(var + eps)` followed by a learned affine
-    - **Which axis** — two candidate axes on a `(N, C)` tensor, and that single choice is the only difference between the family
-    - **Six numbers you can point at** — the `(2, 3)` batch from the on-ramp reduced three ways: down the columns for BatchNorm, across the rows for LayerNorm, and both at once for GroupNorm
-    - **The same thing on a random tensor** — `(4, 6)` drawn from `N(3.0, 2.0)`, so the hand arithmetic is shown not to depend on a rigged example
-    - **Side by side** — which layer keeps `gamma`, which keeps `beta`, and which keeps neither
-    - **BatchNorm** — one mean and variance per feature, computed across the batch, which couples every sample in it
-    - **Running statistics** — an exponential moving average kept because eval time has no batch to measure, which is why train and eval differ
-    - **Why batch size matters** — estimate error scales as `1 / sqrt(N)`, so tiny batches feed noisy statistics to the network
-    - **What BatchNorm is for** — "internal covariate shift" was the claim; conditioning the optimization landscape is what it delivers
-    - **LayerNorm** — one mean and variance per sample across its features, so samples stay independent and sequence length stops mattering
-    - **RMSNorm** — drop the mean subtraction, divide by the root-mean-square, and lose almost nothing (Zhang and Sennrich, arXiv:1910.07467)
-    - **GroupNorm and the family** — split channels into `G` groups and normalize each per sample; InstanceNorm and GroupNorm are its endpoints
-    - **Pre-norm against post-norm** — where the layer sits relative to the residual changes trainability at depth as much as which layer you pick
-    - **Choosing** — the decision list, and why sequence models settled on LayerNorm and then RMSNorm
-    - **Interview questions** — which axis each one reduces over, and where the train/eval gap comes from
+    - **Two neurons by hand** — upstream gradient times local gradient
+    - **Reverse mode** — one output, millions of inputs
+    - **Four local rules** — matmul, bias, element-wise, softmax cross-entropy
+    - **An MLP in NumPy** — seven gradients, 99% accuracy
+    - **Gradient checking**, **the shape contract**, **the missing 1/N bug**
 
   </Accordion>
-<Accordion title="5. Learning Rate Schedules">
+  <Accordion title="Weight Initialization">
 
-    - **The plain-language version** — the learning rate is the step size; warm up, run fast, slow down to settle, like parking a car
-    - **Start here** — a step size that is right at the start is wrong later, and the two halves of a schedule fix two different problems; the section ends with the table of what the rest of the page settles
-    - **Every schedule is one line** — `lr(t) = base * multiplier(t)`; the families differ only in the multiplier
-    - **A ten-step schedule you can check by hand** — base `1e-3`, warmup 2, total 10, cosine after warmup, printed at every one of the ten steps
-    - **The two failures, and why one shape fixes both** — diverging early on a full-size step, and crawling late around the minimum: the two ends a schedule has to serve
-    - **All seven shapes at the same steps** — the six decay laws plus SGDR, each evaluated at the same five step counts so the curves are comparable
-    - **Why the rate has to move** — the arithmetic of both ends: a `2.2627e-02` random shove from Adam's first step at width 512, and the fraction of a percent that annealing to zero buys
-    - **Warmup** — a linear ramp from zero that buys time for the second-moment estimates to become trustworthy
-    - **The decay families** — six schedules measured at base `1e-3`, `1000` steps, warmup `100`, side by side
-    - **Cosine annealing** — `eta_min` plus a half-cosine, and why the shape's slow start and fast finish matches what training needs
-    - **Noam and inverse sqrt** — the original Transformer's `d_model^-0.5 * min(step^-0.5, step * warmup^-1.5)`, in one expression
-    - **Warmup-stable-decay** — hold the base rate, then anneal only at the end, which makes the total step count a non-decision
-    - **SGDR restarts** — repeated cosine cycles of growing length, each restart shaking the optimizer out of a sharp minimum
-    - **Implementing it** — `LambdaLR` covers all of them, because every schedule is a function of step count times the base rate
-    - **Choosing** — which schedule for a transformer, a CNN, and a short fine-tuning run
-    - **Interview questions** — why warmup is an optimizer problem rather than a data problem
+    - **Symmetry** — equal weights stay equal forever
+    - **Variance through a layer** — $\text{Var}(y) = n\,\text{Var}(w)\,\text{Var}(x)$
+    - **Gains multiply** — 0.5 per layer is $10^{-12}$ after 40
+    - **Xavier and He** — $2/(n_{\text{in}} + n_{\text{out}})$ and $2/n_{\text{in}}$
+    - **PyTorch's default** — $1/(3n)$, and why it usually works anyway
 
   </Accordion>
-<Accordion title="6. Optimizers">
+  <Accordion title="Normalization">
 
-    - **The plain-language version** — SGD steps straight downhill, momentum keeps rolling, adaptive methods give each weight its own step; moments, EMA, weight decay
-    - **Start here** — the gradient tells you a direction, not a distance, and every optimizer on this page is an argument about the distance; the section ends with the table of what the rest of the page settles
-    - **One step, two parameters, by hand** — `p = [1, 1]` with `g = [0.1, 10.0]`: SGD moves the two coordinates 100 to 1, Adam moves both by the learning rate
-    - **The families, before the details** — what each optimizer keeps per parameter and what it does with it, stated before any formula
-    - **The two problems** — curvature makes one direction far steeper than another, and minibatches make the direction noisy
-    - **A test problem** — two quadratics with a known answer, so every number on the page comes from one runnable script
-    - **The SGD column, reproduced without a loop** — on a quadratic each step multiplies `p` by `(1 - lr * lambda)`, so a forty-step run is one line of arithmetic
-    - **SGD and its stability limit** — the ceiling on learning rate set by the sharpest direction, and the divergence one notch past it
-    - **Momentum** — an exponential buffer of past gradients: it averages away the noise and accelerates along the consistent direction
-    - **Adaptive scaling** — RMSprop divides by the running root-mean-square of the gradient, giving each parameter its own effective rate
-    - **Adam** — first moment for direction, second for scale, each bias corrected
-    - **Watch it run for two steps** — the trace to read first: two parameters, two steps, every intermediate value printed
-    - **Why the bias correction exists** — both buffers start at zero, so early estimates read too small; dividing by `1 - beta^t` fixes it exactly
-    - **Scale invariance** — multiply every gradient by a constant and Adam's update does not move, which is a feature and a trap
-    - **The step size is capped** — for a constant gradient the update is exactly `lr * sign(g)`, so the learning rate is a per-step distance limit
-    - **Weight decay, and why AdamW exists** — L2 added to the gradient is not shrinking under Adam, because the adaptive denominator rescales the penalty (Loshchilov and Hutter, arXiv:1711.05101)
-    - **Lion** — one buffer instead of two, and the sign of an interpolation between the buffered and current gradient
-    - **Adafactor** — factorizes the second moment into a row vector and a column vector, so state costs less than the weight matrix
-    - **Memory cost** — state is float32 master precision, counted per parameter, which is the real reason optimizers dominate peak memory
-    - **Choosing** — the decision list, and the pairings that matter with schedules and weight decay
-    - **Interview questions** — derive both bias corrections, and explain AdamW to someone who thinks it is just Adam with a penalty
+    - **By hand** — $[1, 2, 3] \to [-1.225, 0, 1.225]$, then $\gamma$ and $\beta$
+    - **The one choice** — which values are averaged together
+    - **BatchNorm** — running statistics, train versus eval, and the batch-size problem
+    - **LayerNorm, RMSNorm, GroupNorm** — per-sample alternatives
+    - **Pre-norm versus post-norm** — a clean residual path
 
   </Accordion>
-<Accordion title="7. Hyperparameter Search">
+  <Accordion title="Optimizers">
 
-    - **The plain-language version** — parameters are learned, hyperparameters are chosen; trials, search space, grid, random, pruning, Bayesian search
-    - **Start here** — a search is a budget of GPU-hours, so the question is allocation rather than cleverness
-    - **What is worth searching** — the few knobs whose effect is not derived by any of the math in this chapter
-    - **Grid against random** — grid over `P` axes with `k` values costs `k^P` trials but tests only `k` distinct values per axis; random tests them all (Bergstra and Bengio)
-    - **The axis a grid cannot see** — a drawn `lr x wd` grid where the score actually responds to the sum of the two exponents, which no grid point isolates
-    - **Log-uniform spaces** — learning rates span orders of magnitude, and `1e-4` to `1.1e-4` is not the same kind of gap as `1e-5` to `1.1e-5`
-    - **Which values each sampler actually picks** — twenty log-uniform draws from `1e-5` to `1e-1`, sorted, next to the same range sampled linearly
-    - **Pruning with successive halving** — most configurations are obviously bad early, so spend a small budget on many and escalate the survivors
-    - **The whole ladder, eight configurations** — one bracket run end to end, so every symbol in the general formula has a small sibling you can redo
-    - **Hyperband** — successive halving has a free parameter you cannot choose well, so run several brackets and combine the results
-    - **ASHA** — the asynchronous version: no global barrier, so stragglers stop deciding when a rung happens
-    - **Model-based search** — fit a surrogate to finished trials and pick the next point by what it predicts, rather than sampling blindly
-    - **Optuna** — define-by-run, dynamic search spaces, and a pruner wired into the training loop
-    - **Ray Tune** — the scheduler you want when trials span many machines, and what it costs to reach for it
-    - **Population based training** — the one common method that tunes hyperparameters _during_ a run instead of before it
-    - **A protocol that works** — the order to do things in, from one manual run to a full study
-    - **Interview questions** — why random beats grid in three dimensions, and what a pruner earns back
+    - **SGD's two problems** — ill-conditioning and differing gradient scales
+    - **Momentum** — consistent gradients amplified tenfold, oscillating ones halved
+    - **RMSprop and Adam** — per-parameter scaling; bias correction turns a $3.16\eta$ first step into $\eta$
+    - **AdamW** — L2 under Adam can have no effect at all
+    - **Lion, Adafactor, memory cost** — AdamW needs 16 bytes per parameter
+
+  </Accordion>
+  <Accordion title="Learning Rate Schedules">
+
+    - **Two jobs** — warm up at the start, anneal at the end
+    - **A schedule by hand** — cosine is exactly half the peak at its midpoint
+    - **Decay shapes** — step, exponential, cosine, linear, inverse square root
+    - **WSD and SGDR** — open-ended budgets and restarts
+    - **Peak rate matters more than shape**
+
+  </Accordion>
+  <Accordion title="Overfitting and Regularization">
+
+    - **Three splits** — training, validation, test, and leakage
+    - **Polynomials** — degree 9 gets training error 0.004 and validation error 0.88
+    - **Bias and variance**, **learning curves**, **double descent**
+    - **Weight decay** — $\lambda = 10^{-4}$ cuts validation error 14×
+    - **Dropout, early stopping, label smoothing**
+
+  </Accordion>
+  <Accordion title="Hyperparameter Search">
+
+    - **What matters** — learning rate first
+    - **Random beats grid** — 125 learning rates instead of 5 for the same budget
+    - **Log-uniform sampling**, **successive halving**, **Hyperband and ASHA**
+    - **TPE and Gaussian processes**, **population-based training**
+    - **A protocol** — finish by re-running the winners across seeds
+
+  </Accordion>
+  <Accordion title="Training and Debugging">
+
+    - **The recipe** — data, baselines, simple pipeline, fit, regularize, tune
+    - **Checks** — initial loss near $\ln C$; overfit one batch; inspect the actual inputs
+    - **Loss curves and monitoring** — gradient norm, update-to-weight ratio near $10^{-3}$
+    - **Silent bugs and NaN debugging**, **reproducibility**
 
   </Accordion>
 </Accordions>
@@ -293,44 +238,39 @@ Every heading in this chapter, in reading order, with the one detail that makes 
 
 ## Prerequisites
 
-Phase 1 supplies the calculus and Phase 2 supplies the machinery. Four pages in particular:
-
-- [Derivatives and Gradients](/ai/math-foundations/derivatives-and-gradients) for partial derivatives, the chain rule, and the Jacobian-vector products that backward passes compute
-- [Backprop from Scratch](/ai/math-foundations/backprop-from-scratch) for the reverse-mode traversal that [MLP from Scratch](/ai/neural-networks/mlp-from-scratch) reimplements in vectorized form
-- [Matrix Multiplication](/ai/pytorch/matrix-multiplication) for `matmul` broadcasting, which is what turns a loop over neurons into one call
-- [Training Loop](/ai/pytorch/training-loop) for `nn.Module`, parameter registration, and the five-step harness every example here plugs into
-
-Install the two search libraries used on the last page:
+- [Derivatives and Gradients](/ai/math-foundations/derivatives-and-gradients) for partial derivatives and the chain rule
+- [Softmax and Logits](/ai/math-foundations/softmax-and-logits) and [Information Theory and Loss](/ai/math-foundations/information-the-and-loss) for the classification output and its loss
+- [Backprop from Scratch](/ai/math-foundations/backprop-from-scratch) for a general scalar autograd engine, complementary to the vectorized backpropagation page here
+- [Matrix Multiplication](/ai/pytorch/matrix-multiplication) and [Training Loop](/ai/pytorch/training-loop) for the PyTorch mechanics every example uses
 
 ```bash
-uv add optuna
+uv add optuna     # used on the hyperparameter search page
 ```
-
-```bash title="optional, for the distributed scheduler"
-uv add "ray[tune]"
-```
-
-Everything else runs on the PyTorch you installed in Phase 2.
 
 ---
 
-## What you should be able to do afterwards
+## What should be possible afterwards
 
-- Write a two-hidden-layer MLP with no framework help, derive all five backward gradients on paper, and confirm them against autograd to within `1e-6`
-- Explain why `nn.Linear` initializes to `U(-1/sqrt(fan_in), 1/sqrt(fan_in))`, why that is neither Xavier nor He, and what it does to activation variance over forty layers
-- State which axis BatchNorm, LayerNorm, and GroupNorm each reduce over, and why that makes BatchNorm unusable at batch size 2
-- Write the Adam update from memory, including both bias corrections, and explain why AdamW's weight decay behaves differently from L2 added to the loss
-- Pick a learning rate schedule for a transformer, a CNN, and a short fine-tuning run, and justify the choice
-- Set up an Optuna study with a pruner and a log-uniform learning rate, and explain why the pruner earns back its wasted trials
+- Compute a neuron, a layer, and a small network's forward pass by hand, and explain why activations are needed
+- Choose the right output activation and loss for a task, and derive the cross-entropy gradient $\mathbf{p} - \mathbf{y}$
+- Run gradient descent by hand and predict when a learning rate will diverge
+- Backpropagate through a small network by hand, implement an MLP without autograd, and verify it with gradient checking
+- Derive Xavier and He initialization, and say which normalization layer suits which model
+- Write the Adam update with bias correction and explain why AdamW exists
+- Diagnose overfitting from learning curves and choose regularization accordingly
+- Set up a hyperparameter search that reproduces, and debug a training run that does not work
 
 ---
 
 ## Canonical resources
 
-- [`karpathy/makemore`](https://github.com/karpathy/makemore) — the same character-level model built eight ways, from a bigram count to a transformer, which is the clearest available demonstration of what each abstraction is doing
-- [`optuna/optuna`](https://github.com/optuna/optuna) — the define-by-run search library used on the last page, with TPE, CMA-ES, and three pruners built in
-- Andrej Karpathy, _Neural Networks: Zero to Hero_, parts 2 to 4 — the manual backward pass, the initialization and normalization material, and building GPT
-- _Root Mean Square Layer Normalization_ (Zhang and Sennrich, arXiv:1910.07467) — the paper that drops mean-centering from LayerNorm and shows nothing is lost
-- _Decoupled Weight Decay Regularization_ (Loshchilov and Hutter, arXiv:1711.05101) — where AdamW comes from, and the argument against adaptive methods inheriting L2 regularization
-- _Delving Deep into Rectifiers_ (He et al., arXiv:1502.01852) — the source of Kaiming initialization
-- _Understanding the difficulty of training deep feedforward neural networks_ (Glorot and Bengio, arXiv:1011.3953) — the source of Xavier initialization and of the variance-propagation analysis behind it
+- Andrej Karpathy, _Neural Networks: Zero to Hero_ — backpropagation by hand, initialization, normalization, and building up to GPT
+- Andrej Karpathy, [_A Recipe for Training Neural Networks_](https://karpathy.github.io/2019/04/25/recipe/) — the practical procedure the last page follows
+- Michael Nielsen, [_Neural Networks and Deep Learning_](http://neuralnetworksanddeeplearning.com/) — a free book that builds intuition for backpropagation and learning
+- Goodfellow, Bengio and Courville, _Deep Learning_ (MIT Press, 2016) — chapters 6 to 8 on networks, regularization, and optimization
+- _Understanding the difficulty of training deep feedforward neural networks_ (Glorot and Bengio, 2010) — Xavier initialization
+- _Delving Deep into Rectifiers_ (He et al., arXiv:1502.01852) — He initialization
+- _Batch Normalization_ (Ioffe and Szegedy, arXiv:1502.03167) and _Layer Normalization_ (Ba et al., arXiv:1607.06450)
+- _Adam: A Method for Stochastic Optimization_ (Kingma and Ba, arXiv:1412.6980) and _Decoupled Weight Decay Regularization_ (Loshchilov and Hutter, arXiv:1711.05101)
+- _Dropout: A Simple Way to Prevent Neural Networks from Overfitting_ (Srivastava et al., 2014)
+- _Random Search for Hyper-Parameter Optimization_ (Bergstra and Bengio, 2012)

@@ -1,0 +1,231 @@
+---
+title: Training and Debugging
+description: 'A step-by-step recipe for training a neural network that works, and how to find out why one does not: checks to run before training (initial loss, overfitting one batch, inspecting the data), reading loss curves, what to monitor during a run, the bugs that train silently, diagnosing NaN losses, and reproducibility.'
+---
+
+Neural network bugs are unusual: most of them do not crash. A model with a wrong label alignment, a doubled softmax, or a missing `model.eval()` still trains, still produces a loss curve that goes down, and still reports a number — just a worse one than it should be. Training is therefore done as a sequence of small, verifiable steps, each of which rules out a class of bug before the next adds complexity.
+
+This page collects the whole section into a working procedure. Each check links to the page that explains why it works.
+
+**Builds on:** every earlier page in this section, especially [Loss Functions](/ai/neural-networks/loss-functions), [Gradient Descent](/ai/neural-networks/gradient-descent), and [Overfitting and Regularization](/ai/neural-networks/regularization).
+
+---
+
+## The recipe
+
+<Steps>
+<Step>
+
+**Look at the data.** Read raw examples and their labels. Check the class balance, the ranges of input values, duplicates, and corrupted or mislabelled examples. Most problems that seem to be modelling problems are data problems.
+
+</Step>
+<Step>
+
+**Establish baselines.** Know the score of a trivial predictor — always the majority class, always the mean, "tomorrow equals today" — and of a simple model such as logistic regression. A neural network that does not beat them has not learned anything useful.
+
+</Step>
+<Step>
+
+**Build the simplest end-to-end pipeline.** A small, standard model, the default optimizer (Adam at $10^{-3}$, or AdamW), no regularization, no augmentation, no learning-rate schedule. Get data loading, training, evaluation, and logging working.
+
+</Step>
+<Step>
+
+**Run the pre-training checks below**, especially overfitting a single batch.
+
+</Step>
+<Step>
+
+**Fit the training set.** Grow the model until training loss is low. It is easier to regularize a model that fits than to rescue one that underfits.
+
+</Step>
+<Step>
+
+**Regularize.** Add data augmentation, weight decay, dropout, and early stopping until the gap between training and validation loss closes ([regularization](/ai/neural-networks/regularization)).
+
+</Step>
+<Step>
+
+**Tune.** Learning rate first, then a schedule, then the remaining hyperparameters ([hyperparameter search](/ai/neural-networks/hyperparameter-search)). Change one thing at a time while diagnosing, and confirm improvements across seeds.
+
+</Step>
+</Steps>
+
+---
+
+## Checks before training
+
+### The initial loss
+
+Before any update, a classifier with small random weights outputs nearly uniform probabilities, so its cross-entropy should be about $\ln C$ for $C$ classes ([why](/ai/neural-networks/loss-functions#a-built-in-sanity-check)):
+
+|             Classes | Expected initial loss |
+| ------------------: | --------------------: |
+|                   2 |                 0.693 |
+|                  10 |                 2.303 |
+|               1,000 |                 6.908 |
+| 50,000 (vocabulary) |                 10.82 |
+
+A first loss far above $\ln C$ means the network is confidently wrong at initialization: the output layer's weights are too large, or the labels are misaligned. A loss of exactly 0 or `NaN` means the loss is wired wrong. For regression with MSE, the initial loss should be close to the variance of the targets.
+
+### Overfit one batch
+
+Take a single small batch — say 8 to 32 examples — and train on it alone, repeatedly, with no regularization. A correct model and pipeline drives the loss to nearly zero within a few hundred steps, because a network has more than enough capacity to memorize a handful of examples.
+
+```python
+x, y = next(iter(train_loader))                  # one fixed batch
+for step in range(500):
+    loss = loss_fn(model(x), y)
+    optimizer.zero_grad(); loss.backward(); optimizer.step()
+print(loss.item())                               # should approach 0
+```
+
+If the loss does not go to zero, something between input and loss is broken, and training on the full dataset would only hide it: gradients not flowing (a detached tensor, frozen parameters, `requires_grad=False`), the optimizer not receiving the model's parameters, labels misaligned with inputs, or a learning rate far off. This one test catches more bugs than any other.
+
+### Look at exactly what the model sees
+
+Plot or print the input batch **immediately before** it enters the model, after all preprocessing and augmentation, together with its labels. This catches images that are all black (wrong normalization), labels that do not match their inputs (shuffling inputs and labels separately), text that was tokenized wrongly, and augmentations that destroyed the content.
+
+### Shapes and modes
+
+- Print the shape of every tensor through one forward pass. A prediction of shape `(N, 1)` compared with targets of shape `(N,)` is silently **broadcast** to `(N, N)` by many loss functions, producing a meaningless loss with no error.
+- Confirm that `model.train()` is called before training and `model.eval()` before evaluation, so dropout and BatchNorm behave correctly ([normalization](/ai/neural-networks/normalization#training-and-evaluation-behave-differently)).
+
+---
+
+## Reading the loss curve
+
+| What the curve does                                        | Likely cause                                                       | What to try                                                     |
+| :--------------------------------------------------------- | :----------------------------------------------------------------- | :-------------------------------------------------------------- |
+| Stuck at $\ln C$ from the start                            | No learning: gradients not flowing, or learning rate far too small | Overfit-one-batch test; check `optimizer.step()` and parameters |
+| Becomes `NaN` or `inf`                                     | Divergence: learning rate too high, or a numerical bug             | See the NaN checklist below                                     |
+| Drops, then plateaus high                                  | Underfitting, or learning rate too low or too high for this phase  | Bigger model; tune learning rate; add a schedule                |
+| Very noisy, large oscillations                             | Learning rate too high, or batch too small                         | Lower the learning rate; increase the batch                     |
+| Sudden spikes that recover                                 | Occasional large gradients, bad batches                            | Gradient clipping; warmup; inspect the offending batches        |
+| Training falls, validation rises                           | Overfitting                                                        | Regularize; early stopping; more data                           |
+| Validation loss rises while validation accuracy also rises | The model is growing overconfident on its mistakes                 | Usually fine; label smoothing helps calibration                 |
+| A drop at the end of training                              | Learning rate decay letting the model settle                       | Expected with cosine or step schedules                          |
+
+Plot loss on a logarithmic axis and smooth noisy curves with a moving average; the raw per-step loss is too noisy to read.
+
+---
+
+## What to monitor during a run
+
+| Quantity                        | Healthy range or pattern                                          | What a problem looks like                                                                                                  |
+| :------------------------------ | :---------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------- |
+| Training and validation loss    | Both falling; gap small or slowly growing                         | See the table above                                                                                                        |
+| Learning rate                   | Follows the intended schedule                                     | A schedule stepped at the wrong frequency                                                                                  |
+| Global gradient norm            | Roughly stable, slowly decreasing                                 | Sudden growth before divergence; persistent clipping                                                                       |
+| Update-to-weight ratio          | About $10^{-3}$ per step: $\lVert\Delta w\rVert / \lVert w\rVert$ | Far above: learning rate too high; far below: too low                                                                      |
+| Activation statistics per layer | Mean square roughly constant across layers                        | Collapse or growth with depth ([initialization](/ai/neural-networks/layers-and-initialization#diagnosing-a-scale-problem)) |
+| Fraction of zero ReLU outputs   | Around 50%                                                        | Above about 90%: dying units                                                                                               |
+
+```python
+total = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)   # returns pre-clip norm
+log({"grad_norm": total.item(), "lr": scheduler.get_last_lr()[0], "loss": loss.item()})
+```
+
+`clip_grad_norm_` returns the norm **before** clipping, so logging its return value monitors gradient health for free.
+
+---
+
+## Bugs that train silently
+
+| Bug                                                | Symptom                                                            | Fix                                                                                          |
+| :------------------------------------------------- | :----------------------------------------------------------------- | :------------------------------------------------------------------------------------------- |
+| Forgetting `optimizer.zero_grad()`                 | Gradients accumulate across steps; erratic, effectively huge steps | Zero gradients every step                                                                    |
+| Softmax in the model **and** `CrossEntropyLoss`    | Slow learning, under-confident outputs                             | Output raw logits ([why](/ai/neural-networks/loss-functions#logits-and-numerical-stability)) |
+| Missing `model.eval()` at evaluation               | Validation results vary with batch composition                     | Switch modes correctly                                                                       |
+| Augmentation applied to validation data            | Validation scores noisy and pessimistic                            | Separate train and evaluation transforms                                                     |
+| Inputs and labels shuffled separately              | Loss stays near the uniform-guess level                            | Shuffle pairs together; inspect batches                                                      |
+| Prediction shape `(N, 1)` against target `(N,)`    | Loss broadcast to `(N, N)`, meaningless                            | Match shapes exactly                                                                         |
+| `view` or `reshape` where `permute` was needed     | Pixels or tokens scrambled; poor accuracy                          | Permute axes, then reshape                                                                   |
+| Data leakage between splits                        | Validation scores far too good, collapse in deployment             | Deduplicate; split by group or by time                                                       |
+| Pretrained model fed differently normalized inputs | Much lower accuracy than published                                 | Use the checkpoint's preprocessing                                                           |
+| Loss not averaged over the batch                   | Effective learning rate scales with batch size                     | Use mean reduction ([the 1/N bug](/ai/neural-networks/mlp-from-scratch#the-missing-1n-bug))  |
+
+Each one produces a working training loop and a plausible-looking number. The overfit-one-batch test, the initial-loss check, and inspecting the model's actual inputs between them catch most of them.
+
+---
+
+## When the loss becomes NaN
+
+Work through the causes in order of likelihood:
+
+1. **Learning rate too high.** Lower it by 10× and add warmup. If the problem disappears, it was divergence.
+2. **Exploding gradients.** Log the gradient norm; if it grows rapidly just before the `NaN`, add gradient clipping ([clipping](/ai/classical-deep-learning/vanishing-gradients#gradient-clipping-the-fix-for-exploding)).
+3. **Numerically unsafe operations.** `log(0)`, division by a value that can be zero, `sqrt` of a negative number, or `exp` of a large value. Use fused, stable functions (`log_softmax`, `BCEWithLogitsLoss`) and add a small $\epsilon$ to denominators.
+4. **Bad input data.** A single `NaN` or infinite value in the inputs or labels contaminates everything. Check with `torch.isfinite(x).all()`.
+5. **Low-precision overflow.** `float16` overflows above about 65,504. Use `bfloat16`, or a gradient scaler with `float16` ([Devices and Precision](/ai/pytorch/devices-and-precision)).
+
+`torch.autograd.set_detect_anomaly(True)` makes PyTorch raise an error at the first operation producing a `NaN` in the backward pass, with a traceback to the forward operation responsible. It is slow, so it is used only while debugging.
+
+---
+
+## Reproducibility
+
+Results vary between runs because of random initialization, data shuffling, dropout, and non-deterministic GPU kernels. To make a run repeatable:
+
+```python
+import random, numpy as np, torch
+
+def seed_everything(seed: int = 0):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+# For bit-exact GPU results, at some speed cost:
+# torch.use_deterministic_algorithms(True)
+```
+
+Seeding makes a single run reproducible; it does not make a result reliable. Differences between configurations should be confirmed across several seeds, and reported as a mean and standard deviation.
+
+---
+
+## Key terms
+
+| Term                       | Meaning                                                                       |
+| :------------------------- | :---------------------------------------------------------------------------- |
+| **baseline**               | The score of a trivial or simple model, which a network must beat             |
+| **overfit-one-batch test** | Training on one small batch until the loss nears zero, to verify the pipeline |
+| **initial loss check**     | Confirming the untrained loss is near $\ln C$ for $C$ classes                 |
+| **gradient norm**          | The length of the full gradient vector, monitored for stability               |
+| **update-to-weight ratio** | Size of each update relative to the weights, about $10^{-3}$ when healthy     |
+| **silent bug**             | An error that does not crash but degrades results                             |
+| **anomaly detection**      | PyTorch's mode that raises at the first operation producing a NaN in backward |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="A new 10-class classifier starts at a loss of 9.0. What does that indicate?">
+
+    The expected initial loss is $\ln 10 = 2.30$, because small random weights give near-uniform predictions. A loss of 9.0 means the network is confidently wrong at initialization, typically because the final layer's weights or the logits are far too large, or because labels are misaligned with inputs. It should be fixed before training.
+
+  </Accordion>
+  <Accordion title="What is the overfit-one-batch test, and what does failing it mean?">
+
+    Train repeatedly on a single small batch with no regularization; a working network memorizes it and the loss approaches zero. If it does not, the bug is in the pipeline rather than the model's capacity: gradients not flowing, parameters missing from the optimizer, misaligned labels, or a badly wrong learning rate.
+
+  </Accordion>
+  <Accordion title="Training loss is stuck at the uniform-guess value. List likely causes.">
+
+    The model is not learning at all. Likely causes: `optimizer.step()` never called or the optimizer built from the wrong parameters; gradients blocked by a `detach()` or `no_grad()`; frozen parameters; a learning rate far too small; inputs and labels shuffled independently so no pattern exists; or dead units throughout a layer.
+
+  </Accordion>
+  <Accordion title="The loss becomes NaN after a few hundred steps. How should it be debugged?">
+
+    Lower the learning rate and add warmup to test for divergence; log the gradient norm to check for explosion and add clipping; look for unsafe operations such as `log(0)` or division by zero and replace them with stable fused functions; check the data for non-finite values; and check for `float16` overflow. `torch.autograd.set_detect_anomaly(True)` locates the first operation producing a NaN.
+
+  </Accordion>
+  <Accordion title="Name three bugs that let training run normally but degrade results.">
+
+    Applying softmax before `CrossEntropyLoss`, which applies it again; forgetting `model.eval()`, so dropout and BatchNorm behave as in training during evaluation; and comparing predictions of shape `(N, 1)` with targets of shape `(N,)`, which broadcasts the loss to `(N, N)`. None of them raises an error.
+
+  </Accordion>
+  <Accordion title="Why monitor the update-to-weight ratio?">
+
+    It measures how much each step changes the weights relative to their size. About $10^{-3}$ per step is typical of healthy training. Much larger means the learning rate is too high and weights are being overwritten; much smaller means learning is too slow. It is a quick, architecture-independent check on the learning rate.
+
+  </Accordion>
+</Accordions>

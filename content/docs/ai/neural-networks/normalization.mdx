@@ -1,699 +1,199 @@
 ---
 title: Normalization
-description: 'BatchNorm, LayerNorm, RMSNorm and GroupNorm, which axis each one reduces over, train against eval behaviour, and pre-norm against post-norm.'
+description: 'Why deep networks normalize their activations: normalization worked by hand on three numbers, the learned scale and shift, the one choice that separates every normalization layer (which values are averaged together), BatchNorm with its running statistics and batch-size problem, LayerNorm for sequences, RMSNorm, GroupNorm and InstanceNorm, pre-norm against post-norm around residual connections, and which to use where.'
 ---
 
-A normalization layer computes a mean and a variance from the <Tip term="activations">The numbers a layer hands to the next one: its output. In a network these are the values inside the tensors between layers.</Tip>, subtracts and divides, then rescales by two learned parameters. That is the whole operation. What separates BatchNorm from LayerNorm from RMSNorm from GroupNorm is one decision: which axis the mean and variance are computed over.
+A **normalization layer** rescales the activations passing through a network so that, within some group of values, they have mean 0 and standard deviation 1, then applies a learned scale and shift. Normalization keeps every layer's input at a predictable scale throughout training — not just at initialization, which [Weight Initialization](/ai/neural-networks/layers-and-initialization) arranges, but after thousands of weight updates have changed every layer. Networks with normalization train faster, tolerate higher learning rates, and are far less sensitive to initialization. Nearly every modern architecture uses it.
 
-That single choice determines whether the layer works at batch size 2, whether it behaves differently in training and inference, and whether it is usable in a sequence model at all.
+The layers differ in one thing only: **which values are averaged together** to compute the mean and standard deviation. This page computes normalization by hand, then compares the groupings.
 
-If that sentence is not yet obvious, the next section does the entire operation on three numbers, and the section after that does it on six.
-
----
-
-## The plain-language version
-
-As numbers flow through a deep network, their typical size drifts: one layer's outputs might average 0.01, another's 300. Layers downstream then have to cope with inputs of unpredictable scale, and training becomes slow and fragile.
-
-A **normalization layer** fixes the scale on the spot. It takes a group of numbers, subtracts their average, and divides by their spread, so the group comes out centered at 0 with a spread of 1. It then multiplies by a learned **scale** and adds a learned **shift**, so the network can still choose a different size if that helps.
-
-It is like grading on a curve. Raw scores from an easy test and a hard test cannot be compared directly; converting each to "how far above or below the class average" makes them comparable.
-
-The only real difference between the named variants is **which group of numbers** gets averaged together.
-
-| Word                                  | Plain meaning                                                                                                                                                  |
-| :------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **activations**                       | The numbers a layer outputs and hands to the next layer.                                                                                                       |
-| **mean / variance**                   | The average, and the average squared distance from it. Normalizing subtracts the mean and divides by the square root of the variance.                          |
-| **epsilon (`eps`)**                   | A tiny number added before dividing, so a group with zero spread does not cause division by zero.                                                              |
-| **scale and shift (`gamma`, `beta`)** | The two learned parameters applied after normalizing, so the layer can undo the normalization if the network wants to.                                         |
-| **axis**                              | The direction of the tensor the average is taken over: across the batch, across the features, or across groups of channels.                                    |
-| **BatchNorm**                         | Averages each feature over all examples in the batch. Standard in CNNs. Behaves differently in training and evaluation.                                        |
-| **LayerNorm**                         | Averages over all features of one example. Independent of batch size. Standard in transformers.                                                                |
-| **RMSNorm**                           | LayerNorm without subtracting the mean: just divide by the root mean square. Cheaper, and used by most modern LLMs.                                            |
-| **GroupNorm**                         | Averages over groups of channels within one example. Used in vision when batches are small.                                                                    |
-| **running statistics**                | The average mean and variance BatchNorm records during training, used in place of batch statistics at evaluation time.                                         |
-| **train / eval mode**                 | The switch (`model.train()`, `model.eval()`) that tells BatchNorm whether to use batch statistics or its running statistics.                                   |
-| **channel**                           | In images, one feature map, such as red, green, or blue at the input, or one learned filter's output deeper in.                                                |
-| **residual connection**               | Adding a block's input to its output (`x + f(x)`), so information and gradients can skip the block. Transformers use one around every block.                   |
-| **pre-norm / post-norm**              | Whether the normalization sits before the block inside the residual branch (pre-norm, modern default) or after the addition (post-norm, original transformer). |
-| **covariate shift**                   | A layer's input distribution changing during training because earlier layers keep changing.                                                                    |
+**Builds on:** [Weight Initialization](/ai/neural-networks/layers-and-initialization) for why activation scale matters, and [Descriptive Statistics](/ai/math-foundations/descriptive-statistics) for mean and variance.
 
 ---
 
-## Start here
+## Normalization, by hand
 
-Forget networks for four lines of arithmetic. Take the three numbers `1, 2, 3` and ask for a version of them that is centered on zero and spread about one unit wide.
+Take three numbers, $x = [1, 2, 3]$:
 
-1. **Average them.** `mu = (1 + 2 + 3) / 3 = 2.0`.
-2. **Subtract that average from each number.** The results are `-1, 0, +1`. They always add back to zero, which is why this step is called centering.
-3. **Measure the spread.** Square each deviation and average the squares: `(1 + 0 + 1) / 3 = 0.6667`. That number is the variance. Its square root, `sqrt(0.6667) = 0.8165`, is the standard deviation.
-4. **Divide each deviation by the spread.** `-1 / 0.8165 = -1.2247`, `0 / 0.8165 = 0.0`, `1 / 0.8165 = 1.2247`.
+1. **Mean:** $\mu = (1 + 2 + 3)/3 = 2$.
+2. **Centre:** subtract the mean: $[-1, 0, 1]$.
+3. **Variance:** average the squared deviations: $(1 + 0 + 1)/3 = 0.667$, so the standard deviation is $\sqrt{0.667} = 0.816$.
+4. **Scale:** divide by the standard deviation: $\hat{x} = [-1.225, 0, 1.225]$, which has mean 0 and standard deviation 1.
+5. **Learned scale and shift:** multiply by $\gamma$ and add $\beta$. With $\gamma = 2$, $\beta = 1$: $[-1.449, 1, 3.449]$.
 
-Step 4 is normalization. Read its answer back to check it: `[-1.2247, 0.0, 1.2247]` has mean exactly `0.0` and standard deviation `0.99999`, and its mean square is `0.99999`. Not exactly `1.0`, because the divisor in step 4 is `sqrt(0.6667 + eps)` with `eps = 1e-5`, which is `0.816503` instead of the true `0.816497`. That tiny shortfall shows up again later as a `0.9996` in a table.
-
-There is one step left, and it is the step the model learns:
-
-5. **Rescale and shift.** Multiply by `gamma` and add `beta`. With `gamma = 2` and `beta = 1` the three numbers become `-1.4495, 1.0, 3.4495`: mean `1.0`, standard deviation `1.99999`. `gamma` controls the spread, `beta` controls the center, and both are learned, so the network is free to undo the normalization, set it to do nothing at all, or aim it somewhere else entirely.
-
-Those five steps are one formula:
+As one formula:
 
 $$
-y = \gamma \cdot \frac{x - \mu}{\sqrt{\operatorname{var} + \varepsilon}} + \beta
+y = \gamma \cdot \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta
 $$
 
-Read it out loud as: _subtract the average of this group of numbers, divide by the spread of this group of numbers, then scale by gamma and shift by beta._
-
-Now the only question that matters. In every one of those five steps, what is "this group"? The layer is handed a whole tensor of numbers and has to decide which of them get averaged together into one `mu` and one `var`. Six numbers, two rows and three columns:
-
-```text
-              c0   c1   c2
-sample 0       1    2    3
-sample 1       5    4    7
-```
-
-- BatchNorm pairs each number with the number directly below it: `(1, 5)`, `(2, 4)`, `(3, 7)`. Three groups of two.
-- LayerNorm averages each row whole: `(1, 2, 3)` and `(5, 4, 7)`. Two groups of three.
-- GroupNorm cuts each row into `G` chunks of channels, and `G` has to divide `C`, so on three channels the legal choices are `G = 1`, which is the whole row, and `G = 3`, which is `(1)`, `(2)`, `(3)` each alone.
-
-Same six inputs, different groupings, different output, different set of things that can go wrong at deployment. That is the entire difference between these layers, and the rest of this page is what each grouping costs you.
-
-What the page settles, in order:
-
-| Section                    | The question it answers                                                                                          |
-| :------------------------- | :--------------------------------------------------------------------------------------------------------------- |
-| The general form           | What the five steps above are called, symbol by symbol                                                           |
-| Which axis                 | The six numbers worked through for BatchNorm, LayerNorm and GroupNorm, then a larger random tensor to confirm it |
-| BatchNorm                  | Why its numbers come from other people's data, and what that does at small batch sizes                           |
-| LayerNorm                  | Why normalizing one sample at a time is what sequence models need                                                |
-| RMSNorm                    | What you can throw away from the formula and get away with                                                       |
-| GroupNorm and the family   | The one knob that turns any of these into another                                                                |
-| Pre-norm against post-norm | Where the layer sits relative to the residual connection, and what that does to gradients                        |
-| Choosing                   | Which one to use, by model type                                                                                  |
+$\epsilon$ (typically $10^{-5}$) prevents division by zero when a group has no spread. $\gamma$ and $\beta$ are **learned parameters**, one per feature, initialized to 1 and 0. They matter: forcing every layer's input to exactly mean 0 and variance 1 could remove information the network needs, so it is given the freedom to choose any scale and offset — including undoing the normalization entirely if that turns out best. The difference is that the scale is now controlled by two explicit parameters rather than emerging from the interaction of every weight below.
 
 ---
 
-## The general form
+## The one choice: which values to average
 
-Every normalization layer in PyTorch computes this:
-
-```text
-y = gamma * (x - mu) / sqrt(var + eps) + beta
-```
-
-Read it out loud as: _the number, minus the mean of its group, divided by the spread of its group, then stretched by gamma and moved by beta._ It is the five steps of "Start here" written as one line.
-
-| Symbol  | What it is                                                    | Where it comes from                       |
-| :------ | :------------------------------------------------------------ | :---------------------------------------- |
-| `x`     | one activation value, one cell of the input tensor            | the previous layer                        |
-| `mu`    | the mean of the group `x` belongs to                          | computed from the activations, on the fly |
-| `var`   | the variance of that same group                               | computed from the activations, on the fly |
-| `eps`   | a small constant so the division never has a zero denominator | a fixed number, `1e-5` by default         |
-| `gamma` | the learned stretch                                           | a parameter, initialized to `1`           |
-| `beta`  | the learned shift                                             | a parameter, initialized to `0`           |
-| `y`     | the normalized value that goes to the next layer              | the output                                |
-
-`mu` and `var` come from the activations. `gamma` and `beta` are learned parameters of the same shape as the normalized axes, initialized to `1` and `0`, so the layer starts as an identity in scale and can undo its own normalization if that turns out to be best. They are the layer's <Tip term="affine parameters">"Affine" just means multiply, then add. Gamma multiplies, beta adds.</Tip>, the only part of the operation that is learned rather than computed. `eps` prevents division by zero and defaults to `1e-5` in `BatchNorm` and `LayerNorm`. On the three-number walk above it is the reason the output spread is `0.99999` rather than `1.0`.
-
-One convention worth pinning down: the variance here divides by the count `n`, not by `n - 1`. On `1, 2, 3` that is the difference between variance `0.6667` and variance `1.0`, and between normalized output `[-1.2247, 0.0, 1.2247]` and a tidy `[-1.0, 0.0, 1.0]`. Both are correct arithmetic; the layers use the `n` version, and so does `numpy` by default, which is why every number on this page is reproducible.
-
-RMSNorm drops the `mu` term and the `beta` parameter, which is a real simplification rather than a cosmetic one.
-
-What normalization buys you: the mean-square of the activations entering each layer stays near a fixed value regardless of depth. That is the same quantity as the variance when the mean is zero, and you just computed it by hand: `[-1.2247, 0.0, 1.2247]` squares to `1.49998, 0.0, 1.49998`, and the three squares average to `0.99999`. [Layers and Initialization](/ai/neural-networks/layers-and-initialization) showed that a bad initialization scale makes activations collapse by a factor of six per layer. Normalization resets the scale at every block, so the initialization stops mattering. It also lets you use a larger learning rate, because the loss surface becomes smoother and its <Tip term="curvature">How sharply a surface bends. A badly conditioned surface bends very steeply in one direction and barely at all in another, which makes one fixed step size wrong for both.</Tip> better conditioned.
-
----
-
-## Which axis
-
-Take a tensor of shape `(N, C)`, a batch of `N` samples with `C` features each. There are two axes to <Tip term="reduce over">To collapse an axis by summarizing it: averaging down it leaves one number where there used to be many.</Tip>, and the choice defines the layer:
-
-| Layer          | Reduces over                     | Statistic shared by             | Uses other samples? |
-| :------------- | :------------------------------- | :------------------------------ | :------------------ |
-| `BatchNorm1d`  | the batch axis `N`               | all samples, per feature        | Yes                 |
-| `LayerNorm`    | the feature axis `C`             | one sample, across its features | No                  |
-| `RMSNorm`      | the feature axis `C`             | one sample, across its features | No                  |
-| `InstanceNorm` | the spatial axes                 | one sample, one channel         | No                  |
-| `GroupNorm`    | channels in a group plus spatial | one sample, one group           | No                  |
-
-Read the second column as "which cells are averaged together", and the fourth as "does my answer depend on whose data was in the batch with mine". Only one row says Yes.
-
-### Six numbers you can point at
-
-Here is the `(2, 3)` array from "Start here", two samples, three features, six numbers total:
+An activation tensor has several axes: batch, features (or channels), and for images, height and width. Each normalization layer computes $\mu$ and $\sigma$ over a different subset. With a batch of 2 samples and 3 features:
 
 ```text
-              c0   c1   c2
-sample 0       1    2    3
-sample 1       5    4    7
+             feature 0   feature 1   feature 2
+sample 0         1           2           3
+sample 1         5           4           7
 ```
 
-Worked through for each of the three groupings. Every number below is arithmetic you can do on paper, and the code block after them is the same computation in `numpy`.
+- **BatchNorm** averages **down each column**, across the batch: groups $(1, 5)$, $(2, 4)$, $(3, 7)$. Each feature is normalized using all samples in the batch.
+- **LayerNorm** averages **along each row**, across features: groups $(1, 2, 3)$ and $(5, 4, 7)$. Each sample is normalized using only its own values.
 
-**BatchNorm: one statistic per column.** The groups run down the array, so a column's two numbers are averaged together and never leave their column.
+| Layer            | Statistics computed over                               | Depends on other samples in the batch? |
+| :--------------- | :----------------------------------------------------- | :------------------------------------- |
+| **BatchNorm**    | The batch (and spatial positions), per channel         | Yes                                    |
+| **LayerNorm**    | All features of one sample                             | No                                     |
+| **RMSNorm**      | All features of one sample, without centring           | No                                     |
+| **InstanceNorm** | Spatial positions of one channel of one sample         | No                                     |
+| **GroupNorm**    | A group of channels plus spatial positions, per sample | No                                     |
 
-| Group | Numbers averaged | `mu`  | Deviations | `var`               | `sqrt(var + eps)` |
-| :---- | :--------------- | :---- | :--------- | :------------------ | :---------------- |
-| `c0`  | `1, 5`           | `3.0` | `-2, +2`   | `(4 + 4) / 2 = 4.0` | `2.000002`        |
-| `c1`  | `2, 4`           | `3.0` | `-1, +1`   | `(1 + 1) / 2 = 1.0` | `1.000005`        |
-| `c2`  | `3, 7`           | `5.0` | `-2, +2`   | `(4 + 4) / 2 = 4.0` | `2.000002`        |
-
-Dividing each deviation by its column's spread gives every cell in the top row `-0.99999875`, `-0.999995`, `-0.99999875` and every cell in the bottom row the same three values with a plus sign. With only two numbers in a group, the deviations are always equal and opposite, so BatchNorm at `N = 2` can only ever answer `+1` or `-1`.
-
-| After BatchNorm | `c0`   | `c1`   | `c2`   |
-| :-------------- | :----- | :----- | :----- |
-| sample 0        | `-1.0` | `-1.0` | `-1.0` |
-| sample 1        | `+1.0` | `+1.0` | `+1.0` |
-
-Each column now has mean `0.0` and spread `1.0`. Each row has become a flat line: the two samples differ from each other by exactly the same amount in every feature, and the per-sample spread is `0.0`. BatchNorm promised nothing about rows.
-
-**LayerNorm: one statistic per row.** The groups run across the array, so the three numbers of a row are averaged together and never leave their row.
-
-| Group    | Numbers averaged | `mu`     | Deviations                  | `var`                                     | `sqrt(var + eps)` |
-| :------- | :--------------- | :------- | :-------------------------- | :---------------------------------------- | :---------------- |
-| sample 0 | `1, 2, 3`        | `2.0`    | `-1, 0, +1`                 | `(1 + 0 + 1) / 3 = 0.6667`                | `0.816503`        |
-| sample 1 | `5, 4, 7`        | `5.3333` | `-0.3333, -1.3333, +1.6667` | `(0.1111 + 1.7778 + 2.7778) / 3 = 1.5556` | `1.247223`        |
-
-| After LayerNorm | `c0`      | `c1`     | `c2`     |
-| :-------------- | :-------- | :------- | :------- |
-| sample 0        | `-1.2247` | `0.0`    | `1.2247` |
-| sample 1        | `-0.2673` | `-1.069` | `1.3363` |
-
-Sample 0's row is the "Start here" walk again, same three numbers, same `[-1.2247, 0.0, 1.2247]`. Each row now has mean `0.0` and spread `1.0`; each column is whatever it happens to be, here `[-0.7460, -0.5345, 1.2805]` across the two rows. LayerNorm promised nothing about columns.
-
-Notice that `5, 4, 7` and `1, 2, 3` are normalized with completely different numbers, `1.247223` versus `0.816503`. That is the whole reason LayerNorm does not care what else is in the batch.
-
-**GroupNorm: one statistic per row, per group of channels.** Now the row is cut into chunks, and each chunk gets its own mean and variance. `G` is the number of chunks, and it has to divide `C` evenly, so with `C = 3` the only legal choices are `G = 1` and `G = 3`:
-
-| `G` | Groups            | Numbers averaged                | Output                                        |
-| :-- | :---------------- | :------------------------------ | :-------------------------------------------- |
-| 1   | the whole row     | `1, 2, 3` and `5, 4, 7`         | identical to LayerNorm above, to the last bit |
-| 3   | one channel alone | `1` alone, `5` alone, and so on | all six cells `0.0`                           |
-
-`G = 3` is the degenerate end of the family: a group of one number has that number as its mean, so every deviation is `0`, its variance is `0`, and the output is `0 / sqrt(0 + eps) = 0.0`. Nothing survives. This is `InstanceNorm` on a tensor with no spatial size, and it is the reason group size has to be chosen against the number of elements, not the number of channels.
-
-To see a real middle case, give the samples a fourth feature:
-
-```text
-              c0   c1   c2   c3
-sample 0       1    2    3    5
-sample 1       5    4    7   11
-```
-
-With `C = 4` and `G = 2`, each group is two channels of one row:
-
-| Group                      | Numbers averaged | `mu`  | `var`                      | `sqrt(var + eps)` | Output cells         |
-| :------------------------- | :--------------- | :---- | :------------------------- | :---------------- | :------------------- |
-| sample 0, channels 0 and 1 | `1, 2`           | `1.5` | `(0.25 + 0.25) / 2 = 0.25` | `0.50001`         | `-0.99998, +0.99998` |
-| sample 0, channels 2 and 3 | `3, 5`           | `4.0` | `(1 + 1) / 2 = 1.0`        | `1.000005`        | `-1.0, +1.0`         |
-| sample 1, channels 0 and 1 | `5, 4`           | `4.5` | `(0.25 + 0.25) / 2 = 0.25` | `0.50001`         | `+0.99998, -0.99998` |
-| sample 1, channels 2 and 3 | `7, 11`          | `9.0` | `(4 + 4) / 2 = 4.0`        | `2.000002`        | `-1.0, +1.0`         |
-
-The same six-plus numbers, four groups of two, and nothing crosses a row boundary. In a CNN each group also swallows every spatial position, which is what makes its statistics stable: two channels times an `8x8` map is `2 * 64 = 128` numbers in a group instead of two.
-
-All three, in one `numpy` run:
-
-```python title="axis_walk.py"
-import numpy as np
-
-eps = 1e-5
-x = np.array([[1.0, 2.0, 3.0],
-              [5.0, 4.0, 7.0]])
-
-print("batchnorm, down the columns")
-print(((x - x.mean(0)) / np.sqrt(x.var(0) + eps)).round(4))
-
-print("layernorm, across the rows")
-mu = x.mean(1, keepdims=True)
-print(((x - mu) / np.sqrt(x.var(1, keepdims=True) + eps)).round(4))
-
-print("groupnorm, G=3 then G=1")
-for G in (3, 1):
-    xr = x.reshape(2, G, 3 // G)
-    m = xr.mean(axis=2, keepdims=True)
-    v = xr.var(axis=2, keepdims=True)
-    print(G, ((xr - m) / np.sqrt(v + eps)).reshape(2, 3).round(4))
-```
-
-```text
-batchnorm, down the columns
-[[-1. -1. -1.]
- [ 1.  1.  1.]]
-layernorm, across the rows
-[[-1.2247  0.      1.2247]
- [-0.2673 -1.069   1.3363]]
-groupnorm, G=3 then G=1
-3 [[0. 0. 0.]
- [0. 0. 0.]]
-1 [[-1.2247  0.      1.2247]
- [-0.2673 -1.069   1.3363]]
-```
-
-The `G = 1` block is character-for-character the LayerNorm block, which is the "the end points are exact" claim of the GroupNorm section demonstrated on six numbers you can point at.
-
-### The same thing on a random tensor
-
-Here is what that means on a concrete tensor, larger and random this time. `x` is `(4, 6)` drawn from `N(3.0, 2.0)`, so nothing about it is centered:
-
-```python title="axes.py"
-import numpy as np
-
-eps = 1e-5
-
-def batchnorm(x):                    # reduce over axis 0, the batch
-    return (x - x.mean(0)) / np.sqrt(x.var(0) + eps)
-
-def layernorm(x):                    # reduce over axis 1, the features
-    mu = x.mean(1, keepdims=True)
-    return (x - mu) / np.sqrt(x.var(1, keepdims=True) + eps)
-
-def rmsnorm(x):                      # reduce over axis 1, no mean subtraction
-    return x / np.sqrt((x**2).mean(1, keepdims=True) + eps)
-
-x = np.random.default_rng(0).normal(loc=3.0, scale=2.0, size=(4, 6))
-
-for name, f in (("BatchNorm", batchnorm), ("LayerNorm", layernorm), ("RMSNorm", rmsnorm)):
-    o = f(x)
-    print(f"{name:<10} per-feature mean {np.round(o.mean(0), 4).tolist()}")
-    print(f"{'':<10} per-feature std  {np.round(o.std(0), 4).tolist()}")
-    print(f"{'':<10} per-sample  mean {np.round(o.mean(1), 4).tolist()}")
-    print(f"{'':<10} per-sample  RMS  {np.round(np.sqrt((o**2).mean(1)), 4).tolist()}")
-```
-
-The input itself has global mean `2.7717` and global std `1.6974`, per-feature means spanning `1.82` to `3.82`, and per-sample means spanning `1.21` to `3.79`. After each normalization:
-
-| Statistic after  | `BatchNorm`                  | `LayerNorm`                               | `RMSNorm`                              |
-| :--------------- | :--------------------------- | :---------------------------------------- | :------------------------------------- |
-| per-feature mean | `[0, 0, 0, 0, 0, 0]`         | `[-0.10, 0.59, -0.12, 0.09, -0.85, 0.39]` | `[0.67, 1.22, 0.68, 0.84, 0.63, 1.05]` |
-| per-feature std  | `[1, 1, 1, 1, 0.9996, 1]`    | `[1.23, 0.70, 0.93, 0.98, 0.88, 0.38]`    | `[0.94, 0.23, 0.39, 0.46, 0.23, 0.15]` |
-| per-sample mean  | `[0.48, -0.08, -0.87, 0.47]` | `[0, 0, 0, 0]`                            | `[0.97, 0.84, 0.64, 0.94]`             |
-| per-sample RMS   | `[0.90, 0.81, 1.22, 1.02]`   | `[1, 1, 1, 1]`                            | `[1, 1, 1, 1]`                         |
-
-Each row of that table is a promise, and each column shows which promise a layer keeps. Read the BatchNorm column down: its first two entries are all zeros and ones, because those are the statistics it reduced over, and its last two entries are unpromised numbers. Read any other column and the fixed statistics are the row that says "per-sample".
-
-Each layer zeroes exactly what it reduces over and leaves the other axis untouched. BatchNorm forces every feature to have mean zero across the batch and says nothing about any individual sample. LayerNorm forces every sample to have mean zero across its features and says nothing about any individual feature. RMSNorm forces the per-sample RMS to one but leaves the per-sample mean alone, which is why its per-sample means stay near `0.9` instead of going to zero.
-
-The `0.9996` in the BatchNorm row is `eps` becoming visible. That feature's variance in the input is `0.01179`, the smallest of the six, so `eps = 1e-5` is about a tenth of a percent of it and the divisor is slightly too large. For the other five features, with variances between `0.31` and `7.23`, `eps` is negligible and the std rounds to `1`. This is the practical meaning of `eps`: it dominates exactly when a feature has stopped varying, which is also when you want the layer to stop amplifying noise. The six-number walk shows the same thing at a smaller scale: the column holding `2` and `4` has variance `1.0`, and its normalized cells are `0.999995` rather than `1.0`.
-
-<Callout type="info">
-  ### BatchNorm couples samples together
-
-BatchNorm's statistic depends on every other sample in the batch. That has three consequences: the
-output for a given input changes depending on what it is batched with, the layer behaves
-differently in training and inference, and it cannot be used for online or single-sample inference
-without carrying the <Tip term="running statistics">Averages of past batch statistics that the layer stores as part of its state, so eval mode can behave the same way without seeing a batch at all.</Tip> around. Every other layer in this table is a pure
-per-sample function.
-
-</Callout>
-
-### Side by side
-
-| Layer          | Needs the rest of the batch | Different in train and eval | Works at `N = 1` | Works with variable-length sequences | Extra stored buffers          |
-| :------------- | :-------------------------- | :-------------------------- | :--------------- | :----------------------------------- | :---------------------------- |
-| `BatchNorm`    | Yes                         | Yes                         | No               | No                                   | `running_mean`, `running_var` |
-| `LayerNorm`    | No                          | No                          | Yes              | Yes                                  | none                          |
-| `RMSNorm`      | No                          | No                          | Yes              | Yes                                  | none                          |
-| `InstanceNorm` | No                          | No                          | Yes              | Yes                                  | none                          |
-| `GroupNorm`    | No                          | No                          | Yes              | Yes                                  | none                          |
-
-`gamma` and `beta` exist on every layer except RMSNorm, which keeps `gamma` alone. The top row is the only one with anything to carry between steps, and it is the only one whose answers change when you change the people in the batch.
+Everything about how these layers behave — and fail — follows from the last column.
 
 ---
 
 ## BatchNorm
 
-For a batch `x` of shape `(N, C)`:
+**Batch normalization** (Ioffe and Szegedy, 2015) normalizes each feature (each channel, in a CNN) over the examples in the current mini-batch, and over all spatial positions for images. It was the first normalization layer and it made very deep CNNs much easier to train.
 
-```text
-train:  mu = mean over N        var = variance over N        (per feature)
-eval:   mu = running_mean       var = running_var             (accumulated during training)
-```
+### Training and evaluation behave differently
 
-Read those two lines as: same formula, different source for the statistics. In training the mean comes from the batch standing in front of the layer; in eval it comes from averages the layer has been quietly writing down all along.
+During training, $\mu$ and $\sigma$ come from the current batch. At evaluation there may be no batch — a single image arrives at a time — and predictions must not depend on which other examples happen to be processed alongside. So BatchNorm also keeps **running statistics**, exponential moving averages of the batch statistics updated at every training step:
 
-The train and eval paths are genuinely different computations, controlled by `model.train()` and `model.eval()`. This is the layer that makes forgetting `model.eval()` a real bug rather than a style issue.
+$$
+\text{running} \leftarrow (1 - m)\cdot\text{running} + m \cdot \text{batch statistic}, \qquad m = 0.1
+$$
 
-### Running statistics
+At evaluation, the running averages replace the batch statistics. Starting from 0 with a constant batch mean of 4.0, the running mean goes $0.4,\ 0.76,\ 1.08,\ 1.38,\ 1.64, \dots$, closing a tenth of the remaining gap per step, so it reflects roughly the last 10 to 20 batches.
 
-At eval time there is no batch to take statistics from, so BatchNorm keeps an <Tip term="exponential moving average">A running average that mixes in each new value with a fixed weight and forgets old values at the same rate, so recent batches count more than ancient ones.</Tip> updated on every training step. PyTorch's update rule is:
-
-```text
-running = (1 - momentum) * running + momentum * batch_stat
-```
-
-Read it out loud as: _keep a fraction `1 - momentum` of what you already knew, and add a fraction `momentum` of what you just saw._ This is <Tip term="momentum">In this one formula, the weight given to the new observation. It is a different meaning from the momentum of an optimizer, which is a memory of past gradients.</Tip> in its other sense, not the optimizer sense. With `momentum = 0.1` by default, the weight remaining on the initial value after `t` steps is `(1 - momentum)^t`:
-
-| Steps | Weight on the initial value |
-| :---- | :-------------------------- |
-| 10    | `0.3487`                    |
-| 22    | `0.0985`                    |
-| 44    | `0.0097`                    |
-
-The effective window is about `1 / momentum = 10` steps. Starting a batch mean of `4.0` from `running = 0.0`, the running mean reaches `2.62` after 10 steps and `3.72` after 25.
-
-Here is that same walk one step at a time, so the rule is not a black box. The batch mean is `4.0` on every step and `running` starts at `0.0`:
-
-| Step | Arithmetic                 | `running` |
-| :--- | :------------------------- | :-------- |
-| 0    | start                      | `0.0`     |
-| 1    | `0.9 * 0.0 + 0.1 * 4.0`    | `0.4`     |
-| 2    | `0.9 * 0.4 + 0.1 * 4.0`    | `0.76`    |
-| 3    | `0.9 * 0.76 + 0.1 * 4.0`   | `1.084`   |
-| 4    | `0.9 * 1.084 + 0.1 * 4.0`  | `1.3756`  |
-| 5    | `0.9 * 1.3756 + 0.1 * 4.0` | `1.638`   |
-
-Every step closes exactly a tenth of whatever gap is left, so the approach to `4.0` is smooth and never arrives. After five steps it has covered a bit over 40% of the distance; it needs on the order of tens of steps to be close enough to matter, which is the same fact the `(1 - momentum)^t` table says.
-
-<Callout type="warn">
-  ### PyTorch's `momentum` is inverted
-
-In most EMA formulations, `momentum` is the weight on the _old_ value. In PyTorch's `BatchNorm`, it
-is the weight on the _new_ batch statistic. Setting `momentum=0.9` does not make the average
-smoother, it makes it react almost entirely to the last batch. TensorFlow's `BatchNormalization`
-uses the opposite convention, so porting a model means inverting this number. Pass `momentum=None`
-to switch to a cumulative average over all batches seen so far.
-
-</Callout>
+This is why `model.train()` and `model.eval()` matter: forgetting `model.eval()` at test time makes predictions depend on the test batch, and leaving a frozen backbone in train mode silently updates its running statistics. (PyTorch's `momentum` argument is the weight on the **new** value; many other libraries use the opposite convention.)
 
 ### Why batch size matters
 
-The batch statistics are estimates of the population statistics, and their error scales as `1 / sqrt(N)`. When the running statistics have converged to the truth, the difference between what train mode computes and what eval mode computes is entirely that estimation error:
+Batch statistics are **estimates** of the true statistics, and an estimate from $N$ samples has error proportional to $1/\sqrt{N}$:
 
-| Batch size | Mean abs difference, train against eval | Max abs difference | Std of the batch mean |
-| :--------- | :-------------------------------------- | :----------------- | :-------------------- |
-| 2          | `0.7526`                                | `2.4977`           | `0.7071`              |
-| 4          | `0.5029`                                | `1.9987`           | `0.5000`              |
-| 8          | `0.3459`                                | `1.5805`           | `0.3536`              |
-| 16         | `0.2429`                                | `1.2327`           | `0.2500`              |
-| 32         | `0.1705`                                | `0.9568`           | `0.1768`              |
-| 64         | `0.1208`                                | `0.7222`           | `0.1250`              |
-| 128        | `0.0854`                                | `0.5455`           | `0.0884`              |
-| 256        | `0.0603`                                | `0.4093`           | `0.0625`              |
+| Batch size                                               |    2 |    4 |   16 |   64 |  256 |
+| :------------------------------------------------------- | ---: | ---: | ---: | ---: | ---: |
+| Typical error in the batch mean (in standard deviations) | 0.71 | 0.50 | 0.25 | 0.13 | 0.06 |
 
-Measured over 64 features with population mean 0 and variance 1, running statistics converged. The last column is the theoretical `1 / sqrt(N)` and the first column tracks it closely. Check it on one row yourself: `1 / sqrt(4) = 0.5` and the table says `0.5000`; `1 / sqrt(2) = 0.7071`, the same value as the `N = 2` row, and halving it by going to `N = 4` is the whole shape of the curve.
+At batch size 2, the mean used in training differs from the running mean used at evaluation by about 0.7 standard deviations, so the network is trained on one distribution and tested on another. The limiting case is stark: with 2 samples, every normalized feature is just $\pm 1$, whatever the values. BatchNorm needs batches of roughly 16 or more per device, which rules it out for large detection and segmentation models whose images are big enough that only 1 or 2 fit on each GPU.
 
-At batch size 2, the mean activation shifts by `0.75` standard deviations between train and eval mode. A model trained this way learns to expect one distribution and is tested on another, and the gap shows up as validation accuracy that is much worse than training accuracy with no overfitting in sight. This is the entire reason GroupNorm and LayerNorm displaced BatchNorm in detection and segmentation, where memory limits force batch sizes of 1 or 2 per GPU.
+### Why BatchNorm helps
 
-There is a sharper version of the same point, and you have already seen it: at `N = 2` the six-number BatchNorm output was nothing but `+1` and `-1`. With two numbers there is exactly one shape a centered column can have, so the batch statistic cannot describe anything except "which one is bigger". Add a third sample and the values start to vary:
-
-```python title="bn_two.py"
-import numpy as np
-
-eps = 1e-5
-
-def bn(x):
-    return (x - x.mean(0)) / np.sqrt(x.var(0) + eps)
-
-for x in (np.array([[1.0, 2.0, 3.0], [5.0, 4.0, 7.0]]),
-          np.array([[-100.0, 0.5, 3.0], [7.0, 4.0, 3.1]])):
-    print(bn(x).round(4))
-
-x3 = np.array([[1.0, 2.0, 3.0], [5.0, 4.0, 7.0], [9.0, 8.0, 6.0]])
-print(bn(x3).round(4))
-```
-
-```text
-[[-1. -1. -1.]
- [ 1.  1.  1.]]
-[[-1.    -1.    -0.998]
- [ 1.     1.     0.998]]
-[[-1.2247 -1.069  -1.3728]
- [ 0.     -0.2673  0.9806]
- [ 1.2247  1.3363  0.3922]]
-```
-
-Two rows in, two rows out, and both are `+/-1` apart from rounding: the second array spans `-100` to `7` in one column and `3.0` to `3.1` in another, and BatchNorm turns it into the same pattern as the first. Three rows and the outputs become real numbers again, `-1.3728` and `0.9806` among them. A two-sample batch is a statistic estimated from nothing.
-
-### What BatchNorm is for
-
-The original paper motivated it as reducing "internal <Tip term="covariate shift">The input distribution of a layer drifting over time because the layers before it are changing.</Tip>", the idea that each layer's input distribution moves as the layers below it update. That explanation did not survive scrutiny. Santurkar et al. (2018) showed that BatchNorm often increases the measured covariate shift while still improving training, and that what it does instead is smooth the loss surface, making the gradient more predictive and permitting larger learning rates. The technique works; the original reason for why was wrong.
+The original paper explained it as reducing **internal covariate shift**, the drift of each layer's input distribution as earlier layers update. Santurkar et al. (2018) showed this explanation does not hold up: BatchNorm can even increase that drift while still helping. What it does is make the loss surface smoother, so gradients are more reliable from one step to the next and larger learning rates are stable. Its noise — each example's normalization depends on random batch-mates — also acts as a mild regularizer.
 
 ---
 
 ## LayerNorm
 
-For a single sample's feature vector `x` of length `C`:
+**Layer normalization** (Ba, Kiros and Hinton, 2016) normalizes each sample independently, over its own features. Nothing crosses the batch boundary, so:
 
-```text
-mu   = mean over C
-var  = variance over C
-y    = gamma * (x - mu) / sqrt(var + eps) + beta
-```
+- **Training and evaluation are identical.** There are no running statistics.
+- **Batch size 1 works**, as does any batch size.
+- **Variable-length sequences work.** Each token is normalized on its own, so padding in other sequences cannot contaminate it.
+- **One-token-at-a-time generation works**, because each new token is normalized without reference to anything else.
 
-Read it out loud as: _within one sample, over its own features._ Nothing here mentions `N`, and that is the point. On the six numbers above, this is the version that averaged `1, 2, 3` together and got `[-1.2247, 0.0, 1.2247]`, while sample 1's `5, 4, 7` was normalized with a completely different spread, `1.247223`.
-
-Nothing crosses the batch boundary. The statistic for sample `i` depends only on sample `i`, so the layer is a pure <Tip term="elementwise">Applied to each item independently, with no item's answer depending on any other item's.</Tip> function of each row and behaves identically in train and eval mode. There are no running statistics and `model.eval()` changes nothing.
-
-Three consequences, and they are why LayerNorm dominates sequence modeling:
-
-**Variable-length sequences work.** In a batch of padded sentences, sample 7 has 40 real tokens and sample 9 has 300. BatchNorm over the batch axis would mix a mostly-padding feature distribution into the statistic for a mostly-real feature. LayerNorm normalizes each token independently, so padding never contaminates anything.
-
-**Autoregressive generation works.** Generating token 500 requires the same computation as generating token 1, and the <Tip term="KV cache">The stored keys and values of the tokens already generated, so a language model does not recompute them for each new token.</Tip> means each new token is processed alone. A layer whose output depends on the rest of the batch cannot be used this way. LayerNorm can, which is a prerequisite for caching at all.
-
-**Batch size 1 works.** Inference servers process one request at a time. BatchNorm at `N = 1` has zero variance across the batch and produces a division by `sqrt(eps)`, which destroys the activations.
-
-The cost is that LayerNorm mixes features with different meanings. In a CNN, normalizing across the channel axis at one spatial position averages over channels that detect unrelated things. That is why CNNs kept BatchNorm for years, and why GroupNorm is the usual replacement there.
-
----
+These properties make LayerNorm the standard in RNNs and transformers. The cost is that it averages across features that may mean unrelated things. In a CNN, averaging over all channels at once mixes "edge detector" with "red detector" statistics, which is why CNNs kept BatchNorm.
 
 ## RMSNorm
 
-Zhang and Sennrich (2019) removed the mean subtraction:
+**RMSNorm** (Zhang and Sennrich, 2019) simplifies LayerNorm by dropping the mean subtraction and the shift $\beta$, dividing only by the root mean square:
 
-```text
-RMS(x) = sqrt( mean over C of x^2 + eps )
-y      = gamma * x / RMS(x)
-```
+$$
+y = \gamma \cdot \frac{x}{\sqrt{\tfrac{1}{C}\sum_i x_i^2 + \epsilon}}
+$$
 
-Read it out loud as: _divide each number by the root-mean-square of its own row._ No subtracting a center first, no re-shifting afterward.
+The insight is that LayerNorm's benefit comes from fixing the **scale**, not the centre. Since mean square $=$ mean$^2$ $+$ variance, the two layers are identical when the input is already centred, which transformer activations approximately are. RMSNorm saves one reduction and one parameter vector per layer, and is used by LLaMA, Mistral, Qwen, Gemma, and most recent language models.
 
-No `mu`, no `beta`. One reduction instead of two, one fewer learned parameter.
+## GroupNorm and InstanceNorm
 
-The justification is that re-centering invariance is not what makes LayerNorm work. Re-scaling invariance is. If the input is already mean-centered the two are identical, and on centered input the maximum absolute difference between them is `3.331e-16`, which is machine epsilon:
-
-```python title="rms_vs_ln.py"
-import numpy as np
-
-eps = 1e-5
-
-def layernorm(x):
-    mu = x.mean(1, keepdims=True)
-    return (x - mu) / np.sqrt(x.var(1, keepdims=True) + eps)
-
-def rmsnorm(x):
-    return x / np.sqrt((x**2).mean(1, keepdims=True) + eps)
-
-x = np.random.default_rng(0).normal(3.0, 2.0, (4, 6))
-xc = x - x.mean(1, keepdims=True)
-
-print(f"{np.abs(layernorm(xc) - rmsnorm(xc)).max():.3e}")   # 3.331e-16
-print(f"{np.abs(layernorm(x) - rmsnorm(x)).max():.3f}")     # 2.294
-```
-
-On the uncentered input the difference is `2.294`, so the equivalence holds only when the mean is already near zero. In a transformer it usually is, because the <Tip term="residual stream">The running sum that flows down a transformer: every block adds its output to it rather than replacing it.</Tip> stays roughly centered, which is why the approximation costs nothing in practice.
-
-The identity `RMS(x)^2 = mu^2 + var` is what connects them. Centering removes `mu^2` and leaves `var`. On the six numbers, sample 0 is `[1, 2, 3]`: its mean square is `(1 + 4 + 9) / 3 = 4.6667`, and its mean and variance are `2.0` and `0.6667`, so `mu^2 + var = 4.0 + 0.6667 = 4.6667`. The identity holds exactly, and the same check on sample 1 is `(25 + 16 + 49) / 3 = 30.0` against `5.3333^2 + 1.5556 = 28.4444 + 1.5556 = 30.0`. The `mu^2` term is the whole difference between the two layers: sample 0 carries `4.0` of it, so RMSNorm divides by `sqrt(4.6667 + eps) = 2.1602` instead of LayerNorm's `0.816503`, and its row becomes `[0.4629, 0.9258, 1.3887]` instead of `[-1.2247, 0.0, 1.2247]`. Same shape, spread `1.0` in the RMS sense, and a mean of `0.9258` that nobody asked to be zero.
-
-RMSNorm is what LLaMA, Mistral, Qwen, Gemma, and most models after 2023 use. In PyTorch it is `nn.RMSNorm(normalized_shape, eps=None)`, where `eps=None` means it falls back to `torch.finfo(x.dtype).eps`, about `1.19e-7` in `float32`. That is smaller than LayerNorm's `1e-5` default, so the two are not numerically interchangeable when you load one into the other.
+**GroupNorm** (Wu and He, 2018) splits the channels into $G$ groups (often 32) and normalizes each group over its channels and all spatial positions, per sample. It is independent of batch size, like LayerNorm, but averages only over related channels, so it suits CNNs. It is the standard replacement for BatchNorm in detection and segmentation models trained with small batches. Its two extremes are the other layers: $G = 1$ (all channels in one group) is LayerNorm, and $G = C$ (one channel per group) is **InstanceNorm**, which normalizes each channel of each image separately. InstanceNorm removes per-image contrast and colour statistics, which is exactly what style transfer wants.
 
 ---
 
-## GroupNorm and the family
+## Where normalization goes: pre-norm and post-norm
 
-GroupNorm splits the channel axis into `G` groups and normalizes each group over its channels and all spatial positions, per sample:
-
-```python title="groupnorm.py"
-import numpy as np
-
-eps = 1e-5
-
-def groupnorm(x, G):
-    N, C, H, W = x.shape
-    xr = x.reshape(N, G, C // G, H, W)
-    mu = xr.mean(axis=(2, 3, 4), keepdims=True)
-    var = xr.var(axis=(2, 3, 4), keepdims=True)
-    return ((xr - mu) / np.sqrt(var + eps)).reshape(N, C, H, W)
-```
-
-`C // G` is the channels per group, and the three axes in `mean(axis=(2, 3, 4))` are those channels plus every spatial position: the reshape is how you tell `numpy` which cells are allowed to be averaged together, which is the six-number exercise scaled up. Read the function out loud as: _per sample, per group, average over the group's channels and all of space._
-
-The group size sets how many elements each statistic is estimated from:
-
-| `C` | `G` | Channels per group | Elements per statistic at `8x8` | Equivalent to                |
-| :-- | :-- | :----------------- | :------------------------------ | :--------------------------- |
-| 64  | 64  | 1                  | 64                              | `InstanceNorm`               |
-| 64  | 32  | 2                  | 128                             | -                            |
-| 64  | 8   | 8                  | 512                             | -                            |
-| 512 | 1   | 512                | 25088 at `7x7`                  | `LayerNorm` over `(C, H, W)` |
-
-The two end points are exact, not approximate. Measured against the equivalent layers:
+In a network with [residual connections](/ai/classical-deep-learning/vision-architectures#resnet-the-residual-connection), the normalization can sit after the residual addition or inside the residual branch:
 
 ```text
-C=512 G=1  vs LayerNorm over (C,H,W) : max diff 0.000e+00
-C=64  G=64 vs InstanceNorm           : max diff 0.000e+00
+post-norm:  h = Norm(h + Block(h))        the original 2017 Transformer
+pre-norm:   h = h + Block(Norm(h))        GPT-2 and almost everything since
 ```
 
-The same exactness on six hand-checkable numbers is in "GroupNorm: one statistic per row, per group of channels" above: `G = 1` on the `(2, 3)` array reproduced LayerNorm's output digit for digit, and `G = 3` reproduced `InstanceNorm`, which is to say it output nothing but zeros.
-
-GroupNorm with `G = 1` is LayerNorm over the channel and spatial axes. With `G = C` it is InstanceNorm. `G = 32` is the default the paper recommends and what most detection and segmentation models use, because 32 channels times the spatial extent gives a statistic estimated from enough elements to be stable while staying independent of batch size.
-
-The whole family is one knob:
-
-| Layer          | Batch axis | Channel axis     | Spatial axes |
-| :------------- | :--------- | :--------------- | :----------- |
-| `BatchNorm`    | reduce     | keep             | reduce       |
-| `LayerNorm`    | keep       | reduce           | reduce       |
-| `InstanceNorm` | keep       | reduce           | reduce       |
-| `GroupNorm`    | keep       | reduce in groups | reduce       |
-
-Read a "reduce" cell as "this axis is inside the average" and a "keep" cell as "this axis gets its own separate average". Only four axes exist to place, and every layer on this page is one placement of them. BatchNorm is the only row that reduces over the batch. That is the single fact that generates every difference in behaviour between it and the rest.
-
----
-
-## Pre-norm against post-norm
-
-Where the normalization sits relative to the residual connection matters as much as which one you pick.
-
-```text
-post-norm:  h <- LN( h + Block(h) )        the original Transformer
-pre-norm:   h <- h + Block( LN(h) )        GPT-2 onward, and nearly everything since
-```
-
-Read them out loud as: _post-norm adds first and normalizes the sum_, and _pre-norm normalizes the input, runs the block, then adds_. `h` is the <Tip term="residual stream">The running sum that flows down a transformer: every block adds its output to it rather than replacing it.</Tip>, and `Block` is one attention-plus-feed-forward layer.
-
-In pre-norm the residual stream carries an unnormalized additive path from the input all the way to the output. In post-norm every path back through the network passes through a LayerNorm.
-
-Naming the two: a layer is _pre_-norm when the normalization is inside the block, on the block's input, and _post_-norm when it is after the residual add, on the block's output. Everything else about the two architectures is the same line of arithmetic.
-
-Measuring the RMS of `dL/dW` at each block, 40 residual blocks with a linear block function and a random seed gradient:
-
-| Placement   | Block 40 (near loss) | Block 20    | Block 1 (near input) | Ratio block1 / block40 |
-| :---------- | :------------------- | :---------- | :------------------- | :--------------------- |
-| `pre-norm`  | `6.080e-02`          | `8.917e-02` | `2.908e-01`          | `4.783`                |
-| `post-norm` | `4.279e-02`          | `4.599e-02` | `4.648e-02`          | `1.086`                |
-
-Read that table as one number per row: in pre-norm the earliest block's gradients are `4.783` times the last block's, and in post-norm they are `1.086` times, which is nearly equal.
-
-Pre-norm's parameter gradients grow toward the input, and the growth is `O(sqrt(L))`:
-
-| `L`       | 4       | 8       | 16      | 32      | 64      |
-| :-------- | :------ | :------ | :------ | :------ | :------ |
-| ratio     | `1.571` | `2.107` | `2.995` | `4.129` | `6.095` |
-| `sqrt(L)` | `2.000` | `2.828` | `4.000` | `5.657` | `8.000` |
-
-Doubling depth multiplies the ideal `sqrt(L)` by `1.414` each time, and the measured ratio climbs by factors of `1.341`, `1.421`, `1.379`, `1.476` as `L` doubles through the table. It tracks `sqrt(L)` rather than `L`, and that difference is the difference between a manageable drift and a runaway: `L` itself would have grown by `2` per doubling instead of about `1.4`.
-
-Post-norm's parameter gradients are flat across depth, within 9% at every depth tested. Its residual-stream activation RMS is pinned to exactly `1.0` at every block, because the LayerNorm normalizes the output of the add.
-
-Neither of these is a defect on its own. The consequence that decided the architecture is a training-stability one, established by Xiong et al. (2020): at initialization, post-norm produces large gradients in the layers near the output, and training diverges unless the learning rate is <Tip term="warmed up">Raising the learning rate from a small value over the first few hundred steps, so an unstable start is survived before the model is asked to move fast.</Tip>. Pre-norm's gradients are well behaved at any depth, so it trains without warmup. That is why GPT-2 switched, and why almost every model since has followed.
-
-Post-norm still shows up, and not only in the original Transformer. When the schedule is tuned, it often reaches slightly better final quality, because the normalization after the residual add keeps the stream at a controlled scale and lets later blocks contribute as much as early ones. If you have the budget to tune warmup carefully, post-norm is worth trying. If you do not, use pre-norm.
-
-<Callout type="info">
-  ### Gradient-check your LayerNorm backward
-
-The LayerNorm backward is the one people get wrong, because the mean and variance both depend on
-every element of the row, so the <Tip term="Jacobian">The matrix of every output's derivative with respect to every input. For LayerNorm one row of numbers produces one row of outputs, and every output depends on every input, so it is not diagonal.</Tip> has three terms rather than one:
-
-$$
-dx = \frac{dy - \operatorname{mean}(dy) - \hat{x} \cdot \operatorname{mean}(dy \cdot \hat{x})}{\sigma}
-$$
-
-Read it out loud as: _the incoming gradient, minus its own mean, minus the part that would move the mean again, all divided by the spread._ Dropping either of the two subtracted terms gives a gradient that is wrong in a way that still
-trains, just worse. Checking it against central differences gives a relative error of `9.2e-10`
-for the correct form.
-
-</Callout>
+In **pre-norm**, the residual path from input to output is a clean chain of additions with nothing in the way, so gradients reach early layers easily. Training is stable without careful tuning. In **post-norm**, every path back passes through a normalization layer; Xiong et al. (2020) showed this gives large gradients near the output at initialization, so post-norm training diverges without a learning-rate **warmup**. Post-norm can reach slightly better final quality when tuned, but pre-norm is the default because it is robust. Measured on 40 residual blocks, pre-norm's parameter gradients grow toward the input by a factor of about $\sqrt{L}$, a mild and manageable drift.
 
 ---
 
 ## Choosing
 
-Ask three questions in this order, and stop at the first one that rules something out:
+| Model                                                | Normalization                              |
+| :--------------------------------------------------- | :----------------------------------------- |
+| CNN for classification, batch ≥ 16 per device        | BatchNorm                                  |
+| CNN for detection or segmentation with small batches | GroupNorm (32 groups)                      |
+| Style transfer                                       | InstanceNorm                               |
+| Transformer                                          | RMSNorm or LayerNorm, in pre-norm position |
+| RNN or LSTM                                          | LayerNorm                                  |
+| Batch size 1 or 2, any model                         | Anything except BatchNorm                  |
 
-1. Is the batch smaller than about 16 on each device? Then BatchNorm is out.
-2. Do sequences vary in length, or does generation process one token at a time? Then BatchNorm is still out, and LayerNorm or RMSNorm is in.
-3. Is it a CNN whose channels mean unrelated things at one position? Then GroupNorm or InstanceNorm, not LayerNorm across channels.
+Three questions decide it: is the batch small? (then not BatchNorm) Are inputs sequences of varying length or generated one token at a time? (then LayerNorm or RMSNorm) Is it a CNN whose channels mean unrelated things? (then GroupNorm rather than LayerNorm).
 
-| Model                                          | Use                                    |
-| :--------------------------------------------- | :------------------------------------- |
-| CNN for classification                         | `BatchNorm2d`, batch size 16 or larger |
-| CNN for detection or segmentation, small batch | `GroupNorm` with `num_groups=32`       |
-| Style transfer                                 | `InstanceNorm2d`                       |
-| Transformer, any kind                          | `RMSNorm`, pre-norm                    |
-| RNN or LSTM                                    | `LayerNorm`                            |
-| Batch size 1 or 2, any model                   | Anything except `BatchNorm`            |
-| Tabular MLP                                    | `BatchNorm1d`, or none                 |
+---
 
-The batch size row overrides everything else. If you cannot guarantee a batch of at least 16 per device, BatchNorm's train-eval gap will dominate whatever else you tune.
+## Key terms
+
+| Term                         | Meaning                                                                                    |
+| :--------------------------- | :----------------------------------------------------------------------------------------- |
+| **normalization**            | Rescaling a group of values to mean 0 and standard deviation 1                             |
+| **$\gamma$, $\beta$**        | Learned per-feature scale and shift applied after normalizing                              |
+| **BatchNorm**                | Normalizes each feature over the batch; uses running statistics at evaluation              |
+| **running statistics**       | Moving averages of batch mean and variance, used in evaluation mode                        |
+| **LayerNorm**                | Normalizes each sample over its own features                                               |
+| **RMSNorm**                  | LayerNorm without mean subtraction or shift                                                |
+| **GroupNorm / InstanceNorm** | Per-sample normalization over groups of channels / single channels, plus spatial positions |
+| **pre-norm / post-norm**     | Normalization inside the residual branch / after the residual addition                     |
 
 ---
 
 ## Interview questions
 
 <Accordions>
+  <Accordion title="Normalize [1, 2, 3] by hand.">
+
+    The mean is 2, the deviations are $-1, 0, 1$, the variance is $2/3$, and the standard deviation is 0.816, giving $[-1.225, 0, 1.225]$. A learned $\gamma$ and $\beta$ then rescale and shift it; with $\gamma = 2$ and $\beta = 1$ it becomes $[-1.449, 1, 3.449]$.
+
+  </Accordion>
+  <Accordion title="Why do normalization layers have learnable γ and β?">
+
+    Forcing every layer's input to exactly zero mean and unit variance could remove useful information, such as a feature that should be mostly positive. $\gamma$ and $\beta$ let the network choose any scale and offset, including undoing the normalization. The benefit remains because the scale is controlled by two explicit parameters instead of emerging from all the weights below.
+
+  </Accordion>
   <Accordion title="What is the difference between BatchNorm and LayerNorm?">
 
-    Which axis they reduce over. BatchNorm computes one mean and variance per feature across the batch axis, so samples are coupled. LayerNorm computes one per sample across the feature axis, so each sample is independent.
+    BatchNorm normalizes each feature across the examples in a batch; LayerNorm normalizes each example across its own features. BatchNorm therefore depends on the batch, needs running statistics for evaluation, behaves differently in train and eval modes, and fails at small batch sizes. LayerNorm is a per-example function with none of those issues, which suits sequences and generation.
 
   </Accordion>
-  <Accordion title="Why does LayerNorm work in sequence models and BatchNorm does not?">
+  <Accordion title="Why does BatchNorm fail with small batches?">
 
-    Three reasons. Padded sequences of different lengths would mix statistics across samples. Autoregressive generation with a KV cache processes one token at a time. And inference at batch size 1 gives BatchNorm zero variance across the batch.
-
-  </Accordion>
-  <Accordion title="What does RMSNorm remove, and why is that safe?">
-
-    The mean subtraction and the `beta` bias. On mean-centered input it is identical to LayerNorm to within `3.3e-16`. It keeps the re-scaling invariance, which is the part that does the work, and saves one reduction.
+    The batch mean and variance are estimates whose error scales as $1/\sqrt{N}$: about 0.7 standard deviations at $N = 2$. Training then uses statistics that differ substantially from the running statistics used at evaluation, so the model is evaluated on a different distribution from the one it was trained on. At $N = 2$ each normalized feature is simply $\pm 1$.
 
   </Accordion>
-  <Accordion title="How does BatchNorm behave differently in train and eval mode?">
+  <Accordion title="What does forgetting model.eval() do to a network with BatchNorm?">
 
-    Training uses the current batch statistics and updates the running averages. Evaluation uses the running averages and ignores the batch. Forgetting `model.eval()` means your validation metric is computed with training-mode normalization.
-
-  </Accordion>
-  <Accordion title={<>What is PyTorch's <code>BatchNorm</code> <code>momentum</code> convention?</>}>
-
-    `running = (1 - momentum) * running + momentum * batch_stat`, so `momentum` is the weight on the new statistic. That is inverted from the usual EMA convention and from TensorFlow's, and the effective averaging window is about `1 / momentum` steps.
+    Evaluation uses the current batch's statistics instead of the running averages, so predictions depend on which examples are batched together and degrade badly for small or unrepresentative batches. It also keeps updating the running statistics with test data.
 
   </Accordion>
-  <Accordion title="Why does BatchNorm fail at small batch sizes?">
+  <Accordion title="Why did RMSNorm replace LayerNorm in many language models?">
 
-    The batch statistics are estimates with error scaling as `1/sqrt(N)`. At `N = 2` the mean activation differs between train and eval mode by `0.75` standard deviations, so the model trains on one distribution and is tested on another.
-
-  </Accordion>
-  <Accordion title="On a batch of two samples, what can BatchNorm output?">
-
-    Only `+1` or `-1` per cell, up to `eps`, and before gamma and beta are applied. With two numbers in a group the deviations are equal and opposite and the spread is half the gap, so every column normalizes to the same pair of signs whatever the values were. That is the same fact that makes `N = 2` statistics useless.
+    It drops mean subtraction and the shift parameter, dividing only by the root mean square. Because mean square equals squared mean plus variance, it equals LayerNorm on centred inputs, and transformer activations are close to centred. It is slightly cheaper with no loss in quality, because rescaling rather than recentring is what provides the benefit.
 
   </Accordion>
-  <Accordion title="Why does GroupNorm replace BatchNorm in detection?">
+  <Accordion title="Why is pre-norm more stable than post-norm?">
 
-    It is independent of batch size, so a per-GPU batch of 1 or 2, which is what large-image detection forces, gives stable statistics. `num_groups=32` estimates each statistic from 32 channels times the spatial extent.
-
-  </Accordion>
-  <Accordion title="What are the two extremes of GroupNorm?">
-
-    `G = 1` is LayerNorm over the channel and spatial axes. `G = C` is InstanceNorm. Both equivalences are exact.
-
-  </Accordion>
-  <Accordion title="What has to be true of the group count and the channel count?">
-
-    `G` must divide the channel count evenly, because every group has to be the same size. A `(2, 3)` array only allows `G = 1` or `G = 3`, and `G = 3` puts a single number in each group, which has zero variance and outputs exactly zero.
-
-  </Accordion>
-  <Accordion title="What is the difference between pre-norm and post-norm?">
-
-    Post-norm applies LayerNorm after the residual add, `LN(h + Block(h))`. Pre-norm applies it inside the block, `h + Block(LN(h))`, leaving the residual stream unnormalized.
-
-  </Accordion>
-  <Accordion title="Why did transformers move to pre-norm?">
-
-    At initialization post-norm produces large gradients near the output and diverges without learning rate warmup. Pre-norm trains stably at any depth without warmup. Measured over 40 blocks, pre-norm's parameter gradients grow as `sqrt(L)` toward the input while post-norm's stay flat within 9%.
-
-  </Accordion>
-  <Accordion title="Was the original motivation for BatchNorm correct?">
-
-    No. It was proposed to reduce internal covariate shift, but Santurkar et al. (2018) showed BatchNorm often increases that shift while still helping. What it does is smooth the loss surface, which makes gradients more predictive and permits larger learning rates.
+    Pre-norm normalizes inside the residual branch, so the skip path from input to output is an uninterrupted chain of additions and gradients reach early layers without passing through normalization. Post-norm puts a normalization on every path, which produces large gradients near the output at initialization and requires learning-rate warmup to avoid divergence.
 
   </Accordion>
 </Accordions>

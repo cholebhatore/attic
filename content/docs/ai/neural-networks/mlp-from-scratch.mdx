@@ -1,732 +1,311 @@
 ---
-title: MLP from Scratch
-description: 'Cached forward pass, the seven analytical backward gradients, gradient checking against central differences, and where each shape comes from.'
+title: Backpropagation
+description: 'How the gradient of every weight is computed in one backward sweep: why numerical differentiation is too slow, the chain rule as upstream gradient times local gradient, a two-neuron network backpropagated by hand, the four local rules that cover a whole MLP, a complete MLP trained from scratch in NumPy with its seven gradients derived, gradient checking, the shape contract, the missing-1/N bug, and what autograd automates.'
 ---
 
-[Backprop from Scratch](/ai/math-foundations/backprop-from-scratch) built reverse-mode differentiation over a scalar graph. This page does the same thing over matrices, where every gradient has a shape that has to line up with the parameter it updates, and where getting the shape right is most of the work.
+**Backpropagation** is the algorithm that computes the gradient of the loss with respect to every parameter in a network, in a single backward sweep that costs about as much as one extra forward pass. [Gradient descent](/ai/neural-networks/gradient-descent) needs those gradients at every step; backpropagation is how they are obtained. It was popularized for neural networks by Rumelhart, Hinton and Williams in 1986, and every deep learning framework's `backward()` is an implementation of it.
 
-The network is two linear layers with a ReLU between them and a softmax cross-entropy loss on top. Seven gradients come out of the backward pass. All seven are derived here, implemented in NumPy, and checked against central differences to a relative error of `1e-10`.
+This page starts with the chain rule on a network of two neurons, computed by hand, then extracts the four rules that cover any multi-layer perceptron, then builds and trains a complete MLP in NumPy with no autograd at all, and verifies it.
 
-Symbols on this page (`@`, `.T`, `axis=0`, the `d` prefix on `dz2`, `dW2`, and friends) are decoded in [Notation and Symbols](/ai/math-foundations/notation-and-symbols).
-
----
-
-## The plain-language version
-
-An **MLP** (multi-layer perceptron) is the simplest real neural network: an input, one or more **hidden layers**, and an output layer, each a matrix multiply plus a bias, with an activation function between them. This page builds a two-layer MLP for **classification**, meaning it picks one of several classes for each input.
-
-Training it needs two passes:
-
-- **Forward pass**: push the input through the layers to get class probabilities and a loss. Save the intermediate values on the way, because the backward pass needs them.
-- **Backward pass**: start from the loss and work backwards, layer by layer, computing the gradient for every weight and bias. This is **backpropagation**: the chain rule, applied to matrices.
-
-Then you check your hand-derived gradients against brute-force numerical ones. If they agree, your math is right.
-
-| Word                              | Plain meaning                                                                                                                                |
-| :-------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------- |
-| **MLP**                           | Multi-layer perceptron: stacked fully connected layers with activations between them.                                                        |
-| **input / hidden / output layer** | The input layer is the data itself. Hidden layers are in the middle. The output layer produces the final scores, one per class.              |
-| **hidden unit**                   | One neuron in a hidden layer.                                                                                                                |
-| **sample**                        | One example in the batch: one row of `x`.                                                                                                    |
-| **class / label**                 | The categories the network chooses between, and the correct one for each sample. Labels are stored as integers: `y = [0, 2]`.                |
-| **one-hot**                       | A label written as a vector with a 1 at the true class and 0 elsewhere. Label 2 of 3 classes is `[0, 0, 1]`.                                 |
-| **logits**                        | The raw output scores, one per class, before softmax.                                                                                        |
-| **softmax**                       | Turns logits into probabilities that are positive and add up to 1.                                                                           |
-| **cross-entropy loss**            | The standard classification loss: minus the log of the probability the model gave the correct class. 1.0 gives loss 0; 0.01 gives about 4.6. |
-| **cache**                         | The intermediate values saved during the forward pass for use in the backward pass.                                                          |
-| **gradient (`dW`, `dz`)**         | The `d` prefix means "gradient of the loss with respect to". `dW2` is how the loss changes as each entry of `W2` changes.                    |
-| **gradient checking**             | Nudge one weight up and down by a tiny amount, measure how the loss changes, and compare with your computed gradient.                        |
-| **relative error**                | The difference between two numbers divided by their size. A gradient check passes when it is tiny, around `1e-7` or smaller.                 |
-| **epoch**                         | One full pass over the training data.                                                                                                        |
+**Builds on:** [Gradient Descent](/ai/neural-networks/gradient-descent), [Loss Functions](/ai/neural-networks/loss-functions#categorical-cross-entropy) for the softmax cross-entropy gradient, and [Derivatives and Gradients](/ai/math-foundations/derivatives-and-gradients) for the chain rule. [Backprop from Scratch](/ai/math-foundations/backprop-from-scratch) builds the same idea as a general scalar autograd engine.
 
 ---
 
-## Start here
+## Why a special algorithm is needed
 
-On the previous page every node in the graph held a single number, and the backward pass was one rule repeated:
+The obvious way to get a gradient is **numerical differentiation**: nudge one parameter by a tiny $h$, rerun the network, and see how the loss changes:
 
-```
-node.grad = (local derivative) * (out.grad)     sent to each input
-```
+$$
+\frac{\partial L}{\partial \theta_j} \approx \frac{L(\theta_j + h) - L(\theta_j - h)}{2h}
+$$
 
-That rule is unchanged here, word for word. What changes is what a node holds: a rectangle of numbers instead of a number. So the gradient arriving at a weight is a whole matrix, and the update `W -= lr * dW` only works if that matrix has the same shape as `W`. Products of numbers always work; products of arrays work only when the inner dimensions agree. A wrong transpose then does one of two things: it trips a shape error, which is the good case, or, when the shapes happen to fit anyway, it hands you a gradient of exactly the right shape containing exactly the wrong numbers. Both cases show up below. The loud one is what the shape contract at the end of this page is for; the quiet one is why the gradient check exists.
+That costs two forward passes **per parameter**. A network with 10 million parameters would need 20 million forward passes for one gradient step. Backpropagation gets all 10 million partial derivatives from one forward pass and one backward pass, roughly three times the cost of a forward pass alone. Without it, training neural networks would be impossible.
 
-Here is the smallest instance that exercises every step of the backward pass: two samples, three features, three hidden units, three classes, with hand-sized weights.
+The trick is to reuse work. Every parameter's gradient shares most of its chain-rule product with its neighbours', and backpropagation computes each shared piece exactly once.
 
-```python title="toy.py"
-import numpy as np
+---
 
-x  = np.array([[1.0, 0.0, -2.0],
-               [0.5, 1.0, -1.0]])        # (2, 3)  two samples, three features
-W1 = np.array([[0.5, -0.5, 0.2],
-               [0.0, -1.0, 0.4],
-               [-1.0, -0.3, 0.5]])       # (3, 3)
-b1 = np.array([0.0, 0.0, 0.2])
-W2 = np.array([[0.3, -0.2, 0.1],
-               [0.5, 0.4, -0.3],
-               [-0.1, 0.2, 0.6]])        # (3, 3)
-b2 = np.zeros(3)
-y  = np.array([0, 2])                    # labels: sample 0 is class 0, sample 1 is class 2
+## The chain rule, worked on two neurons
 
-def softmax(z):
-    e = np.exp(z - z.max(axis=1, keepdims=True))
-    return e / e.sum(axis=1, keepdims=True)
+A tiny network with one input, one hidden ReLU neuron, and one output, trained with squared error:
 
-# forward
-z1 = x @ W1 + b1
-a1 = np.maximum(0.0, z1)
-z2 = a1 @ W2 + b2
-p  = softmax(z2)
-loss = -np.log(p[np.arange(2), y]).mean()
+$$
+z_1 = w_1 x, \qquad a_1 = \text{ReLU}(z_1), \qquad z_2 = w_2 a_1, \qquad L = (z_2 - y)^2
+$$
 
-# backward, the five steps
-dz2 = (p - np.eye(3)[y]) / 2
-dW2 = a1.T @ dz2
-db2 = dz2.sum(axis=0)
-da1 = dz2 @ W2.T
-dz1 = da1 * (z1 > 0)
-dW1 = x.T @ dz1
-db1 = dz1.sum(axis=0)
+With $x = 2$, $y = 1$, $w_1 = 0.5$, $w_2 = -1.5$:
 
-for name, v in [("z1", z1), ("a1", a1), ("z2", z2), ("p", p), ("dz2", dz2),
-                ("dW2", dW2), ("db2", db2), ("da1", da1), ("dz1", dz1),
-                ("dW1", dW1), ("db1", db1)]:
-    print(f"  {name:<4} {str(v.shape):<8} {np.round(v, 4).tolist()}")
-print(f"  loss {loss:.6f}")
-```
+### Forward pass: compute and store every intermediate value
+
+| Quantity | Computation        | Value |
+| :------- | :----------------- | ----: |
+| $z_1$    | $0.5 \times 2$     |   1.0 |
+| $a_1$    | $\text{ReLU}(1.0)$ |   1.0 |
+| $z_2$    | $-1.5 \times 1.0$  |  −1.5 |
+| $L$      | $(-1.5 - 1)^2$     |  6.25 |
+
+### Backward pass: from the loss back to each weight
+
+Work in reverse. At each node, multiply the gradient arriving from above (the **upstream gradient**) by the node's own derivative (the **local gradient**):
+
+| Gradient                    | Upstream × local                                                  | Value |
+| :-------------------------- | :---------------------------------------------------------------- | ----: |
+| $\partial L / \partial z_2$ | $2(z_2 - y) = 2(-2.5)$                                            |  −5.0 |
+| $\partial L / \partial w_2$ | $\partial L/\partial z_2 \times a_1 = -5.0 \times 1.0$            |  −5.0 |
+| $\partial L / \partial a_1$ | $\partial L/\partial z_2 \times w_2 = -5.0 \times (-1.5)$         |   7.5 |
+| $\partial L / \partial z_1$ | $\partial L/\partial a_1 \times \text{ReLU}'(z_1) = 7.5 \times 1$ |   7.5 |
+| $\partial L / \partial w_1$ | $\partial L/\partial z_1 \times x = 7.5 \times 2$                 |  15.0 |
+
+Checking with numerical differentiation gives $15.000$ and $-5.000$. A gradient step with $\eta = 0.01$ moves $w_1 \to 0.35$ and $w_2 \to -1.45$, and the loss drops from 6.25 to 4.06.
+
+Three things to see in this table:
+
+1. **Each step uses only local information.** A node needs the upstream gradient and its own derivative, nothing else. That makes the algorithm modular: any operation can join the network if it knows its local derivative.
+2. **Shared work is reused.** $\partial L/\partial z_2$ was computed once and used twice — for $w_2$ and for passing back to $a_1$. In a large network, every layer's upstream gradient is reused by all the parameters below it.
+3. **The forward pass must be stored.** The backward pass needed $a_1$, $z_1$, and $x$ from the forward pass. This is why training uses far more memory than inference: every intermediate activation is kept until the backward pass consumes it.
+
+The local derivative of ReLU, $\text{ReLU}'(z_1)$, was 1 here because $z_1 > 0$. Had $z_1$ been negative, it would have been 0 and $w_1$ would have received no gradient — the [dead neuron](/ai/neural-networks/neurons-and-activations#the-dead-neuron-problem) effect, visible in one line.
+
+---
+
+## Why backward and not forward
+
+The chain rule can be evaluated in either direction. **Forward-mode** differentiation pushes derivatives from one input forward through the network and yields the derivative of every output with respect to **that one input**. **Reverse-mode**, which is backpropagation, pulls derivatives from one output backward and yields the derivative of **that one output** with respect to every input.
+
+Training has one output (the scalar loss) and millions of inputs (the parameters). Reverse mode gets every needed derivative in one sweep; forward mode would need one sweep per parameter. That asymmetry is the whole reason backpropagation is the algorithm of deep learning.
+
+---
+
+## The four local rules
+
+A multi-layer perceptron is built from four kinds of operation, and each has a simple local backward rule. With a batch of $N$ examples as rows, and an incoming gradient $\mathbf{G}$ with the same shape as the operation's output:
+
+| Operation (forward)                                  | Backward: gradient for each input                                                                                               |
+| :--------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------ |
+| Matrix multiply $\mathbf{Z} = \mathbf{A}\mathbf{W}$  | $\partial L/\partial \mathbf{W} = \mathbf{A}^\top \mathbf{G}$, and $\partial L/\partial \mathbf{A} = \mathbf{G}\mathbf{W}^\top$ |
+| Add a bias broadcast over the batch                  | $\partial L/\partial \mathbf{b} = $ sum of $\mathbf{G}$ over the batch axis                                                     |
+| Element-wise activation $\mathbf{A} = f(\mathbf{Z})$ | $\partial L/\partial \mathbf{Z} = \mathbf{G} \odot f'(\mathbf{Z})$ (for ReLU, a 0/1 mask)                                       |
+| Softmax followed by cross-entropy                    | $\partial L/\partial \mathbf{Z} = (\mathbf{P} - \mathbf{Y}) / N$, with $\mathbf{Y}$ one-hot                                     |
+
+Each rule is forced by shapes. A weight of shape $(H, C)$ must receive a gradient of shape $(H, C)$; the only product of an $(N, H)$ activation and an $(N, C)$ incoming gradient with that shape is $\mathbf{A}^\top\mathbf{G}$. The sum over the batch in the weight and bias rules is where the per-example gradients are combined into one averaged gradient.
+
+The last rule is the [softmax cross-entropy gradient](/ai/neural-networks/loss-functions#categorical-cross-entropy) divided by the batch size, because the loss is a mean over $N$ examples.
+
+---
+
+## A complete MLP from scratch
+
+The network: inputs of $D$ features, one hidden ReLU layer of width $H$, and $C$ output classes, trained with softmax cross-entropy:
 
 ```text
-  z1   (2, 3)   [[2.5, 0.1, -0.6], [1.25, -0.95, 0.2]]
-  a1   (2, 3)   [[2.5, 0.1, 0.0], [1.25, 0.0, 0.2]]
-  z2   (2, 3)   [[0.8, -0.46, 0.22], [0.355, -0.21, 0.245]]
-  p    (2, 3)   [[0.5424, 0.1539, 0.3037], [0.4058, 0.2306, 0.3635]]
-  dz2  (2, 3)   [[-0.2288, 0.0769, 0.1519], [0.2029, 0.1153, -0.3182]]
-  dW2  (3, 3)   [[-0.3183, 0.3365, -0.0182], [-0.0229, 0.0077, 0.0152], [0.0406, 0.0231, -0.0636]]
-  db2  (3,)     [-0.0259, 0.1923, -0.1664]
-  da1  (2, 3)   [[-0.0688, -0.1292, 0.1294], [0.006, 0.2431, -0.1882]]
-  dz1  (2, 3)   [[-0.0688, -0.1292, 0.0], [0.006, 0.0, -0.1882]]
-  dW1  (3, 3)   [[-0.0658, -0.1292, -0.0941], [0.006, 0.0, -0.1882], [0.1317, 0.2584, 0.1882]]
-  db1  (3,)     [-0.0629, -0.1292, -0.1882]
-  loss 0.811780
+x    (N, D)            input batch
+z1 = x @ W1 + b1       (N, H)   hidden pre-activation
+a1 = relu(z1)          (N, H)   hidden activation
+z2 = a1 @ W2 + b2      (N, C)   logits
+p  = softmax(z2)       (N, C)   probabilities
+L  = mean(-log p[i, y_i])       cross-entropy
 ```
 
-Every line below in this section is one number pulled out of that printout and checked with arithmetic you can do in your head.
+Here weights multiply on the right, so $\mathbf{W}_1$ is $(D, H)$ — the transpose of how `nn.Linear` stores it.
 
-**Step 1, by hand.** Look at sample 1, whose label is `y = 2`. Its predicted probabilities are `[0.4058, 0.2306, 0.3635]`, the truth is `[0, 0, 1]`, and `N = 2`:
+### The data and the initialization
 
-| Class `k` | `p[1, k]` | truth `delta_ky` | `p_k - delta_ky` | divided by `N` | printed `dz2[1, k]` |
-| :-------- | :-------- | :--------------- | :--------------- | :------------- | :------------------ |
-| 0         | 0.4058    | 0                | 0.4058           | 0.2029         | 0.2029              |
-| 1         | 0.2306    | 0                | 0.2306           | 0.1153         | 0.1153              |
-| 2         | 0.3635    | 1                | -0.6365          | -0.3182        | -0.3182             |
+Three Gaussian clusters in four dimensions: $N = 300$, $D = 4$, $C = 3$, with $H = 16$ hidden units. The model has $4 \cdot 16 + 16 + 16 \cdot 3 + 3 = 131$ parameters. Weights start from He initialization, standard deviation $\sqrt{2/\text{fan-in}}$, the scale [Weight Initialization](/ai/neural-networks/layers-and-initialization) derives for ReLU.
 
-The model put 36% on the class that was actually right, so the true class gets a large negative entry (`raise this logit`) and each wrong class gets a positive one (`push these logits down`). Each row of `dz2` also adds to zero — the toy's two rows sum to `[0.0, -0.0]`, the minus sign being floating-point noise on an exact zero — because `p` and the one-hot both sum to 1. Softmax cross-entropy never asks for a level shift, only for a reshuffling.
-
-**One entry of `dW2`, position by position.** `dW2 = a1.T @ dz2`, so entry `(0, 2)` pairs hidden unit 0's output with class 2's error, sample by sample, and adds:
-
-| Sample | `a1[i, 0]`, what came in | `dz2[i, 2]`, what class 2 asked for | Product     |
-| :----- | :----------------------- | :---------------------------------- | :---------- |
-| 0      | 2.5                      | 0.1519                              | 0.3796      |
-| 1      | 1.25                     | -0.3182                             | -0.3978     |
-|        |                          | Sum                                 | **-0.0182** |
-
-That is the printed `dW2[0, 2]`, and it is the sentence from the previous page with numbers attached: the weight's gradient is a correlation between what the unit said and what the error asked to change. Sample 0 wants class 2 raised while unit 0 is firing; sample 1 wants class 2 lowered while unit 0 is also firing; the two nearly cancel.
-
-**The bias is just a column sum.** `b2` is added to every row, so `db2[2] = 0.1519 + (-0.3182) = -0.1664`, the printed value. Nothing about a bias gradient is special except that it collapses the batch axis.
-
-The difference between the two pages, in one table:
-
-|                    | Scalar graph, previous page       | Matrix graph, this page                               |
-| :----------------- | :-------------------------------- | :---------------------------------------------------- |
-| A node holds       | one number                        | a rectangle of numbers                                |
-| Local derivative   | one number                        | an expression over whole arrays                       |
-| Backward rule      | arriving gradient times local one | identical                                             |
-| Extra failure mode | none, numbers always multiply     | a wrong transpose still multiplies and gives nonsense |
-| How you catch it   | hand arithmetic                   | check every output's shape against what it updates    |
-
-What the rest of the page settles, in order: what the network is and where its starting numbers come from; which values the forward pass has to hold on to; the five backward steps, each with its shape going in and its shape coming out; a working NumPy implementation and a training run; a brute-force check that the derivation is not self-delusion; and the two rules — the <Tip term="shape contract">The promise that every gradient comes back the same shape as the parameter it updates. It is the cheapest correctness test there is, because a violated contract means the derivation was wrong before you even look at the numbers.</Tip> and the `/N` — that explain the single most common way people break all of it.
-
----
-
-## The network
-
-```text
-x    (N, D)   inputs, N samples of D features
-z1 = x @ W1 + b1        (N, H)   pre-activation
-a1 = relu(z1)           (N, H)   hidden activations
-z2 = a1 @ W2 + b2       (N, C)   logits
-p  = softmax(z2)        (N, C)   class probabilities
-L  = -mean( log p[i, y[i]] )     scalar cross-entropy
-```
-
-`W1` is `(D, H)`, `b1` is `(H,)`, `W2` is `(H, C)`, `b2` is `(C,)`. Note that these are the transposes of what `nn.Linear` stores, because here the weights multiply on the right.
-
-Read the loss line out loud as: for each row, take the probability assigned to the class that row actually belongs to, take its log, flip the sign, and average over rows. A row that is confidently right (`p` near 1) costs almost nothing, because `log 1 = 0`; a row that is confidently wrong costs a lot, because `log` of a tiny number is a large negative one.
-
-The <Tip term="logits">The raw per-class scores coming out of the last layer, before any normalization. Adding a constant to all of them, or scaling them by a positive number, leaves the prediction unchanged.</Tip> are what `z2` holds: in the toy above, six numbers, two samples times three classes, none of them normalized yet. That is why the loss is computed from `p` and not from `z2` — a logit of `-0.46` means nothing until softmax turns it into a probability.
-
-The diagram below shows this exact handoff from hidden layer activations to raw logits and normalized class probabilities:
-
-![Three hidden nodes feeding three logits, a softmax operation, and three probabilities that sum to 1](/ai/maths/softmax-covering-logits.png)
-
-The dataset is three Gaussian blobs in four dimensions:
-
-```python title="data.py"
+```python title="mlp_setup.py"
 import numpy as np
 
 def make_data(seed=0, N=300, D=4, C=3):
     rng = np.random.default_rng(seed)
     centroids = rng.standard_normal((C, D)) * 2.0
     y = rng.integers(0, C, N)
-    x = centroids[y] + rng.standard_normal((N, D)) * 0.7
-    return x, y
+    return centroids[y] + rng.standard_normal((N, D)) * 0.7, y
 
-x, y = make_data()
-print(x.shape, y.shape)      # (300, 4) (300,)
-print(y[:12].tolist())       # [1, 2, 1, 0, 2, 2, 2, 0, 0, 2, 0, 1]
-print(np.bincount(y))        # [92 96 112]
-```
-
-So `N = 300`, `D = 4`, `C = 3`, and `H = 16` is the one width we choose freely. The whole model is therefore `4*16 + 16 + 16*3 + 3 = 131` numbers: 64 in `W1`, 16 in `b1`, 48 in `W2`, 3 in `b2`. Seven gradients cover all 131 of them, plus the three intermediate gradient arrays the chain rule needs along the way.
-
-Weights start at He normal, `std = sqrt(2 / fan_in)`, which [Layers and Initialization](/ai/neural-networks/layers-and-initialization) showed is the right scale for ReLU:
-
-```python title="init.py"
 def init_params(D, H, C, seed=1):
     rng = np.random.default_rng(seed)
-    return (
-        rng.standard_normal((D, H)) * np.sqrt(2 / D),
-        np.zeros(H),
-        rng.standard_normal((H, C)) * np.sqrt(2 / H),
-        np.zeros(C),
-    )
+    return (rng.standard_normal((D, H)) * np.sqrt(2 / D), np.zeros(H),
+            rng.standard_normal((H, C)) * np.sqrt(2 / H), np.zeros(C))
 ```
 
-The <Tip term="fan-in">How many inputs a single unit receives: the length of the vector on the left side of the weight matrix. For `W1` here it is `D = 4`; for `W2` it is `H = 16`.</Tip> for `W1` is 4, so its entries are drawn with `std = sqrt(2 / 4) = 0.7071`. The fan-in for `W2` is 16, so its entries use `std = sqrt(2 / 16) = 0.3536`. Wider layers get smaller weights, because more inputs each contributing variance has to be compensated to keep the output scale fixed.
-
----
-
-## The forward pass, cached
-
-Backpropagation needs the intermediate values from the forward pass. Every gradient below is a function of something computed on the way in, so the forward pass has to keep those values around. That is what the <Tip term="cached forward pass">The forward pass storing its intermediates (pre-activations, activations, probabilities) in a tuple so the backward pass can read them later, instead of recomputing them.</Tip> is, and it is also why training uses more memory than inference: inference can throw each intermediate away as soon as the next one is computed.
+### Forward pass, with a cache
 
 ```python title="forward.py"
-import numpy as np
-
 def softmax(z):
-    z = z - z.max(axis=1, keepdims=True)      # the log-sum-exp trick
+    z = z - z.max(axis=1, keepdims=True)        # stability: shift so the max exponent is e^0
     e = np.exp(z)
     return e / e.sum(axis=1, keepdims=True)
 
 def forward(x, y, W1, b1, W2, b2):
     z1 = x @ W1 + b1
     a1 = np.maximum(0.0, z1)
-    z2 = a1 @ W2 + b2
-    p = softmax(z2)
+    p = softmax(a1 @ W2 + b2)
     N = x.shape[0]
     loss = -np.log(p[np.arange(N), y]).mean()
-    return loss, (x, y, z1, a1, p, N)
+    return loss, (x, y, z1, a1, p, N)            # everything the backward pass needs
 ```
 
-Six things go into the cache. Each one is there because a specific gradient below is a function of it — nothing extra:
+The cache holds exactly what the backward rules consume: `x` and `a1` for the weight gradients, `z1` for the ReLU mask, `p` and `y` for the output gradient.
 
-| Cached value | Shape       | Needed by              |
-| :----------- | :---------- | :--------------------- |
-| `x`          | `(N, D)`    | `dW1`                  |
-| `y`          | `(N,)`      | `dz2`                  |
-| `z1`         | `(N, H)`    | the ReLU mask in `dz1` |
-| `a1`         | `(N, H)`    | `dW2`                  |
-| `p`          | `(N, C)`    | `dz2`                  |
-| `N`          | one integer | the `/ N` in `dz2`     |
+### Backward pass: the seven gradients
 
-With `N = 300`, `D = 4`, `H = 16`, `C = 3` that is `1200 + 300 + 4800 + 4800 + 900 + 1 = 12001` stored numbers, about 94 KB in `float64`. Inference would need only the activation it is currently computing, at most 4800 numbers. The ratio is small here and roughly constant per layer, which is the whole reason activation memory scales with depth.
+Applying the four rules from the loss back to the input, one layer at a time:
 
-Subtracting the row maximum inside `softmax` does not change the result, since softmax is shift-invariant, and it prevents `exp` from overflowing on large logits. [Softmax and Logits](/ai/math-foundations/softmax-and-logits) covers why.
+| Step | Gradient                    | Rule applied          | Expression                 | Shape            |
+| ---: | :-------------------------- | :-------------------- | :------------------------- | :--------------- |
+|    1 | logits `dz2`                | softmax cross-entropy | `(p - onehot(y)) / N`      | `(N, C)`         |
+|    2 | `dW2`, `db2`                | matmul weight; bias   | `a1.T @ dz2`; `dz2.sum(0)` | `(H, C)`, `(C,)` |
+|    3 | hidden activation `da1`     | matmul input          | `dz2 @ W2.T`               | `(N, H)`         |
+|    4 | hidden pre-activation `dz1` | element-wise ReLU     | `da1 * (z1 > 0)`           | `(N, H)`         |
+|    5 | `dW1`, `db1`                | matmul weight; bias   | `x.T @ dz1`; `dz1.sum(0)`  | `(D, H)`, `(H,)` |
 
-The loss starts at `2.194449` on this dataset with `H = 16`. Guessing uniformly among three classes would give `ln(3) = 1.0986`, so the random network is worse than guessing: it makes confident wrong predictions. Unwrap the number to see how confident: `exp(-2.194449) = 0.1114`, so the geometric mean of the probabilities it put on the right answers is about 11%, against the 33% a coin flip would give. That is normal and it is the reason warmup exists.
-
----
-
-## The backward pass
-
-Work backwards from the loss. The chain rule applies at every step, and at every step the shape of the incoming gradient determines the shape of the outgoing one.
-
-Five steps, seven gradients. Read this table before the derivations, and again after:
-
-| Step | Gradient produced | Shape going in              | Shape coming out    | The one-sentence reason the chain rule gives that expression                                                                                                                                                   |
-| :--- | :---------------- | :-------------------------- | :------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1    | `dz2`             | the loss itself, one number | `(N, C)`            | The loss touches every logit through softmax, and the derivative of softmax cross-entropy collapses to prediction minus truth, averaged over `N`.                                                              |
-| 2    | `dW2`, `db2`      | `dz2`, `(N, C)`             | `(H, C)` and `(C,)` | `z2 = a1 @ W2 + b2`, so the local derivative for the right-hand operand is its partner `a1` transposed, and the local derivative for an additive broadcast bias is 1, so its contributions sum down the batch. |
-| 3    | `da1`             | `dz2`, `(N, C)`             | `(N, H)`            | To move the arriving gradient onto the left-hand operand you multiply by the other factor, `W2`, and only `W2.T` makes the inner dimensions agree.                                                             |
-| 4    | `dz1`             | `da1`, `(N, H)`             | `(N, H)`            | ReLU is element-wise, so its local derivative is an element-wise mask: pass the gradient where the unit fired, zero it where it did not.                                                                       |
-| 5    | `dW1`, `db1`      | `dz1`, `(N, H)`             | `(D, H)` and `(H,)` | Same two rules as step 2, one layer down, with `x` in place of `a1`.                                                                                                                                           |
-
-Two things to notice in the right-hand column before any derivation. First, steps 2 and 5 are the same rule applied twice, so there are really only three ideas here (softmax, matmul, element-wise). Second, `/ N` appears exactly once, in step 1, and every gradient below inherits it by multiplication — which is why one missing division corrupts all seven at once.
-
-### 1. Gradient at the logits
-
-**In:** the seed, `dL/dL = 1`, one number. **Out:** `dz2`, shape `(N, C)`, one entry per sample per class.
-
-This is the one worth deriving in full, because it collapses beautifully. For a single sample, `L = -log p_y` and `p = softmax(z)`:
-
-```text
-dp_y/dz_k = p_y * (delta_ky - p_k)
-
-dL/dz_k   = -(1/p_y) * dp_y/dz_k
-          = -(1/p_y) * p_y * (delta_ky - p_k)
-          = p_k - delta_ky
-```
-
-`delta_ky` is the Kronecker delta: `1` when `k` is the true class `y`, `0` otherwise. It is the derivative of the one-hot you are comparing against. The `p_y` in the numerator and the `1 / p_y` in front cancel, which is the entire collapse: the ugly softmax Jacobian survives only through its diagonal-ish factor and then dies.
-
-Averaging over the batch divides by `N`:
-
-```text
-dz2 = (p - onehot(y)) / N          shape (N, C)
-```
-
-Read it out loud as: prediction minus truth, row by row, then divided by the batch size.
-
-The gradient of softmax cross-entropy with respect to its logits is the predicted distribution minus the target distribution. No Jacobian, no matrix. This is the single most useful identity in deep learning, and it is why `nn.CrossEntropyLoss` takes logits rather than probabilities: the combination of `log_softmax` and `nll_loss` produces this exact expression in one numerically stable step.
-
-On the toy, sample 1 is the table in `Start here`: `[0.4058, 0.2306, 0.3635] - [0, 0, 1]`, halved, giving `dz2[1] = [0.2029, 0.1153, -0.3182]`. And because the previous page handed you the checker, you can confirm the identity without trusting the algebra at all:
-
-```python title="check_dz2.py"
-# continuing from toy.py
-h = 1e-5
-
-def loss_of(zz):                        # recompute the loss from any logits
-    return -np.log(softmax(zz)[np.arange(2), y]).mean()
-
-for i, k in [(0, 2), (1, 2), (0, 0)]:
-    zp = z2.copy(); zp[i, k] += h
-    zm = z2.copy(); zm[i, k] -= h
-    numeric = (loss_of(zp) - loss_of(zm)) / (2 * h)
-    print(f"  dL/dz2[{i},{k}]: central difference {numeric:+.6f}   analytic dz2[{i},{k}] {dz2[i,k]:+.6f}")
-```
-
-```text
-  dL/dz2[0,2]: central difference +0.151853   analytic dz2[0,2] +0.151853
-  dL/dz2[1,2]: central difference -0.318230   analytic dz2[1,2] -0.318230
-  dL/dz2[0,0]: central difference -0.228784   analytic dz2[0,0] -0.228784
-```
-
-Same agreement, on all 131 parameters of the real network, is what the gradient-checking section at the end of this page turns into a routine.
-
-### 2. Gradients of the second layer
-
-**In:** `dz2`, shape `(N, C)`. **Out:** `dW2`, shape `(H, C)`, and `db2`, shape `(C,)`.
-
-`z2 = a1 @ W2 + b2`. Treating `a1` as fixed:
-
-```text
-dW2 = a1.T @ dz2          (H, N) @ (N, C) -> (H, C)     matches W2
-db2 = dz2.sum(axis=0)     (N, C) -> (C,)                matches b2
-```
-
-Read the first line out loud as: what came in, transposed, times what the error asked for. Read the second as: the bias touched every row, so add the rows up.
-
-Why the chain rule lands on `a1.T`: `W2` is the right operand of a matmul, so its local derivative is the left operand `a1`, and to send an `(N, C)` gradient back onto a parameter indexed `(H, C)` the `N` axis has to be the inner one — hence the transpose, hence the `(H, C)`. In the real network that is the only product which consumes `dz2` and lands in `W2`'s shape, and that is the practical meaning of the shape contract deriving the expression.
-
-The toy shows the case where shapes cannot save you. Its `W2` is square, so the wrong guess `dz2.T @ a1` also comes back `(3, 3)`:
-
-```python title="wrong_transpose.py"
-# continuing from toy.py
-dW2_correct = a1.T @ dz2
-dW2_swapped = dz2.T @ a1
-print(np.round(dW2_correct, 4).tolist())
-print(np.round(dW2_swapped, 4).tolist())
-print(dW2_correct.shape, dW2_swapped.shape, np.abs(dW2_correct - dW2_swapped).max())
-```
-
-```text
-  [[-0.3183, 0.3365, -0.0182], [-0.0229, 0.0077, 0.0152], [0.0406, 0.0231, -0.0636]]
-  [[-0.3183, -0.0229, 0.0406], [0.3365, 0.0077, 0.0231], [-0.0182, 0.0152, -0.0636]]
-  (3, 3) (3, 3) 0.3593615379711108
-```
-
-Right shape, swapped entries, off by up to `0.3593615`, and `W2 -= lr * dW2` accepts it without a word. In the real network the same swap gives `(C, H)` against `(H, C)` weights with `H != C`, so the update does raise and you get told. Shape narrows the candidate expressions; it does not always pick between them, and when it does not, the job belongs to the finite difference at the end of this page.
-
-The <Tip term="reduce">Collapse an axis by summing, averaging, or maxing over it. `dz2.sum(axis=0)` reduces the batch axis, turning `(N, C)` into `(C,)`.</Tip> along `axis=0` is the same shape argument in its simplest form.
-
-`db2` is a column sum because the bias is broadcast across all `N` rows, so its gradient is the sum of the contributions from each row. The same reasoning gives `db1` below.
-
-The `Start here` tables did this entry and this column on the toy: `dW2[0, 2] = 2.5 * 0.1519 + 1.25 * (-0.3182) = -0.0182`, and `db2[2] = 0.1519 - 0.3182 = -0.1664`.
-
-### 3. Pushing through to the hidden layer
-
-**In:** `dz2`, shape `(N, C)`. **Out:** `da1`, shape `(N, H)` — the same shape as `a1`.
-
-```text
-da1 = dz2 @ W2.T          (N, C) @ (C, H) -> (N, H)     matches a1
-```
-
-Read it out loud as: each sample's class errors get redistributed over hidden units in proportion to the weights that connect them.
-
-Why this expression and not the other order: `a1` is the _left_ operand of the matmul, so the arriving gradient stays on the left and `W2` comes across as its transpose on the right. Compare with step 2, where the same `W2` was used untransposed on the other side. Both are the same chain rule; the only difference is which operand the gradient is landing on, and that is visible in the shapes alone.
-
-On the toy, `da1[0, 0]` is sample 0's three class errors times row 0 of `W2`, `[0.3, -0.2, 0.1]`: `-0.2288 * 0.3 + 0.0769 * (-0.2) + 0.1519 * 0.1 = -0.0686 - 0.0154 + 0.0152 = -0.0688`, the printed value.
-
-This is the first of two steps that carry the gradient _away_ from the loss instead of onto a parameter. Steps 2 and 5 end the walk on weights and biases; steps 3 and 4 hand it further back. Their outputs `da1` and `dz1` are activation gradients, and with `dz2` above them those three are the only ones of the seven that still carry a batch axis.
-
-### 4. Through the ReLU
-
-**In:** `da1`, shape `(N, H)`. **Out:** `dz1`, shape `(N, H)`, unchanged.
-
-ReLU's derivative is `1` where the pre-activation was positive and `0` elsewhere, so the gradient is masked element-wise:
-
-```text
-dz1 = da1 * (z1 > 0)      (N, H)                        matches z1
-```
-
-Read it out loud as: the ReLU lets the gradient through on exactly the entries it let the signal through on. That is the scalar rule from the previous page — arriving gradient times local derivative — applied independently to every one of the `N * H` entries, which is why no transpose appears anywhere.
-
-This is where a dead unit shows up. If `z1[i, j] <= 0` for every sample `i`, then column `j` of `dz1` is entirely zero, so `dW1[:, j]` and `db1[j]` are zero, so that unit never updates and stays dead.
-
-You can watch it happen on the toy by moving one bias so hidden unit 1 never fires:
-
-```python title="dead_unit.py"
-# continuing from toy.py, with hidden unit 1 pushed below zero for both samples
-b1 = np.array([0.0, -1.0, 0.2])
-z1 = x @ W1 + b1
-a1 = np.maximum(0.0, z1)
-z2 = a1 @ W2 + b2
-p  = softmax(z2)
-dz2 = (p - np.eye(3)[y]) / 2
-da1 = dz2 @ W2.T
-dz1 = da1 * (z1 > 0)
-dW1 = x.T @ dz1
-db1 = dz1.sum(axis=0)
-
-for name, v in [("z1", z1), ("a1", a1), ("dz1", dz1), ("dW1", dW1), ("db1", db1)]:
-    print(f"  {name:<4} {str(v.shape):<8} {np.round(v, 4).tolist()}")
-```
-
-```text
-  z1   (2, 3)   [[2.5, -0.9, -0.6], [1.25, -1.95, 0.2]]
-  a1   (2, 3)   [[2.5, 0.0, 0.0], [1.25, 0.0, 0.2]]
-  dz1  (2, 3)   [[-0.0699, 0.0, 0.0], [0.006, 0.0, -0.1882]]
-  dW1  (3, 3)   [[-0.0669, 0.0, -0.0941], [0.006, 0.0, -0.1882], [0.1338, 0.0, 0.1882]]
-  db1  (3,)     [-0.0639, 0.0, -0.1882]
-```
-
-Both entries of `z1[:, 1]` are negative, so the mask kills column 1, and the zeros propagate exactly as claimed: `dW1[:, 1]` and `db1[1]` are zero, so `W1[:, 1]` and `b1[1]` will not move by any learning rate. The same unit is also frozen in the layer above, since `a1[:, 1] = 0` makes row 1 of `dW2` all zeros too. Dead means dead everywhere.
-
-### 5. Gradients of the first layer
-
-**In:** `dz1`, shape `(N, H)`. **Out:** `dW1`, shape `(D, H)`, and `db1`, shape `(H,)`.
-
-```text
-dW1 = x.T @ dz1           (D, N) @ (N, H) -> (D, H)     matches W1
-db1 = dz1.sum(axis=0)     (N, H) -> (H,)                matches b1
-```
-
-Read it out loud as: the input that came in, transposed, times what the hidden layer's error asks to change — the identical rule to step 2 with one layer removed from the path.
-
-On the toy, one entry against the printed array: `dW1[2, 0] = x[0, 2] * dz1[0, 0] + x[1, 2] * dz1[1, 0] = (-2) * (-0.0688) + (-1) * 0.006 = 0.1377 - 0.006 = 0.1317`. And `db1[0] = -0.0688 + 0.006 = -0.0629`.
-
-That is all seven: `dz2`, `dW2`, `db2`, `da1`, `dz1`, `dW1`, `db1`. Notice which ones kept the batch axis and which ones lost it, because `The shape contract` near the end of this page turns that split into a checklist you can run without re-deriving anything.
-
----
-
-## Implementing it
+Steps 2 and 5 are the same rule applied to different layers. A deeper network just repeats steps 3 to 5 once per extra layer. In code:
 
 ```python title="backward.py"
 def backward(cache, W2):
     x, y, z1, a1, p, N = cache
-    dz2 = (p - np.eye(p.shape[1])[y]) / N
-    dW2 = a1.T @ dz2
-    db2 = dz2.sum(axis=0)
-    da1 = dz2 @ W2.T
-    dz1 = da1 * (z1 > 0)
-    dW1 = x.T @ dz1
-    db1 = dz1.sum(axis=0)
+    dz2 = (p - np.eye(p.shape[1])[y]) / N       # step 1
+    dW2, db2 = a1.T @ dz2, dz2.sum(axis=0)      # step 2
+    da1 = dz2 @ W2.T                            # step 3
+    dz1 = da1 * (z1 > 0)                        # step 4
+    dW1, db1 = x.T @ dz1, dz1.sum(axis=0)       # step 5
     return dW1, db1, dW2, db2
 ```
 
-Line up the eight statements against the five-step table: the unpack, then step 1, then the two halves of step 2, then step 3, then step 4, then the two halves of step 5, then the return. Each of the seven gradients appears exactly once, in the order the chain rule produces them.
+`np.eye(C)[y]` is the one-hot encoding: indexing the identity matrix by label picks one row per example.
 
-`np.eye(C)[y]` is the one-hot encoding: indexing an identity matrix by the label vector picks out one row per sample. Eleven lines, seven gradients, no framework.
+### Training
 
-And the training loop, which is the five steps from [Training Loop](/ai/pytorch/training-loop) with autograd replaced by the function above:
-
-```python title="mlp.py"
-import numpy as np
-
-# make_data, init_params, softmax, forward, backward as defined above
-
-def accuracy(x, y, W1, b1, W2, b2):
-    logits = np.maximum(0.0, x @ W1 + b1) @ W2 + b2
-    return (logits.argmax(axis=1) == y).mean()
-
-def train(x, y, H=16, lr=0.5, epochs=200):
-    D, C = x.shape[1], int(y.max()) + 1
-    W1, b1, W2, b2 = init_params(D, H, C)
-
-    for epoch in range(epochs):
-        loss, cache = forward(x, y, W1, b1, W2, b2)
-        dW1, db1, dW2, db2 = backward(cache, W2)
-
-        W1 -= lr * dW1
-        b1 -= lr * db1
-        W2 -= lr * dW2
-        b2 -= lr * db2
-
-        if epoch % 25 == 0 or epoch == epochs - 1:
-            print(f"  epoch {epoch:>3}  loss {loss:.6f}  "
-                  f"acc {accuracy(x, y, W1, b1, W2, b2) * 100:5.1f}%")
-
-    return W1, b1, W2, b2
-
+```python title="train.py"
 x, y = make_data()
-train(x, y)
+W1, b1, W2, b2 = init_params(4, 16, 3)
+for epoch in range(200):
+    loss, cache = forward(x, y, W1, b1, W2, b2)
+    dW1, db1, dW2, db2 = backward(cache, W2)
+    W1 -= 0.5 * dW1; b1 -= 0.5 * db1; W2 -= 0.5 * dW2; b2 -= 0.5 * db2
 ```
 
-```text
-  epoch   0  loss 2.194449  acc  84.7%
-  epoch  25  loss 0.098911  acc  97.7%
-  epoch  50  loss 0.068335  acc  97.7%
-  epoch  75  loss 0.053909  acc  97.3%
-  epoch 100  loss 0.045966  acc  97.7%
-  epoch 125  loss 0.041065  acc  98.0%
-  epoch 150  loss 0.037954  acc  98.0%
-  epoch 175  loss 0.035718  acc  98.3%
-  epoch 199  loss 0.034094  acc  99.0%
-```
+| Epoch    |     0 |    25 |    50 |   100 |   199 |
+| :------- | ----: | ----: | ----: | ----: | ----: |
+| Loss     | 2.194 | 0.099 | 0.068 | 0.046 | 0.034 |
+| Accuracy | 84.7% | 97.7% | 97.7% | 97.7% | 99.0% |
 
-The four `W -= lr * dW` statements are the only place the contract is enforced at runtime, and they enforce it only halfway. A gradient with an incompatible shape is loud: `W1` is `(4, 16)`, so handing it a `(16, 4)` fails on the spot with `ValueError: operands could not be broadcast together with shapes (4,16) (16,4)`. A gradient with a broadcastable shape is silent: hand the same `(4, 16)` array a `(16,)` — exactly the shape of `db1`, the mistake you make by swapping two returns — and NumPy applies that one row to all four rows of `W1` and reports nothing.
-
-Accuracy is already 84.7% at epoch 0 because the blobs are well separated and He initialization points the network in a usable direction before any training. Loss falls by a factor of 22 in the first 25 epochs, `2.194449` to `0.098911`, and then grinds. The non-monotonic accuracy at epoch 75, dipping to 97.3% while the loss keeps falling, is the network becoming more confident about the samples it already gets right rather than fixing the ones it gets wrong. Full-batch SGD on a separable problem does that; it has no stochasticity left to escape with.
+The initial loss, 2.194, is above the uniform-guess value $\ln 3 = 1.099$: the random network makes confident wrong predictions on some examples. Loss falls by a factor of 22 in the first 25 epochs, then slowly — the network is mostly growing more confident on examples it already classifies correctly.
 
 ---
 
 ## Gradient checking
 
-Never trust a hand-derived backward pass. The check is brute force: perturb each parameter by a small `h`, measure how much the loss moves, and compare that against the <Tip term="analytical gradient">The gradient you derived by hand and coded, as opposed to the one estimated by nudging the loss. "Analytical" here just means "the one from my derivation".</Tip>.
+A hand-written backward pass that is slightly wrong still trains, just badly, and the loss curve can look healthy. The only reliable test is **gradient checking**: compare every analytical gradient against the numerical estimate from the central difference above, parameter by parameter.
 
-```text
-dL/dtheta ~= ( L(theta + h) - L(theta - h) ) / 2h
-```
+On the network above, with $h = 10^{-5}$ in `float64`, the maximum relative error for all four parameter arrays is about $10^{-10}$:
 
-Read it out loud as: nudge this one number up and down, and the slope is how much the loss moved per unit of nudge.
+| Relative error         | Interpretation                                                           |
+| :--------------------- | :----------------------------------------------------------------------- |
+| below $10^{-7}$        | Correct                                                                  |
+| $10^{-5}$ to $10^{-3}$ | Probably correct but in low precision; recheck in `float64`              |
+| above $10^{-2}$        | A bug: usually a missing transpose, a wrong sum axis, or a missing $1/N$ |
 
-Central difference rather than forward difference, because the error is `O(h^2)` instead of `O(h)`. At `h = 1e-5` that is a truncation error around `1e-10`. The secant line through `theta - h` and `theta + h` has slope `(L(theta + h) - L(theta - h)) / 2h`, which converges onto the tangent line (the true derivative `dL/dtheta`) as `h` shrinks:
-
-![Secant line through f(x-h) and f(x+h) compared with the tangent line at f(x)](/ai/maths/tangent-line-slope-as-derivative.png)
-
-The cost is concrete: 131 parameters times two forward passes is 262 forward passes, against the 1 forward plus 1 backward a real step needs. Cheap on this page, and the reason the check is run once during development rather than in a training loop.
-
-```python title="gradcheck.py"
-import numpy as np
-
-def gradcheck(x, y, D, H, C, h=1e-5):
-    W1, b1, W2, b2 = init_params(D, H, C)
-    loss, cache = forward(x, y, W1, b1, W2, b2)
-    analytic = dict(zip(("W1", "b1", "W2", "b2"), backward(cache, W2)))
-    params = {"W1": W1, "b1": b1, "W2": W2, "b2": b2}
-
-    print(f"  loss at init = {loss:.6f}")
-    for name, arr in params.items():
-        numeric = np.zeros_like(arr)
-        it = np.nditer(arr, flags=["multi_index"])
-        while not it.finished:
-            i = it.multi_index
-            old = arr[i]
-
-            arr[i] = old + h
-            plus, _ = forward(x, y, W1, b1, W2, b2)
-            arr[i] = old - h
-            minus, _ = forward(x, y, W1, b1, W2, b2)
-            arr[i] = old
-
-            numeric[i] = (plus - minus) / (2 * h)
-            it.iternext()
-
-        a = analytic[name]
-        abs_err = np.abs(a - numeric).max()
-        rel_err = abs_err / max(np.abs(a).max(), 1e-12)
-        print(f"  {name:<4} {str(arr.shape):<10} abs {abs_err:.3e}  rel {rel_err:.3e}")
-
-x, y = make_data()
-gradcheck(x, y, D=x.shape[1], H=16, C=3)
-```
-
-```text
-  loss at init = 2.194449
-  W1   (4, 16)     abs 4.297e-11  rel 7.728e-11
-  b1   (16,)       abs 2.457e-11  rel 1.019e-10
-  W2   (16, 3)     abs 1.056e-10  rel 8.115e-11
-  b2   (3,)        abs 1.073e-11  rel 4.045e-11
-```
-
-All four relative errors sit at `1e-10`, which is the floor set by the `h^2` truncation term. The derivation is correct.
-
-Two rules for reading this number:
-
-| Relative error   | Meaning                                                                             |
-| :--------------- | :---------------------------------------------------------------------------------- |
-| `< 1e-7`         | Correct. This is float32 noise plus truncation                                      |
-| `1e-5` to `1e-3` | Probably correct in `float32`. Recheck in `float64`                                 |
-| `> 1e-2`         | A bug. Almost always a missing transpose, a wrong reduction axis, or a missing `/N` |
-
-Do the check in `float64`. In `float32` the difference `L(theta + h) - L(theta - h)` loses significant digits to cancellation, and a correct gradient can look wrong. NumPy defaults to `float64` for `standard_normal`, which is why the numbers above are so clean.
-
-Note that the check tests _shapes_ for free: `np.zeros_like(arr)` is built from the parameter, so the subtraction `a - numeric` raises before a single error number is read, and a gradient that came back `(16, 4)` instead of `(4, 16)` cannot get past it. What the check does _not_ catch is a gradient with the right shape that is wrong in a way that happens to give the right slope on this particular data, which is why the `> 1e-2` row is a floor to aim at rather than a line you may hover over.
-
-<Callout type="info">
-  ### `torch.autograd.gradcheck` is this function
-
-PyTorch ships the same check as `torch.autograd.gradcheck(fn, inputs, eps=1e-6)`. It exists because
-custom `autograd.Function` implementations get backward passes wrong constantly, and because the
-check is cheap relative to the debugging it saves. Use it whenever you write one.
-
-</Callout>
+The central difference has error proportional to $h^2$, versus $h$ for a one-sided difference, so it is the one to use. The check must run in `float64`, because in `float32` subtracting two nearly equal losses loses most of the significant digits. It costs two forward passes per parameter, so it is run once on a small model during development, never during training. PyTorch provides it as `torch.autograd.gradcheck` for custom operations.
 
 ---
 
 ## The shape contract
 
-Every parameter gradient has the same shape as its parameter. That is not a coincidence and it is the fastest sanity check available: if `dW1` does not have shape `(D, H)`, the derivation is wrong. Here is the promise spelled out for every tensor in the run, with `N = 300`, `D = 4`, `H = 16`, `C = 3`:
+**Every parameter's gradient has exactly the parameter's shape**, and every activation's gradient has the activation's shape. Checking that after deriving a backward pass catches most errors before any number is examined:
 
-| Tensor | Shape       | Role                                     |
-| :----- | :---------- | :--------------------------------------- |
-| `x`    | `(300, 4)`  | input batch                              |
-| `W1`   | `(4, 16)`   | parameter                                |
-| `z1`   | `(300, 16)` | pre-activation, cached for the ReLU mask |
-| `a1`   | `(300, 16)` | hidden activation, cached for `dW2`      |
-| `W2`   | `(16, 3)`   | parameter                                |
-| `z2`   | `(300, 3)`  | logits                                   |
-| `p`    | `(300, 3)`  | probabilities, cached for `dz2`          |
-| `dz2`  | `(300, 3)`  | gradient at the logits                   |
-| `dW2`  | `(16, 3)`   | matches `W2`                             |
-| `db2`  | `(3,)`      | matches `b2`                             |
-| `da1`  | `(300, 16)` | matches `a1`                             |
-| `dz1`  | `(300, 16)` | matches `z1`                             |
-| `dW1`  | `(4, 16)`   | matches `W1`                             |
-| `db1`  | `(16,)`     | matches `b1`                             |
+| Tensor      | Shape    | Gradient shape | Keeps the batch axis?  |
+| :---------- | :------- | :------------- | :--------------------- |
+| `W1`        | `(D, H)` | `(D, H)`       | No — summed over batch |
+| `a1`, `z1`  | `(N, H)` | `(N, H)`       | Yes                    |
+| `W2`        | `(H, C)` | `(H, C)`       | No                     |
+| logits `z2` | `(N, C)` | `(N, C)`       | Yes                    |
 
-Scan the `d` rows and the pattern the five steps were built around is visible in one column: activation gradients keep the batch dimension. Parameter gradients lose it, summed away by the `x.T @` and `a1.T @` products. That sum is the entire content of mini-batching: a batch of 300 samples contributes one averaged gradient, not 300 of them.
+Activation gradients keep one row per example; parameter gradients sum over the batch. That sum is the content of mini-batch training: $N$ examples contribute one averaged gradient.
 
-So the four rules worth memorizing, in the order they let you derive a backward pass without calculus:
+Shapes do not catch everything. When a weight matrix is square, the wrong expression `dz2.T @ a1` has the same shape as the correct `a1.T @ dz2`, and the update runs without complaint. Gradient checking catches what shapes cannot.
 
-| Situation                                     | What the shape forces                     |
-| :-------------------------------------------- | :---------------------------------------- |
-| Gradient for an activation, e.g. `da1`        | Same shape as the activation, batch kept  |
-| Gradient for a weight in `left @ right`       | `left.T @ incoming` or `incoming @ right` |
-| Gradient for a broadcast bias                 | `incoming.sum(axis=0)`                    |
-| Gradient through an element-wise nonlinearity | `incoming * local_derivative`, shape kept |
+### The missing-1/N bug
+
+The $1/N$ enters once, at step 1, and every other gradient inherits it by multiplication. Dropping it makes every gradient exactly $N$ times too large — on this network, 300 times — so the effective learning rate is $N$ times the intended one. Every shape is still correct. The bug often goes unnoticed, because lowering the learning rate "fixes" training; it resurfaces when the batch size changes and the tuned learning rate suddenly stops working. The same bug appears with gradient accumulation if the summed micro-batch gradients are not divided by the number of micro-batches.
 
 ---
 
-## The one bug everyone writes
+## What autograd automates
 
-Every gradient above carries the `/ N` from step 1 by multiplication, so a single missing division inflates all seven at once, and every shape stays legal. Drop the `/N` from `dz2`:
+The same network in PyTorch:
 
-```text
-max|dW2| with /N     = 1.301190e+00
-max|dW2| without /N  = 3.903569e+02
-ratio                = 300.0 = N
-```
-
-The gradient is exactly `N` times too large, so the effective learning rate is `N` times what you set. At `N = 300` and `lr = 0.5` the network diverges immediately. The failure is quiet in a specific way: if you lower `lr` to compensate, the network trains normally and you never learn the bug is there. It only surfaces when you change the batch size, because then the effective learning rate changes with it and your tuned `lr` stops working.
-
-This is the shape contract's sibling failure, and the two are worth telling apart. A gradient of the wrong shape is mostly caught the moment it meets `W -= lr * dW`, with the loophole the `W1` example showed earlier: a broadcastable shape such as `(16,)` slips straight through. A missing `/N` is caught by nothing at all: every gradient keeps the perfectly correct shape, so the contract passes, the update runs, the loss goes down, and the only symptom is that `lr` means something other than what you typed.
-
-The same class of bug appears with gradient accumulation, covered in [Training Loop](/ai/pytorch/training-loop): `loss.backward()` adds to `.grad`, so four micro-batches summed without dividing by four give four times the gradient a true large batch would.
-
----
-
-## What autograd is doing for you
-
-Compare the code above with the same network in PyTorch:
-
-```python title="same_in_torch.py"
-import numpy as np
+```python
 import torch
 from torch import nn
 
-x_np, y_np = make_data()
-x = torch.from_numpy(x_np).float()
-y = torch.from_numpy(y_np).long()
-
 model = nn.Sequential(nn.Linear(4, 16), nn.ReLU(), nn.Linear(16, 3))
-loss_fn = nn.CrossEntropyLoss()
-opt = torch.optim.SGD(model.parameters(), lr=0.5)
-
-for epoch in range(200):
-    opt.zero_grad()
-    loss = loss_fn(model(x), y)
-    loss.backward()
-    opt.step()
+optimizer = torch.optim.SGD(model.parameters(), lr=0.5)
+loss = nn.CrossEntropyLoss()(model(x_t), y_t)   # x_t, y_t: the data as tensors
+optimizer.zero_grad(); loss.backward(); optimizer.step()
 ```
 
-`loss.backward()` computes all seven gradients by walking the graph that the forward pass built. [Autograd Engine](/ai/pytorch/autograd-engine) covers how the graph is recorded. The value of writing the NumPy version first is that you know what those seven gradients are, so when a shape error appears in a real model you can tell which of the seven is wrong.
+During the forward pass, PyTorch records every operation in a graph. `loss.backward()` walks that graph in reverse, applying each operation's local backward rule — exactly the five steps above, for every operation in any architecture. [Autograd Engine](/ai/pytorch/autograd-engine) covers how the graph is recorded. Writing the NumPy version once is what makes autograd debuggable: when a gradient is wrong or `NaN`, it is one of a small number of local rules that broke.
 
-What the PyTorch version handles that the NumPy version does by hand:
+| Concern             | NumPy version          | PyTorch                                        |
+| :------------------ | :--------------------- | :--------------------------------------------- |
+| Deriving gradients  | By hand, per operation | Recorded automatically                         |
+| Batch averaging     | Manual $1/N$           | `reduction="mean"` by default                  |
+| Numerical stability | Manual max subtraction | Fused `log_softmax`                            |
+| Memory              | Whole cache kept       | Each node freed after its backward step        |
+| Weight layout       | `(in, out)`            | `(out, in)`, so `nn.Linear` computes `x @ W.T` |
 
-| Feature              | NumPy version          | PyTorch version                              |
-| :------------------- | :--------------------- | :------------------------------------------- |
-| Batch reduction      | manual `/N`            | `reduction="mean"` is the default            |
-| Numerical stability  | manual max-subtraction | fused inside `log_softmax`                   |
-| Memory               | cache everything       | frees each node once its backward runs       |
-| Weight storage order | `(in, out)`            | `(out, in)`, so `F.linear` uses `@ W.T`      |
-| Speed                | CPU BLAS               | GPU, and fused kernels under `torch.compile` |
+---
 
-The weight storage order row is the one that bites people converting checkpoints. See [Checkpointing](/ai/pytorch/checkpointing) for the conversion.
+## Key terms
+
+| Term                            | Meaning                                                                                    |
+| :------------------------------ | :----------------------------------------------------------------------------------------- |
+| **backpropagation**             | Reverse-mode application of the chain rule, giving every parameter's gradient in one sweep |
+| **upstream gradient**           | The gradient of the loss with respect to an operation's output, arriving from above        |
+| **local gradient**              | The derivative of an operation's output with respect to its own input                      |
+| **forward cache**               | Intermediate values saved in the forward pass for use in the backward pass                 |
+| **reverse mode / forward mode** | Differentiating from the output back / from one input forward                              |
+| **gradient checking**           | Comparing analytical gradients with central-difference estimates                           |
+| **shape contract**              | A gradient always has the shape of the tensor it belongs to                                |
 
 ---
 
 ## Interview questions
 
 <Accordions>
-  <Accordion title="What is the gradient of softmax cross-entropy with respect to the logits?">
+  <Accordion title="Why is backpropagation used instead of numerical differentiation?">
 
-    `p - onehot(y)`, averaged over the batch. The softmax Jacobian and the log cancel exactly, which is why the expression contains no matrix.
-
-  </Accordion>
-  <Accordion title={<>Why does <code>nn.CrossEntropyLoss</code> take logits instead of probabilities?</>}>
-
-    Applying `log_softmax` and `nll_loss` together produces `p - onehot(y)` in one pass and subtracts the row maximum internally, so it is stable for large logits. Passing softmax output double-applies the nonlinearity and loses that stability.
+    Numerical differentiation needs two forward passes per parameter, so 20 million passes for a 10-million-parameter network, for a single step. Backpropagation computes all partial derivatives with one forward and one backward pass, about three times the cost of a forward pass, by computing each shared piece of the chain-rule product once and reusing it.
 
   </Accordion>
-  <Accordion title="Why does the backward pass need a cache?">
+  <Accordion title="Backpropagate by hand: z1 = w1·x, a1 = ReLU(z1), z2 = w2·a1, L = (z2 − y)², with x = 2, y = 1, w1 = 0.5, w2 = −1.5.">
 
-    Every parameter gradient is a product of an incoming gradient and a forward-pass intermediate. `dW2 = a1.T @ dz2` needs `a1`, and the ReLU mask needs `z1`. Nothing in the backward pass can recompute them from the parameters alone.
-
-  </Accordion>
-  <Accordion title="Why is training more memory-hungry than inference?">
-
-    Training holds every cached intermediate until its backward node runs. Inference computes and discards, which is why `torch.no_grad()` and `inference_mode` cut memory so sharply.
+    Forward: $z_1 = 1$, $a_1 = 1$, $z_2 = -1.5$, $L = 6.25$. Backward: $\partial L/\partial z_2 = 2(z_2 - y) = -5$; $\partial L/\partial w_2 = -5 \cdot a_1 = -5$; $\partial L/\partial a_1 = -5 \cdot w_2 = 7.5$; ReLU passes it because $z_1 > 0$, so $\partial L/\partial z_1 = 7.5$; $\partial L/\partial w_1 = 7.5 \cdot x = 15$.
 
   </Accordion>
-  <Accordion title="How do you verify a hand-written backward pass?">
+  <Accordion title="Why is reverse mode the right choice for neural networks?">
 
-    Central differences, `(L(theta + h) - L(theta - h)) / 2h`, with `h = 1e-5` in `float64`. A correct implementation matches to a relative error around `1e-10`. Above `1e-2` there is a bug.
-
-  </Accordion>
-  <Accordion title="Why central difference rather than forward difference?">
-
-    Forward difference has `O(h)` truncation error, central difference `O(h^2)`. At `h = 1e-5` that is the difference between an error floor of `1e-5` and `1e-10`.
+    Reverse mode gives the derivatives of one output with respect to all inputs in one sweep; forward mode gives the derivatives of all outputs with respect to one input. Training has a single scalar output, the loss, and millions of parameters, so reverse mode needs one sweep while forward mode would need one per parameter.
 
   </Accordion>
-  <Accordion title="What shape does a parameter gradient have, and why?">
+  <Accordion title="Why does training use more memory than inference?">
 
-    The same shape as the parameter. Activation gradients carry the batch dimension; parameter gradients do not, because the batch is summed away by the transpose-multiply.
-
-  </Accordion>
-  <Accordion title="What happens if you forget to divide by the batch size?">
-
-    The gradient is `N` times too large, so the effective learning rate is `N` times what you set. Lowering `lr` hides it until you change the batch size.
+    The backward pass needs the forward pass's intermediate values — inputs to each matrix multiply, pre-activations for activation derivatives — so all of them are kept until backward consumes them. Inference can discard each activation as soon as the next layer has used it. Activation memory grows with depth and batch size, which is what gradient checkpointing trades compute to reduce.
 
   </Accordion>
-  <Accordion title="Where does a dead ReLU unit show up in the backward pass?">
+  <Accordion title="Give the backward rules for Z = A W + b and for A = ReLU(Z).">
 
-    Its column in `dz1` is zero for every sample, so the corresponding column of `dW1` and the matching entry of `db1` are zero. The unit cannot recover within that run.
+    With incoming gradient $\mathbf{G}$: $\partial L/\partial \mathbf{W} = \mathbf{A}^\top\mathbf{G}$, $\partial L/\partial \mathbf{A} = \mathbf{G}\mathbf{W}^\top$, and $\partial L/\partial \mathbf{b} = \mathbf{G}$ summed over the batch. For ReLU, $\partial L/\partial \mathbf{Z} = \mathbf{G} \odot (\mathbf{Z} > 0)$, an element-wise mask.
 
   </Accordion>
-  <Accordion title={<>Why store <code>W</code> as <code>(in, out)</code> here and <code>(out, in)</code> in <code>nn.Linear</code>?</>}>
+  <Accordion title="What does gradient checking test, and how should its result be read?">
 
-    The NumPy version multiplies on the right, so `W` has to be `(in, out)`. PyTorch stores one neuron's weights per row for readability and applies the transpose inside `F.linear`.
+    It compares each analytical gradient with the central difference $(L(\theta + h) - L(\theta - h))/2h$. In `float64`, relative errors below $10^{-7}$ mean correct, and above $10^{-2}$ mean a bug, typically a transpose, a wrong reduction axis, or a missing $1/N$. It must run in double precision because subtracting nearly equal losses in `float32` destroys the significant digits.
+
+  </Accordion>
+  <Accordion title="What happens if the 1/N is dropped from the output gradient?">
+
+    Every gradient becomes exactly $N$ times larger, because all of them inherit that factor by multiplication, so the effective learning rate is $N$ times too high. Shapes are unaffected and nothing errors. Lowering the learning rate hides it, and it reappears whenever the batch size changes.
 
   </Accordion>
 </Accordions>
