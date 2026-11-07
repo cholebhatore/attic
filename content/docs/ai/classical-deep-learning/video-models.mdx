@@ -1,0 +1,119 @@
+---
+title: Video Models
+description: 'Extending CNNs from images to video: clips as 5D tensors, 3D convolutions and their cost, factorized (2+1)D convolutions, the main video architectures from C3D to SlowFast and video transformers, temporal sampling and transforms, and pretrained video backbones.'
+---
+
+A **video** is a sequence of images, called **frames**, captured over time, typically 24 to 60 per second. A video model receives a short run of frames, a **clip**, and must understand both what is in each frame (appearance) and how it changes from frame to frame (motion). Recognizing "opening a door" versus "closing a door" is impossible from any single frame; the difference is entirely in the motion.
+
+Video models extend image CNNs with one extra axis, time. Everything from [Convolutions](/ai/classical-deep-learning/convolutions) carries over, and the cost of the extra axis drives most design decisions.
+
+**Builds on:** [Convolutions](/ai/classical-deep-learning/convolutions), [CNN Architectures](/ai/classical-deep-learning/vision-architectures), and [Transfer Learning](/ai/classical-deep-learning/transfer-and-ensembles) for adapting pretrained backbones.
+
+---
+
+## Clips as tensors
+
+A clip is a 5D tensor: `(B, C, T, H, W)`, where `T` is the number of frames. Everything from the image case carries over with one extra axis.
+
+```python
+clip = torch.randn(4, 3, 16, 112, 112)   # batch 4, RGB, 16 frames, 112x112
+```
+
+## 3D convolutions
+
+`nn.Conv3d` slides a `kT x kH x kW` volume over the clip. Its weight has shape `(C_out, C_in, kT, kH, kW)`.
+
+```python
+conv3d = nn.Conv3d(3, 64, kernel_size=(3, 3, 3), padding=1)
+print(conv3d.weight.shape)   # (64, 3, 3, 3, 3)
+print(conv3d(clip).shape)    # (4, 64, 16, 112, 112)
+```
+
+Parameter and FLOP counts scale with `kT`, so a `3 x 3 x 3` conv costs three times what a `3 x 3` conv costs at the same channel widths. Video models are therefore much shallower and narrower than image models at the same nominal size.
+
+## Factorized spatiotemporal convolutions
+
+C3D uses full `3 x 3 x 3` kernels. R(2+1)D splits each one into a `1 x 3 x 3` spatial convolution followed by a `3 x 1 x 1` temporal convolution, with a ReLU between them.
+
+```python
+nn.Sequential(
+    nn.Conv3d(3, 45, kernel_size=(1, 3, 3), padding=(0, 1, 1)), nn.ReLU(),
+    nn.Conv3d(45, 64, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
+)
+```
+
+The intermediate channel count is chosen so the factorized block has the same parameter count as the full `3 x 3 x 3` it replaces. The extra nonlinearity and the decoupled spatial and temporal statistics make it train better, and it is the design most later video CNNs kept.
+
+Other factorizations:
+
+| Variant     | Structure                                       | Trade-off                        |
+| :---------- | :---------------------------------------------- | :------------------------------- |
+| C3D         | Full `3 x 3 x 3`                                | Expensive, works                 |
+| R(2+1)D     | `1 x 3 x 3` then `3 x 1 x 1`                    | Cheaper, better accuracy         |
+| CSN         | Depthwise `3 x 3 x 3` then `1 x 1` channel mix  | Cheapest conv variant            |
+| SlowFast    | Two pathways, low and high temporal frame rate  | Separates motion from appearance |
+| TimeSformer | Divided space-time attention over frame patches | No convolutions at all           |
+| VideoMAE    | Masked autoencoding pretraining on tubelets     | Self-supervised pretraining      |
+
+## Temporal sampling and transforms
+
+`torchvision` provides video models and `transforms.v2` handles the video axis natively through `tv_tensors.Video`.
+
+```python title="video_transforms.py"
+from torchvision.transforms import v2
+
+vid_tf = v2.Compose([
+    v2.RandomResizedCrop(112, antialias=True),
+    v2.RandomHorizontalFlip(),
+    v2.UniformTemporalSubsample(16),      # resample T frames down to 16
+    v2.Normalize(mean=(0.4322, 0.4060, 0.3774), std=(0.2280, 0.2211, 0.2169)),
+])
+```
+
+`UniformTemporalSubsample` picks evenly spaced frames from whatever `T` the clip has, so a loader can hand in variable-length clips. Sampling rate matters more than clip length: Kinetics models typically see 16 or 32 frames sampled at 2 to 8 frame intervals, and the interval determines the temporal frequencies the model can represent.
+
+`torchvision.models.video` ships `r3d_18`, `mc3_18`, and `r2plus1d_18`, all pretrained on Kinetics-400.
+
+```python
+from torchvision.models.video import r2plus1d_18, R2Plus1D_18_Weights
+
+weights = R2Plus1D_18_Weights.KINETICS400_V1
+model = r2plus1d_18(weights=weights)
+model.head = nn.Linear(model.head.in_features, num_classes)
+```
+
+The same transfer learning rules apply as for images, with one addition: a Kinetics-pretrained model has learned generic human activity, which transfers poorly to domains like surgical video or industrial monitoring where the motion statistics are completely different.
+
+---
+
+## Key terms
+
+| Term                   | Meaning                                                                                                           |
+| :--------------------- | :---------------------------------------------------------------------------------------------------------------- |
+| **frame / clip**       | A frame is one image in a video. A clip is a short run of frames fed to the model together.                       |
+| **3D convolution**     | A filter that slides over time as well as height and width, so it can detect motion.                              |
+| **spatiotemporal**     | Involving both space (height, width) and time.                                                                    |
+| **`(B, C, T, H, W)`**  | The 5D layout of a batch of clips: batch, channels, frames, height, width                                         |
+| **(2+1)D convolution** | A 3D convolution factorized into a spatial $1 \times k \times k$ and a temporal $k \times 1 \times 1$ convolution |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title={<>What shape is a video batch, and what shape is a <code>Conv3d</code> weight?</>}>
+
+    Video is 5D: `(B, C, T, H, W)`, for example `4, 3, 16, 112, 112` for four RGB clips of sixteen frames. A `Conv3d` weight is `(C_out, C_in / groups, kT, kH, kW)`, so 64 to 64 channels with a `3 x 3 x 3` kernel is `(64, 64, 3, 3, 3)`.
+
+  </Accordion>
+  <Accordion title="Why does R(2+1)D outperform C3D at lower cost?">
+
+    A full `3 x 3 x 3` kernel spends 27 multiply-adds per connection and one nonlinearity. R(2+1)D factorizes it into a `1 x 3 x 3` spatial convolution followed by a `3 x 1 x 1` temporal one with a ReLU between them, which is fewer operations (9 plus 3) and gains an extra nonlinearity, so it is both cheaper and more accurate.
+
+  </Accordion>
+  <Accordion title="What does temporal subsampling control, and what breaks if the sampling interval is too large?">
+
+    The interval between sampled frames sets the temporal frequencies the network can represent, effectively the frame rate it sees, and it also sets compute: `T` frames multiply the spatial cost by `T`. Too large an interval aliases, so a fast action arrives as a jump between unrelated poses and the dynamics cannot be learned.
+
+  </Accordion>
+</Accordions>

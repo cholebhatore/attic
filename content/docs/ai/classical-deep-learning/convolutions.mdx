@@ -1,311 +1,375 @@
 ---
 title: Convolutions
-description: 'Kernels and filters, stride, padding, pooling, the output size formula, dilated convolutions, and how receptive fields grow with depth.'
+description: 'What a convolution is and why images need it: weight sharing and locality, a convolution computed by hand, learned filters, multiple input and output channels, padding, stride, dilation, the output size formula, pooling, the feature hierarchy, receptive fields, and efficient variants such as depthwise and 1x1 convolutions.'
 ---
 
-A dense layer on a `224 x 224 x 3` image has `150528` inputs. Projecting those to `64` outputs costs `9633792` weights, and every one of them is position-specific, so a detector for a vertical edge has to be relearned separately at each of `50176` locations.
+A **convolution** is an operation that slides a small grid of learned weights, the **kernel** or **filter**, across an input such as an image, and at each position computes a weighted sum of the values underneath. The result is another grid, the **feature map**, that is large wherever the input locally resembles the filter's pattern. A **convolutional neural network (CNN)** stacks many such layers, and it is the architecture that made deep learning work on images.
 
-A convolution instead slides one small kernel over the image and reuses the same weights at every position. The same `64` edge detectors cost `64 x 3 x 3 x 3 + 64 = 1792` parameters, about five thousand times fewer, and an edge learned in the top-left corner transfers to the bottom-right.
+This page builds the operation from the problem it solves, computes one by hand, then adds the pieces — channels, padding, stride, pooling — one at a time, ending with how stacked convolutions see larger and larger regions of the image.
 
----
-
-## The plain-language version
-
-To a computer an image is a grid of numbers. A grayscale image is one grid with one number per **pixel** (its brightness). A color image is three grids stacked, one each for red, green, and blue, called **channels**. A `224 x 224` color photo is a tensor of shape `(3, 224, 224)`: 150,528 numbers.
-
-A **convolution** is a small **filter** (also called a **kernel**), typically 3 by 3, that slides across the image. At every position it multiplies its 9 weights by the 9 pixels underneath, adds them up, and writes one number into the output. That output grid, called a **feature map**, lights up wherever the image looks like the filter's pattern: a vertical edge, a patch of red, a corner.
-
-It is like checking a page for a typo with a magnifying glass you slide along every line. The glass is the same everywhere; only its position changes. That reuse is the point: an edge detector learned in one corner works in every other corner, for the same 9 weights.
-
-A **CNN** (convolutional neural network) stacks many convolution layers. Early layers find edges and colors, middle layers combine them into textures and parts, and late layers recognize whole objects.
-
-| Word                                | Plain meaning                                                                                                                          |
-| :---------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------- |
-| **pixel**                           | One dot of an image, stored as a number (often 0 to 255, or 0 to 1 after scaling).                                                     |
-| **channel**                         | One grid in a stack of grids: R, G, and B for a color image; one feature map per filter deeper in the network.                         |
-| **`(C, H, W)` / `(B, C, H, W)`**    | The shape convention: channels, height, width, with a batch axis `B` in front.                                                         |
-| **kernel / filter**                 | The small grid of learned weights that slides over the input. A filter covers all input channels, so its shape is `(C_in, k, k)`.      |
-| **feature map**                     | The output grid of one filter: where, and how strongly, its pattern appears.                                                           |
-| **weight sharing**                  | Reusing the same filter weights at every position. The reason CNNs need far fewer parameters than dense layers on images.              |
-| **stride**                          | How many pixels the filter jumps between positions. Stride 2 halves the output's height and width.                                     |
-| **padding**                         | Extra border pixels (usually zeros) added around the input so the filter can be centered on edge pixels and the output keeps its size. |
-| **dilation**                        | Spacing out the filter's taps, so a 3 by 3 filter covers a wider area without more weights.                                            |
-| **pooling**                         | Shrinking a feature map by summarizing each small window, usually by its maximum (max pooling) or average.                             |
-| **receptive field**                 | The patch of the original image that one output number can "see". It grows with every layer.                                           |
-| **downsampling**                    | Reducing height and width (with stride or pooling) so later layers work at coarser scales.                                             |
-| **grouped / depthwise convolution** | Splitting channels into groups that are filtered separately, to save compute. Depthwise gives every channel its own filter.            |
-| **CNN**                             | Convolutional neural network: convolution layers (plus activations and pooling) followed by a small classifier.                        |
+**Builds on:** [Images as tensors](/ai/classical-deep-learning/vision-and-sequence-basics#images-as-tensors) for the `(C, H, W)` layout, and [Neurons and Activations](/ai/neural-networks/neurons-and-activations) for ReLU.
 
 ---
 
-## Kernels, filters, and channels
+## Why images need a different layer
 
-Three words get used interchangeably and are not the same thing.
+A dense layer connects every input to every output. A small `224 x 224` RGB image has $224 \times 224 \times 3 = 150{,}528$ inputs. Mapping it to just 64 outputs takes $150{,}528 \times 64 = 9{,}633{,}792$ weights, and each weight belongs to one specific pixel. A vertical-edge detector learned for the top-left corner must be learned again, separately, for each of the 50,176 pixel positions.
 
-| Term           | Means                                                           |
-| :------------- | :-------------------------------------------------------------- |
-| Kernel         | The `kH x kW` window that slides over one input channel         |
-| Filter         | One full `C_in x kH x kW` slice, summed over all input channels |
-| Output channel | One filter's response map, i.e. one feature map                 |
+Images have two properties a dense layer ignores:
 
-So a `Conv2d(3, 64, kernel_size=3)` has `64` filters, each reading all `3` input channels, producing `64` output feature maps. Its weight tensor has shape `(C_out, C_in, kH, kW) = (64, 3, 3, 3)`.
+1. **Locality.** Meaningful patterns — an edge, a corner, an eye — are made of **nearby** pixels. A pixel in the top-left corner says almost nothing about one in the bottom-right at the first stage of processing.
+2. **Translation equivariance.** A pattern means the same thing wherever it appears. An edge is an edge in any part of the image.
+
+A convolution builds both in. Each output looks only at a small neighbourhood (locality), and the **same** weights are used at every position (weight sharing). Sixty-four $3 \times 3$ filters over 3 channels cost $64 \times 3 \times 3 \times 3 + 64 = 1{,}792$ parameters — about 5,000 times fewer than the dense layer — and an edge learned anywhere is detected everywhere.
+
+These built-in assumptions are the convolution's [inductive bias](/ai/classical-deep-learning/vision-and-sequence-basics#inductive-bias). When they match the data, as they do for images, the network learns from far fewer examples.
+
+---
+
+## The operation, computed by hand
+
+Start with one channel. A $5 \times 5$ grayscale image that is dark on the left and bright on the right, and a $3 \times 3$ kernel:
+
+```text
+image (5 x 5)                kernel (3 x 3)
+0  0  0  1  1                -1  0  1
+0  0  0  1  1                -1  0  1
+0  0  0  1  1                -1  0  1
+0  0  0  1  1
+0  0  0  1  1
+```
+
+Place the kernel over the top-left $3 \times 3$ patch, multiply each pair of overlapping numbers, and sum. That sum is one output value. Then slide one column right and repeat, and so on across every position where the kernel fits.
+
+At the top-left position the patch is all zeros, so the output is 0. One step to the right, the patch covers columns 1–3:
+
+```text
+patch           x  kernel        products
+0  0  1           -1  0  1        0  0  1
+0  0  1           -1  0  1        0  0  1        sum = 3
+0  0  1           -1  0  1        0  0  1
+```
+
+Doing this at all nine positions gives the **feature map**:
+
+```text
+feature map (3 x 3)
+0  3  3
+0  3  3
+0  3  3
+```
+
+The kernel computes "right column minus left column", so it responds where brightness increases from left to right: the output is 0 in the flat region and 3 where the patch straddles the edge. This kernel is a **vertical-edge detector**, and its feature map is a picture of where vertical edges are.
+
+Formally, for input $X$ and a $k \times k$ kernel $K$ with bias $b$:
+
+$$
+Y[i, j] = b + \sum_{u=0}^{k-1} \sum_{v=0}^{k-1} X[i + u,\ j + v] \cdot K[u, v]
+$$
+
+Strictly, this is **cross-correlation**; a mathematical convolution flips the kernel first. Deep learning libraries compute cross-correlation and call it convolution. Since the kernel is learned, the network simply learns the flipped version, and nothing changes.
+
+---
+
+## Filters are learned, not designed
+
+Before deep learning, kernels were designed by hand: Sobel kernels for edges, Gaussian kernels for blur, Gabor kernels for oriented textures. A CNN instead starts its kernels as random numbers and learns them by gradient descent, exactly like any other weight.
+
+Because one kernel is used at every position, its gradient is the **sum** of the gradients from every position it touched:
+
+$$
+\frac{\partial L}{\partial K[u, v]} = \sum_{i, j} \frac{\partial L}{\partial Y[i, j]} \cdot X[i + u,\ j + v]
+$$
+
+Every position in every training image contributes evidence about what the kernel should detect, which is another reason CNNs learn efficiently.
+
+What they learn is remarkably consistent. The first layer of nearly every image CNN ends up with oriented edge detectors and colour-blob detectors resembling the hand-designed Gabor filters — and resembling the receptive fields of neurons in the primary visual cortex.
+
+---
+
+## Multiple channels in and out
+
+Real images have 3 channels, and inner layers have dozens or hundreds. Two rules extend the operation:
+
+**A filter spans all input channels.** For an input with $C_{\text{in}}$ channels, one filter is a $C_{\text{in}} \times k \times k$ block of weights. At each position it multiplies and sums over the whole block — all channels at once — and produces **one** number. So one filter always produces one feature map, however many channels it reads.
+
+**A layer has many filters.** A layer with $C_{\text{out}}$ filters produces $C_{\text{out}}$ feature maps, stacked as the output's channels. Each filter learns to detect a different pattern.
+
+| Term               | Shape                                                   | Meaning                                                   |
+| :----------------- | :------------------------------------------------------ | :-------------------------------------------------------- |
+| **Kernel**         | $k \times k$                                            | The 2D slice of weights applied to one input channel      |
+| **Filter**         | $C_{\text{in}} \times k \times k$                       | One kernel per input channel; produces one output channel |
+| **Layer weights**  | $C_{\text{out}} \times C_{\text{in}} \times k \times k$ | All filters of the layer                                  |
+| **Output channel** | $H_{\text{out}} \times W_{\text{out}}$                  | One filter's feature map                                  |
+
+The words are often used interchangeably in practice; the shapes are what matter.
+
+**Worked parameter count.** A layer mapping 64 input channels to 128 output channels with $3 \times 3$ kernels has $128 \times 64 \times 3 \times 3 = 73{,}728$ weights plus 128 biases. The count depends only on channels and kernel size, never on the image's height and width.
 
 ```python
 import torch.nn as nn
 
-conv = nn.Conv2d(in_channels=3, out_channels=64, kernel_size=3, padding=1)
-print(conv.weight.shape)  # (64, 3, 3, 3)
-print(conv.bias.shape)    # (64,)
+conv = nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1)
+print(conv.weight.shape)   # (128, 64, 3, 3)  = (C_out, C_in, k, k)
+print(conv.bias.shape)     # (128,)
 ```
 
-PyTorch uses `NCHW` ordering: a batch of images is `(B, C, H, W)`, and `nn.Conv2d` expects that. TensorFlow's default `NHWC` is the main source of shape bugs when porting models.
-
-The operation on a single output position is a dot product over the whole patch:
-
-```text
-out[n, co, i, j] = bias[co] + sum over ci, ki, kj of
-                   x[n, ci, i*s + ki*d, j*s + kj*d] * w[co, ci, ki, kj]
-```
-
-That is a `sum`, not a correlation with a flipped kernel, which makes PyTorch's `Conv2d` a cross-correlation. Nobody flips in practice and nothing breaks.
-
----
-
-## The output size formula
-
-Everything about conv shapes comes from one line:
-
-```text
-H_out = floor((H_in + 2*padding - dilation*(kernel - 1) - 1) / stride) + 1
-```
-
-Worked cases on a `32 x 32` input:
-
-| Kernel | Stride | Padding | Dilation | Output | Notes                          |
-| -----: | -----: | ------: | -------: | -----: | :----------------------------- |
-|      3 |      1 |       0 |        1 |     30 | Valid, shrinks                 |
-|      3 |      1 |       1 |        1 |     32 | Same size, the common choice   |
-|      3 |      2 |       1 |        1 |     16 | Halves resolution              |
-|      5 |      1 |       2 |        1 |     32 | Same size with a bigger kernel |
-|      1 |      1 |       0 |        1 |     32 | Pointwise, mixes channels only |
-|      3 |      1 |       2 |        2 |     32 | Dilated, same size, wider view |
-|      7 |      2 |       3 |        1 |     16 | ResNet stem                    |
-
-Two rules of thumb fall out. With an odd kernel, `padding = (kernel - 1) / 2` at `stride = 1` preserves spatial size. With any kernel, `padding = floor(kernel / 2)` at `stride = 2` halves it.
-
-<Callout type="info">
-  ### Dilation buys receptive field for free
-
-A `3 x 3` kernel at `dilation = 2` touches pixels two apart, covering a `5 x 5` footprint while still using nine weights. Stacking dilations `1, 2, 4, 8` grows the receptive field exponentially with no parameter cost, which is why DeepLab and WaveNet use it instead of more pooling.
-
-</Callout>
-
----
-
-## Stride
-
-Stride is how far the kernel moves between positions. Stride `2` discards every other output, halving each spatial dimension and cutting compute fourfold.
-
-Modern architectures mostly replaced strided pooling with strided convolution, because a strided conv learns which samples to keep rather than hard-coding a max. ResNet does this at the start of every block that changes resolution.
+PyTorch uses **`NCHW`** layout: a batch is `(B, C, H, W)`. TensorFlow defaults to `NHWC`, a common source of bugs when porting models.
 
 ---
 
 ## Padding
 
-`padding = 0` is called **valid** convolution and shrinks the feature map. `padding` chosen to preserve size is called **same**.
+The worked example turned a $5 \times 5$ input into a $3 \times 3$ output, because a $3 \times 3$ kernel fits in only 3 positions per row. This causes two problems: every layer shrinks the image (ten layers would shrink a $32 \times 32$ image to $12 \times 12$), and border pixels are covered by fewer kernel positions than central ones, so edge information is underused.
 
-Zero padding has one known artefact: the border pixels of every feature map are computed from a patch that is mostly zeros, so activations near the edge carry less information. It compounds over depth, which is why very deep networks sometimes use replicate or circular padding.
+**Padding** adds a border of extra values, usually zeros, around the input before convolving. With a $3 \times 3$ kernel, one pixel of padding on every side turns a $5 \times 5$ input into $7 \times 7$, and the output is back to $5 \times 5$.
 
-```python
-nn.ZeroPad2d(1)      # constant 0
-nn.ReplicationPad2d(1)  # repeats the edge pixel
-nn.ReflectionPad2d(1)   # mirrors around the edge
-```
+- **Valid** convolution: no padding; the output shrinks by $k - 1$.
+- **Same** convolution: padding $p = (k - 1)/2$ for odd $k$, so the output size equals the input size at stride 1. A $3 \times 3$ kernel needs $p = 1$, a $5 \times 5$ needs $p = 2$.
+
+Zero padding has a mild artefact: outputs near the border are computed partly from artificial zeros. Replicate padding (repeating edge pixels) and reflect padding (mirroring) avoid it at slightly higher cost.
+
+---
+
+## Stride
+
+**Stride** is how many pixels the kernel moves between positions. Stride 1 visits every position. Stride 2 skips every other one, so the output is roughly half the height and half the width, with a quarter of the positions and a quarter of the compute.
+
+Stride is one of the two main ways a CNN **downsamples** — reduces spatial resolution so that later layers work on a coarser, more abstract grid. The other is pooling, below.
+
+---
+
+## Dilation
+
+**Dilation** spaces the kernel's taps apart. A $3 \times 3$ kernel at dilation 2 reads pixels two apart, covering a $5 \times 5$ area with only 9 weights. Stacking dilations of 1, 2, 4, 8 grows the area a layer can see exponentially without any downsampling, which is why segmentation models (DeepLab) and audio models (WaveNet), which must keep full resolution, use it.
+
+---
+
+## The output size formula
+
+With all four settings defined, the output height (and width, by the same formula) is:
+
+$$
+H_{\text{out}} = \left\lfloor \frac{H_{\text{in}} + 2p - d\,(k - 1) - 1}{s} \right\rfloor + 1
+$$
+
+for padding $p$, dilation $d$, kernel size $k$, and stride $s$. The term $d(k - 1) + 1$ is the kernel's effective footprint. At $d = 1$ the formula reduces to $\lfloor (H_{\text{in}} + 2p - k) / s \rfloor + 1$.
+
+Checking the hand-worked example: $H_{\text{in}} = 5$, $k = 3$, $p = 0$, $s = 1$: $(5 + 0 - 3)/1 + 1 = 3$. Correct.
+
+Common cases on a $32 \times 32$ input:
+
+| Kernel | Stride | Padding | Dilation | Output | Use                                |
+| -----: | -----: | ------: | -------: | -----: | :--------------------------------- |
+|      3 |      1 |       0 |        1 |     30 | Valid convolution, shrinks         |
+|      3 |      1 |       1 |        1 |     32 | Same size; the most common setting |
+|      3 |      2 |       1 |        1 |     16 | Halves resolution                  |
+|      5 |      1 |       2 |        1 |     32 | Same size, larger kernel           |
+|      1 |      1 |       0 |        1 |     32 | Pointwise; mixes channels only     |
+|      3 |      1 |       2 |        2 |     32 | Dilated, same size, wider view     |
+|      7 |      2 |       3 |        1 |     16 | The ResNet stem                    |
 
 ---
 
 ## Pooling
 
-Pooling summarizes a local window, usually with a max or a mean.
+**Pooling** shrinks a feature map by summarizing each small window with one number. It has no weights. **Max pooling** keeps the largest value in each window; **average pooling** keeps the mean. A $2 \times 2$ max pool with stride 2:
 
-| Layer                                    | What it does                                       | Parameters |
-| :--------------------------------------- | :------------------------------------------------- | ---------: |
-| `nn.MaxPool2d(2, 2)`                     | Max over each `2 x 2` window, halves resolution    |          0 |
-| `nn.AvgPool2d(2, 2)`                     | Mean over each `2 x 2` window                      |          0 |
-| `nn.AdaptiveAvgPool2d(1)`                | Mean over the whole feature map, output is `1 x 1` |          0 |
-| `nn.Conv2d(C, C, 2, stride=2, groups=C)` | Learned per-channel downsample                     |         2C |
-
-Max pooling is the standard choice between conv blocks: it is translation-tolerant and has no parameters. Its downside is that it discards exact position, which matters for segmentation.
-
-`AdaptiveAvgPool2d(1)` is the global average pool that ends a modern classifier. It flattens a `C x H x W` feature map to `C` numbers regardless of the input resolution, which is what lets one backbone accept both `224 x 224` and `384 x 384` images.
-
-```python
-backbone = nn.Sequential(conv_stem, nn.AdaptiveAvgPool2d(1), nn.Flatten())
-head = nn.Linear(512, 10)
+```text
+input (4 x 4)          2 x 2 max pool          output (2 x 2)
+1  3 | 2  1
+4  2 | 0  1            max of each block        4  2
+-----+-----                                     5  8
+5  1 | 1  1
+0  2 | 3  8
 ```
+
+Max pooling answers "did this feature appear anywhere in this window?" and discards exactly where. This adds a small amount of **translation invariance**: shifting the input by one pixel often leaves the pooled output unchanged. It also halves resolution, quartering the work of every later layer.
+
+**Global average pooling** averages each entire feature map down to a single number, turning a $C \times H \times W$ tensor into a vector of $C$ values. It ends nearly every modern classification CNN: it replaces huge dense layers, and because it works for any $H$ and $W$, one network can accept images of different sizes. In PyTorch it is `nn.AdaptiveAvgPool2d(1)`.
+
+Many modern architectures downsample with stride-2 convolutions instead of max pooling, because a strided convolution **learns** how to summarize rather than always taking the maximum.
 
 ---
 
-## Receptive field progression
+## Building a CNN
 
-The receptive field of a unit is how much of the original input it can see. It grows with every layer, and it grows faster than the kernel size suggests because each layer's window is measured in the _previous_ layer's coordinates.
+A CNN repeats one pattern — **convolution, normalization, nonlinearity**, with occasional downsampling — and ends with global pooling and a small classifier:
 
-Track two quantities per layer: `RF`, the receptive field, and `j`, the jump, which is the stride of everything above it.
+```python title="small_cnn.py"
+import torch
+import torch.nn as nn
 
-```text
-RF_n = RF_(n-1) + (k_n - 1) * j_(n-1)
-j_n  = j_(n-1) * s_n
-RF_0 = 1, j_0 = 1
+def block(c_in, c_out):
+    return nn.Sequential(nn.Conv2d(c_in, c_out, 3, padding=1), nn.BatchNorm2d(c_out), nn.ReLU())
+
+model = nn.Sequential(
+    block(3, 32), block(32, 32), nn.MaxPool2d(2),     # 32x32 -> 16x16
+    block(32, 64), block(64, 64), nn.MaxPool2d(2),    # 16x16 -> 8x8
+    block(64, 128),
+    nn.AdaptiveAvgPool2d(1), nn.Flatten(),            # (B, 128)
+    nn.Linear(128, 10),                               # 10 class logits
+)
+print(model(torch.randn(8, 3, 32, 32)).shape)         # (8, 10)
 ```
 
-Applied to the first three blocks of VGG16 on a `224 x 224` image:
+The ReLU between convolutions is essential: without a nonlinearity, any stack of convolutions collapses to a single convolution. Normalization is covered in [Normalization](/ai/neural-networks/normalization).
 
-| Layer     | `k, s` | Spatial out | `RF` | `j` |
-| :-------- | :----: | ----------: | ---: | --: |
-| Input     | `n/a`  | `224 x 224` |    1 |   1 |
-| `conv1_1` | `3, 1` | `224 x 224` |    3 |   1 |
-| `conv1_2` | `3, 1` | `224 x 224` |    5 |   1 |
-| `pool1`   | `2, 2` | `112 x 112` |    6 |   2 |
-| `conv2_1` | `3, 1` | `112 x 112` |   10 |   2 |
-| `conv2_2` | `3, 1` | `112 x 112` |   14 |   2 |
-| `pool2`   | `2, 2` |   `56 x 56` |   16 |   4 |
-| `conv3_1` | `3, 1` |   `56 x 56` |   24 |   4 |
-| `conv3_2` | `3, 1` |   `56 x 56` |   32 |   4 |
-| `conv3_3` | `3, 1` |   `56 x 56` |   40 |   4 |
-| `pool3`   | `2, 2` |   `28 x 28` |   44 |   8 |
+### The feature hierarchy
 
-By `pool3` a single unit sees a `44 x 44` patch of the input. Three more blocks and it sees the whole image. This is the mechanism behind the hierarchy of features: early units see pixels and edges, deep units see object parts, and the units feeding the classifier see the entire scene.
+Each layer's filters operate on the previous layer's feature maps, not on pixels, so each layer detects **combinations** of what the layer below found. Zeiler and Fergus (arXiv:1311.2901) visualized this in a trained network:
 
-It also explains a design constraint. If your object is `64` pixels across, no unit shallower than `RF = 64` can classify it, and stacking `3 x 3` convolutions at `stride = 1` with no pooling grows `RF` by only `2` per layer.
+| Depth        | Detects                                    |
+| :----------- | :----------------------------------------- |
+| Layer 1      | Oriented edges, colour blobs               |
+| Layer 2      | Corners, simple textures, edge junctions   |
+| Layer 3      | Repeated textures and patterns (mesh, fur) |
+| Layers 4–5   | Object parts: eyes, wheels, faces, text    |
+| Final layers | Whole objects and their arrangement        |
 
-<Callout type="warn">
+Channel counts usually **increase** as resolution **decreases** (3 → 32 → 64 → 128 above): deeper layers have fewer positions but many more kinds of pattern to represent.
+
+---
+
+## Receptive fields
+
+The **receptive field** of a unit is the region of the original input that can influence its value. A unit in the first $3 \times 3$ layer sees a $3 \times 3$ patch of pixels. A unit in the second layer sees a $3 \times 3$ patch of first-layer units, each of which sees $3 \times 3$ pixels, so it sees $5 \times 5$ pixels.
+
+Downsampling makes it grow faster. After a stride-2 layer, adjacent units are two pixels apart in the original image, so the next $3 \times 3$ kernel spans more of it. Tracking the receptive field $R$ and the **jump** $j$ (the distance in input pixels between adjacent units at the current layer):
+
+$$
+R_n = R_{n-1} + (k_n - 1)\, j_{n-1}, \qquad j_n = j_{n-1}\, s_n, \qquad R_0 = j_0 = 1
+$$
+
+Applied to the first three blocks of VGG-16 on a $224 \times 224$ image:
+
+| Layer     | $k, s$ | Output size | $R$ | $j$ |
+| :-------- | :----: | ----------: | --: | --: |
+| Input     |   —    | `224 x 224` |   1 |   1 |
+| `conv1_1` |  3, 1  | `224 x 224` |   3 |   1 |
+| `conv1_2` |  3, 1  | `224 x 224` |   5 |   1 |
+| `pool1`   |  2, 2  | `112 x 112` |   6 |   2 |
+| `conv2_1` |  3, 1  | `112 x 112` |  10 |   2 |
+| `conv2_2` |  3, 1  | `112 x 112` |  14 |   2 |
+| `pool2`   |  2, 2  |   `56 x 56` |  16 |   4 |
+| `conv3_1` |  3, 1  |   `56 x 56` |  24 |   4 |
+| `conv3_2` |  3, 1  |   `56 x 56` |  32 |   4 |
+| `conv3_3` |  3, 1  |   `56 x 56` |  40 |   4 |
+| `pool3`   |  2, 2  |   `28 x 28` |  44 |   8 |
+
+By `pool3`, one unit sees a $44 \times 44$ patch, and a few blocks later it sees the whole image. This is the mechanism behind the feature hierarchy: a unit can only detect an object part if its receptive field is large enough to contain that part. It also sets a design constraint — an object 100 pixels wide cannot be recognized by a unit whose receptive field is 40 pixels.
+
+<Callout type="info">
   ### Two 3x3 convolutions beat one 5x5
 
-A stack of two `3 x 3` convolutions has `RF = 5`, the same as a single `5 x 5`. It uses `2 * 3 * 3 = 18` weights per channel pair instead of `25`, and it inserts a ReLU in the middle, so it is both cheaper and more nonlinear. Every architecture after VGG uses `3 x 3` almost exclusively.
+Two stacked $3 \times 3$ layers have a $5 \times 5$ receptive field, the same as one $5 \times 5$ layer. They use $2 \times 9 = 18$ weights per channel pair instead of 25, and they put a ReLU in between, making the stack more expressive. Three $3 \times 3$ layers match a $7 \times 7$ with 27 weights instead of 49. This argument, from VGG, is why almost every modern CNN uses $3 \times 3$ kernels.
 
 </Callout>
 
 ---
 
-## Convolutions are matrix multiplies
+## Efficient variants
 
-Frameworks implement a convolution by rearranging the input into a matrix where each column is one flattened patch, then calling a GEMM. The rearrangement is called `im2col`.
+### 1x1 convolutions
 
-```python
-import torch
+A $1 \times 1$ convolution has no spatial extent: at each pixel it takes a weighted sum across channels. It is a dense layer applied independently at every position. It is the cheapest way to change the number of channels, and it appears throughout modern architectures to shrink channels before an expensive operation (see [Inception and ResNet bottlenecks](/ai/classical-deep-learning/vision-architectures)).
 
-x = torch.randn(1, 3, 5, 5)
-patches = torch.nn.functional.unfold(x, kernel_size=3, padding=1)
-print(patches.shape)  # (1, 27, 25) -> 27 = 3*3*3, 25 = 5*5 output positions
+### Grouped and depthwise convolutions
 
-w = torch.randn(8, 27)
-out = (w @ patches).view(1, 8, 5, 5)
-```
+A standard convolution lets every filter read every input channel. A **grouped** convolution with $g$ groups splits the channels into $g$ independent sets, each convolved separately, cutting weights and compute by a factor of $g$. A **depthwise** convolution is the extreme case, $g = C_{\text{in}}$: each channel gets its own single $k \times k$ kernel, and no channels are mixed.
 
-`unfold` is `im2col` and `fold` is its inverse. This is why convolution throughput tracks matmul throughput, and why it costs memory: `im2col` expands the input by a factor of `k * k`.
+A **depthwise separable** convolution follows a depthwise convolution (spatial filtering per channel) with a $1 \times 1$ convolution (channel mixing), splitting the two jobs a standard convolution does at once:
 
----
+| Variant ($C \to C$ channels, $3 \times 3$) | Weights    | For $C = 256$ |
+| :----------------------------------------- | :--------- | ------------: |
+| Standard                                   | $9C^2$     |       589,824 |
+| Grouped, $g = 4$                           | $9C^2 / 4$ |       147,456 |
+| Depthwise                                  | $9C$       |         2,304 |
+| Depthwise separable                        | $9C + C^2$ |        67,840 |
 
-## Grouped and depthwise convolutions
+The depthwise separable version uses about a ninth of the weights. It is the building block of MobileNet and EfficientNet, designed for phones.
 
-`groups = g` splits the input channels into `g` independent sets, convolves each separately, and concatenates. `groups = 1` is a normal conv, `groups = C_in` is a **depthwise** conv where each channel is filtered on its own.
+### How convolutions are actually computed
 
-| Variant                                 | `groups`      | Weights for `C -> C`, `3 x 3` |
-| :-------------------------------------- | :------------ | ----------------------------: |
-| Standard                                | `1`           |                   `9 * C * C` |
-| Grouped, `g = 4`                        | `4`           |               `9 * C * C / 4` |
-| Depthwise                               | `C`           |                       `9 * C` |
-| Depthwise separable (depthwise + `1x1`) | `C`, then `1` |               `9 * C + C * C` |
-
-Depthwise separable convolutions are the MobileNet trick: for `C = 256` that is `2304 + 65536 = 67840` weights against `589824` for a standard conv, roughly an eighth. Grouped convolutions of other sizes power ResNeXt and AlexNet, the latter out of memory necessity on two 2012 GPUs.
+Libraries usually compute a convolution as a single matrix multiplication. The **im2col** transformation copies every $C_{\text{in}} \times k \times k$ patch of the input into one column of a matrix; multiplying the $(C_{\text{out}}, C_{\text{in}}k^2)$ weight matrix by that patch matrix computes every output at once. This is why convolution speed tracks matrix-multiply speed on GPUs, and also why convolutions use a lot of memory: im2col duplicates each input pixel up to $k^2$ times.
 
 ---
 
-## A minimal CNN
+## Key terms
 
-```python
-import torch
-import torch.nn as nn
-
-class SmallCNN(nn.Module):
-    def __init__(self, num_classes: int = 10) -> None:
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.Conv2d(32, 32, 3, padding=1), nn.BatchNorm2d(32), nn.ReLU(),
-            nn.MaxPool2d(2),                                     # 32 -> 16
-            nn.Conv2d(32, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.MaxPool2d(2),                                     # 16 -> 8
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-        )
-        self.head = nn.Linear(128, num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.features(x))
-
-model = SmallCNN()
-x = torch.randn(8, 3, 32, 32)
-print(model(x).shape)  # (8, 10)
-```
-
-The `conv -> norm -> relu` triple is the standard block. Norm placement is covered in [Normalization](/ai/neural-networks/normalization); pre-activation ordering is covered on the next page.
+| Term                         | Meaning                                                                                 |
+| :--------------------------- | :-------------------------------------------------------------------------------------- |
+| **convolution**              | Sliding a kernel over the input and computing a weighted sum at each position           |
+| **kernel / filter**          | The small grid of learned weights; a filter spans all input channels                    |
+| **feature map**              | The output grid of one filter: where, and how strongly, its pattern appears             |
+| **weight sharing**           | Using the same kernel at every position                                                 |
+| **locality**                 | Each output depends only on a small neighbourhood of the input                          |
+| **translation equivariance** | Shifting the input shifts the feature map by the same amount                            |
+| **padding**                  | Extra border values so the kernel can cover edge pixels and output size is preserved    |
+| **stride**                   | The step between kernel positions; stride 2 halves resolution                           |
+| **dilation**                 | Spacing between kernel taps, enlarging coverage without more weights                    |
+| **pooling**                  | Summarizing each window (max or average); adds slight translation invariance            |
+| **receptive field**          | The input region that can affect one unit                                               |
+| **depthwise separable**      | A per-channel spatial convolution followed by a $1 \times 1$ channel-mixing convolution |
 
 ---
 
 ## Interview questions
 
 <Accordions>
-  <Accordion title="Why does a convolution use fewer parameters than a dense layer on the same input, and what assumption does that encoding buy you?">
+  <Accordion title="Why does a convolution use far fewer parameters than a dense layer, and what does it assume?">
 
-    On a `224 x 224 x 3` input a dense layer has `150,528` inputs and costs `9,633,792` weights to reach 64 outputs, and every weight is tied to one position. Sixty-four `3 x 3 x 3` filters cost `64 * 3 * 3 * 3 + 64 = 1792`. What the saving buys is translation invariance: an edge learned in the top-left corner applies at the bottom-right instead of being relearned at each of 50,176 locations.
+    A dense layer from a `224 x 224 x 3` image to 64 outputs needs 9,633,792 weights, each tied to one pixel. Sixty-four `3 x 3 x 3` filters need 1,792, because each output reads only a small neighbourhood (locality) and the same filter is reused at every position (weight sharing). The assumptions are that useful patterns are local and mean the same thing anywhere in the image.
+
+  </Accordion>
+  <Accordion title="Compute the feature map of a [-1, 0, 1] vertical-edge kernel on an image that is 0 on the left and 1 on the right.">
+
+    At each position the kernel computes the sum of the right column minus the sum of the left column of the patch. In a flat region both are equal and the output is 0. Where the patch straddles the boundary, the right column is all 1s and the left all 0s, so with three rows the output is 3. The feature map is 0 away from the edge and 3 along it.
 
   </Accordion>
   <Accordion title={<>Compute the output size of <code>Conv2d(64, 128, kernel_size=3, stride=2, padding=1, dilation=2)</code> on a <code>56 x 56</code> input.</>}>
 
-    `floor((56 + 2*1 - 2*(3-1) - 1) / 2) + 1 = floor(53 / 2) + 1 = 27`, so `27 x 27 x 128`. Dilation 2 makes the kernel cover a `5 x 5` footprint while still using nine weights per slice.
+    $\lfloor (56 + 2 - 2 \cdot 2 - 1)/2 \rfloor + 1 = \lfloor 53/2 \rfloor + 1 = 27$, so the output is `128 x 27 x 27`. Dilation 2 gives the kernel a `5 x 5` footprint with nine weights.
 
   </Accordion>
-  <Accordion title="What is the difference between a kernel, a filter, and an output channel?">
+  <Accordion title="How many parameters does a 3x3 convolution from 64 to 128 channels have, and what is its weight shape?">
 
-    A kernel is one `C_in x k x k` weight slice that reads all input channels at a single position. A filter is the whole set of kernels for one output channel. Output channels count filters, so `out_channels` is how many feature maps the layer produces.
-
-  </Accordion>
-  <Accordion title={<>What shape is <code>nn.Conv2d(3, 16, 3).weight</code>, and why is <code>C_in</code> the second dimension rather than the first?</>}>
-
-    `(16, 3, 3, 3)`, ordered `C_out, C_in, kH, kW`. `C_in` sits second because the tensor is laid out as one row per output channel, so `weight[o]` is the complete slice that reads every input channel at one position, and the dimensions after it stay contiguous for the sliding window.
+    $128 \times 64 \times 3 \times 3 = 73{,}728$ weights plus 128 biases. The weight tensor is `(C_out, C_in, k, k) = (128, 64, 3, 3)`. The count is independent of the image's height and width.
 
   </Accordion>
-  <Accordion title={<>Derive the receptive field of a stack of four <code>3 x 3</code> convolutions at <code>stride = 1</code>, then of the same stack with a <code>2 x 2</code> max pool inserted after the second.</>}>
+  <Accordion title="Why is a nonlinearity needed between convolution layers?">
 
-    With no pooling the jump stays 1, so `RF = 1 + 4 * (3 - 1) = 9`: a `9 x 9` patch. Insert a `2 x 2` stride-2 pool after the second convolution and the recurrence `RF_n = RF_(n-1) + (k_n - 1) * j_(n-1)` gives `5` after two convs, then `6` with jump `2`, then `10`, then `18`. Same four convolutions, twice the receptive field, at the cost of half the resolution downstream.
-
-  </Accordion>
-  <Accordion title={<>Why did VGG use two <code>3 x 3</code> convolutions instead of one <code>5 x 5</code>?</>}>
-
-    Two `3 x 3` convolutions cost `2 * 3 * 3 = 18` weights per input-output pair against `5 * 5 = 25` for one `5 x 5`, they cover the same `5 x 5` footprint, and they put a nonlinearity between them. Cheaper and strictly more expressive on the same field of view, which is the entire VGG argument.
+    A convolution is a linear operation, and a composition of linear operations is linear, so a stack of convolutions without activations collapses into a single convolution with a larger kernel. ReLU between layers is what lets the network build nonlinear combinations of features.
 
   </Accordion>
-  <Accordion title="What does a dilated convolution do, and when would you choose it over pooling?">
+  <Accordion title="Derive the receptive field of four stacked 3x3 convolutions at stride 1, then with a 2x2 stride-2 pool after the second.">
 
-    A dilated convolution spaces the kernel taps `d` apart, so a `3 x 3` at dilation 2 covers a `5 x 5` area with nine weights and adds no parameters. Choose it over pooling when you need the wider receptive field but cannot afford to lose resolution: DeepLab for dense segmentation, WaveNet for audio, where downsampling destroys the signal the model has to generate back.
-
-  </Accordion>
-  <Accordion title={<>What does <code>AdaptiveAvgPool2d(1)</code> give you that <code>AvgPool2d(H, W)</code> does not?</>}>
-
-    `AdaptiveAvgPool2d(1)` produces one value per channel whatever the spatial size, so the network accepts any input resolution and the classifier's input width stays fixed. `AvgPool2d(H, W)` hard-codes a window; feed it a different size and the output shape changes and no longer matches the head.
+    Without pooling the jump stays 1, so $R = 1 + 4 \times 2 = 9$. With the pool after the second convolution: $R = 5$ after two convolutions, 6 after the pool with jump 2, then $6 + 2 \times 2 = 10$ and $10 + 2 \times 2 = 14$. Downsampling makes later kernels cover more of the input.
 
   </Accordion>
-  <Accordion title="Explain grouped convolution. What is a depthwise convolution, and what does it lose relative to a standard one?">
+  <Accordion title="Why did VGG use two 3x3 convolutions instead of one 5x5?">
 
-    Grouped convolution splits `C_in` into `g` groups and gives each `C_out / g` filters, so no kernel mixes channels across groups: parameters and compute both fall by `g`. Depthwise is the case `g = C_in`, one filter per channel. It keeps the same spatial receptive field per channel but loses all cross-channel mixing, which is why MobileNet follows every depthwise conv with a `1 x 1` pointwise conv to reintroduce it.
+    Same $5 \times 5$ receptive field, 18 weights per channel pair instead of 25, and an extra ReLU between them, so it is cheaper and more expressive.
 
   </Accordion>
-  <Accordion title="Why do most modern architectures use a stride-2 convolution instead of max pooling to halve resolution?">
+  <Accordion title="What is the difference between translation equivariance and translation invariance, and which layers provide each?">
 
-    A stride-2 convolution learns which samples to keep; max pooling hard-codes taking the maximum. It also keeps the block pure convolutions, which is easier to fuse and to port to accelerators, and ResNet needs a strided conv on the residual branch anyway whenever channels change, so the shortcut can stay an identity everywhere else.
+    Equivariance: shifting the input shifts the output by the same amount. Convolutions are equivariant because the same kernel is applied at every position. Invariance: shifting the input leaves the output unchanged. Max pooling adds a small amount locally, and global average pooling at the end makes the final feature vector largely invariant to where the object is.
+
+  </Accordion>
+  <Accordion title="What does global average pooling give that a flatten-plus-dense head does not?">
+
+    It reduces each channel to one number whatever the spatial size, so the classifier's input size is fixed and the network accepts any image resolution. It also removes the enormous dense layer a flatten would require: VGG-16's dense head holds about 124 million of its 138 million parameters.
+
+  </Accordion>
+  <Accordion title="Explain depthwise separable convolution and its cost saving.">
+
+    A depthwise convolution filters each channel separately with its own $k \times k$ kernel, then a $1 \times 1$ convolution mixes channels. For $C = 256$ and $3 \times 3$ kernels that is $9C + C^2 = 67{,}840$ weights against $9C^2 = 589{,}824$ for a standard convolution, about a ninth. It separates spatial filtering from channel mixing, which a standard convolution does jointly.
+
+  </Accordion>
+  <Accordion title="When is dilation preferred over pooling?">
+
+    When the receptive field must grow but resolution cannot be lost, as in dense segmentation where every pixel needs a label (DeepLab) or audio generation where every sample must be produced (WaveNet). Dilation enlarges coverage without downsampling and without extra parameters.
 
   </Accordion>
 </Accordions>

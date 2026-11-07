@@ -1,42 +1,13 @@
 ---
-title: Transfer, Ensembles, Video
-description: 'Freezing a backbone and training a new head, staged unfreezing, logit averaging and bagging, torch.func.vmap ensembles, and 3D convolutions on video.'
+title: Transfer Learning and Ensembles
+description: 'Reusing and combining trained models: why pretrained features transfer, linear probing versus fine-tuning, discriminative learning rates, catastrophic forgetting and the domain gap, ensembles with logit versus probability averaging, bagging and snapshot ensembles, and evaluating many models at once with torch.func.vmap.'
 ---
 
-Very few projects train a vision model from scratch. The default is to load a backbone pretrained on ImageNet-1k or ImageNet-22k, replace the head, and train. This page covers how to do that, how to combine several such models, and how the same machinery extends to video.
+**Transfer learning** is reusing what a model learned on one task as the starting point for another. A network trained on the 1.28 million images of ImageNet has already learned to detect edges, textures, and object parts, and those features are useful for almost any image task. Starting from it instead of from random weights needs far less data and compute. An **ensemble** combines the predictions of several trained models, usually by averaging; because different models make different mistakes, the average is more accurate than any single member.
 
----
+A vision network is divided into two parts for transfer: the **backbone**, the large stack of layers that turns an image into a feature vector and is reused, and the **head**, the small final layer that maps features to the task's classes and is replaced.
 
-## The plain-language version
-
-**Transfer learning** means reusing what a model learned on one task to help with another. A network trained on a million ImageNet photos has already learned to detect edges, textures, and object parts. Those skills are useful for almost any image task, so instead of starting from random weights, you start from that trained network and only adapt it to your task. Like hiring an experienced photographer and teaching them your product line, rather than teaching someone what a camera is.
-
-A vision model is split into two parts for this:
-
-- **Backbone**: the big stack of layers that turns an image into a feature vector. This is the reusable part.
-- **Head**: the small final layer that turns those features into your task's classes. This gets replaced.
-
-An **ensemble** combines several models' predictions, usually by averaging them. Different models make different mistakes, so the average is more reliable than any single one, like asking several doctors instead of one.
-
-**Video** is a stack of images over time, so it adds a time axis: shape `(B, C, T, H, W)`.
-
-| Word                                        | Plain meaning                                                                                                                                |
-| :------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------- |
-| **pretrained model**                        | A model already trained on a large dataset, used as a starting point.                                                                        |
-| **backbone / feature extractor**            | The main body of the network, which produces a feature vector for each image.                                                                |
-| **head**                                    | The task-specific final layer(s) on top of the backbone.                                                                                     |
-| **freezing**                                | Setting `requires_grad = False` on the backbone so its weights do not change during training.                                                |
-| **linear probing**                          | Freeze the whole backbone and train only a new linear head. Fast, and a measure of how good the features already are.                        |
-| **fine-tuning**                             | Also update some or all backbone weights, usually with a small learning rate. Slower, but adapts further.                                    |
-| **domain gap**                              | How different your images are from the pretraining images (for example, X-rays versus everyday photos). A bigger gap needs more fine-tuning. |
-| **ImageNet-1k / -22k**                      | The standard pretraining datasets, with about 1,000 and about 22,000 classes.                                                                |
-| **ensemble**                                | Several models whose predictions are combined.                                                                                               |
-| **logit averaging / probability averaging** | Combining raw scores versus combining softmax probabilities. They give different answers when the models disagree in confidence.             |
-| **bagging**                                 | Bootstrap aggregating: train each model on a random resample of the data (drawn with replacement), then average them.                        |
-| **`vmap`**                                  | A PyTorch function that runs the same code over a batch of models (or inputs) at once, instead of in a Python loop.                          |
-| **frame / clip**                            | A frame is one image in a video. A clip is a short run of frames fed to the model together.                                                  |
-| **3D convolution**                          | A filter that slides over time as well as height and width, so it can detect motion.                                                         |
-| **spatiotemporal**                          | Involving both space (height, width) and time.                                                                                               |
+**Builds on:** [CNN Architectures](/ai/classical-deep-learning/vision-architectures) for backbones and `timm`, and [Overfitting and Regularization](/ai/neural-networks/regularization), since both techniques are ultimately about generalizing from limited data.
 
 ---
 
@@ -70,7 +41,7 @@ net = nn.Sequential(model, head)
 opt = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=0.01)
 ```
 
-Two details that go wrong often. `requires_grad = False` does not stop BatchNorm from updating its running statistics, so you also need `model.eval()` on the frozen part, or better, freeze norm layers explicitly:
+Two details that go wrong often. `requires_grad = False` does not stop BatchNorm from updating its running statistics, so the frozen part must also be put in `model.eval()`, or better, freeze norm layers explicitly:
 
 ```python
 from timm.layers import BatchNormAct2d
@@ -84,7 +55,7 @@ And `num_classes=0` strips the head and returns pooled features, whose width is 
 
 ### Fine-tuning
 
-Unfreezing everything works better when you have data, but the early layers should move slowly. A single learning rate for the whole model is the usual mistake: it is either too small for the new head or too large for the pretrained weights.
+Unfreezing everything works better when there is enough data, but the early layers should move slowly. A single learning rate for the whole model is the usual mistake: it is either too small for the new head or too large for the pretrained weights.
 
 ```python title="finetune.py"
 param_groups = [
@@ -100,13 +71,13 @@ The alternative is staged unfreezing: train the head for a few epochs, unfreeze 
 <Callout type="warn">
   ### Catastrophic forgetting
 
-Fine-tuning on a narrow dataset overwrites the general features the backbone learned. Accuracy on your task goes up and the model's behaviour on anything else degrades, sometimes badly. Low learning rates, weight decay, early stopping, and LoRA on the projection weights all slow this down. If you need the backbone for more than one task afterwards, keep the original checkpoint and train adapters instead of the base weights.
+Fine-tuning on a narrow dataset overwrites the general features the backbone learned. Accuracy on the new task goes up and the model's behaviour on anything else degrades, sometimes badly. Low learning rates, weight decay, early stopping, and LoRA on the projection weights all slow this down. If the backbone is needed for more than one task afterwards, keep the original checkpoint and train adapters instead of the base weights.
 
 </Callout>
 
 ### Domain gap
 
-Pretraining helps in proportion to how similar the target domain is. Natural images to natural images transfers well. Natural images to satellite, medical, or spectrogram data transfers much less, and in those cases a self-supervised pretraining run on unlabelled target-domain images often beats an ImageNet initialization. Check whether the checkpoint's normalization statistics are anywhere near your data before you conclude the backbone is useless.
+Pretraining helps in proportion to how similar the target domain is. Natural images to natural images transfers well. Natural images to satellite, medical, or spectrogram data transfers much less, and in those cases a self-supervised pretraining run on unlabelled target-domain images often beats an ImageNet initialization. Check whether the checkpoint's normalization statistics are anywhere near the target data before concluding that the backbone is useless.
 
 ---
 
@@ -123,7 +94,7 @@ Training `M` models and averaging them is the most reliable accuracy improvement
 | Geometric averaging   | `softmax(mean(log_softmax(logits_m)))`  | Sharper, closer to logit averaging      |
 | Label averaging       | Average the predicted class labels      | Loses confidence, rarely used           |
 
-Averaging logits and averaging probabilities give different answers when the members disagree in confidence. Logit averaging lets one very confident member dominate. Probability averaging caps each member's contribution at `1.0`, which is usually what you want.
+Averaging logits and averaging probabilities give different answers when the members disagree in confidence. Logit averaging lets one very confident member dominate. Probability averaging caps each member's contribution at `1.0`, which is usually the desired behaviour.
 
 ```python title="ensemble.py"
 import torch
@@ -158,7 +129,7 @@ Cross-architecture ensembles gain the most, because a ConvNeXt and a Swin transf
 
 ### Vectorized evaluation with vmap
 
-Looping over `M` models launches `M` sets of kernels. If the members share an architecture, you can stack their parameters and evaluate all of them in one batched call.
+Looping over `M` models launches `M` sets of kernels. If the members share an architecture, their parameters can be stacked and evaluate all of them in one batched call.
 
 ```python title="vmap_ensemble.py"
 from torch.func import vmap, functional_call
@@ -192,90 +163,34 @@ An ensemble costs `M` times the latency and memory of one model. Production syst
 
 ---
 
-## Video data
+## Key terms
 
-A clip is a 5D tensor: `(B, C, T, H, W)`, where `T` is the number of frames. Everything from the image case carries over with one extra axis.
-
-```python
-clip = torch.randn(4, 3, 16, 112, 112)   # batch 4, RGB, 16 frames, 112x112
-```
-
-### 3D convolutions
-
-`nn.Conv3d` slides a `kT x kH x kW` volume over the clip. Its weight has shape `(C_out, C_in, kT, kH, kW)`.
-
-```python
-conv3d = nn.Conv3d(3, 64, kernel_size=(3, 3, 3), padding=1)
-print(conv3d.weight.shape)   # (64, 3, 3, 3, 3)
-print(conv3d(clip).shape)    # (4, 64, 16, 112, 112)
-```
-
-Parameter and FLOP counts scale with `kT`, so a `3 x 3 x 3` conv costs three times what a `3 x 3` conv costs at the same channel widths. Video models are therefore much shallower and narrower than image models at the same nominal size.
-
-### Factorized spatiotemporal convolutions
-
-C3D uses full `3 x 3 x 3` kernels. R(2+1)D splits each one into a `1 x 3 x 3` spatial convolution followed by a `3 x 1 x 1` temporal convolution, with a ReLU between them.
-
-```python
-nn.Sequential(
-    nn.Conv3d(3, 45, kernel_size=(1, 3, 3), padding=(0, 1, 1)), nn.ReLU(),
-    nn.Conv3d(45, 64, kernel_size=(3, 1, 1), padding=(1, 0, 0)),
-)
-```
-
-The intermediate channel count is chosen so the factorized block has the same parameter count as the full `3 x 3 x 3` it replaces. The extra nonlinearity and the decoupled spatial and temporal statistics make it train better, and it is the design most later video CNNs kept.
-
-Other factorizations:
-
-| Variant     | Structure                                       | Trade-off                        |
-| :---------- | :---------------------------------------------- | :------------------------------- |
-| C3D         | Full `3 x 3 x 3`                                | Expensive, works                 |
-| R(2+1)D     | `1 x 3 x 3` then `3 x 1 x 1`                    | Cheaper, better accuracy         |
-| CSN         | Depthwise `3 x 3 x 3` then `1 x 1` channel mix  | Cheapest conv variant            |
-| SlowFast    | Two pathways, low and high temporal frame rate  | Separates motion from appearance |
-| TimeSformer | Divided space-time attention over frame patches | No convolutions at all           |
-| VideoMAE    | Masked autoencoding pretraining on tubelets     | Self-supervised pretraining      |
-
-### Temporal sampling and transforms
-
-`torchvision` provides video models and `transforms.v2` handles the video axis natively through `tv_tensors.Video`.
-
-```python title="video_transforms.py"
-from torchvision.transforms import v2
-
-vid_tf = v2.Compose([
-    v2.RandomResizedCrop(112, antialias=True),
-    v2.RandomHorizontalFlip(),
-    v2.UniformTemporalSubsample(16),      # resample T frames down to 16
-    v2.Normalize(mean=(0.4322, 0.4060, 0.3774), std=(0.2280, 0.2211, 0.2169)),
-])
-```
-
-`UniformTemporalSubsample` picks evenly spaced frames from whatever `T` the clip has, so a loader can hand in variable-length clips. Sampling rate matters more than clip length: Kinetics models typically see 16 or 32 frames sampled at 2 to 8 frame intervals, and the interval determines the temporal frequencies the model can represent.
-
-`torchvision.models.video` ships `r3d_18`, `mc3_18`, and `r2plus1d_18`, all pretrained on Kinetics-400.
-
-```python
-from torchvision.models.video import r2plus1d_18, R2Plus1D_18_Weights
-
-weights = R2Plus1D_18_Weights.KINETICS400_V1
-model = r2plus1d_18(weights=weights)
-model.head = nn.Linear(model.head.in_features, num_classes)
-```
-
-The same transfer learning rules apply as for images, with one addition: a Kinetics-pretrained model has learned generic human activity, which transfers poorly to domains like surgical video or industrial monitoring where the motion statistics are completely different.
+| Term                                        | Meaning                                                                                                                                            |
+| :------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **pretrained model**                        | A model already trained on a large dataset, used as a starting point.                                                                              |
+| **backbone / feature extractor**            | The main body of the network, which produces a feature vector for each image.                                                                      |
+| **head**                                    | The task-specific final layer(s) on top of the backbone.                                                                                           |
+| **freezing**                                | Setting `requires_grad = False` on the backbone so its weights do not change during training.                                                      |
+| **linear probing**                          | Freeze the whole backbone and train only a new linear head. Fast, and a measure of how good the features already are.                              |
+| **fine-tuning**                             | Also update some or all backbone weights, usually with a small learning rate. Slower, but adapts further.                                          |
+| **domain gap**                              | How different the target images are from the pretraining images (for example, X-rays versus everyday photos). A bigger gap needs more fine-tuning. |
+| **ImageNet-1k / -22k**                      | The standard pretraining datasets, with about 1,000 and about 22,000 classes.                                                                      |
+| **ensemble**                                | Several models whose predictions are combined.                                                                                                     |
+| **logit averaging / probability averaging** | Combining raw scores versus combining softmax probabilities. They give different answers when the models disagree in confidence.                   |
+| **bagging**                                 | Bootstrap aggregating: train each model on a random resample of the data (drawn with replacement), then average them.                              |
+| **`vmap`**                                  | A PyTorch function that runs the same code over a batch of models (or inputs) at once, instead of in a Python loop.                                |
 
 ---
 
 ## Interview questions
 
 <Accordions>
-  <Accordion title={<>What does <code>requires_grad = False</code> fail to freeze, and how do you fix it?</>}>
+  <Accordion title={<>What does <code>requires_grad = False</code> fail to freeze, and how is it fixed?</>}>
 
     BatchNorm running statistics. Setting `requires_grad = False` stops the weights and biases from receiving updates, but a module still in train mode recomputes and overwrites its running mean and variance on every forward pass, so the frozen backbone slowly drifts. Put the frozen part in `model.eval()`, or freeze the normalization layers explicitly.
 
   </Accordion>
-  <Accordion title="When would you choose a linear probe over full fine-tuning?">
+  <Accordion title="When is a linear probe preferable to full fine-tuning?">
 
     Below roughly a thousand labelled images, or when the backbone must stay reusable across several tasks. Low and mid features are task-agnostic, so a head trained on frozen pooled features reaches good accuracy in minutes on one GPU, and with 800 images it is hard to beat because full fine-tuning has nothing to learn from and overfits.
 
@@ -297,7 +212,7 @@ The same transfer learning rules apply as for images, with one addition: a Kinet
   </Accordion>
   <Accordion title="Where do snapshot ensembles get their diversity from, and what do they cost?">
 
-    A cosine schedule with warm restarts, saving a checkpoint at each cycle minimum. Each minimum is a different local basin reached by a different learning-rate path, so one run yields several usable members. The cost is storage and `M` forward passes at inference; what you avoid is `M` full training runs.
+    A cosine schedule with warm restarts, saving a checkpoint at each cycle minimum. Each minimum is a different local basin reached by a different learning-rate path, so one run yields several usable members. The cost is storage and `M` forward passes at inference; what it avoids is `M` full training runs.
 
   </Accordion>
   <Accordion title="What is the difference between SWA and an ensemble?">
@@ -310,22 +225,7 @@ The same transfer learning rules apply as for images, with one addition: a Kinet
     It maps over the leading axis of the stacked parameters and buffers (dimension 0 for each) while broadcasting the input batch unchanged, marked `None`. The result gains a leading axis of size `M`: five members become one batched call instead of five separate sets of kernel launches, which is what makes large ensembles and multi-seed evaluation practical.
 
   </Accordion>
-  <Accordion title={<>What shape is a video batch, and what shape is a <code>Conv3d</code> weight?</>}>
-
-    Video is 5D: `(B, C, T, H, W)`, for example `4, 3, 16, 112, 112` for four RGB clips of sixteen frames. A `Conv3d` weight is `(C_out, C_in / groups, kT, kH, kW)`, so 64 to 64 channels with a `3 x 3 x 3` kernel is `(64, 64, 3, 3, 3)`.
-
-  </Accordion>
-  <Accordion title="Why does R(2+1)D outperform C3D at lower cost?">
-
-    A full `3 x 3 x 3` kernel spends 27 multiply-adds per connection and one nonlinearity. R(2+1)D factorizes it into a `1 x 3 x 3` spatial convolution followed by a `3 x 1 x 1` temporal one with a ReLU between them, which is fewer operations (9 plus 3) and gains an extra nonlinearity, so it is both cheaper and more accurate.
-
-  </Accordion>
-  <Accordion title="What does temporal subsampling control, and what breaks if the sampling interval is too large?">
-
-    The interval between sampled frames sets the temporal frequencies the network can represent, effectively the frame rate it sees, and it also sets compute: `T` frames multiply the spatial cost by `T`. Too large an interval aliases, so a fast action arrives as a jump between unrelated poses and the dynamics cannot be learned.
-
-  </Accordion>
-  <Accordion title="How would you build a classifier for 800 labelled images with a strong ImageNet backbone available?">
+  <Accordion title="How should a classifier for 800 labelled images be built with a strong ImageNet backbone available?">
 
     Linear probe. Load an ImageNet backbone with `num_classes=0`, set `requires_grad = False` on its parameters and keep it in `eval()` so its BatchNorm statistics do not move, then train a single head on the pooled features with AdamW. At 800 images that lands within a couple of points of fine-tuning with far less overfitting risk. If it falls short, unfreeze only the last stage at a rate ten times smaller than the head's.
 

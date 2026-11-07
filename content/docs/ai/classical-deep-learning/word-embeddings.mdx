@@ -1,0 +1,377 @@
+---
+title: 'Word Embeddings: Word2Vec and GloVe'
+description: 'What a word embedding is and how one is learned from raw text: the distributional hypothesis, co-occurrence matrices and PMI, the embedding layer as a lookup table, Word2Vec skip-gram and CBOW with negative sampling worked by hand, GloVe derived from co-occurrence ratios, fastText subwords, evaluating embeddings, and the limits of static vectors.'
+---
+
+A **word embedding** is a dense vector of real numbers, typically 50 to 300 long, assigned to each word in a vocabulary so that words with similar meanings have nearby vectors. `cat` and `kitten` end up close together, `cat` and `carburettor` far apart, and directions in the space often line up with relationships such as gender, tense, or country-to-capital. Embeddings are **learned** from unlabelled text, not designed by hand, and they replace the one-hot vectors of [classical NLP](/ai/classical-deep-learning/classical-nlp) as the input layer of every neural language model.
+
+This page builds embeddings in the order the ideas developed: the hypothesis that makes them possible, count-based vectors from a co-occurrence matrix, then the two methods that became standard — **Word2Vec** (Mikolov et al., 2013), which learns vectors by predicting context words, and **GloVe** (Pennington, Socher and Manning, 2014), which fits vectors directly to global co-occurrence statistics.
+
+**Builds on:** [Classical NLP: Text as Numbers](/ai/classical-deep-learning/classical-nlp) for vocabularies and one-hot vectors, [Similarity and Norms](/ai/math-foundations/similarity-and-norms) for the dot product and cosine, and [Information Theory and Loss](/ai/math-foundations/information-the-and-loss) for cross-entropy.
+
+---
+
+## From symbols to vectors with meaning
+
+One-hot vectors make every word equally unrelated to every other: the dot product of `cat` and `kitten` is 0, the same as `cat` and `carburettor`. An embedding replaces that $|V|$-dimensional, all-orthogonal vector with a short dense one:
+
+```text
+one-hot  cat = [0, 0, 1, 0, 0, ..., 0]        length 100,000, one nonzero
+embedded cat = [0.21, -0.43, 0.08, ..., 0.67]  length 300, all nonzero
+```
+
+Three properties define a good embedding:
+
+1. **Similarity is geometric.** Cosine similarity between vectors tracks similarity of meaning, so `cos(cat, kitten)` is high and `cos(cat, carburettor)` near 0.
+2. **Knowledge transfers.** A classifier that learns "`terrible` signals a negative review" partly learns the same about `awful`, because their vectors are close and the classifier's weights respond to them similarly.
+3. **Dimensions are shared, not assigned.** No single coordinate means "animal". Meaning is spread across all 300 dimensions; only directions and distances are interpretable. The representation is **distributed**.
+
+Where can such vectors come from without labelled data? From the **distributional hypothesis**: words that occur in similar contexts tend to have similar meanings. Nobody tells a model that `cat` and `kitten` are related, but both appear near `purr`, `fur`, `feed`, and `the`. Any method that represents a word by its contexts will place them close together.
+
+---
+
+## Count-based vectors: the co-occurrence matrix
+
+The most direct way to represent a word by its contexts is to count them. A **co-occurrence matrix** $X$ has one row and one column per vocabulary word, and $X_{ij}$ is the number of times word $j$ appears within a **context window** (say, one word on either side) of word $i$ across the corpus.
+
+Corpus: `I like deep learning .` `I like NLP .` `I enjoy flying .` — window size 1:
+
+| Row word   |   I | like | enjoy | deep | learning | NLP | flying |   . |
+| :--------- | --: | ---: | ----: | ---: | -------: | --: | -----: | --: |
+| `like`     |   2 |    0 |     0 |    1 |        0 |   1 |      0 |   0 |
+| `enjoy`    |   1 |    0 |     0 |    0 |        0 |   0 |      1 |   0 |
+| `learning` |   0 |    0 |     0 |    1 |        0 |   0 |      0 |   1 |
+| `NLP`      |   0 |    1 |     0 |    0 |        0 |   0 |      0 |   1 |
+
+Each row is now a vector representing its word by its neighbours. `like` and `enjoy` share the context `I`, so their rows have cosine similarity $\frac{2 \cdot 1}{\sqrt{6}\,\sqrt{2}} = 0.58$. `learning` and `NLP` share the context `.` and get $0.5$. `like` and `learning` share nothing and get 0. On three sentences that is crude; on a billion words it captures real similarity.
+
+Raw counts have three problems, each with a classical fix:
+
+| Problem                                             | Fix                                                                  |
+| :-------------------------------------------------- | :------------------------------------------------------------------- |
+| Frequent words (`the`, `.`) dominate every row      | Replace counts with **pointwise mutual information**                 |
+| Rows are as long as the vocabulary and mostly zeros | Compress with **truncated SVD** to a few hundred dimensions          |
+| Counting must be redone to add new text             | (No good fix; one motivation for the prediction-based methods below) |
+
+**Pointwise mutual information (PMI)** measures how much more often two words co-occur than they would if they were independent:
+
+$$
+\text{PMI}(w, c) = \log \frac{P(w, c)}{P(w)\,P(c)}
+$$
+
+PMI is 0 for unrelated words, positive for words that attract each other, and negative for words that avoid each other. `the` co-occurs with everything, but no more than its frequency predicts, so its PMI with most words is near 0. **Positive PMI** (PPMI) clips negative values to 0, because negative estimates from small counts are unreliable.
+
+Factorizing the PPMI matrix with a truncated **singular value decomposition** and keeping the top 300 components gives every word a dense 300-dimensional vector. This method, known as **latent semantic analysis (LSA)** when applied to word-document counts, was the state of the art before 2013. Word2Vec and GloVe both turn out to be closely related to it, as the sections below show.
+
+---
+
+## The embedding layer is a lookup table
+
+In a neural network, embeddings are stored as a matrix $E$ of shape $(|V|, d)$: row $i$ is the vector for word $i$. Multiplying a one-hot vector by $E$ selects one row:
+
+$$
+\mathbf{e}_{\text{cat}} = \text{onehot}(\text{cat})^\top E = E[\text{id}(\text{cat})]
+$$
+
+So an embedding layer is mathematically a dense layer applied to a one-hot input, but it is implemented as an index lookup, which costs $d$ memory reads instead of $|V| \times d$ multiply-adds. During training, only the rows of words that appeared in the batch receive gradient.
+
+```python
+import torch
+import torch.nn as nn
+
+emb = nn.Embedding(num_embeddings=50_000, embedding_dim=300, padding_idx=0)
+ids = torch.tensor([[17, 942, 5, 0, 0]])   # one sentence, padded with id 0
+print(emb(ids).shape)                      # (1, 5, 300)
+```
+
+`padding_idx=0` keeps row 0 fixed at zero so padding contributes nothing. The table can be trained from scratch as part of any model, or initialized from pretrained Word2Vec or GloVe vectors with `nn.Embedding.from_pretrained` and then frozen or fine-tuned.
+
+The question that Word2Vec and GloVe answer is how to train this table **before** any task, from plain text alone.
+
+---
+
+## Word2Vec
+
+**Word2Vec** is a family of two shallow neural models that learn embeddings by solving a fake prediction task: guessing which words appear near which. The prediction itself is thrown away afterwards; the weights learned while doing it are the embeddings.
+
+### The training data: skip-gram pairs
+
+Slide a window over the corpus. At each position, the word in the middle is the **center word** and the words within $C$ positions of it are its **context words**. With $C = 2$ on `the quick brown fox jumps`, centered on `brown`:
+
+```text
+center: brown     context: the, quick, fox, jumps
+training pairs: (brown, the) (brown, quick) (brown, fox) (brown, jumps)
+```
+
+Every position of every sentence produces such pairs. A billion-word corpus yields billions of training examples with no human labelling.
+
+### Two architectures
+
+| Model         | Predicts                                                | Notes                                                       |
+| :------------ | :------------------------------------------------------ | :---------------------------------------------------------- |
+| **Skip-gram** | Each context word from the center word                  | Better vectors for rare words; the more widely used variant |
+| **CBOW**      | The center word from the average of its context vectors | Faster; slightly better on frequent words                   |
+
+CBOW (continuous bag of words) averages the context, so a rare center word contributes one diluted example per window. Skip-gram turns each window into $2C$ separate examples where the rare word is the input, so it receives more updates.
+
+### The skip-gram model
+
+Skip-gram keeps **two** embedding tables:
+
+- $\mathbf{v}_w$, the **center** (input) vector of word $w$, from table $V$.
+- $\mathbf{u}_w$, the **context** (output) vector of word $w$, from table $U$.
+
+The probability that word $o$ appears in the context of center word $c$ is a softmax over the vocabulary of dot products:
+
+$$
+P(o \mid c) = \frac{\exp(\mathbf{u}_o^\top \mathbf{v}_c)}{\sum_{w \in V} \exp(\mathbf{u}_w^\top \mathbf{v}_c)}
+$$
+
+Training maximizes the log-probability of every observed pair. A large dot product $\mathbf{u}_o^\top\mathbf{v}_c$ means "these two co-occur". Two tables are used because a word rarely appears in its own context, and with a single table that would require $\mathbf{v}_w^\top\mathbf{v}_w$ (a squared length, always large) to be small.
+
+**The cost problem.** The denominator sums over every word in the vocabulary. With $|V| = 100{,}000$ and $d = 300$, each training pair needs 100,000 dot products, 30 million multiply-adds, and there are billions of pairs. The full softmax is impractical.
+
+### Negative sampling
+
+**Negative sampling** replaces the $|V|$-way classification with a binary one: is this (center, context) pair real, or a random fake? For each real pair $(c, o)$, draw $K$ **negative** words $n_1, \dots, n_K$ at random and train a logistic regression to score the real pair high and the fakes low:
+
+$$
+\mathcal{L} = -\log \sigma(\mathbf{u}_o^\top\mathbf{v}_c) \;-\; \sum_{k=1}^{K} \log \sigma(-\mathbf{u}_{n_k}^\top\mathbf{v}_c)
+$$
+
+where $\sigma$ is the sigmoid. The first term rewards a large dot product with the true context word; the second rewards small (negative) dot products with the fakes.
+
+Worked example for one pair with $K = 2$:
+
+| Pair                   | Dot product | $\sigma(\pm \text{dot})$ | Loss term            |
+| :--------------------- | ----------: | :----------------------- | :------------------- |
+| real: (`brown`, `fox`) |         2.0 | $\sigma(2.0) = 0.881$    | $-\ln 0.881 = 0.127$ |
+| fake: (`brown`, `tax`) |         1.0 | $\sigma(-1.0) = 0.269$   | $-\ln 0.269 = 1.313$ |
+| fake: (`brown`, `of`)  |        −2.0 | $\sigma(2.0) = 0.881$    | $0.127$              |
+
+The fake pair (`brown`, `tax`) contributes most of the loss because its dot product is wrongly positive, so the gradient pushes $\mathbf{v}_{\text{brown}}$ and $\mathbf{u}_{\text{tax}}$ apart. Each pair now costs $K + 1 = 3$ dot products instead of 100,000. $K = 5$ to 20 works for small corpora, 2 to 5 for large ones.
+
+**Which words are negatives.** Negatives are drawn from the unigram distribution raised to the power $3/4$, $P_n(w) \propto f(w)^{3/4}$, where $f(w)$ is the word's frequency. The exponent flattens the distribution so rare words are sampled somewhat more than their frequency alone would give:
+
+| Word      | Raw frequency | Sampling probability with the $3/4$ power |
+| :-------- | ------------: | ----------------------------------------: |
+| `the`     |          0.90 |                                     0.825 |
+| `cat`     |          0.09 |                                     0.147 |
+| `axolotl` |          0.01 |                                     0.028 |
+
+The exponent was found empirically; 1 oversamples frequent words and 0 (uniform) oversamples junk.
+
+**Subsampling frequent words.** Before training, each occurrence of word $w$ is discarded with probability $1 - \sqrt{t / f(w)}$ with $t \approx 10^{-5}$. A word making up 5% of the corpus is dropped 98.6% of the time; a word at frequency $10^{-5}$ or below is never dropped. Pairs like (`fox`, `the`) carry almost no information, and removing most of them speeds training and improves the vectors of informative words.
+
+### Why similar words end up close
+
+Consider `cat` and `kitten`. Both frequently appear as center words with context words `purr`, `fur`, and `feed`. Each such pair's gradient pulls the center vector toward those context vectors: $\mathbf{v}_{\text{cat}}$ and $\mathbf{v}_{\text{kitten}}$ are both pulled toward $\mathbf{u}_{\text{purr}}$, $\mathbf{u}_{\text{fur}}$, and $\mathbf{u}_{\text{feed}}$. Two vectors pulled toward the same targets end up near each other. The distributional hypothesis is implemented by nothing more than shared gradient targets.
+
+Levy and Goldberg (2014) made the connection to counting exact: skip-gram with negative sampling implicitly factorizes the matrix of $\text{PMI}(w, c) - \log K$. Word2Vec is a streaming, stochastic way of computing something very close to the PMI-plus-SVD vectors of the previous section.
+
+After training, the center vectors $\mathbf{v}$ are usually kept as the embeddings (sometimes averaged with $\mathbf{u}$).
+
+### Analogies as vector arithmetic
+
+Trained Word2Vec vectors show linear structure. The best-known example:
+
+$$
+\mathbf{v}_{\text{king}} - \mathbf{v}_{\text{man}} + \mathbf{v}_{\text{woman}} \approx \mathbf{v}_{\text{queen}}
+$$
+
+The difference $\mathbf{v}_{\text{king}} - \mathbf{v}_{\text{man}}$ approximately isolates a "royalty" direction; adding it to `woman` lands near `queen`. The same holds for `Paris − France + Italy ≈ Rome` and `walking − walk + swim ≈ swimming`. The answer is found by searching for the nearest vector by cosine similarity, **excluding the three query words** — without that exclusion, the nearest vector is very often `king` itself, a detail that makes the analogy results look stronger than the geometry really is.
+
+---
+
+## GloVe
+
+**GloVe** (Global Vectors) learns word vectors by fitting them directly to the global co-occurrence matrix, so that the dot product of two word vectors equals the logarithm of how often the words co-occur. It was designed to combine the strengths of the two earlier families: count-based methods use corpus-wide statistics efficiently but produce weaker vectors, and Word2Vec produces good vectors but sees the corpus only one window at a time.
+
+### The key observation: ratios of co-occurrence probabilities
+
+Let $X_{ik}$ be the number of times word $k$ appears in the context of word $i$, and $P(k \mid i) = X_{ik} / \sum_j X_{ij}$ the probability of seeing $k$ near $i$. The GloVe paper's example compares `ice` and `steam` using probe words $k$, measured on a 6-billion-token corpus:
+
+| Probe word $k$           | `solid`            | `gas`              | `water`            | `fashion`          |
+| :----------------------- | :----------------- | :----------------- | :----------------- | :----------------- |
+| $P(k \mid \text{ice})$   | $1.9\times10^{-4}$ | $6.6\times10^{-5}$ | $3.0\times10^{-3}$ | $1.7\times10^{-5}$ |
+| $P(k \mid \text{steam})$ | $2.2\times10^{-5}$ | $7.8\times10^{-4}$ | $2.2\times10^{-3}$ | $1.8\times10^{-5}$ |
+| Ratio ice / steam        | **8.9**            | **0.085**          | 1.36               | 0.96               |
+
+The raw probabilities are hard to read: `water` is the most likely neighbour of both words, and every value is tiny. The **ratio** is clear. It is large for `solid` (related to ice, not steam), small for `gas` (related to steam, not ice), and near 1 for `water` (related to both) and `fashion` (related to neither). Ratios cancel out the noise of word frequency and isolate exactly the dimension of meaning that distinguishes the two words.
+
+### From ratios to an objective
+
+GloVe asks for word vectors $\mathbf{w}$ and context vectors $\tilde{\mathbf{w}}$ such that the ratio is a function of vector differences:
+
+$$
+(\mathbf{w}_{\text{ice}} - \mathbf{w}_{\text{steam}})^\top \tilde{\mathbf{w}}_k = \log \frac{P(k \mid \text{ice})}{P(k \mid \text{steam})}
+$$
+
+A difference of logs is the log of a ratio, so this holds if each word individually satisfies $\mathbf{w}_i^\top\tilde{\mathbf{w}}_k = \log P(k \mid i) = \log X_{ik} - \log X_i$, where $X_i = \sum_j X_{ij}$. The term $\log X_i$ depends only on $i$, so it is absorbed into a learned bias $b_i$, and a matching bias $\tilde{b}_k$ is added for symmetry. The target for every pair becomes:
+
+$$
+\mathbf{w}_i^\top \tilde{\mathbf{w}}_j + b_i + \tilde{b}_j \approx \log X_{ij}
+$$
+
+This is the whole model: **the dot product of two word vectors, plus biases, should equal the log of their co-occurrence count.** It also explains why GloVe vectors support analogies: by construction, vector differences encode log ratios of co-occurrence, which is exactly the "ice versus steam" signal.
+
+### The weighted least-squares loss
+
+Fitting that target over all pairs gives a weighted least-squares problem:
+
+$$
+J = \sum_{i, j \,:\, X_{ij} > 0} f(X_{ij}) \left( \mathbf{w}_i^\top \tilde{\mathbf{w}}_j + b_i + \tilde{b}_j - \log X_{ij} \right)^2
+$$
+
+Only nonzero counts are included, because $\log 0$ is undefined and the vast majority of pairs never co-occur. The **weighting function** $f$ decides how much each pair matters:
+
+$$
+f(x) = \begin{cases} (x / x_{\max})^{\alpha} & x < x_{\max} \\ 1 & \text{otherwise} \end{cases} \qquad x_{\max} = 100,\ \alpha = 0.75
+$$
+
+| Count $X_{ij}$ | 1     | 5     | 10    | 50    | 100 or more |
+| :------------- | :---- | :---- | :---- | :---- | :---------- |
+| Weight $f$     | 0.032 | 0.106 | 0.178 | 0.595 | 1.000       |
+
+Two failure modes are avoided at once. Pairs seen once or twice are mostly noise, so they get small weights. Pairs seen millions of times, like (`of`, `the`), are capped at weight 1 so they cannot dominate the loss.
+
+**One term worked through.** Suppose $X_{ij} = 190$, so the target is $\ln 190 = 5.25$, and the current vectors give $\mathbf{w}_i^\top\tilde{\mathbf{w}}_j + b_i + \tilde{b}_j = 4.80$. The weight is $f(190) = 1$, so this pair adds $1 \times (4.80 - 5.25)^2 = 0.20$ to $J$, and its gradient pushes the dot product up. A pair with $X_{ij} = 5$ and the same squared error of $0.20$ would contribute only $0.106 \times 0.20 = 0.02$.
+
+### Training and the final vectors
+
+1. **Count once.** Stream the corpus and accumulate $X$ as a sparse table. GloVe weights each co-occurrence by $1/d$, where $d$ is the distance between the two words in the window, so adjacent words count more than words four positions apart.
+2. **Optimize over nonzero entries.** Shuffle the nonzero $(i, j)$ pairs and run AdaGrad on $J$ for a fixed number of passes. Training cost depends on the number of nonzero entries, not on corpus length, so adding more text to an existing count table is cheap.
+3. **Combine the two tables.** $\mathbf{w}$ and $\tilde{\mathbf{w}}$ play symmetric roles, so the published vectors are $\mathbf{w} + \tilde{\mathbf{w}}$, which slightly reduces noise.
+
+Pretrained GloVe vectors were released at 50, 100, 200, and 300 dimensions, trained on Wikipedia plus Gigaword (6 billion tokens) and on Common Crawl (42 and 840 billion tokens).
+
+### Word2Vec against GloVe
+
+| Property           | Word2Vec (skip-gram, negative sampling)   | GloVe                                                    |
+| :----------------- | :---------------------------------------- | :------------------------------------------------------- |
+| Input              | Local windows, streamed one at a time     | The global co-occurrence matrix, counted once            |
+| Objective          | Logistic: real pairs versus sampled fakes | Weighted least squares on log counts                     |
+| What it factorizes | Shifted PMI, implicitly                   | Log co-occurrence, explicitly                            |
+| Memory             | Small; no count table                     | Must store the sparse count table                        |
+| Pretrained release | Google News, 300 dimensions               | Wikipedia + Gigaword and Common Crawl, 50–300 dimensions |
+| Quality            | Comparable                                | Comparable                                               |
+
+Once hyperparameters such as window size and subsampling are matched, the two give very similar downstream results (Levy, Goldberg and Dagan, 2015). They are two routes to nearly the same object: low-dimensional vectors whose dot products approximate a log-scaled co-occurrence statistic.
+
+---
+
+## fastText: vectors from subwords
+
+Word2Vec and GloVe assign each word an independent vector, which has two consequences. Words absent from training have no vector at all, and morphological relatives like `run`, `running`, and `runner` share nothing unless the corpus happens to make them similar. Both hurt in languages with rich morphology, such as Finnish or Turkish, where one root can take hundreds of forms.
+
+**fastText** (Bojanowski et al., 2017) represents each word as the sum of vectors for its character n-grams. With boundary markers `<` and `>` and $n = 3$, the word `where` is:
+
+```text
+<wh, whe, her, ere, re>   plus the whole word  <where>
+```
+
+The paper uses all n-grams of length 3 to 6. Training is skip-gram with negative sampling, unchanged except that $\mathbf{v}_{\text{where}}$ is the sum of its n-gram vectors. Now `running` and `runner` share `<ru`, `run`, `unn`, and so on, and an unseen word such as `unrunnable` still gets a vector built from familiar pieces. This is the same idea that subword tokenizers such as BPE use at the vocabulary level.
+
+---
+
+## Evaluating embeddings
+
+| Kind          | Method                                                            | Example datasets         |
+| :------------ | :---------------------------------------------------------------- | :----------------------- |
+| **Intrinsic** | Correlate cosine similarity with human similarity ratings         | WordSim-353, SimLex-999  |
+| **Intrinsic** | Solve analogies `a : b :: c : ?` by vector arithmetic             | Google analogy set, BATS |
+| **Extrinsic** | Use the vectors as input to a real task and measure task accuracy | Sentiment, NER, parsing  |
+
+Intrinsic tests are cheap but measure only what they test: WordSim-353 rates `cup` and `coffee` as highly similar, mixing **relatedness** with true **similarity**, which SimLex-999 was built to separate. Extrinsic results are what matter, and they do not always track intrinsic scores.
+
+---
+
+## The limits of static embeddings
+
+Word2Vec, GloVe, and fastText all produce **static** embeddings: one vector per word type, the same in every sentence.
+
+- **Polysemy collapses.** `bank` gets one vector that averages the river sense and the financial sense, weighted by how often each appears. No sentence context can separate them.
+- **Social bias is learned with meaning.** Embeddings trained on news text reproduce the associations in that text. Bolukbasi et al. (2016) found Word2Vec completing `man : computer programmer :: woman : ?` with `homemaker`. Any downstream system inherits these associations.
+- **Context arrives too late.** A static embedding layer gives the same input to the network for `bank` in both senses; any disambiguation must happen in later layers.
+
+The fix is a **contextual embedding**: a vector computed for each occurrence of a word from the whole sentence. ELMo (Peters et al., 2018) produced them from the hidden states of a bidirectional LSTM language model; BERT (Devlin et al., 2018) from a transformer. In a modern LLM, the embedding table still exists and is still a lookup exactly like `nn.Embedding`, but it is only the first layer, and every subsequent layer rewrites each token's vector based on its context. The sequence model that first tried to use context to produce output text, the RNN encoder-decoder, is the subject of [Seq2Seq and Attention](/ai/classical-deep-learning/seq2seq-and-attention).
+
+---
+
+## Key terms
+
+| Term                              | Meaning                                                                                                |
+| :-------------------------------- | :----------------------------------------------------------------------------------------------------- |
+| **word embedding**                | A learned dense vector per word, placed so that similar words are close                                |
+| **distributed representation**    | Meaning spread across many dimensions rather than one dimension per concept                            |
+| **distributional hypothesis**     | Words in similar contexts have similar meanings                                                        |
+| **context window**                | The words within $C$ positions of a word that count as its context                                     |
+| **co-occurrence matrix**          | $X_{ij}$ = how often word $j$ appears in the context of word $i$                                       |
+| **PMI**                           | $\log \frac{P(w, c)}{P(w)P(c)}$: how much more often two words co-occur than chance predicts           |
+| **skip-gram / CBOW**              | Predict context words from the center word / the center word from the context                          |
+| **negative sampling**             | Training on "real pair versus $K$ random fake pairs" instead of a softmax over the vocabulary          |
+| **GloVe**                         | Vectors fitted so that $\mathbf{w}_i^\top\tilde{\mathbf{w}}_j + b_i + \tilde{b}_j \approx \log X_{ij}$ |
+| **fastText**                      | Word vectors built as sums of character n-gram vectors                                                 |
+| **static / contextual embedding** | One vector per word type / one vector per occurrence, computed from the sentence                       |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What is a word embedding, and what does it fix about one-hot vectors?">
+
+    A learned dense vector, typically 50 to 300 dimensions, per vocabulary word, trained so similar words have nearby vectors. One-hot vectors are orthogonal, so every word is equally unrelated and nothing learned transfers between words; they are also as long as the vocabulary. Embeddings encode similarity geometrically, are short, and let knowledge about one word generalize to its neighbours.
+
+  </Accordion>
+  <Accordion title="State the distributional hypothesis and explain how Word2Vec implements it.">
+
+    Words that occur in similar contexts tend to have similar meanings. In skip-gram, every (center, context) pair pulls the center vector toward the context word's output vector. Words that share contexts, like `cat` and `kitten` with `purr` and `fur`, are pulled toward the same targets and therefore end up close to each other.
+
+  </Accordion>
+  <Accordion title="Why is the full skip-gram softmax expensive, and how does negative sampling fix it?">
+
+    Its denominator sums $\exp(\mathbf{u}_w^\top\mathbf{v}_c)$ over the whole vocabulary, so each training pair costs $|V|$ dot products: 100,000 for a typical vocabulary, over billions of pairs. Negative sampling replaces the $|V|$-way classification with logistic regression on the true pair against $K$ random negatives, $-\log\sigma(\mathbf{u}_o^\top\mathbf{v}_c) - \sum_k \log\sigma(-\mathbf{u}_{n_k}^\top\mathbf{v}_c)$, costing $K + 1$ dot products.
+
+  </Accordion>
+  <Accordion title="Why does skip-gram use separate center and context vectors?">
+
+    A word rarely appears in its own context, so the model should assign low probability to the pair $(w, w)$. With one table that score is $\mathbf{v}_w^\top\mathbf{v}_w = \lVert\mathbf{v}_w\rVert^2$, which is large for any nonzero vector. Two tables decouple the roles and make optimization easier. The center vectors are normally kept as the embeddings.
+
+  </Accordion>
+  <Accordion title="What does the 3/4 power on the negative-sampling distribution do?">
+
+    It flattens the unigram distribution. Sampling by raw frequency would make almost every negative a function word; uniform sampling would make most negatives rare junk. With the $3/4$ power, a word at frequency 0.01 rises from 1% to about 2.8% of samples in a three-word example, while a word at 0.90 falls to 82.5%. The exponent was chosen empirically.
+
+  </Accordion>
+  <Accordion title="Explain the ice/steam ratio argument behind GloVe.">
+
+    Raw co-occurrence probabilities mix word meaning with word frequency. The ratio $P(k \mid \text{ice}) / P(k \mid \text{steam})$ is large for probe words related only to ice (`solid`, 8.9), small for words related only to steam (`gas`, 0.085), and near 1 for words related to both or neither (`water`, `fashion`). Ratios isolate the meaning that distinguishes two words, so GloVe asks for vector differences to encode log ratios, which leads to $\mathbf{w}_i^\top\tilde{\mathbf{w}}_j + b_i + \tilde{b}_j \approx \log X_{ij}$.
+
+  </Accordion>
+  <Accordion title="Write the GloVe loss and explain the weighting function.">
+
+    $J = \sum_{X_{ij} > 0} f(X_{ij})(\mathbf{w}_i^\top\tilde{\mathbf{w}}_j + b_i + \tilde{b}_j - \log X_{ij})^2$ with $f(x) = (x / 100)^{0.75}$ below 100 and 1 above. Zero counts are skipped because $\log 0$ is undefined. $f$ down-weights rare, noisy pairs (a count of 1 gets weight 0.03) and caps very frequent pairs at 1 so pairs like (`of`, `the`) cannot dominate.
+
+  </Accordion>
+  <Accordion title="How are Word2Vec and GloVe related mathematically?">
+
+    Levy and Goldberg showed that skip-gram with $K$ negative samples implicitly factorizes the matrix $\text{PMI}(w, c) - \log K$. GloVe explicitly factorizes log co-occurrence counts with per-word biases, which absorb the marginal terms that turn log counts into PMI. Both produce low-dimensional vectors whose dot products approximate a log-scaled co-occurrence statistic, and with matched hyperparameters they perform comparably.
+
+  </Accordion>
+  <Accordion title="Why must analogy evaluation exclude the query words?">
+
+    For `king − man + woman`, the resulting vector is usually still closest to `king` itself, because subtracting `man` and adding `woman` moves it only a short distance. Benchmarks exclude the three input words from the candidates, which makes the reported analogy accuracy higher than the raw geometry alone would suggest.
+
+  </Accordion>
+  <Accordion title="What does fastText fix, and how?">
+
+    Static word-level embeddings have no vector for unseen words and treat morphological variants as unrelated. fastText represents a word as the sum of vectors for its character n-grams (lengths 3 to 6, with boundary markers), so `running` and `runner` share most of their pieces and an unseen word still gets a vector from familiar n-grams.
+
+  </Accordion>
+  <Accordion title="Give three limits of static embeddings and what replaced them.">
+
+    Polysemy: `bank` gets one vector mixing its senses. Bias: associations in the training text, such as gendered occupations, are learned along with meaning. And one vector per type cannot use sentence context. Contextual embeddings, first from bidirectional LSTM language models (ELMo) and then transformers (BERT), compute a different vector for each occurrence.
+
+  </Accordion>
+</Accordions>

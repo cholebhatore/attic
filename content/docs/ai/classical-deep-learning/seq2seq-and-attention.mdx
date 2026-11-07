@@ -1,0 +1,385 @@
+---
+title: Seq2Seq and Attention
+description: 'Mapping one sequence to another of a different length: the RNN encoder-decoder, the context vector, teacher forcing and exposure bias, greedy and beam search worked by hand, the fixed-vector bottleneck, Bahdanau attention computed step by step, image captioning with a CNN encoder, and BLEU and other evaluation metrics.'
+---
+
+A **sequence-to-sequence (Seq2Seq)** model maps an input sequence to an output sequence whose length can differ, with no fixed alignment between input and output positions. Translation is the defining case: "the cat is black" (4 words) becomes "le chat est noir" (4 words) but "I miss you" (3) becomes "tu me manques" (3) with the order reversed, and "how are you" becomes "comment allez-vous" (2). A single RNN emits one output per input step, so it cannot do this.
+
+The solution, from Sutskever, Vinyals and Le (arXiv:1409.3215) and Cho et al. (arXiv:1406.1078) in 2014, uses two RNNs: an **encoder** that reads the input into a vector and a **decoder** that writes the output from that vector. Within a year its weakness — everything passes through one fixed-size vector — led Bahdanau, Cho and Bengio (arXiv:1409.0473) to **attention**, the mechanism the transformer is built on.
+
+**Builds on:** [LSTM and GRU](/ai/classical-deep-learning/lstm-and-gru) for the recurrent cells, [Word Embeddings](/ai/classical-deep-learning/word-embeddings) for the input layer, and the [character language model](/ai/classical-deep-learning/recurrent-networks#training-an-rnn-a-character-level-language-model) for next-token prediction.
+
+---
+
+## The encoder-decoder architecture
+
+<Mermaid
+  chart={`
+flowchart LR
+    subgraph ENC["Encoder RNN"]
+        X1["the"] --> X2["cat"] --> X3["is"] --> X4["black"]
+    end
+    X4 --> C["context vector c = h_4"]
+    subgraph DEC["Decoder RNN"]
+        D1["step 1"] --> D2["step 2"] --> D3["step 3"] --> D4["step 4"] --> D5["step 5"]
+    end
+    C --> D1
+    B["BOS"] --> D1
+    D1 --> Y1["le"]
+    D2 --> Y2["chat"]
+    D3 --> Y3["est"]
+    D4 --> Y4["noir"]
+    D5 --> Y5["EOS"]
+`}
+/>
+
+**The encoder** is an RNN (usually an LSTM or GRU) that reads the source tokens $x_1, \dots, x_S$ and produces hidden states $\mathbf{h}_1, \dots, \mathbf{h}_S$. It emits no outputs. Its final state is the **context vector**:
+
+$$
+\mathbf{c} = \mathbf{h}_S
+$$
+
+**The decoder** is a second RNN, with its own weights, that is a [language model](/ai/classical-deep-learning/classical-nlp#language-models-from-counts) **conditioned** on $\mathbf{c}$. Its initial state is set from the context vector, $\mathbf{s}_0 = \mathbf{c}$, and it generates the target one token at a time:
+
+1. Feed a special **beginning-of-sequence** token `<bos>` as the first input.
+2. Update the decoder state: $\mathbf{s}_t = \text{RNN}(\mathbf{s}_{t-1}, \text{emb}(y_{t-1}))$.
+3. Produce a distribution over the target vocabulary: $P(y_t \mid y_{<t}, \mathbf{x}) = \operatorname{softmax}(\mathbf{W}_o\mathbf{s}_t)$.
+4. Choose a token, feed it back as the next input, and repeat until the decoder emits **end-of-sequence** `<eos>`.
+
+The `<eos>` token is how the output length is decided: the model learns when to stop. The whole model defines the probability of a target sentence $\mathbf{y}$ given a source $\mathbf{x}$ by the chain rule:
+
+$$
+P(\mathbf{y} \mid \mathbf{x}) = \prod_{t=1}^{T} P(y_t \mid y_1, \dots, y_{t-1}, \mathbf{c})
+$$
+
+Encoder and decoder are trained **jointly**, end to end, by maximizing $\log P(\mathbf{y} \mid \mathbf{x})$ over a corpus of sentence pairs. The encoder is never told what to put in $\mathbf{c}$; it learns whatever helps the decoder.
+
+### Design details from the original systems
+
+- **Deep LSTMs.** Sutskever et al. used four-layer LSTMs with 1,000 units per layer for both encoder and decoder.
+- **Reversing the source.** Feeding "black is cat the" instead of "the cat is black" improved BLEU by several points. It puts the first source words close in time to the first target words, creating short gradient paths for the start of the translation, which then helps the rest. Bidirectional encoders later made the trick unnecessary.
+- **Bidirectional encoders.** Running the encoder in both directions gives each source position context from both sides; the final forward and backward states are concatenated and projected to form $\mathbf{c}$.
+
+```python title="seq2seq.py"
+import torch
+import torch.nn as nn
+
+class Seq2Seq(nn.Module):
+    def __init__(self, src_vocab: int, tgt_vocab: int, dim: int = 256, hidden: int = 512):
+        super().__init__()
+        self.src_emb = nn.Embedding(src_vocab, dim)
+        self.tgt_emb = nn.Embedding(tgt_vocab, dim)
+        self.encoder = nn.LSTM(dim, hidden, batch_first=True)
+        self.decoder = nn.LSTM(dim, hidden, batch_first=True)
+        self.out = nn.Linear(hidden, tgt_vocab)
+
+    def forward(self, src, tgt_in):
+        _, state = self.encoder(self.src_emb(src))           # state = (h_S, c_S): the context
+        dec_out, _ = self.decoder(self.tgt_emb(tgt_in), state)
+        return self.out(dec_out)                             # (B, T, tgt_vocab) logits
+```
+
+The only link between encoder and decoder is `state`, the encoder's final hidden and cell states passed as the decoder's initial state.
+
+---
+
+## Training with teacher forcing
+
+During training, the decoder's input at step $t$ could be its own previous prediction or the **correct** previous token from the reference translation. **Teacher forcing** uses the correct one:
+
+```text
+target:          le    chat   est    noir   <eos>
+decoder input:  <bos>  le     chat   est    noir        the target shifted right by one
+```
+
+```python
+logits = model(src, tgt_in)                       # tgt_in = [<bos>, le, chat, est, noir]
+loss = nn.functional.cross_entropy(
+    logits.reshape(-1, logits.size(-1)),          # predictions at every step
+    tgt_out.reshape(-1),                          # tgt_out = [le, chat, est, noir, <eos>]
+    ignore_index=PAD,
+)
+```
+
+Teacher forcing has two benefits. Early in training the model's own predictions are garbage, so feeding them back would make every later step meaningless; the correct token keeps each step's learning signal useful. And because every decoder input is known in advance, all steps can be fed in one call, which is much faster.
+
+**Exposure bias** is the cost. At inference no reference exists, so the decoder must consume its own predictions — a distribution of inputs it never saw during training. One early mistake produces an input unlike any training prefix, which makes the next mistake more likely, and errors compound. **Scheduled sampling** (Bengio et al., 2015) mitigates this by feeding the model's own prediction instead of the reference with a probability that increases over training.
+
+---
+
+## Decoding: choosing the output
+
+At inference, the model gives a distribution over the next token at each step. The ideal output is the most probable whole sentence, $\arg\max_{\mathbf{y}} P(\mathbf{y} \mid \mathbf{x})$, but the number of possible sentences is $|V|^T$, so it cannot be searched exhaustively.
+
+**Greedy decoding** takes the most likely token at each step. It is fast but can commit early to a choice that leads to a worse sentence overall.
+
+**Beam search** keeps the $k$ most probable partial sentences (the **beam**) at every step instead of one. At each step, it extends every hypothesis by every possible next token, scores each by the total log-probability so far, and keeps the best $k$.
+
+### A worked example
+
+Suppose the model's probabilities are:
+
+| Prefix  | Next-token probabilities           |
+| :------ | :--------------------------------- |
+| (start) | `the` 0.5, `a` 0.4, `one` 0.1      |
+| `the`   | `animal` 0.4, `cat` 0.3, `dog` 0.3 |
+| `a`     | `cat` 0.9, `dog` 0.1               |
+
+**Greedy** picks `the` (0.5), then the best continuation `animal` (0.4): total probability $0.5 \times 0.4 = 0.20$.
+
+**Beam search with $k = 2$** keeps both `the` (0.5) and `a` (0.4) after step 1. Extending both:
+
+| Hypothesis   | Probability             |
+| :----------- | :---------------------- |
+| `a cat`      | $0.4 \times 0.9 = 0.36$ |
+| `the animal` | $0.5 \times 0.4 = 0.20$ |
+| `the cat`    | $0.5 \times 0.3 = 0.15$ |
+| `the dog`    | $0.15$                  |
+| `a dog`      | $0.04$                  |
+
+It keeps `a cat` and `the animal`, and `a cat` (0.36) beats the greedy answer (0.20). The better sentence started with a slightly less likely first word, which greedy decoding can never recover from.
+
+Two practical details:
+
+- **Scores are summed log-probabilities**, $\sum_t \log P(y_t \mid \dots)$, to avoid numerical underflow from multiplying many small numbers.
+- **Length normalization.** Each extra token multiplies in a probability below 1, so raw scores favour short outputs. Dividing the log-probability by the length (or by $\text{length}^\alpha$ with $\alpha \approx 0.6$–$0.7$) corrects this.
+
+A beam of 4 to 10 is typical for translation; returns diminish beyond that, and very large beams can make output worse. For open-ended generation where variety matters, sampling with a temperature is used instead (see [Decoding](/ai/llm/decoding)).
+
+---
+
+## The fixed-vector bottleneck
+
+Everything the decoder knows about the source sentence passes through $\mathbf{c}$, a single vector of fixed size — perhaps 1,000 numbers — whether the source is 5 words or 50. The encoder must compress the meaning, word order, and every detail of the sentence into that vector before the decoder writes a single word. A point where all information must squeeze through a fixed-size channel is a **bottleneck**.
+
+Cho et al. (arXiv:1409.1259) and Bahdanau et al. measured the consequence. The translation quality of a plain encoder-decoder, measured by BLEU, held up on short sentences and then fell sharply as sentences grew past about 20 words. The failure is about **capacity**, not training: no amount of extra training makes a fixed vector hold an arbitrarily long sentence.
+
+There is a second, subtler problem. The decoder generating word 12 needs mostly source words 11 to 13, but it has only $\mathbf{c}$ — and the encoder's final state is dominated by the last words it read, because even LSTM memory fades. The decoder has no way to **look back** at a specific source word.
+
+---
+
+## Attention: let the decoder look back
+
+**Attention** removes the bottleneck by giving the decoder access to **every** encoder hidden state $\mathbf{h}_1, \dots, \mathbf{h}_S$, not just the last. At each output step, the decoder computes a fresh context vector $\mathbf{c}_t$ as a weighted average of the encoder states, with weights chosen by how relevant each source position is to what is being generated now.
+
+### The three steps at each decoder step $t$
+
+**1. Score every source position.** Compare the decoder's current state $\mathbf{s}_{t-1}$ with each encoder state $\mathbf{h}_j$ using a learned scoring function, giving an **alignment score**:
+
+$$
+e_{tj} = \text{score}(\mathbf{s}_{t-1}, \mathbf{h}_j)
+$$
+
+**2. Normalize the scores into weights** with a softmax over source positions, so the weights are positive and sum to 1:
+
+$$
+\alpha_{tj} = \frac{\exp(e_{tj})}{\sum_{k=1}^{S} \exp(e_{tk})}
+$$
+
+$\alpha_{tj}$ is the **attention weight**: the fraction of its focus the decoder puts on source word $j$ at output step $t$.
+
+**3. Build the context vector** as the weighted sum of encoder states:
+
+$$
+\mathbf{c}_t = \sum_{j=1}^{S} \alpha_{tj}\,\mathbf{h}_j
+$$
+
+The decoder then uses $\mathbf{c}_t$ together with its own state to predict $y_t$ — for example by feeding $[\text{emb}(y_{t-1}); \mathbf{c}_t]$ into the decoder RNN, or by combining $\mathbf{s}_t$ and $\mathbf{c}_t$ before the output layer.
+
+### Worked example
+
+Three source words with 2-dimensional encoder states, and a decoder state, using the dot product as the score:
+
+$$
+\mathbf{h}_1 = [1, 0], \quad \mathbf{h}_2 = [0, 1], \quad \mathbf{h}_3 = [1, 1], \qquad \mathbf{s} = [2, 0]
+$$
+
+| Source $j$ | Score $e_j = \mathbf{s}^\top\mathbf{h}_j$ | $\exp(e_j)$ | Weight $\alpha_j$ |
+| ---------: | ----------------------------------------: | ----------: | ----------------: |
+|          1 |                                         2 |       7.389 |             0.468 |
+|          2 |                                         0 |       1.000 |             0.063 |
+|          3 |                                         2 |       7.389 |             0.468 |
+|    **Sum** |                                           |  **15.778** |         **1.000** |
+
+$$
+\mathbf{c} = 0.468\,[1, 0] + 0.063\,[0, 1] + 0.468\,[1, 1] = [0.937,\ 0.532]
+$$
+
+The decoder state points in the direction of $\mathbf{h}_1$ and $\mathbf{h}_3$, so those positions receive almost all the weight and $\mathbf{h}_2$ is nearly ignored. At the next step the decoder state changes, so the weights change too.
+
+### Scoring functions
+
+| Name                           | $\text{score}(\mathbf{s}, \mathbf{h})$                                   | Source                |
+| :----------------------------- | :----------------------------------------------------------------------- | :-------------------- |
+| **Additive (Bahdanau)**        | $\mathbf{v}^\top \tanh(\mathbf{W}_1\mathbf{s} + \mathbf{W}_2\mathbf{h})$ | Bahdanau et al., 2014 |
+| **Dot product (Luong)**        | $\mathbf{s}^\top\mathbf{h}$                                              | Luong et al., 2015    |
+| **General / bilinear (Luong)** | $\mathbf{s}^\top\mathbf{W}\mathbf{h}$                                    | Luong et al., 2015    |
+| **Scaled dot product**         | $\mathbf{s}^\top\mathbf{h} / \sqrt{d}$                                   | The transformer, 2017 |
+
+Additive attention uses a small feed-forward network and works when $\mathbf{s}$ and $\mathbf{h}$ have different sizes. The dot product needs no parameters and is a single matrix multiply over all positions, which is why it won.
+
+```python title="attention_step.py"
+import torch
+
+def attend(s, H):
+    # s: (B, d) decoder state, H: (B, S, d) all encoder states
+    scores = torch.bmm(H, s.unsqueeze(-1)).squeeze(-1)    # (B, S)    e_j = s . h_j
+    alpha = scores.softmax(dim=-1)                        # (B, S)    attention weights
+    context = torch.bmm(alpha.unsqueeze(1), H).squeeze(1) # (B, d)    sum_j alpha_j h_j
+    return context, alpha
+```
+
+### What attention changed
+
+- **The bottleneck is gone.** The source is represented by $S$ vectors, one per word, so capacity grows with sentence length. Bahdanau et al.'s attention model held its BLEU score on sentences of 50 to 60 words where the plain encoder-decoder had collapsed.
+- **Short gradient paths.** Each output step connects directly to every source position through the weighted sum, so a gradient reaches source word 3 in one step instead of travelling back through the whole encoder.
+- **Alignment comes for free.** Plotting $\alpha_{tj}$ as a matrix, target words by source words, shows which source words each output word used. For English to French it is roughly diagonal, bending where word order differs (French adjectives after nouns), even though no alignment was ever supervised.
+
+### The road to the transformer
+
+In attention vocabulary, the decoder state is a **query** ("what am I looking for?"), each encoder state is a **key** (what is scored against the query) and a **value** (what is averaged). In Bahdanau attention the keys and values are the same vectors $\mathbf{h}_j$.
+
+Two steps lead from here to the transformer. First, apply attention not only from decoder to encoder, but from every position of a sequence to every other position of the same sequence — **self-attention** — so each word's representation is built from the words around it. Second, notice that once every position can read every other position directly, the recurrence is no longer needed to carry information along the sequence, and removing it lets all positions be computed in parallel. That is "Attention Is All You Need" (2017), covered in [Transformer Basics](/ai/transformers/transformer-basics).
+
+---
+
+## Image captioning: the same model with a CNN encoder
+
+Nothing in the encoder-decoder requires the input to be text. **Image captioning** replaces the encoder RNN with a pretrained CNN ([CNN Architectures](/ai/classical-deep-learning/vision-architectures)) and keeps the decoder: a one-to-many sequence model.
+
+| Model                                                            | Encoder                                          | Decoder             | Contribution                                         |
+| :--------------------------------------------------------------- | :----------------------------------------------- | :------------------ | :--------------------------------------------------- |
+| **Show and Tell** (Vinyals et al., 2015)                         | CNN's pooled feature vector                      | LSTM                | The image vector is fed as the decoder's first input |
+| **Deep Visual-Semantic Alignments** (Karpathy and Fei-Fei, 2015) | CNN features of image regions                    | RNN                 | Aligns sentence fragments with image regions         |
+| **Show, Attend and Tell** (Xu et al., 2015)                      | CNN's $14 \times 14$ feature map (196 locations) | LSTM with attention | Attention over image locations                       |
+
+Show and Tell has exactly the bottleneck problem: one 2,048-number pooled vector must describe the whole scene. Show, Attend and Tell applies the same fix as translation. It keeps the CNN's spatial feature map as 196 vectors, one per image region, and attends over them at each word. The attention maps show the model looking at the dog while writing "dog" and at the grass while writing "grass".
+
+The general rule: whenever an architecture compresses a variable-size input into one vector and a consumer must produce detailed output from it, keep the uncompressed representations and let the consumer attend over them.
+
+---
+
+## Evaluating generated text
+
+### BLEU
+
+**BLEU** (Papineni et al., 2002) scores a candidate translation by how many of its n-grams appear in one or more reference translations, combining $n = 1$ to $4$.
+
+**Modified precision.** For each $n$, count the candidate's n-grams that appear in the reference, clipping each n-gram's count at the maximum times it appears in any reference, and divide by the number of n-grams in the candidate. Clipping prevents gaming: the candidate `the the the the the the the` against reference `the cat is on the mat` would have unigram precision $7/7$ without clipping; `the` appears twice in the reference, so the clipped precision is $2/7$.
+
+**Brevity penalty.** Precision alone rewards very short outputs ("the" alone has perfect precision). With candidate length $c$ and reference length $r$:
+
+$$
+\text{BP} = \begin{cases} 1 & c > r \\ e^{1 - r/c} & c \le r \end{cases}
+\qquad
+\text{BLEU} = \text{BP} \cdot \exp\left(\tfrac{1}{4}\sum_{n=1}^{4} \log p_n\right)
+$$
+
+**Worked example.** Reference: `the cat sat on the mat` (6 words). Candidate: `the cat sat on mat` (5 words).
+
+| $n$ | Candidate n-grams                   | In reference     | $p_n$       |
+| --: | :---------------------------------- | :--------------- | :---------- |
+|   1 | the, cat, sat, on, mat              | all 5            | $5/5 = 1.0$ |
+|   2 | the cat, cat sat, sat on, on mat    | 3 (not `on mat`) | $3/4$       |
+|   3 | the cat sat, cat sat on, sat on mat | 2                | $2/3$       |
+|   4 | the cat sat on, cat sat on mat      | 1                | $1/2$       |
+
+The geometric mean of the precisions is $(1 \times 0.75 \times 0.667 \times 0.5)^{1/4} = 0.707$. The brevity penalty is $e^{1 - 6/5} = 0.819$. BLEU $= 0.819 \times 0.707 = 0.58$, often reported as 58. Real BLEU is computed over a whole test corpus, not sentence by sentence, and good machine translation scores roughly 30 to 45 on standard benchmarks.
+
+### Other metrics
+
+| Metric           | Measures                                                                | Used for         | Weakness                                    |
+| :--------------- | :---------------------------------------------------------------------- | :--------------- | :------------------------------------------ |
+| **BLEU**         | Clipped n-gram precision with a brevity penalty                         | Translation      | No synonyms; one wording counts as correct  |
+| **METEOR**       | Unigram matches including stems and synonyms, with a word-order penalty | Translation      | Needs language resources such as WordNet    |
+| **ROUGE**        | N-gram **recall** against references                                    | Summarization    | Rewards copying the source                  |
+| **CIDEr**        | TF-IDF-weighted n-gram similarity to many references                    | Captioning       | Sensitive to the number of references       |
+| **Perplexity**   | How well the model predicts held-out reference text                     | Language models  | Says nothing about generated output quality |
+| **Human rating** | Adequacy (meaning preserved) and fluency                                | Final evaluation | Slow, expensive, hard to reproduce          |
+
+All n-gram metrics share one flaw: a correct output that uses different words from the reference is penalized. They are useful for tracking progress on one system and unreliable for comparing two strong systems. Modern evaluation adds learned metrics and model-based judges, covered in [Agents](/ai/agents).
+
+---
+
+## Key terms
+
+| Term                  | Meaning                                                                                                |
+| :-------------------- | :----------------------------------------------------------------------------------------------------- |
+| **Seq2Seq**           | A model mapping an input sequence to an output sequence of possibly different length                   |
+| **encoder / decoder** | The network that reads the input into vectors / the conditional language model that writes the output  |
+| **context vector**    | The vector passed from encoder to decoder: the final state, or with attention a per-step weighted sum  |
+| **`<bos>` / `<eos>`** | Special tokens that start decoding and signal that the output is finished                              |
+| **teacher forcing**   | Feeding the reference previous token to the decoder during training                                    |
+| **exposure bias**     | The train-test mismatch caused by teacher forcing: the model never trains on its own mistakes          |
+| **beam search**       | Decoding that keeps the $k$ most probable partial outputs at every step                                |
+| **bottleneck**        | A fixed-size vector through which all information must pass                                            |
+| **attention**         | Computing a per-step weighted sum over all encoder states, with weights from a learned relevance score |
+| **alignment**         | The attention weights read as a soft map from output words to input words                              |
+| **BLEU**              | Corpus-level clipped n-gram precision with a brevity penalty                                           |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why can a single RNN not do translation, and how does the encoder-decoder fix it?">
+
+    A single RNN emits one output per input step, so the output length is tied to the input length and the outputs are aligned position by position. Translations differ in length and word order. The encoder-decoder reads the entire source into a context vector first, then a separate decoder RNN generates the target token by token, conditioned on that vector, until it emits `<eos>`, so the output length is decided by the model.
+
+  </Accordion>
+  <Accordion title="What is teacher forcing, and what problem does it cause?">
+
+    Feeding the correct previous target token as the decoder's input during training instead of the model's own prediction. It keeps early training stable and lets all steps run in one parallel call. The cost is exposure bias: at inference the decoder consumes its own predictions, a distribution it never trained on, so one mistake can push it into unfamiliar territory where errors compound. Scheduled sampling mixes in the model's own predictions as training progresses.
+
+  </Accordion>
+  <Accordion title="Show with numbers why beam search can beat greedy decoding.">
+
+    If the first-step probabilities are `the` 0.5 and `a` 0.4, greedy commits to `the`. If the best continuation of `the` has probability 0.4 but `a` is followed by `cat` with 0.9, then `the …` scores 0.20 while `a cat` scores 0.36. A beam of width 2 keeps `a` alive after step 1 and finds the better sentence; greedy never can.
+
+  </Accordion>
+  <Accordion title="Why does beam search need length normalization?">
+
+    Each additional token multiplies the sequence probability by a number below 1, so summed log-probabilities always favour shorter hypotheses, and the search tends to end with `<eos>` too early. Dividing the score by the length, or by $\text{length}^\alpha$, compares hypotheses per token instead.
+
+  </Accordion>
+  <Accordion title="Describe the fixed-vector bottleneck and the evidence for it.">
+
+    In a plain encoder-decoder, the decoder sees the source only through the encoder's final state, a fixed-size vector, whatever the source length. Cho et al. and Bahdanau et al. found BLEU holding on short sentences and falling sharply beyond about 20 words, while the attention model held its score to 50–60 words. It is a capacity limit: a fixed vector cannot hold an arbitrarily long sentence.
+
+  </Accordion>
+  <Accordion title="Write the attention equations for a Seq2Seq decoder and explain each quantity.">
+
+    Scores $e_{tj} = \text{score}(\mathbf{s}_{t-1}, \mathbf{h}_j)$ compare the decoder state with each encoder state. Weights $\alpha_{tj} = \operatorname{softmax}_j(e_{tj})$ are positive and sum to 1 over source positions. The context $\mathbf{c}_t = \sum_j \alpha_{tj}\mathbf{h}_j$ is recomputed every output step. $\alpha_{tj}$ is the soft alignment: how much output step $t$ draws on source word $j$.
+
+  </Accordion>
+  <Accordion title="Compute an attention context by hand for h = [1,0], [0,1], [1,1] and s = [2,0].">
+
+    Dot-product scores are 2, 0, and 2. Exponentials are 7.389, 1, and 7.389, summing to 15.778, so the weights are 0.468, 0.063, and 0.468. The context is $0.468[1,0] + 0.063[0,1] + 0.468[1,1] = [0.937, 0.532]$: the positions aligned with the decoder state dominate.
+
+  </Accordion>
+  <Accordion title="Compare additive and dot-product attention.">
+
+    Additive (Bahdanau) attention scores with a small network, $\mathbf{v}^\top\tanh(\mathbf{W}_1\mathbf{s} + \mathbf{W}_2\mathbf{h})$, which works when the two vectors differ in size and adds parameters. Dot-product (Luong) attention scores with $\mathbf{s}^\top\mathbf{h}$, which has no parameters and computes all positions in one matrix multiply. The transformer uses the dot product scaled by $1/\sqrt{d}$ to keep the softmax from saturating as the dimension grows.
+
+  </Accordion>
+  <Accordion title="Besides removing the bottleneck, what else does attention improve?">
+
+    Gradient paths: every output step connects directly to every source position through the weighted sum, so the gradient to an early source word does not have to traverse the whole encoder recurrence. And interpretability: the attention weights form an alignment matrix between output and input words, learned without any alignment supervision.
+
+  </Accordion>
+  <Accordion title="How does image captioning reuse the Seq2Seq design, and where does attention enter?">
+
+    The encoder RNN is replaced by a pretrained CNN. Show and Tell feeds the CNN's pooled feature vector to an LSTM decoder as its first input, which recreates the bottleneck. Show, Attend and Tell keeps the $14 \times 14$ feature map as 196 region vectors and attends over them at each word, exactly as translation attention attends over source words.
+
+  </Accordion>
+  <Accordion title="Compute BLEU for candidate 'the cat sat on mat' against reference 'the cat sat on the mat'.">
+
+    Clipped n-gram precisions are $1$, $3/4$, $2/3$, and $1/2$ for $n = 1$ to $4$, with geometric mean 0.707. The candidate has 5 words against 6 in the reference, so the brevity penalty is $e^{1 - 6/5} = 0.819$. BLEU $= 0.819 \times 0.707 = 0.58$.
+
+  </Accordion>
+  <Accordion title="Why is BLEU a weak metric for comparing two strong systems?">
+
+    It counts exact n-gram overlap with a small set of references, so a fluent, correct output phrased differently from the reference is penalized, and precision saturates when both systems are good. It ranks systems that differ by large margins reasonably well, but differences of a point or two between strong systems often do not match human judgments.
+
+  </Accordion>
+</Accordions>

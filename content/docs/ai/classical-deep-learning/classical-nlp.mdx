@@ -1,52 +1,77 @@
 ---
-title: Classical NLP and Seq2Seq
-description: 'Word2Vec and GloVe embeddings, encoder-decoder translation, teacher forcing, CNN-to-RNN image captioning, and the fixed-vector bottleneck that motivated attention.'
+title: 'Classical NLP: Text as Numbers'
+description: 'How text becomes numbers before any neural network sees it: tokens and vocabularies, one-hot vectors, bag of words, n-grams, TF-IDF worked by hand, cosine similarity between documents, n-gram language models with smoothing, perplexity, and the distributional hypothesis that leads to word embeddings.'
 ---
 
-Before transformers, NLP was a pipeline of separate pieces: an embedding table learned on unlabeled text, a recurrent encoder, a recurrent decoder, and a search procedure at inference time. The pieces are worth knowing because the vocabulary is still in use, because the embedding idea survives intact inside every modern tokenizer, and because the failure of this pipeline is exactly what attention was invented to fix.
+**Natural Language Processing (NLP)** is the field of AI concerned with making computers read, interpret, and produce human language. Every NLP system, from a 1990s spam filter to a modern LLM, starts with the same problem: a neural network or statistical model consumes vectors of numbers, while text is a variable-length string of discrete symbols. How text is turned into numbers determines what a model can learn.
 
----
+This page covers the classical answers, in the order they were developed: splitting text into tokens, encoding tokens as one-hot vectors, representing documents by counts (bag of words, n-grams, TF-IDF), and modelling language with counted probabilities (n-gram language models). Each method is still used — TF-IDF and its refinement BM25 still power search engines — and each one's limitation motivates the next. The last limitation, that counting treats every word as unrelated to every other, is what [Word Embeddings](/ai/classical-deep-learning/word-embeddings) solves.
 
-## The plain-language version
-
-**NLP (Natural Language Processing)** is the field of AI that enables computers to understand, interpret, and generate human language. Typical tasks:
-
-| Task                    | Input → output                             | Example                                       |
-| :---------------------- | :----------------------------------------- | :-------------------------------------------- |
-| **text classification** | text → one label                           | spam or not spam; positive or negative review |
-| **sequence labeling**   | text → one label per word                  | marking every person and place name           |
-| **machine translation** | text in one language → text in another     | English to French                             |
-| **summarization**       | long text → short text                     | a news article to two sentences               |
-| **language modeling**   | text so far → probability of the next word | autocomplete                                  |
-| **image captioning**    | image → text                               | a photo to "a dog catching a frisbee"         |
-
-Every one of these needs text turned into numbers first. This page follows how that was done before transformers: counting words, then learned **word embeddings** (Word2Vec, GloVe), then **encoder-decoder** networks (Seq2Seq) that read one sequence and write another. It ends at the weakness of that design, which is what attention was invented to fix.
-
-| Word                     | Plain meaning                                                                                                                           |
-| :----------------------- | :-------------------------------------------------------------------------------------------------------------------------------------- |
-| **corpus**               | The collection of text a model learns from.                                                                                             |
-| **token / tokenization** | A token is one unit of text (a word, or part of one). Tokenization splits text into tokens.                                             |
-| **vocabulary (`V`)**     | The fixed list of all tokens the model knows, each with an integer ID.                                                                  |
-| **one-hot vector**       | A vector of length `V` with a 1 at the token's ID and 0 elsewhere. Identifies a word but says nothing about meaning.                    |
-| **embedding**            | A short, dense, learned vector for each token, placed so similar words get similar vectors.                                             |
-| **context window**       | The words on either side of a word that count as its "context" when learning embeddings.                                                |
-| **static embedding**     | One fixed vector per word regardless of the sentence (Word2Vec, GloVe). `bank` gets the same vector by a river and in finance.          |
-| **contextual embedding** | A vector computed from the whole sentence, so the same word gets different vectors in different sentences (BERT, transformers).         |
-| **encoder / decoder**    | The encoder reads the input sequence into a vector; the decoder writes the output sequence from it, one token at a time.                |
-| **Seq2Seq**              | Sequence-to-sequence: an encoder-decoder for tasks where input and output are both sequences, such as translation.                      |
-| **teacher forcing**      | During training, feeding the decoder the correct previous word rather than its own guess.                                               |
-| **greedy / beam search** | Ways to choose the output words at inference: always take the most likely word (greedy), or keep the best few partial sentences (beam). |
-| **bottleneck**           | A point where all information must squeeze through a fixed-size vector. Long inputs lose detail there.                                  |
-| **BLEU**                 | A translation score counting how many word sequences in the output also appear in reference translations.                               |
-| **perplexity**           | A language-model score: roughly, how many words the model is choosing between on average. Lower is better.                              |
+**Builds on:** [Vision and Sequence Basics](/ai/classical-deep-learning/vision-and-sequence-basics) and, for the vector maths, [Similarity and Norms](/ai/math-foundations/similarity-and-norms).
 
 ---
 
-## Before neural NLP: counting words
+## What NLP systems are asked to do
 
-Before any network learned an embedding, text was represented by counting. These methods are still in daily use as fast baselines and in search engines, and their weaknesses explain why embeddings were needed.
+| Task                      | Input → output                              | Example                                           |
+| :------------------------ | :------------------------------------------ | :------------------------------------------------ |
+| **Text classification**   | Text → one label                            | Spam or not spam; positive or negative review     |
+| **Sequence labelling**    | Text → one label per token                  | Mark each word as person, place, or neither (NER) |
+| **Language modelling**    | Text so far → probability of the next token | Autocomplete; the core of every LLM               |
+| **Machine translation**   | Text in one language → text in another      | English to French                                 |
+| **Summarization**         | Long text → short text                      | A news article to two sentences                   |
+| **Information retrieval** | Query → ranked documents                    | Web search                                        |
+| **Question answering**    | Question (+ context) → answer               | "Who wrote Hamlet?" → "Shakespeare"               |
 
-Take three short documents:
+Classification and retrieval need a vector for a whole **document** (any unit of text: a sentence, a review, a web page). Labelling, language modelling, and translation need a vector for each **token**. The methods below supply one or the other.
+
+---
+
+## Tokens and vocabularies
+
+**Tokenization** is splitting raw text into a sequence of units called **tokens**. The choice of unit is the first modelling decision:
+
+| Level         | `"unhappiness isn't rare"` becomes         | Vocabulary size | Trade-off                                                    |
+| :------------ | :----------------------------------------- | :-------------- | :----------------------------------------------------------- |
+| **Word**      | `unhappiness`, `is`, `n't`, `rare`         | 100k–1M+        | Short sequences; unseen words are unrepresentable            |
+| **Character** | `u`, `n`, `h`, `a`, `p`, …                 | ~100            | Nothing is unseen; sequences become 5–6× longer              |
+| **Subword**   | `un`, `happi`, `ness`, `is`, `n't`, `rare` | 30k–200k        | Frequent words stay whole, rare ones split into known pieces |
+
+Classical NLP used word-level tokens, usually after **normalization**: lowercasing, and sometimes **stemming** (crudely cutting suffixes, `running` → `run`) or **lemmatization** (mapping to a dictionary form, `ran` → `run`). Modern systems use subword tokenizers such as byte-pair encoding, covered in [Tokenization](/ai/llm/tokenization).
+
+The **vocabulary** $V$ is the fixed list of tokens a model knows, each assigned an integer **ID**. It is built from the training **corpus** (the collection of training text), typically by keeping tokens that occur at least a minimum number of times. Every other token is replaced by a special **unknown** token `<unk>`; this is the **out-of-vocabulary (OOV)** problem. A few more special tokens are standard: `<pad>` to fill short sequences in a batch, and `<bos>` / `<eos>` to mark the beginning and end of a sequence.
+
+```text
+vocabulary:  {<pad>: 0, <unk>: 1, the: 2, cat: 3, sat: 4, on: 5, mat: 6}
+"the cat sat on the rug"  ->  [2, 3, 4, 5, 2, 1]        rug is out of vocabulary
+```
+
+Token IDs are labels, not quantities. ID 6 is not "twice" ID 3, and feeding raw IDs to a model as numbers would impose a meaningless ordering. They must be turned into vectors.
+
+---
+
+## One-hot vectors
+
+A **one-hot vector** represents token $i$ as a vector of length $|V|$ with a 1 in position $i$ and 0 everywhere else. With the vocabulary `[cat, dog, mat, sat, the]`:
+
+```text
+cat = [1, 0, 0, 0, 0]
+dog = [0, 1, 0, 0, 0]
+mat = [0, 0, 1, 0, 0]
+```
+
+One-hot encoding is an **encoding**, a fixed rule with no learned parameters (see [Encoding versus embedding](/ai/math-foundations/ai-basics#encoding-versus-embedding)). It is lossless — every token gets a distinct vector — but it has two structural flaws:
+
+1. **Every pair of words is equally different.** The dot product of any two distinct one-hot vectors is 0, and the distance between any two is $\sqrt{2}$. `cat` is exactly as far from `dog` as from `mat`. A model that learns something about cats learns nothing about dogs, because their inputs share no component.
+2. **Size grows with the vocabulary.** With $|V| = 100{,}000$, each token is a 100,000-dimensional vector with a single nonzero entry.
+
+Both flaws persist in every count-based method below, because they are all built by adding one-hot vectors together.
+
+---
+
+## Bag of words
+
+A **bag of words (BoW)** represents a document by how many times each vocabulary word appears in it, ignoring order. It is the sum of the one-hot vectors of the document's tokens. Take three documents:
 
 ```text
 d1: the cat sat on the mat
@@ -54,405 +79,199 @@ d2: the dog sat on the log
 d3: the cat chased the dog
 ```
 
-**Bag of words.** Represent a document by how many times each vocabulary word appears, ignoring order. With the vocabulary `[cat, chased, dog, log, mat, on, sat, the]`, `d1` becomes `[1, 0, 0, 0, 1, 1, 1, 2]`. Word order is lost entirely: "dog bites man" and "man bites dog" get the same vector.
+With vocabulary `[cat, chased, dog, log, mat, on, sat, the]`, each document becomes one row of a **document-term matrix**:
 
-**N-grams.** Keep a little order by counting runs of `n` consecutive words. The **bigrams** (`n = 2`) of `d3` are `the cat`, `cat chased`, `chased the`, `the dog`. Now "dog bites" and "bites dog" are different features, at the cost of a much larger vocabulary.
+| Doc  | cat | chased | dog | log | mat |  on | sat | the |
+| :--- | --: | -----: | --: | --: | --: | --: | --: | --: |
+| `d1` |   1 |      0 |   0 |   0 |   1 |   1 |   1 |   2 |
+| `d2` |   0 |      0 |   1 |   1 |   0 |   1 |   1 |   2 |
+| `d3` |   1 |      1 |   1 |   0 |   0 |   0 |   0 |   2 |
 
-**TF-IDF.** Raw counts overweight words like `the` that appear everywhere and say nothing. TF-IDF (term frequency times inverse document frequency) scales each count by how rare the word is across documents:
+Documents can now be compared with **cosine similarity**, the cosine of the angle between two vectors: $\cos(\mathbf{a}, \mathbf{b}) = \frac{\mathbf{a}\cdot\mathbf{b}}{\lVert\mathbf{a}\rVert\,\lVert\mathbf{b}\rVert}$, which ignores document length.
+
+$$
+\cos(d_1, d_2) = \frac{1 \cdot 1 + 1 \cdot 1 + 2 \cdot 2}{\sqrt{8}\,\sqrt{8}} = \frac{6}{8} = 0.75, \qquad
+\cos(d_1, d_3) = \frac{1 + 4}{\sqrt{8}\,\sqrt{7}} = 0.67
+$$
+
+So by this measure `d1` (a cat on a mat) is more similar to `d2` (a dog on a log) than to `d3` (a cat chasing a dog). The similarity comes largely from `the`, `sat`, and `on` — words that say little about meaning — which is the problem TF-IDF addresses.
+
+A bag of words also loses all order: "dog bites man" and "man bites dog" get identical vectors. Even so, a linear classifier on BoW features is a strong baseline for topic and spam classification, because topic is mostly a matter of which words appear.
+
+---
+
+## N-grams
+
+An **n-gram** is a run of $n$ consecutive tokens. Unigrams ($n = 1$) are single words, bigrams ($n = 2$) pairs, trigrams ($n = 3$) triples. Counting n-grams instead of single words restores **local** order:
 
 ```text
-idf(word) = log(N / number of documents containing the word)        N = 3 documents
-
-the  : in all 3      -> log(3/3) = 0.000     carries no information
-cat  : in d1 and d3  -> log(3/2) = 0.405
-mat  : in d1 only    -> log(3/1) = 1.099     most distinctive
+d3 bigrams:  "the cat", "cat chased", "chased the", "the dog"
 ```
 
-So in `d1`, `mat` gets the highest weight and `the` gets zero. Search engines ranked documents with this idea (and its refinement, BM25) for decades. Libraries differ in small details, such as adding 1 inside the log, so exact values vary.
-
-**N-gram language models.** Predict the next word from counts of what followed the previous words. From the corpus above, `cat` is followed once by `sat` and once by `chased`, so `P(sat | cat) = 1 / 2 = 0.5`. This was how autocomplete and speech recognition worked before neural networks.
-
-**What counting cannot do.** Every one of these treats words as unrelated symbols. `cat` and `dog` share nothing, so a model that learned something about cats learns nothing about dogs. Vectors are as long as the vocabulary and mostly zeros. Embeddings fix both problems, and the next section starts there.
+Now "dog bites" and "bites dog" are different features, and "not good" can be learned as negative even though "good" alone is positive. The cost is size: the number of possible bigrams is $|V|^2$, and most of them occur rarely, so the feature vectors become even larger and sparser. In practice systems use unigrams plus bigrams, and keep only n-grams above a frequency threshold.
 
 ---
 
-## From one-hot to embeddings
+## TF-IDF
 
-A vocabulary of `V` words represented as one-hot vectors has `V` dimensions, and every pair of words is exactly orthogonal. The dot product of `cat` and `dog` is `0`, the same as the dot product of `cat` and `aircraft`. There is no similarity to learn from and the input dimension grows with the vocabulary.
+Raw counts overweight words that appear everywhere. **TF-IDF** (term frequency × inverse document frequency) reweights each count by how distinctive the word is across the collection. It has two factors:
 
-One-hot is an **encoding**: a fixed rule with no parameters. An embedding is **learned**. [Encoding versus embedding](/ai/math-foundations/ai-basics#encoding-versus-embedding) on the AI Basics page compares the two side by side.
+- **Term frequency** $\text{tf}(w, d)$: how often word $w$ appears in document $d$, either the raw count or the count divided by the document length.
+- **Inverse document frequency** $\text{idf}(w) = \log\dfrac{N}{\text{df}(w)}$, where $N$ is the number of documents and $\text{df}(w)$ is the number of documents containing $w$.
 
-An embedding is a learned lookup table: a matrix `E` of shape `(V, d)` where row `i` is the vector for token `i`.
+$$
+\text{tf-idf}(w, d) = \text{tf}(w, d) \times \text{idf}(w)
+$$
 
-```python
-import torch
-import torch.nn as nn
+The IDF factor is 0 for a word in every document and largest for a word in only one. For the three documents above ($N = 3$):
 
-emb = nn.Embedding(num_embeddings=50000, embedding_dim=300, padding_idx=0)
-ids = torch.tensor([[5, 12, 809, 0, 0]])
-print(emb(ids).shape)          # (1, 5, 300)
-print(emb.weight.shape)        # (50000, 300)
-```
+| Word  | In documents | $\text{idf} = \ln(3 / \text{df})$ | Reading                               |
+| :---- | :----------- | --------------------------------: | :------------------------------------ |
+| `the` | 3            |                             0.000 | Present everywhere; carries no signal |
+| `sat` | 2            |                             0.405 | Moderately common                     |
+| `cat` | 2            |                             0.405 | Moderately common                     |
+| `mat` | 1            |                             1.099 | Unique to `d1`; most distinctive      |
 
-The lookup is a row select, not a matrix multiply, so it costs nothing compared to a dense projection. `padding_idx` fixes that row at zero and excludes it from gradient updates. Setting `sparse=True` on the embedding produces sparse gradients, which only some optimizers support.
+In `d1`, `the` appears twice but scores $2 \times 0 = 0$, while `mat` appears once and scores $1 \times 1.099 = 1.099$. The document's vector is now dominated by the words that set it apart. Libraries differ in small details (adding 1 inside the logarithm to avoid division by zero, normalizing each vector to unit length), so exact values vary.
 
-Everything downstream works in this `d`-dimensional space instead of the `V`-dimensional one.
+TF-IDF vectors compared by cosine similarity were the standard for search for decades. **BM25**, the refinement still used in Elasticsearch and as the lexical half of [hybrid search](/ai/rag/hybrid-search), adds two corrections: term frequency saturates (the tenth occurrence of a word matters less than the second), and long documents are penalized so they do not win just by containing more words.
 
 ---
 
-## Word2Vec
+## Language models from counts
 
-Two architectures from Mikolov et al. (arXiv:1301.3781, arXiv:1310.4546), both trained on the co-occurrence statistics of a plain corpus.
+A **language model** assigns a probability to a sequence of tokens, or equivalently predicts the next token given the previous ones. By the chain rule of probability, any sequence probability factors into next-token predictions:
 
-| Model     | Input             | Predicts          | Better at              |
-| :-------- | :---------------- | :---------------- | :--------------------- |
-| Skip-gram | One center word   | Its context words | Rare words             |
-| CBOW      | The context words | The center word   | Frequent words, faster |
+$$
+P(w_1, w_2, \dots, w_T) = \prod_{t=1}^{T} P(w_t \mid w_1, \dots, w_{t-1})
+$$
 
-Skip-gram is the one that produces the useful embeddings. For a center word `w_t` and a window of size `C`, it maximizes:
+This is exact, but the conditioning history grows without limit, and most long histories never appear in any corpus. An **n-gram language model** makes the **Markov assumption**: the next word depends only on the previous $n - 1$ words. For a bigram model ($n = 2$):
+
+$$
+P(w_t \mid w_1, \dots, w_{t-1}) \approx P(w_t \mid w_{t-1}) = \frac{\text{count}(w_{t-1}, w_t)}{\text{count}(w_{t-1})}
+$$
+
+Estimating probabilities by dividing counts like this is the **maximum-likelihood estimate**.
+
+### Worked example
+
+Train a bigram model on three sentences, with `<s>` and `</s>` marking the start and end:
 
 ```text
-sum over t, sum over -C <= j <= C, j != 0 of   log p(w_(t+j) | w_t)
+<s> I like cats </s>
+<s> I like dogs </s>
+<s> I hate cats </s>
 ```
 
-with `p` modelled as a softmax over the whole vocabulary. That softmax is the problem: normalizing over `V = 100000` words for every window position is intractable.
+`I` is followed twice by `like` and once by `hate`, so $P(\text{like} \mid \text{I}) = 2/3$ and $P(\text{hate} \mid \text{I}) = 1/3$. `like` is followed once each by `cats` and `dogs`, so each gets $1/2$. The probability of the sentence "I like cats":
 
-### Negative sampling
+$$
+P = \underbrace{P(\text{I} \mid \langle s \rangle)}_{1} \cdot \underbrace{P(\text{like} \mid \text{I})}_{2/3} \cdot \underbrace{P(\text{cats} \mid \text{like})}_{1/2} \cdot \underbrace{P(\langle /s \rangle \mid \text{cats})}_{1} = \frac{1}{3}
+$$
 
-Replace the softmax with a binary classification: distinguish the true context word from `K` noise samples.
+Now score "I hate dogs", a perfectly reasonable sentence. `hate` was never followed by `dogs`, so $P(\text{dogs} \mid \text{hate}) = 0$ and the whole sentence gets probability 0. This is the **sparsity problem**: almost every plausible n-gram is missing from any finite corpus, and the problem grows rapidly with $n$.
 
-```text
-log sigmoid(u_o . v_c) + sum over k=1..K of  E[ log sigmoid(-u_k . v_c) ]
-```
+### Smoothing
 
-`v_c` is the center word's vector, `u_o` is the context word's vector from a second table. `K` is typically `5` to `20` for small corpora and `2` to `5` for large ones. Noise words are drawn from the unigram distribution raised to the `3/4` power, which slightly boosts rare words relative to their true frequency.
+**Smoothing** moves a little probability mass from seen n-grams to unseen ones. The simplest form, **add-one (Laplace) smoothing**, adds 1 to every count:
 
-```python title="skipgram.py"
-import torch
-import torch.nn.functional as F
+$$
+P(w_t \mid w_{t-1}) = \frac{\text{count}(w_{t-1}, w_t) + 1}{\text{count}(w_{t-1}) + |V|}
+$$
 
-def nce_loss(center, context, negatives):
-    # center: (B, d), context: (B, d), negatives: (B, K, d)
-    pos = (center * context).sum(-1)                          # (B,)
-    neg = torch.bmm(negatives, center.unsqueeze(-1)).squeeze(-1)  # (B, K)
-    return -(F.logsigmoid(pos) + F.logsigmoid(-neg).sum(-1)).mean()
-```
+With 6 possible next tokens (`I`, `like`, `hate`, `cats`, `dogs`, `</s>`), $P(\text{dogs} \mid \text{hate}) = (0 + 1)/(1 + 6) = 1/7$: small but no longer zero. Add-one moves too much mass on large vocabularies; practical systems used **Kneser-Ney smoothing**, which also uses how many different contexts a word appears in, and **backoff**, which falls back to a shorter n-gram when the longer one is unseen.
 
-Two more tricks matter in practice:
+### Perplexity
 
-- **Subsampling frequent words.** Drop token `w` with probability `1 - sqrt(t / f(w))` where `f(w)` is its corpus frequency and `t` is around `1e-5`. This removes most occurrences of `the` and `of`, which carry no distributional signal and otherwise dominate the gradient.
-- **Window sampling.** Instead of a fixed window, draw the actual window size uniformly each time so nearby words are seen more often than distant ones.
+Language models are evaluated by **perplexity**: the exponentiated average negative log-probability the model assigns to each token of held-out text.
 
-### What the vectors encode
+$$
+\text{PPL} = \exp\left(-\frac{1}{T}\sum_{t=1}^{T} \log P(w_t \mid w_{<t})\right)
+$$
 
-The trained vectors support linear analogy arithmetic. The famous case is:
+Perplexity has a concrete reading: it is the number of equally likely choices the model is effectively picking between at each step. A model that assigns probability $1/4$ to every correct token has perplexity exactly 4, as if choosing uniformly among four words. If a model assigns $0.5, 0.25, 0.125, 0.5$ to four tokens, the average log-probability is $-1.75 \ln 2$ and the perplexity is $2^{1.75} = 3.36$. Lower is better. Perplexity is also $e^{\text{cross-entropy}}$, so it is the same quantity neural language models minimize, reported on a more readable scale.
 
-```text
-vec("king") - vec("man") + vec("woman")  ≈  vec("queen")
-```
-
-Cosine similarity between the result and every vocabulary vector ranks `queen` near the top. Similar structure appears for capital-country pairs, comparative adjectives, and verb tenses. It is the strongest evidence that a simple co-occurrence objective learns something like semantic composition, and it is the reason static embeddings were the standard NLP input layer for five years.
+Well-smoothed 5-gram models reached perplexities around 140 on the Penn Treebank benchmark; LSTM language models brought that below 60.
 
 ---
 
-## GloVe
+## What counting cannot do
 
-Global Vectors (Pennington et al., 2014) skips the windowing and factorizes the whole co-occurrence matrix directly.
+Every method on this page is built from one-hot vectors, so every method inherits their central flaw: **words are atomic symbols with no relationship to each other**.
 
-Build `X`, where `X_ij` counts how often word `j` appears in the context of word `i` over the entire corpus. Then fit vectors so their dot product predicts the log of that count:
+- Having seen "I like cats" many times, a bigram model learns nothing about "I like kittens", because `kittens` and `cats` share no counts.
+- A TF-IDF search for "car" does not match a document that only says "automobile".
+- An n-gram model needs to see every word combination separately, which is why it needed enormous corpora and still assigned zero to most plausible sentences.
 
-```text
-J = sum over i,j of  f(X_ij) * (w_i . v_j + b_i + c_j - log X_ij)^2
-```
+What is missing is a representation in which **similar words have similar vectors**, so that evidence about one word automatically generalizes to its neighbours. The idea that makes this possible is the **distributional hypothesis**, stated by J. R. Firth in 1957 as "a word is characterized by the company it keeps": words that occur in similar contexts tend to have similar meanings. `cats` and `kittens` both appear near `purr`, `feed`, `cute`, and `the`; `car` and `automobile` both appear near `drive`, `engine`, and `road`.
 
-The weighting function caps the influence of very frequent pairs:
-
-```text
-f(X) = (X / X_max)^0.75   if X < X_max
-f(X) = 1                  otherwise
-```
-
-with `X_max = 100` in the original paper. Without it, a handful of pairs like `the` with `of` would dominate the loss.
-
-```python title="glove.py"
-import torch
-
-def glove_loss(W, V, b, c, X, X_max=100.0, alpha=0.75):
-    # W, V: (V_size, d);  X: dense or sparse co-occurrence counts
-    pred = W @ V.T + b[:, None] + c[None, :]
-    weight = torch.clamp(X / X_max, max=1.0).pow(alpha)
-    return (weight * (pred - torch.log(X.clamp(min=1e-12))) ** 2).sum()
-```
-
-In practice nobody builds the dense `X`. The reference implementation streams the corpus, counts co-occurrences into a sparse table, shuffles it, and runs AdaGrad for a fixed number of passes.
-
-### Word2Vec against GloVe
-
-| Property           | Word2Vec                    | GloVe                                    |
-| :----------------- | :-------------------------- | :--------------------------------------- |
-| Data structure     | Sliding windows over text   | Global co-occurrence matrix              |
-| Objective          | Binary classification (NCE) | Weighted least squares on log counts     |
-| Local vs global    | Local context only          | Uses global statistics                   |
-| Memory             | Low, streams the corpus     | Must store the co-occurrence table       |
-| Analogy accuracy   | Comparable                  | Comparable, slightly better on some sets |
-| Pretrained vectors | Google News 300d            | Wikipedia and Gigaword, 50 to 300d       |
-
-In most head-to-head evaluations the two are within a point of each other downstream. GloVe's advantage is that it makes explicit use of corpus-wide statistics, which helps on small corpora where any individual window is uninformative.
+Turning that hypothesis into dense, learned vectors is the subject of the next page, [Word Embeddings](/ai/classical-deep-learning/word-embeddings).
 
 ---
 
-## The limits of static embeddings
+## Key terms
 
-One vector per word type, fixed at inference time. Three consequences:
-
-- **Polysemy collapses.** `bank` gets a single vector averaging the river sense and the financial sense. Context cannot disambiguate it because there is no mechanism to change the vector.
-- **Out-of-vocabulary words have nothing.** Any token not in the training vocabulary maps to an unknown vector.
-- **Morphology is ignored.** `run`, `runs`, `running`, and `ran` are four unrelated vectors unless the corpus happens to make them similar.
-
-Subword methods fix the third one. FastText represents a word as a bag of character n-grams and sums their vectors, so `running` and `run` share most of their representation and novel words still get a vector. Byte-pair encoding, covered in [Phase 6](/ai/llm), solves the second by building the vocabulary out of frequent byte sequences rather than whole words.
-
-Contextual embeddings (ELMo, then BERT) solve the first by computing a different vector for each word occurrence from a bidirectional language model. That is the transition point between this page and Phase 5.
-
----
-
-## Seq2Seq
-
-Sutskever et al. (arXiv:1409.3215) mapped a variable-length input sequence to a variable-length output sequence with two RNNs and nothing in between but a single vector.
-
-<Mermaid
-  chart={`
-flowchart TD
-    subgraph ENC["Encoder LSTM"]
-        X1["le"] --> X2["chat"] --> X3["est"] --> X4["EOS"]
-    end
-    X4 --> C["context vector c"]
-    C --> D1["decoder step 1"]
-    D1 --> D2["decoder step 2"]
-    D2 --> D3["decoder step 3"]
-    D3 --> D4["EOS"]
-    D1 --> Y1["the"]
-    D2 --> Y2["cat"]
-    D3 --> Y3["is"]
-`}
-/>
-
-The encoder reads the whole source sentence and ends in some hidden state. That state, and only that state, is passed to the decoder, which then generates the target one token at a time from its own previous output.
-
-```python title="seq2seq.py"
-import torch
-import torch.nn as nn
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-
-class Encoder(nn.Module):
-    def __init__(self, vocab: int, dim: int = 300, hidden: int = 512, layers: int = 2):
-        super().__init__()
-        self.emb = nn.Embedding(vocab, dim, padding_idx=0)
-        self.rnn = nn.LSTM(dim, hidden, layers, bidirectional=True, batch_first=True)
-        self.proj = nn.Linear(hidden * 2, hidden)
-
-    def forward(self, x, lengths):
-        packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        out, (h, c) = self.rnn(packed)
-        out, _ = pad_packed_sequence(out, batch_first=True)      # (B, T, 2*hidden)
-        h = self.proj(torch.cat([h[-2], h[-1]], dim=-1))         # (B, hidden)
-        c = self.proj(torch.cat([c[-2], c[-1]], dim=-1))
-        return out, (h.unsqueeze(0), c.unsqueeze(0))
-
-class Decoder(nn.Module):
-    def __init__(self, vocab: int, dim: int = 300, hidden: int = 512, layers: int = 2):
-        super().__init__()
-        self.emb = nn.Embedding(vocab, dim, padding_idx=0)
-        self.rnn = nn.LSTM(dim, hidden, layers, batch_first=True)
-        self.out = nn.Linear(hidden, vocab)
-
-    def forward(self, y, state):
-        out, state = self.rnn(y, state)      # y: (B, 1)
-        return self.out(out), state
-```
-
-`h[-2]` and `h[-1]` are the forward and backward final states of the top bidirectional layer. Concatenating and projecting them gives a single context vector, which is the `c` in the diagram.
-
-### Teacher forcing
-
-During training, feed the ground-truth previous token to the decoder rather than the token it predicted. Training parallelizes across all target positions and converges much faster.
-
-```python
-target_in = torch.cat([bos.expand(B, 1), y_true[:, :-1]], dim=1)   # shifted right
-logits, _ = decoder(target_in, state)
-loss = F.cross_entropy(logits.reshape(-1, V), y_true.reshape(-1), ignore_index=0)
-```
-
-At inference there is no ground truth, so the decoder consumes its own predictions. The mismatch between the two regimes is **exposure bias**: the model never saw its own mistakes during training, so one wrong token can push it off-distribution for the rest of the sequence. Scheduled sampling interpolates between the two, feeding predictions with increasing probability as training progresses.
-
-### Decoding
-
-Greedy search takes the `argmax` at every step and produces repetitive, degenerate output on translation. Beam search keeps the top `k` partial hypotheses and is the standard for deterministic tasks, with `k` between `4` and `10`. Sampling with temperature is used when diversity matters more than likelihood. Both are covered in detail in [Phase 6](/ai/llm).
-
-Two small tricks from the original paper still hold:
-
-- **Reverse the input sentence.** Feeding `a b c` as `c b a` puts the first source words closer to the start of decoding, where gradients are strongest. It bought several BLEU points in 2014.
-- **Use a deep encoder and share nothing.** Four LSTM layers with no weight sharing beat two layers with sharing.
-
----
-
-## The fixed-vector bottleneck
-
-Everything the decoder knows about the source passes through one vector of size `hidden`, regardless of whether the source is four words or four hundred.
-
-Bahdanau et al. (arXiv:1409.0473) measured this directly. BLEU for a plain encoder-decoder stays flat on short sentences and then falls off sharply past roughly twenty words, while their attention-based variant holds its score out to sixty words. The degradation is not a training failure; it is an information capacity failure. Compressing a long sentence into `512` floats loses content, and the loss grows with length.
-
-The fix is to stop compressing. Keep every encoder hidden state `h_1 ... h_T`, and at each decoder step compute a weighted sum where the weights come from a learned alignment between the decoder state and each encoder state:
-
-```text
-e_tj = a(s_(t-1), h_j)                alignment score, a small feed-forward net
-alpha_tj = softmax_j(e_tj)            attention weights
-c_t = sum over j of alpha_tj * h_j    per-step context vector
-```
-
-Now the context vector `c_t` is recomputed at every decoding step and can point at whichever source positions matter for the token being generated. On translation, those weights align to the source word being translated, which is why attention maps on `en`-`fr` look like a soft diagonal.
-
-That single change, a per-step weighted sum over stored encoder states, is the mechanism that becomes self-attention in [Phase 5](/ai/transformers). Once the context vector no longer needs a recurrence to be updated, the recurrence itself stops being necessary.
-
----
-
-## Image captioning
-
-Swap the RNN encoder for a CNN and the same architecture describes images.
-
-| Model                                                        | Encoder                    | Decoder                           | The contribution                                     |
-| :----------------------------------------------------------- | :------------------------- | :-------------------------------- | :--------------------------------------------------- |
-| Show and Tell (Vinyals, 2014)                                | CNN, final vector          | LSTM                              | Treat the image as the first word                    |
-| Deep Visual-Semantic Alignments (Karpathy and Fei-Fei, 2014) | CNN region features        | RNN with a soft-alignment decoder | Aligns words to image regions                        |
-| Show, Attend and Tell (Xu, 2015)                             | CNN, `14 x 14` feature map | LSTM with spatial attention       | Attention over image locations, with a visualization |
-
-Show and Tell is the Seq2Seq structure with one substitution:
-
-```python title="caption.py"
-import timm
-import torch
-import torch.nn as nn
-
-class Captioner(nn.Module):
-    def __init__(self, vocab: int, feat_dim: int = 2048, hidden: int = 512):
-        super().__init__()
-        self.backbone = timm.create_model("resnet50", pretrained=True, num_classes=0)
-        self.project = nn.Linear(feat_dim, hidden)
-        self.emb = nn.Embedding(vocab, hidden, padding_idx=0)
-        self.cell = nn.LSTMCell(hidden, hidden)
-        self.out = nn.Linear(hidden, vocab)
-
-    def forward(self, image, tokens):
-        B = image.shape[0]
-        zeros = torch.zeros(B, self.cell.hidden_size, device=image.device)
-        h, c = self.cell(self.project(self.backbone(image)), (zeros, zeros))
-
-        logits = []
-        for t in range(tokens.shape[1]):
-            h, c = self.cell(self.emb(tokens[:, t]), (h, c))
-            logits.append(self.out(h))
-        return torch.stack(logits, dim=1)      # (B, T, vocab)
-```
-
-The image feature is projected to the embedding dimension and used as the input at `t = 0`, exactly as a start-of-sequence token would be. Everything after that is the language model from the previous section.
-
-Show, Attend and Tell keeps the CNN's `14 x 14 x 2048` feature map instead of pooling it, flattens it to `196` spatial locations, and computes attention weights over those locations at each decoding step. The resulting heatmaps show the model looking at the dog when it writes "dog" and at the grass when it writes "grass", which was the first widely shared visualization of attention doing something interpretable.
-
-<Callout type="info">
-  ### The same bottleneck, different modality
-
-A pooled `2048`-dimensional image vector has to hold the whole scene for a caption of arbitrary length. Spatial attention relieves it in exactly the way source-word attention relieves the translation encoder. Any architecture that compresses variable-size input into a fixed vector has this problem, and the fix is always the same: keep the pre-pool representations and let the consumer select from them.
-
-</Callout>
-
----
-
-## Evaluation
-
-| Metric     | Measures                                                             | Weakness                                                                   |
-| :--------- | :------------------------------------------------------------------- | :------------------------------------------------------------------------- |
-| Perplexity | Exponentiated mean negative log-likelihood of the corpus             | Says nothing about output quality                                          |
-| BLEU       | N-gram precision against one or more references                      | Ignores recall beyond brevity penalty, insensitive to word order at high n |
-| METEOR     | Unigram match with stemming and synonymy, plus fragmentation penalty | Needs WordNet for full effect                                              |
-| ROUGE      | N-gram recall, for summarization                                     | Rewards copying                                                            |
-| CIDEr      | TF-IDF weighted n-gram similarity, for captioning                    | Sensitive to reference count                                               |
-| SPICE      | Scene-graph tuple matching                                           | Expensive parser                                                           |
-| Human      | Adequacy and fluency ratings                                         | Slow, expensive, not reproducible                                          |
-
-All the automatic metrics correlate only loosely with human judgment, and all of them can be gamed by producing frequent n-grams. They are useful for tracking progress during development and meaningless for comparing two systems that are close. Modern evaluation uses learned judges and human preference data, covered in [Phase 11](/ai/agents).
+| Term                          | Meaning                                                                                   |
+| :---------------------------- | :---------------------------------------------------------------------------------------- |
+| **corpus**                    | The collection of text a model is built from                                              |
+| **token / tokenization**      | A unit of text (word, subword, character), and the act of splitting text into them        |
+| **vocabulary**                | The fixed list of known tokens, each with an integer ID                                   |
+| **OOV / `<unk>`**             | A token not in the vocabulary, and the placeholder that replaces it                       |
+| **one-hot vector**            | A vector as long as the vocabulary, with a single 1 at the token's ID                     |
+| **bag of words**              | A document as a vector of word counts, order ignored                                      |
+| **n-gram**                    | A run of $n$ consecutive tokens                                                           |
+| **TF-IDF**                    | Term frequency times inverse document frequency: counts reweighted by distinctiveness     |
+| **cosine similarity**         | The cosine of the angle between two vectors; similarity independent of length             |
+| **language model**            | A probability distribution over sequences, factored into next-token predictions           |
+| **Markov assumption**         | The next token depends only on the previous $n - 1$                                       |
+| **smoothing**                 | Reassigning probability mass to unseen n-grams so nothing gets probability 0              |
+| **perplexity**                | $\exp$ of the average negative log-probability; the effective number of choices per token |
+| **distributional hypothesis** | Words that occur in similar contexts have similar meanings                                |
 
 ---
 
 ## Interview questions
 
 <Accordions>
-  <Accordion title="Why is a one-hot vocabulary representation unusable as a model input?">
+  <Accordion title="Why can token IDs not be fed to a model directly as numbers?">
 
-    A 50,000-entry vector with a single 1 makes every pair of words equally distant: the dot product of any two distinct one-hots is zero, so similarity has to be rediscovered inside the first weight matrix from co-occurrence counts. It also spends a wide multiply-add over almost all zeros and gives no transfer between words that appear in similar contexts.
-
-  </Accordion>
-  <Accordion title={<>What does <code>nn.Embedding</code> compute, and why is a lookup cheaper than a projection?</>}>
-
-    It gathers the row of a learned `num_embeddings x embedding_dim` table indexed by token ID, which is exactly what a one-hot times a matrix computes. The gather touches `embedding_dim` numbers instead of `vocab_size * embedding_dim`, and gradient flows only to the rows actually looked up.
+    IDs are arbitrary labels assigned by the vocabulary. Treating them as quantities imposes a meaningless order and scale: ID 6 would be "twice" ID 3 and "closer" to ID 5 than to ID 100. They must first become vectors, either by a fixed encoding such as one-hot or by a learned embedding lookup.
 
   </Accordion>
-  <Accordion title="Contrast skip-gram and CBOW, and say which produces better embeddings for rare words.">
+  <Accordion title="What are the two structural flaws of one-hot vectors?">
 
-    Skip-gram predicts each context word from the center word; CBOW predicts the center word from the averaged context vectors. Skip-gram is better on rare words: one rare center word generates an example per window position, while CBOW dilutes it inside an average of five context words.
-
-  </Accordion>
-  <Accordion title={<>Write the negative sampling objective and explain what the <code>3/4</code> power on the noise distribution does.</>}>
-
-    $\log \sigma(\mathbf{v}_c \cdot \mathbf{u}_o) - \sum_{j=1}^K \log \sigma(-\mathbf{v}_c \cdot \mathbf{u}_j)$, with $\sigma$ the logistic, $\mathbf{v}$ the center table and $\mathbf{u}$ the context table. Noise is drawn from the unigram distribution raised to the `3/4` power: exponent 1 samples a word exactly as often as it occurs, exponent 0 is uniform, and `3/4` lifts rare words so they earn more negative-sample gradient than their raw counts would give them.
+    Every pair of distinct words has dot product 0 and the same distance, so no similarity is encoded and nothing learned about one word transfers to another. And the vector length equals the vocabulary size, so representations are huge and almost entirely zeros.
 
   </Accordion>
-  <Accordion title="Why does Word2Vec subsample frequent words, and with what probability?">
+  <Accordion title="Compute the IDF of a word that appears in every document. Why is that the desired behaviour?">
 
-    Words like "the" and "of" carry almost no distributional signal but appear in every window, so they dominate the updates. Each token `w` is dropped with probability $1 - \sqrt{t / f(w)}$, where $f(w)$ is its corpus frequency and $t \approx 10^{-5}$, which removes most occurrences of the top few hundred words and spends the compute on informative pairs.
-
-  </Accordion>
-  <Accordion title="What is the GloVe weighting function for, and what breaks without it?">
-
-    `f(X) = (X / X_max)^0.75` below `X_max` and `1` above it weights each co-occurrence by how reliable its count is. Without it a pair seen once contributes exactly as much to the squared loss as a pair seen ten thousand times, and the long tail of noisy counts drives the fit.
+    $\text{idf} = \log(N / N) = \log 1 = 0$. A word present in every document cannot help distinguish one document from another, so its weight should be zero regardless of how often it appears. Words like `the` and `of` are suppressed automatically without a hand-made stop-word list.
 
   </Accordion>
-  <Accordion title="Give two failure modes of static word embeddings and name the technique that fixes each.">
+  <Accordion title="What does a bag of words lose, and what do n-grams recover?">
 
-    Polysemy: one vector for "bank" averages the river and financial senses and no context can separate them, which contextual representations fix (ELMo, then BERT). Unknown and inflected forms: a word with no row in the table simply has no embedding, which subword character n-grams in fastText or byte-pair encoding fix.
-
-  </Accordion>
-  <Accordion title="What is teacher forcing, and what is exposure bias?">
-
-    Teacher forcing feeds the ground-truth previous token as the decoder input at every training step instead of the model's own prediction, which makes training parallel and stable. Exposure bias is the consequence: at inference the decoder conditions on its own outputs, so one early mistake puts it on a trajectory it never saw during training and errors compound.
+    It loses all order: "dog bites man" and "man bites dog" get the same vector, and negation like "not good" is invisible. Counting n-grams recovers local order within a window of $n$ tokens, so "not good" becomes its own feature, at the cost of a feature space that grows roughly as $|V|^n$ and is extremely sparse.
 
   </Accordion>
-  <Accordion title="Why did the original Seq2Seq paper reverse the input sentence?">
+  <Accordion title="State the Markov assumption in an n-gram language model and the problem it creates.">
 
-    Reversing the source puts its first words next to the target's first words in time, shortening the average distance the attention mechanism has to span across the two sequences. Sutskever et al. reported several BLEU points from that change alone.
-
-  </Accordion>
-  <Accordion title="Describe the fixed-vector bottleneck precisely, and what evidence Bahdanau et al. used to demonstrate it.">
-
-    One fixed hidden vector, 512 floats, is the only thing the decoder may read about a source sentence of arbitrary length. Bahdanau et al. measured the failure directly: BLEU for a plain encoder-decoder stays flat on short sentences and falls off sharply past roughly twenty words, while their attention model holds its score out to sixty. It is an information capacity limit, not a training problem.
+    The next token depends only on the previous $n - 1$ tokens, so $P(w_t \mid w_{<t}) \approx P(w_t \mid w_{t-n+1}, \dots, w_{t-1})$, estimated by counting. It makes estimation possible but caps the context at $n - 1$ words, and it creates sparsity: most plausible n-grams never appear in the corpus and get probability zero, which grows worse as $n$ increases.
 
   </Accordion>
-  <Accordion title={<>Write the attention equations for a Seq2Seq decoder and explain what <code>alpha_tj</code> represents.</>}>
+  <Accordion title="What is smoothing, and why is it necessary?">
 
-    `e_tj = a(s_(t-1), h_j)` scores decoder state against every encoder state, `alpha_tj = exp(e_tj) / sum_j exp(e_tj)` normalizes it, and `c_t = sum_j alpha_tj h_j` builds a per-step summary. `alpha_tj` is the soft alignment: the fraction of source position `j` the decoder uses at target step `t`. Because the weights sum to one per step, the encoder output becomes a distribution over source positions instead of one fixed vector.
-
-  </Accordion>
-  <Accordion title="In Show and Tell, how is the image injected into the LSTM?">
-
-    The CNN's pooled feature vector goes through a linear layer to the hidden-state width and is fed in as the LSTM's first input, so the image is treated as the first word. From there the caption is generated exactly like a sentence.
+    Moving some probability mass from observed n-grams to unobserved ones. Without it, any sentence containing a single unseen n-gram gets probability zero, so perplexity is infinite and the model cannot rank plausible sentences. Add-one smoothing adds 1 to every count; Kneser-Ney and backoff are the practical methods.
 
   </Accordion>
-  <Accordion title="What does spatial attention in Show, Attend and Tell give you that global average pooling does not?">
+  <Accordion title="Define perplexity and interpret a perplexity of 4.">
 
-    Global average pooling compresses the whole scene into one 2048-dimensional vector that must serve a caption of any length, and it discards where anything is. Spatial attention keeps the `14 x 14` map as 196 locations and lets each decoding step select from them, which relieves the bottleneck and yields heatmaps showing the model looking at the dog while writing "dog".
+    $\text{PPL} = \exp(-\frac{1}{T}\sum_t \log P(w_t \mid w_{<t}))$, the exponentiated average negative log-likelihood, equal to $e^{\text{cross-entropy}}$. A perplexity of 4 means the model is, on average, as uncertain as if choosing uniformly among four tokens at each step.
 
   </Accordion>
-  <Accordion title="Why is BLEU a poor metric for comparing two good captioning systems?">
+  <Accordion title="Why does a TF-IDF search for 'car' miss a document about 'automobiles', and what idea fixes it?">
 
-    BLEU measures n-gram overlap with reference text. Captioning has one or a few references for an open-ended output space, so two fluent, correct captions that use different wording score each other down for not copying the reference, and precision saturates. It ranks systems that differ by large margins and cannot separate two good ones.
+    TF-IDF is built from one-hot word identities, so `car` and `automobile` are unrelated dimensions with no overlap. The distributional hypothesis fixes it: words in similar contexts have similar meanings, so learning vectors from co-occurrence places `car` and `automobile` close together. Dense retrieval with embeddings exploits exactly that.
 
   </Accordion>
 </Accordions>

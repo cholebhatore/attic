@@ -1,0 +1,404 @@
+---
+title: LSTM and GRU
+description: 'Gated recurrent cells from the problem they solve: what an LSTM is, what a gate is, the cell state, every LSTM equation walked through step by step with numbers, why the additive cell update keeps gradients alive, the GRU as a simpler alternative, practical details, sequence classification and forecasting, and where recurrence still wins.'
+---
+
+A **Long Short-Term Memory (LSTM)** network is a recurrent network whose cell keeps two vectors instead of one: a **cell state** $\mathbf{c}_t$ that acts as long-term memory, and a hidden state $\mathbf{h}_t$ that acts as the working output. The cell state is changed only by element-wise erasing and adding, controlled by three learned **gates** that decide at each step what to forget, what to write, and what to reveal. Because memory is carried forward by addition rather than by repeated matrix multiplication, gradients survive across hundreds of steps instead of a dozen.
+
+Hochreiter and Schmidhuber introduced the LSTM in 1997; the forget gate, now considered essential, was added by Gers, Schmidhuber and Cummins in 2000. The **Gated Recurrent Unit (GRU)**, by Cho et al. in 2014, is a simpler gated cell with one state vector and two gates. Together they were the default sequence models from about 2014 until transformers in 2017.
+
+**Builds on:** [Recurrent Neural Networks](/ai/classical-deep-learning/recurrent-networks) and [Vanishing and Exploding Gradients](/ai/classical-deep-learning/vanishing-gradients). The second page is the reason this one exists.
+
+---
+
+## The problem, restated as a design goal
+
+In a vanilla RNN the whole memory is rewritten at every step:
+
+$$
+\mathbf{h}_t = \tanh(\mathbf{W}_{hh}\mathbf{h}_{t-1} + \mathbf{W}_{xh}\mathbf{x}_t + \mathbf{b})
+$$
+
+Two things go wrong. First, keeping a fact for 50 steps requires the network to reproduce it through 50 matrix multiplications and 50 `tanh` squashes, which it cannot do accurately. Second, the gradient flowing back through those 50 steps is multiplied by $\operatorname{diag}(\tanh')\mathbf{W}_{hh}$ each time and vanishes.
+
+The LSTM's design goal follows directly:
+
+1. **Keep a memory that is not rewritten by default.** If nothing relevant happens, the memory should pass to the next step unchanged — as if the update were the identity.
+2. **Make changes to it explicit and selective.** Erasing part of it, writing to part of it, and reading from it should each be separate, learned decisions that depend on the current input.
+
+An identity update has derivative 1, which solves the gradient problem by construction. Selective control solves the usefulness problem: the network decides what is worth keeping.
+
+---
+
+## What a gate is
+
+A **gate** is a vector of numbers between 0 and 1 that is multiplied element-wise into another vector, scaling each element between "block completely" (0) and "pass completely" (1). It is computed by a small layer with a sigmoid activation:
+
+$$
+\mathbf{g} = \sigma(\mathbf{W}\mathbf{x}_t + \mathbf{U}\mathbf{h}_{t-1} + \mathbf{b}), \qquad \sigma(z) = \frac{1}{1 + e^{-z}} \in (0, 1)
+$$
+
+Applying it uses the **Hadamard product** $\odot$, element-wise multiplication of two vectors of equal length:
+
+$$
+[0.9,\ 0.1,\ 0.5] \odot [2.0,\ 2.0,\ -4.0] = [1.8,\ 0.2,\ -2.0]
+$$
+
+The first element passes almost fully, the second is almost blocked, the third is halved. Three properties make gates work:
+
+- **They are soft and differentiable.** A gate value of 0.93 is allowed, so the gate can be trained by gradient descent like any other layer.
+- **They are input-dependent.** The gate is recomputed at every step from $\mathbf{x}_t$ and $\mathbf{h}_{t-1}$, so the network can keep memory closed for twenty steps and open it on the one word that matters.
+- **They act per unit.** Each memory unit has its own gate value, so one unit can hold a fact while its neighbour is overwritten.
+
+The sigmoid is used for gates because its range is exactly the range of a "how much" fraction. `tanh`, with range $(-1, 1)$, is used for **content**, the values that get written, because content can be positive or negative.
+
+---
+
+## The LSTM cell, step by step
+
+At each step the cell receives three things — the input $\mathbf{x}_t$, the previous hidden state $\mathbf{h}_{t-1}$, and the previous cell state $\mathbf{c}_{t-1}$ — and produces $\mathbf{h}_t$ and $\mathbf{c}_t$.
+
+<Mermaid
+  chart={`
+flowchart LR
+    IN["x_t and h_(t-1)"] --> F["forget gate f_t (sigmoid)"]
+    IN --> I["input gate i_t (sigmoid)"]
+    IN --> G["candidate g_t (tanh)"]
+    IN --> O["output gate o_t (sigmoid)"]
+    CP["c_(t-1)"] --> M1["multiply by f_t"]
+    F --> M1
+    I --> M2["i_t times g_t"]
+    G --> M2
+    M1 --> ADD["add"]
+    M2 --> ADD
+    ADD --> C["c_t"]
+    C --> T["tanh"]
+    T --> M3["multiply by o_t"]
+    O --> M3
+    M3 --> H["h_t"]
+`}
+/>
+
+The path along the bottom — $\mathbf{c}_{t-1}$, multiply, add, $\mathbf{c}_t$ — is the **cell state highway**. It has no weight matrix and no squashing function on it.
+
+### Step 1: decide what to forget
+
+$$
+\mathbf{f}_t = \sigma(\mathbf{W}_{f}\mathbf{x}_t + \mathbf{U}_{f}\mathbf{h}_{t-1} + \mathbf{b}_f)
+$$
+
+The **forget gate** looks at the new input and the previous output and produces, for each memory unit, how much of the old memory to keep. $f = 1$ keeps it, $f = 0$ erases it. In a language model, a unit tracking "the subject is plural" should be erased when a new sentence begins with a new subject.
+
+### Step 2: decide what to write
+
+Writing has two parts: **what** could be written, and **how much** of it to write.
+
+$$
+\begin{aligned}
+\mathbf{g}_t &= \tanh(\mathbf{W}_{g}\mathbf{x}_t + \mathbf{U}_{g}\mathbf{h}_{t-1} + \mathbf{b}_g) && \text{candidate values} \\
+\mathbf{i}_t &= \sigma(\mathbf{W}_{i}\mathbf{x}_t + \mathbf{U}_{i}\mathbf{h}_{t-1} + \mathbf{b}_i) && \text{input gate}
+\end{aligned}
+$$
+
+The **candidate** $\mathbf{g}_t$ is new content proposed for memory — it is exactly the vanilla RNN update. The **input gate** $\mathbf{i}_t$ decides, per unit, how much of that proposal actually gets written. Separating them lets the network compute a candidate every step but commit it only when warranted.
+
+### Step 3: update the cell state
+
+$$
+\mathbf{c}_t = \mathbf{f}_t \odot \mathbf{c}_{t-1} + \mathbf{i}_t \odot \mathbf{g}_t
+$$
+
+This is the line that makes the LSTM work. The new memory is the old memory, partly erased, **plus** the new content, partly admitted. When $\mathbf{f}_t \approx 1$ and $\mathbf{i}_t \approx 0$, $\mathbf{c}_t \approx \mathbf{c}_{t-1}$: the memory passes through untouched.
+
+### Step 4: decide what to output
+
+$$
+\begin{aligned}
+\mathbf{o}_t &= \sigma(\mathbf{W}_{o}\mathbf{x}_t + \mathbf{U}_{o}\mathbf{h}_{t-1} + \mathbf{b}_o) && \text{output gate} \\
+\mathbf{h}_t &= \mathbf{o}_t \odot \tanh(\mathbf{c}_t) && \text{hidden state}
+\end{aligned}
+$$
+
+Not everything in memory is relevant to the current step. The **output gate** selects which parts of the (squashed) cell state are exposed as the hidden state $\mathbf{h}_t$, which feeds the next layer, the output head, and all four gates at the next step. A unit can hold "subject is plural" in $\mathbf{c}$ for many steps with its output gate closed, and open the gate only when a verb is due.
+
+### All six equations together
+
+| Quantity                    | Equation                                                                             | Range     | Role                          |
+| :-------------------------- | :----------------------------------------------------------------------------------- | :-------- | :---------------------------- |
+| Forget gate $\mathbf{f}_t$  | $\sigma(\mathbf{W}_{f}\mathbf{x}_t + \mathbf{U}_{f}\mathbf{h}_{t-1} + \mathbf{b}_f)$ | $(0, 1)$  | How much old memory to keep   |
+| Input gate $\mathbf{i}_t$   | $\sigma(\mathbf{W}_{i}\mathbf{x}_t + \mathbf{U}_{i}\mathbf{h}_{t-1} + \mathbf{b}_i)$ | $(0, 1)$  | How much new content to write |
+| Candidate $\mathbf{g}_t$    | $\tanh(\mathbf{W}_{g}\mathbf{x}_t + \mathbf{U}_{g}\mathbf{h}_{t-1} + \mathbf{b}_g)$  | $(-1, 1)$ | The new content itself        |
+| Output gate $\mathbf{o}_t$  | $\sigma(\mathbf{W}_{o}\mathbf{x}_t + \mathbf{U}_{o}\mathbf{h}_{t-1} + \mathbf{b}_o)$ | $(0, 1)$  | How much memory to expose     |
+| Cell state $\mathbf{c}_t$   | $\mathbf{f}_t \odot \mathbf{c}_{t-1} + \mathbf{i}_t \odot \mathbf{g}_t$              | unbounded | Long-term memory              |
+| Hidden state $\mathbf{h}_t$ | $\mathbf{o}_t \odot \tanh(\mathbf{c}_t)$                                             | $(-1, 1)$ | Working memory and output     |
+
+All four gate-like layers read the same input $[\mathbf{x}_t; \mathbf{h}_{t-1}]$, so implementations compute them with one matrix multiply producing a $4H$-wide vector and split it into four pieces.
+
+---
+
+## A worked example: remembering that the subject is plural
+
+Track one memory unit of a trained LSTM through "keys to the cabinet are". Suppose the unit has learned to store "subject is plural" as a positive value. The gate values below are illustrative of what a trained cell produces at each word; the arithmetic is exact.
+
+| Step | Word      | $f_t$ | $i_t$ | $g_t$ | $o_t$ | $c_t = f_t c_{t-1} + i_t g_t$      | $h_t = o_t \tanh(c_t)$ |
+| ---: | :-------- | ----: | ----: | ----: | ----: | :--------------------------------- | ---------------------: |
+|    1 | `keys`    |  0.00 |  0.95 |  0.90 |  0.10 | $0 + 0.95 \cdot 0.90 = 0.855$      |                  0.069 |
+|    2 | `to`      |  0.98 |  0.05 | −0.30 |  0.10 | $0.98 \cdot 0.855 - 0.015 = 0.823$ |                  0.068 |
+|    3 | `the`     |  0.98 |  0.05 | −0.30 |  0.10 | $0.791$                            |                  0.066 |
+|    4 | `cabinet` |  0.98 |  0.05 | −0.30 |  0.10 | $0.761$                            |                  0.064 |
+|    5 | `are`     |  0.98 |  0.05 | −0.30 |  0.95 | $0.730$                            |              **0.592** |
+
+Reading the table:
+
+- **Step 1:** the input gate opens and writes the plural fact ($c = 0.855$). The output gate stays nearly shut, so the fact is stored but not broadcast ($h = 0.069$).
+- **Steps 2 to 4:** the forget gate stays near 1 and the input gate near 0, so the memory is barely disturbed by irrelevant words. It decays only from 0.855 to 0.761.
+- **Step 5:** a verb is due. The output gate opens and the stored fact appears in the hidden state ($h = 0.592$), where the output layer uses it to prefer `are` over `is`.
+
+Compare the vanilla RNN from the [worked example](/ai/classical-deep-learning/recurrent-networks#a-worked-example-by-hand): with a recurrent weight of 0.9, the same event decays from 0.76 to 0.36 in four steps, and the network has no way to hold the value while hiding it — whatever is in $\mathbf{h}$ is both its memory and its output.
+
+---
+
+## Why the gradient survives
+
+Differentiate the cell update $\mathbf{c}_t = \mathbf{f}_t \odot \mathbf{c}_{t-1} + \mathbf{i}_t \odot \mathbf{g}_t$ with respect to $\mathbf{c}_{t-1}$, along the direct path:
+
+$$
+\frac{\partial \mathbf{c}_t}{\partial \mathbf{c}_{t-1}} = \operatorname{diag}(\mathbf{f}_t) \quad \text{(plus smaller indirect terms through } \mathbf{h}_{t-1} \text{ in the gates)}
+$$
+
+Across many steps, the direct-path gradient is a product of forget-gate values:
+
+$$
+\frac{\partial \mathbf{c}_T}{\partial \mathbf{c}_k} \approx \prod_{t=k+1}^{T} \operatorname{diag}(\mathbf{f}_t)
+$$
+
+Compare the two products over 100 steps:
+
+| Cell                       | Per-step factor               | After 100 steps     |
+| :------------------------- | :---------------------------- | :------------------ |
+| Vanilla RNN, typical       | $\tanh' \cdot w \approx 0.72$ | $5 \times 10^{-15}$ |
+| LSTM, forget gate at 0.98  | $f = 0.98$                    | $0.13$              |
+| LSTM, forget gate at 0.999 | $f = 0.999$                   | $0.90$              |
+
+Three differences make the LSTM factor behave:
+
+1. **No weight matrix on the path.** The vanilla factor contains $\mathbf{W}_{hh}$, whose norm is fixed by training for all inputs. The LSTM factor contains only $\mathbf{f}_t$.
+2. **No squashing derivative on the path.** The cell state is not passed through `tanh` before being carried forward; it is only scaled and added to.
+3. **The factor is learned and input-dependent.** The network can hold $f_t \approx 1$ for exactly the steps where memory must be kept, and drop it to erase. The gradient is preserved precisely where the dependency exists.
+
+Hochreiter and Schmidhuber called this path the **constant error carousel**: in their original 1997 cell, without a forget gate, the factor was exactly 1, so error signals circulated through the cell unchanged indefinitely. Adding the forget gate traded that guarantee for the ability to reset memory, which matters on long continuous streams where the cell state would otherwise grow without bound.
+
+<Callout type="info">
+  ### The same idea as a residual connection
+
+$\mathbf{c}_t = \mathbf{c}_{t-1} + \text{update}$ is a residual connection along time: the derivative of the output with respect to the input contains an identity term. [ResNet](/ai/classical-deep-learning/vision-architectures#resnet-the-residual-connection) applied the same idea across depth in 2015, and the transformer's residual stream applies it again. The **highway network** (Srivastava et al., 2015), a direct ancestor of ResNet, was explicitly an LSTM-style gate applied across layers instead of time.
+
+</Callout>
+
+---
+
+## Practical details
+
+**Parameter count.** Each of the four gate layers has an input matrix $(H, F)$, a recurrent matrix $(H, H)$, and a bias $(H)$. Total: $4(HF + H^2 + H)$, four times a vanilla RNN. For $F = 128$, $H = 256$: $4 \times 98{,}560 = 394{,}240$. (PyTorch keeps two bias vectors per gate, so it reports $4(HF + H^2 + 2H)$.)
+
+**Forget-gate bias initialization.** With the default bias of 0, $f_t$ starts near $\sigma(0) = 0.5$, so an untrained cell halves its memory every step and early gradients vanish just as in a vanilla RNN. Initializing $\mathbf{b}_f$ to 1 or 2 makes the gate start mostly open ($\sigma(1) = 0.73$, $\sigma(2) = 0.88$). Jozefowicz et al. (2015) found this one change closed most of the gap between LSTMs and the best alternatives they searched for.
+
+```python
+lstm = torch.nn.LSTM(input_size=128, hidden_size=256, batch_first=True)
+H = lstm.hidden_size
+for name, p in lstm.named_parameters():
+    if "bias" in name:
+        p.data[H : 2 * H].fill_(1.0)   # PyTorch gate order: input, forget, cell, output
+```
+
+PyTorch has two bias vectors (`bias_ih` and `bias_hh`) and the loop fills both, so the effective forget bias is 2.
+
+**Shapes in PyTorch.** `nn.LSTM` returns the output sequence plus a tuple of final states:
+
+```python
+lstm = torch.nn.LSTM(128, 256, num_layers=2, batch_first=True, bidirectional=True, dropout=0.1)
+out, (h_n, c_n) = lstm(torch.randn(8, 40, 128))
+print(out.shape)   # (8, 40, 512)  top layer, both directions concatenated
+print(h_n.shape)   # (4, 8, 256)   num_layers * num_directions final hidden states
+print(c_n.shape)   # (4, 8, 256)   the matching final cell states
+```
+
+The `dropout` argument applies between stacked layers, not inside the recurrence, and does nothing when `num_layers=1`.
+
+**Peephole connections** (Gers and Schmidhuber, 2000) let each gate also read $\mathbf{c}_{t-1}$ directly. They help on tasks requiring precise timing and are otherwise rarely used; `nn.LSTM` does not implement them.
+
+---
+
+## The GRU: a simpler gated cell
+
+The **Gated Recurrent Unit** keeps the key idea — an additive, gated memory path — and removes the parts that turned out not to be essential. It has one state vector $\mathbf{h}_t$ (no separate cell state) and two gates:
+
+$$
+\begin{aligned}
+\mathbf{z}_t &= \sigma(\mathbf{W}_{z}\mathbf{x}_t + \mathbf{U}_{z}\mathbf{h}_{t-1} + \mathbf{b}_z) && \text{update gate} \\
+\mathbf{r}_t &= \sigma(\mathbf{W}_{r}\mathbf{x}_t + \mathbf{U}_{r}\mathbf{h}_{t-1} + \mathbf{b}_r) && \text{reset gate} \\
+\tilde{\mathbf{h}}_t &= \tanh(\mathbf{W}_{h}\mathbf{x}_t + \mathbf{U}_{h}(\mathbf{r}_t \odot \mathbf{h}_{t-1}) + \mathbf{b}_h) && \text{candidate} \\
+\mathbf{h}_t &= \mathbf{z}_t \odot \mathbf{h}_{t-1} + (1 - \mathbf{z}_t) \odot \tilde{\mathbf{h}}_t && \text{interpolation}
+\end{aligned}
+$$
+
+Reading each line:
+
+- **Update gate $\mathbf{z}_t$** decides, per unit, how much of the old state to keep. The new state is a weighted average of old state and candidate, with weights $z$ and $1 - z$. With $z = 0.9$, $h_{t-1} = 0.8$ and a candidate of $-0.5$, $h_t = 0.9 \cdot 0.8 + 0.1 \cdot (-0.5) = 0.67$: mostly the old value.
+- **Reset gate $\mathbf{r}_t$** decides how much of the old state the candidate is allowed to see. With $r \approx 0$, the candidate is computed from the input alone, as if the sequence had just started — useful at a boundary such as a new sentence.
+- **Candidate $\tilde{\mathbf{h}}_t$** is the vanilla RNN update with a reset-filtered previous state.
+
+The update gate plays the forget and input roles at once, with the constraint "input = 1 − forget". This is what the GRU gives up: an LSTM can keep its memory **and** write new content in the same step ($f = 1$, $i = 1$), or erase without writing ($f = 0$, $i = 0$). A GRU must trade one for the other. The GRU also has no output gate, so everything it remembers is always exposed.
+
+The gradient argument carries over: along the direct path, $\partial \mathbf{h}_t / \partial \mathbf{h}_{t-1} \approx \operatorname{diag}(\mathbf{z}_t)$, a learned factor that can stay near 1.
+
+### RNN, GRU, LSTM compared
+
+| Property                       | Vanilla RNN                                            | GRU                 | LSTM                           |
+| :----------------------------- | :----------------------------------------------------- | :------------------ | :----------------------------- |
+| State vectors                  | 1 ($\mathbf{h}$)                                       | 1 ($\mathbf{h}$)    | 2 ($\mathbf{h}$, $\mathbf{c}$) |
+| Gates                          | 0                                                      | 2 (update, reset)   | 3 (forget, input, output)      |
+| Parameters (relative)          | $1\times$                                              | $3\times$           | $4\times$                      |
+| Memory path                    | Multiplied by $\mathbf{W}_{hh}$ and squashed each step | Gated interpolation | Gated addition                 |
+| Practical dependency range     | ~10–20 steps                                           | Hundreds            | Hundreds                       |
+| Can keep and write in one step | n/a                                                    | No                  | Yes                            |
+
+Chung et al. (2014) and Jozefowicz et al. (2015) found the two gated cells close on most tasks; neither dominated. The GRU is faster and has fewer parameters, which helps on small datasets; the LSTM is slightly more expressive and is the safer default on large ones. Greff et al. (2017), testing eight LSTM variants, found the forget gate and the output activation were the critical components and that no variant reliably beat the standard cell.
+
+---
+
+## Using gated RNNs
+
+### Sequence classification (many-to-one)
+
+A sentiment classifier reads token embeddings with a bidirectional LSTM and classifies from the final states of both directions:
+
+```python title="classifier.py"
+import torch
+import torch.nn as nn
+
+class SentimentLSTM(nn.Module):
+    def __init__(self, vocab: int, dim: int = 128, hidden: int = 256, classes: int = 2):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, dim, padding_idx=0)
+        self.lstm = nn.LSTM(dim, hidden, batch_first=True, bidirectional=True)
+        self.head = nn.Linear(2 * hidden, classes)
+
+    def forward(self, ids):                     # ids: (B, T) token indices
+        _, (h_n, _) = self.lstm(self.emb(ids))  # h_n: (2, B, hidden)
+        return self.head(torch.cat([h_n[0], h_n[1]], dim=-1))
+```
+
+`h_n[0]` is the forward direction's state after the last token; `h_n[1]` is the backward direction's state after reading back to the first token. Concatenated, they summarize the review from both ends. Real batches need [packing](/ai/classical-deep-learning/recurrent-networks#rnns-in-pytorch) so padding does not corrupt these states.
+
+### Time series forecasting
+
+**Forecasting** predicts future values of a measured series (energy load, sales, sensor readings) from its past. The standard framing is a **sliding window**: use the last $W$ values (the window) to predict the next $H$ values (the **horizon**), and slide forward one step to make the next training example. A series of 1,000 points with $W = 48$, $H = 1$ yields $1000 - 48 = 952$ examples.
+
+Producing several future steps can be done three ways:
+
+| Strategy      | How                                                      | Weakness                                                          |
+| :------------ | :------------------------------------------------------- | :---------------------------------------------------------------- |
+| **Recursive** | Predict one step, feed the prediction back in, repeat    | Errors compound: a small bias at step 1 is fed back and amplified |
+| **Direct**    | One output per future step, all predicted at once        | Steps are predicted independently and may be inconsistent         |
+| **Seq2seq**   | An encoder reads the window, a decoder emits the horizon | More parameters; usually best at long horizons                    |
+
+In forecasting, data handling matters more than the choice of cell:
+
+- **Split by time, never randomly.** Neighbouring points are highly correlated, so a random split lets the model interpolate between training points it has seen on either side, and reported accuracy will not survive deployment.
+- **Fit normalization on the training range only.** Standardizing with statistics from the whole series leaks the future into training.
+- **Remove trends by differencing.** Model $y_t - y_{t-1}$ instead of $y_t$. A network cannot extrapolate to values outside its training range, and a trending series is always heading outside it.
+- **Beat a naive baseline.** "Tomorrow equals today" (persistence) or "same as this time last week" (seasonal naive) is strong on many real series. A model that does not beat it has learned nothing useful.
+
+---
+
+## When recurrence still makes sense
+
+Transformers replaced RNNs for language because attention connects any two positions in one step and trains in parallel over the whole sequence. The recurrent design still has one property attention lacks: a **constant-size state**. An RNN summarizes arbitrarily long history in $H$ numbers, so each new step costs the same compute and memory regardless of how much came before. A transformer generating token 10,000 attends over the 9,999 before it, and its [KV cache](/ai/inference) grows linearly.
+
+| Situation                                      | Better choice               |
+| :--------------------------------------------- | :-------------------------- |
+| Large data, long contexts, parallel training   | Transformer                 |
+| Streaming input processed one sample at a time | LSTM / GRU, constant memory |
+| Tiny datasets, short sequences                 | GRU or LSTM                 |
+| Microcontrollers and tight memory budgets      | GRU                         |
+| Irregularly sampled series                     | RNN with time-aware decay   |
+
+Modern **state-space and linear-recurrent models** (Mamba, RWKV, RetNet, xLSTM) revisit exactly this trade-off: recurrent, constant-memory inference with a structure that can still be trained in parallel. They are competitive with transformers on long-context language modelling at lower inference cost.
+
+---
+
+## Key terms
+
+| Term                         | Meaning                                                                                              |
+| :--------------------------- | :--------------------------------------------------------------------------------------------------- |
+| **LSTM**                     | A gated recurrent cell with a separate cell state and forget, input, and output gates                |
+| **gate**                     | A sigmoid vector in $(0, 1)$ multiplied element-wise into another vector to control flow             |
+| **Hadamard product** $\odot$ | Element-wise multiplication of two equal-length vectors                                              |
+| **cell state**               | The LSTM's long-term memory $\mathbf{c}_t$, updated only by gated erasing and adding                 |
+| **candidate**                | The proposed new content $\mathbf{g}_t$ (LSTM) or $\tilde{\mathbf{h}}_t$ (GRU), computed with `tanh` |
+| **constant error carousel**  | The additive cell path along which gradients flow without repeated matrix multiplication             |
+| **GRU**                      | A gated cell with one state, an update gate, and a reset gate                                        |
+| **sliding window / horizon** | Predicting the next $H$ values from the previous $W$ values of a series                              |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="What problem was the LSTM designed to solve, and what is the core design idea?">
+
+    The vanilla RNN's vanishing gradient: memory is rewritten through $\mathbf{W}_{hh}$ and `tanh` at every step, so gradients across many steps shrink exponentially and long-range dependencies are never learned. The LSTM keeps a separate cell state that is carried forward by element-wise scaling and addition, $\mathbf{c}_t = \mathbf{f}_t \odot \mathbf{c}_{t-1} + \mathbf{i}_t \odot \mathbf{g}_t$, with learned gates controlling what is erased, written, and exposed.
+
+  </Accordion>
+  <Accordion title="Write the LSTM equations and say what each gate does.">
+
+    $\mathbf{f}_t, \mathbf{i}_t, \mathbf{o}_t = \sigma(\cdot)$ of $\mathbf{W}\mathbf{x}_t + \mathbf{U}\mathbf{h}_{t-1} + \mathbf{b}$ with separate weights, and $\mathbf{g}_t = \tanh(\cdot)$ of the same form. Then $\mathbf{c}_t = \mathbf{f}_t \odot \mathbf{c}_{t-1} + \mathbf{i}_t \odot \mathbf{g}_t$ and $\mathbf{h}_t = \mathbf{o}_t \odot \tanh(\mathbf{c}_t)$. The forget gate decides how much old memory to keep, the input gate how much of the candidate to write, and the output gate how much of the memory to expose as the hidden state.
+
+  </Accordion>
+  <Accordion title="Why are gates computed with a sigmoid and the candidate with tanh?">
+
+    A gate is a fraction — how much to pass — so its range must be $(0, 1)$, which is the sigmoid's range. The candidate is content to be added to memory, which must be able to push memory up or down, so it needs a signed, zero-centred range: `tanh` gives $(-1, 1)$.
+
+  </Accordion>
+  <Accordion title="Point at the exact term that lets LSTM gradients survive, and compare it with the vanilla RNN.">
+
+    $\partial \mathbf{c}_t / \partial \mathbf{c}_{t-1} = \operatorname{diag}(\mathbf{f}_t)$ along the direct path. The vanilla RNN's one-step factor is $\operatorname{diag}(\tanh'(\mathbf{z}_t))\mathbf{W}_{hh}$, which contains a fixed matrix and a squashing derivative. Over 100 steps a typical vanilla factor of 0.72 gives $5 \times 10^{-15}$; a forget gate held at 0.98 gives 0.13, and the network can choose to hold it there exactly where the dependency exists.
+
+  </Accordion>
+  <Accordion title="What is the constant error carousel?">
+
+    The original 1997 LSTM's cell update $\mathbf{c}_t = \mathbf{c}_{t-1} + \mathbf{i}_t \odot \mathbf{g}_t$, with no forget gate, so the derivative along the cell path is exactly 1 and error signals circulate without decay. The forget gate, added in 2000, turned that factor into a learned value so memory can be reset, which matters on long streams where the cell state would otherwise grow without bound.
+
+  </Accordion>
+  <Accordion title="Why initialize the forget-gate bias to a positive value?">
+
+    With zero bias, $f_t \approx \sigma(0) = 0.5$ at initialization, so an untrained LSTM halves its cell state every step and early gradients vanish as in a vanilla RNN. A bias of 1 or 2 starts the gate at 0.73 or 0.88, so the cell remembers by default and the network can learn to forget where needed.
+
+  </Accordion>
+  <Accordion title="Why does the LSTM need both a cell state and a hidden state?">
+
+    They do different jobs. The cell state is protected memory that should change only when deliberately written. The hidden state is what the rest of the network reads at this step and what the gates use at the next one. The output gate separates them, so the cell can hold a fact for many steps without broadcasting it, and expose it only when it is relevant.
+
+  </Accordion>
+  <Accordion title="Write the GRU equations. What does it give up relative to the LSTM?">
+
+    $\mathbf{z}_t$ and $\mathbf{r}_t$ are sigmoid gates, $\tilde{\mathbf{h}}_t = \tanh(\mathbf{W}_h\mathbf{x}_t + \mathbf{U}_h(\mathbf{r}_t \odot \mathbf{h}_{t-1}) + \mathbf{b}_h)$, and $\mathbf{h}_t = \mathbf{z}_t \odot \mathbf{h}_{t-1} + (1 - \mathbf{z}_t) \odot \tilde{\mathbf{h}}_t$. The single update gate ties input to $1 - $ forget, so it cannot keep memory and write new content in the same step, and with no output gate everything stored is always exposed. In return it has three weight blocks instead of four.
+
+  </Accordion>
+  <Accordion title="How many parameters does an LSTM layer have, and how does that compare with a GRU and a vanilla RNN?">
+
+    $4(HF + H^2 + H)$ for input width $F$ and hidden width $H$: four gate layers, each with an input matrix, a recurrent matrix, and a bias. A GRU has $3(HF + H^2 + H)$ and a vanilla RNN $HF + H^2 + H$. PyTorch stores two biases per gate, adding another $4H$ for the LSTM.
+
+  </Accordion>
+  <Accordion title="Why must time-series splits be chronological?">
+
+    Neighbouring points are strongly correlated. A random split puts points from both before and after each test point into training, so the model interpolates rather than forecasts, and the reported metric leaks information that deployment will never have. A chronological split keeps every test point strictly after all training data.
+
+  </Accordion>
+  <Accordion title="What does a recurrent model give at inference time that a transformer does not?">
+
+    A fixed-size state. Each new step costs the same compute and memory however long the history, because everything is summarized in $H$ numbers. A transformer attends over the whole context, so per-token cost and KV-cache memory grow with length. That is why streaming and edge settings still use recurrent models and why state-space models revisit the design.
+
+  </Accordion>
+</Accordions>

@@ -1,385 +1,336 @@
 ---
-title: Recurrent Networks
-description: 'Recurrent hidden states, backpropagation through time, vanishing and exploding gradients, clipping, LSTM and GRU gating, and sliding-window forecasting.'
+title: Recurrent Neural Networks
+description: 'What a recurrent neural network is and why sequences need one: the hidden state as memory, the recurrence equations with shapes, a step-by-step worked example, unrolling, the input-output patterns of sequence tasks, training a character-level language model, and stacked and bidirectional RNNs.'
 ---
 
-A convolution shares weights across space. A recurrent network shares weights across time. That single change lets a model carry information forward over a variable-length sequence, and it creates the gradient problem that dominated sequence modelling for a decade.
+A **recurrent neural network (RNN)** is a neural network that processes a sequence one element at a time while carrying a vector of memory, the **hidden state**, from each step to the next. At every step the same small network, the **cell**, reads two things, the current input and the previous hidden state, and produces a new hidden state. Because the cell is reused at every position, one set of weights handles sequences of any length.
 
----
+This page builds the RNN from the problem it solves. The next page, [Vanishing and Exploding Gradients](/ai/classical-deep-learning/vanishing-gradients), explains why a plain RNN cannot remember for long, and [LSTM and GRU](/ai/classical-deep-learning/lstm-and-gru) covers the gated cells built to fix that.
 
-## The plain-language version
-
-Much data comes as a **sequence**, where order matters: words in a sentence, notes in a song, a stock price minute by minute. Sequences also vary in length. A dense layer wants a fixed-size input, and a CNN looks at nearby positions only, so neither fits well.
-
-A **recurrent neural network (RNN)** reads a sequence one step at a time and keeps a running summary, called the **hidden state**. At each step it combines the new input with the previous hidden state to produce an updated hidden state. It is like reading a book while keeping notes: after each sentence you update your notes, and the notes are all you carry to the next sentence. The same weights are used at every step, which is why it handles any length.
-
-The catch: training sends gradients backwards through every step. Over a long sequence they get multiplied many times, so they shrink toward zero (the network forgets the start) or blow up. The **LSTM** and **GRU** fix this with **gates**, learned switches that decide what to keep, what to forget, and what to output.
-
-| Word                                | Plain meaning                                                                                                                                  |
-| :---------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------- |
-| **sequence**                        | Ordered data: tokens, audio samples, measurements over time.                                                                                   |
-| **time step**                       | One position in the sequence. Step `t` is the `t`-th element.                                                                                  |
-| **hidden state (`h_t`)**            | The network's running memory: a vector updated at every step that summarizes everything read so far.                                           |
-| **recurrent cell**                  | The small piece of computation applied at every step: new input plus previous hidden state in, new hidden state out.                           |
-| **unrolling**                       | Drawing (or computing) the RNN as one copy of the cell per time step, all sharing weights. It turns a loop into an ordinary deep network.      |
-| **BPTT**                            | Backpropagation through time: ordinary backpropagation run over the unrolled network.                                                          |
-| **truncated BPTT**                  | Only backpropagating through the last `k` steps, to save memory and time on long sequences.                                                    |
-| **vanishing / exploding gradients** | Gradients shrinking to nearly zero or growing huge as they pass back through many steps.                                                       |
-| **gradient clipping**               | Scaling gradients down whenever their total size exceeds a limit. The standard fix for exploding gradients.                                    |
-| **LSTM**                            | Long Short-Term Memory: an RNN cell with a separate **cell state** and three gates (forget, input, output). Keeps information over long spans. |
-| **gate**                            | A vector of numbers between 0 and 1 (from a sigmoid) multiplied into another vector, acting as a learned dimmer switch.                        |
-| **cell state**                      | The LSTM's long-term memory lane, changed only by gated additions, which lets gradients flow far back.                                         |
-| **GRU**                             | Gated Recurrent Unit: a simpler gated cell with two gates and no separate cell state. Often performs about as well as an LSTM.                 |
-| **bidirectional RNN**               | Two RNNs, one reading forwards and one backwards, so every position sees context from both sides.                                              |
-| **stacked RNN**                     | Several RNN layers, each reading the hidden states of the one below.                                                                           |
-| **padding / packing**               | Padding fills short sequences up to a common length; packing tells the RNN to skip the filler.                                                 |
-| **time series**                     | Measurements taken at regular intervals over time, such as temperature every hour.                                                             |
-| **sliding window / horizon**        | Predict the next `H` values (the horizon) from the previous `W` values (the window), then slide forward.                                       |
-| **autoregressive**                  | Predicting the next value from previous values, then feeding predictions back in to predict further ahead.                                     |
+**Builds on:** [Neurons and Activations](/ai/neural-networks/neurons-and-activations) for `tanh` and the sigmoid, and [Vision and Sequence Basics](/ai/classical-deep-learning/vision-and-sequence-basics#sequences-as-tensors) for the `(B, T, F)` sequence shape.
 
 ---
 
-## The recurrent cell
+## What makes sequence data different
 
-One hidden state `h_t` is updated at every timestep from the current input `x_t` and the previous state:
+A **sequence** is an ordered list of items $x_1, x_2, \dots, x_T$ where the order carries meaning. Words in a sentence, characters in a word, audio frames, daily temperatures, and clicks in a session are all sequences. $T$ is the **length**, and each position $t$ is a **time step**, whether or not it has anything to do with clock time.
+
+Three properties separate sequences from the fixed-size feature vectors a dense network handles:
+
+| Property                 | Example                                                                                              | What it demands of a model                              |
+| :----------------------- | :--------------------------------------------------------------------------------------------------- | :------------------------------------------------------ |
+| **Order matters**        | "dog bites man" and "man bites dog" contain the same words                                           | The model must know which item came first               |
+| **Length varies**        | A tweet and a novel are both text                                                                    | The model cannot have one input slot per position       |
+| **Long-range relations** | "The keys to the old wooden cabinet **are** on the table" — `are` agrees with `keys`, six words back | Information from early steps must survive to later ones |
+
+### Why the obvious alternatives fail
+
+**A dense network over the whole sequence.** Concatenate all $T$ word vectors into one long vector. This fixes $T$ at design time, and it ties each weight to one position: a pattern learned for "not good" at positions 3 and 4 does not transfer to positions 17 and 18. The same weakness that makes dense layers wasteful on images (see [Why dense layers are not enough](/ai/classical-deep-learning/vision-and-sequence-basics#why-dense-layers-are-not-enough)) appears along the time axis.
+
+**A fixed window.** Feed only the last $k$ items to a dense network, sliding along. This handles any length, but nothing older than $k$ steps can affect the output. Raising $k$ raises the parameter count linearly, and the right $k$ is unknown in advance.
+
+**Bag of words.** Sum or average all the item vectors. This handles any length with few parameters, and throws order away completely.
+
+What is wanted is something that reads one item at a time like the sliding window, shares weights across positions like a convolution, and can in principle carry information from step 1 all the way to step $T$. That is the recurrent design.
+
+---
+
+## The core idea: a memory updated at every step
+
+Reading a sentence works this way for a person. Nobody holds every previous word verbatim; they keep a running understanding and revise it with each new word. After "The keys to the", the important retained fact is roughly "the subject is plural, something about keys". The next word revises that understanding, and the old words themselves can be forgotten.
+
+An RNN formalizes exactly this. The running understanding is a vector $\mathbf{h}_t$ of fixed width $H$ (for example $H = 256$), and a learned function updates it:
 
 $$
-\begin{aligned}
-\mathbf{h}_t &= \tanh(\mathbf{W}_{ih} \mathbf{x}_t + \mathbf{b}_{ih} + \mathbf{W}_{hh} \mathbf{h}_{t-1} + \mathbf{b}_{hh}) \\
-\mathbf{y}_t &= \mathbf{W}_{hy} \mathbf{h}_t + \mathbf{b}_{hy}
-\end{aligned}
+\mathbf{h}_t = f_\theta(\mathbf{h}_{t-1}, \mathbf{x}_t)
 $$
 
-`W_hh` is applied at every step, so it is the same matrix multiplied by itself as many times as the sequence is long. That fact explains both what RNNs can do and why they fail.
+- $\mathbf{x}_t$ is the input at step $t$, a vector of width $F$ (for text, the embedding of the $t$-th token).
+- $\mathbf{h}_{t-1}$ is the hidden state after the previous step. Before the first step it is set to $\mathbf{h}_0 = \mathbf{0}$ (or learned).
+- $f_\theta$ is the **cell**, with parameters $\theta$. The same $\theta$ is used at every step. That reuse is called **weight sharing across time**.
 
-```python
-import torch
-import torch.nn as nn
+Two consequences follow directly from this one line:
 
-rnn = nn.RNN(input_size=128, hidden_size=256, num_layers=1, batch_first=True)
-x = torch.randn(8, 40, 128)              # batch 8, sequence length 40
-out, h_n = rnn(x)
-print(out.shape)   # (8, 40, 256)  hidden state at every timestep
-print(h_n.shape)   # (1, 8, 256)   hidden state at the last timestep only
-```
+1. **Any length works.** The cell is applied $T$ times for a length-$T$ sequence; nothing in the parameters depends on $T$.
+2. **The hidden state is a lossy summary.** All information about $x_1, \dots, x_t$ that the model will ever use later has to be packed into $H$ numbers. The network must learn what to keep. This is both the strength of the design and, as the later pages show, its central limitation.
 
-Without `batch_first=True` the input layout is `(T, B, H)`, which is what `nn.LSTM` and `nn.GRU` also default to. This is the most common shape bug in sequence code.
+<Callout type="info">
+  ### RNNs are learned state machines
 
-PyTorch keeps two separate biases, `b_ih` and `b_hh`, for CUDA kernel reasons. They are redundant; their sum is what matters.
-
----
-
-## Backpropagation through time
-
-Unroll the recurrence over `T` steps and you have a `T`-layer network where every layer shares the same weights. BPTT is ordinary backprop on that unrolled graph.
-
-The gradient of the final state with respect to an earlier state is a product of `T - k` Jacobians:
-
-```text
-dh_T / dh_k = product over t=k+1..T of  diag(tanh'(z_t)) W_hh
-```
-
-Bounding the norm, with `gamma = max tanh' = 1` and `rho = ||W_hh||_2`:
-
-```text
-||dh_T / dh_k|| <= (gamma * rho)^(T-k)
-```
-
-That exponent is the whole story.
-
-| `rho`     | Behaviour over 40 steps                      | Symptom                                    |
-| :-------- | :------------------------------------------- | :----------------------------------------- |
-| `rho > 1` | Grows exponentially                          | `NaN` loss, gradient explosion             |
-| `rho = 1` | Stays bounded only if the tanh terms are `1` | Unstable in practice                       |
-| `rho < 1` | Decays exponentially                         | Vanishing gradient, no long range learning |
-
-Because the same matrix is reused at every step, there is no value of `rho` that keeps gradients stable for both very long and very short dependencies. A vanilla RNN learns dependencies over roughly ten to twenty steps and not much beyond.
-
-`gamma` makes it worse. `tanh'` is `1` only at zero and falls towards zero as the pre-activation saturates, so a network with large weights has both a large `rho` and small `gamma` terms that fluctuate wildly. This is why ReLU is sometimes used in recurrent cells for the exploding case: `gamma` becomes exactly `1`.
-
----
-
-## Clipping exploding gradients
-
-Clipping is a bound, not a fix. It stops `NaN` and lets training continue; it does nothing about the vanishing direction.
-
-```python
-loss.backward()
-torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-opt.step()
-```
-
-`clip_grad_norm_` rescales the whole gradient vector if its global norm exceeds the threshold, which preserves direction:
-
-```text
-g <- g * min(1, max_norm / ||g||)
-```
-
-`clip_grad_value_` clamps each element independently and distorts direction. Norm clipping is the default choice for RNNs and LSTMs.
-
-<Callout type="warn">
-  ### Clipping and mixed precision
-
-With `torch.amp.GradScaler`, gradients are scaled up during `backward()` to avoid FP16 underflow. Clipping the scaled values gives you a meaningless threshold. Call `scaler.unscale_(opt)` first, then clip, then `scaler.step(opt)`.
+A finite-state machine reads symbols one at a time and moves between a fixed set of states. An RNN is the continuous, differentiable version: the state is a real vector rather than a label, and the transition rule is learned by gradient descent rather than written by hand. With enough hidden units, an RNN can in principle simulate any finite-state machine.
 
 </Callout>
 
-A typical `max_norm` for an LSTM language model is `5.0`, and for most other recurrent work `1.0`. Monitor the pre-clip norm during training; if it is routinely an order of magnitude above the threshold, the threshold is doing the optimization for you and the learning rate is too high.
-
-### Truncated BPTT
-
-For very long sequences, process the input in chunks of length `L`, detach the hidden state at each chunk boundary, and backpropagate only within a chunk.
-
-```python
-h = None
-for chunk in sequence.split(L, dim=1):
-    out, h = rnn(chunk, h)
-    loss = criterion(out, target)
-    loss.backward()
-    h = tuple(t.detach() for t in h)     # cut the graph between chunks
-```
-
-This bounds memory to `O(L)` instead of `O(T)` and caps the gradient chain length. The cost is that dependencies longer than `L` are never learned, which is fine when `L` is chosen above the dependency length you care about.
-
 ---
 
-## LSTM
+## The vanilla RNN cell
 
-The Long Short-Term Memory cell adds a second state `c_t`, the cell state, which is updated additively rather than by overwriting:
+The simplest choice of $f_\theta$, now called the **vanilla** or **Elman** RNN, is one dense layer applied to the concatenation of input and previous state, followed by `tanh`:
 
 $$
 \begin{aligned}
-\mathbf{i}_t &= \sigma(\mathbf{W}_{ii} \mathbf{x}_t + \mathbf{b}_{ii} + \mathbf{W}_{hi} \mathbf{h}_{t-1} + \mathbf{b}_{hi}) && \text{(input gate)} \\
-\mathbf{f}_t &= \sigma(\mathbf{W}_{if} \mathbf{x}_t + \mathbf{b}_{if} + \mathbf{W}_{hf} \mathbf{h}_{t-1} + \mathbf{b}_{hf}) && \text{(forget gate)} \\
-\mathbf{g}_t &= \tanh(\mathbf{W}_{ig} \mathbf{x}_t + \mathbf{b}_{ig} + \mathbf{W}_{hg} \mathbf{h}_{t-1} + \mathbf{b}_{hg}) && \text{(candidate)} \\
-\mathbf{o}_t &= \sigma(\mathbf{W}_{io} \mathbf{x}_t + \mathbf{b}_{io} + \mathbf{W}_{ho} \mathbf{h}_{t-1} + \mathbf{b}_{ho}) && \text{(output gate)} \\
-\mathbf{c}_t &= \mathbf{f}_t \odot \mathbf{c}_{t-1} + \mathbf{i}_t \odot \mathbf{g}_t && \text{(additive cell update)} \\
-\mathbf{h}_t &= \mathbf{o}_t \odot \tanh(\mathbf{c}_t) && \text{(exposed hidden state)}
+\mathbf{h}_t &= \tanh(\mathbf{W}_{xh} \mathbf{x}_t + \mathbf{W}_{hh} \mathbf{h}_{t-1} + \mathbf{b}_h) \\
+\mathbf{y}_t &= \mathbf{W}_{hy} \mathbf{h}_t + \mathbf{b}_y
 \end{aligned}
 $$
 
-| Gate   | Range    | Controls                               |
-| :----- | :------- | :------------------------------------- |
-| Forget | `(0, 1)` | How much of the old cell state to keep |
-| Input  | `(0, 1)` | How much of the candidate to write     |
-| Output | `(0, 1)` | How much of the cell state to expose   |
+| Symbol            | Shape    | Role                                                                         |
+| :---------------- | :------- | :--------------------------------------------------------------------------- |
+| $\mathbf{x}_t$    | $(F)$    | Input at step $t$                                                            |
+| $\mathbf{h}_t$    | $(H)$    | Hidden state after step $t$                                                  |
+| $\mathbf{W}_{xh}$ | $(H, F)$ | **Input-to-hidden** weights: how the new input changes the memory            |
+| $\mathbf{W}_{hh}$ | $(H, H)$ | **Hidden-to-hidden** (recurrent) weights: how the old memory carries forward |
+| $\mathbf{b}_h$    | $(H)$    | Hidden bias                                                                  |
+| $\mathbf{W}_{hy}$ | $(O, H)$ | **Hidden-to-output** weights, only when an output is needed at this step     |
+| $\mathbf{y}_t$    | $(O)$    | Output at step $t$, for example logits over a vocabulary                     |
 
-The key line is `c_t = f_t * c_(t-1) + i_t * g_t`. Differentiating gives:
+Each piece has a reason:
 
-$$
-\frac{\partial \mathbf{c}_t}{\partial \mathbf{c}_{t-1}} = \mathbf{f}_t \quad \text{(plus terms through gate pre-activations)}
-$$
+- **The sum $\mathbf{W}_{xh}\mathbf{x}_t + \mathbf{W}_{hh}\mathbf{h}_{t-1}$** mixes new evidence with old memory. It is equivalent to one weight matrix of shape $(H, F + H)$ applied to the concatenated vector $[\mathbf{x}_t; \mathbf{h}_{t-1}]$.
+- **`tanh`** keeps every hidden unit in $(-1, 1)$. Without a squashing function, repeatedly multiplying by $\mathbf{W}_{hh}$ would let the state grow without bound over a long sequence. `tanh` is preferred over the sigmoid because it is zero-centred, so a unit can push the state in either direction.
+- **The output layer is separate** from the recurrence. The hidden state is the memory; $\mathbf{y}_t$ is a read-out of it for whatever the task needs.
 
-If the forget gate learns to stay near `1`, the gradient passes through almost unchanged for arbitrarily many steps. That is the constant error carousel, and it is why LSTMs learn dependencies over hundreds of timesteps where vanilla RNNs fail at twenty. It replaces the multiplicative `W_hh` chain with an elementwise gate chain.
-
-Two implementation details that matter:
-
-- **Forget gate bias.** Initialize `b_if` to `1` or `2` so the gate starts open. With the default initialization it starts near `sigmoid(0) = 0.5`, and the cell forgets half its state every step before it has learned anything.
-- **Peephole connections** let the gates read `c_(t-1)` directly. They help on tasks needing precise timing and are rarely used otherwise. PyTorch's `nn.LSTM` does not implement them.
-
-```python
-lstm = nn.LSTM(128, 256, num_layers=2, batch_first=True, bidirectional=True, dropout=0.1)
-out, (h_n, c_n) = lstm(torch.randn(8, 40, 128))
-print(out.shape)   # (8, 40, 512)      2 directions x 256
-print(h_n.shape)   # (4, 8, 256)       2 layers x 2 directions
-```
-
-`dropout` between LSTM layers applies to the hidden state passed upward, not to the recurrent connection within a layer. With `num_layers=1` it does nothing.
+**Parameter count.** The recurrent part has $HF + H^2 + H$ parameters, independent of $T$. With $F = 128$ and $H = 256$ that is $32{,}768 + 65{,}536 + 256 = 98{,}560$ — the same for a 5-step and a 5,000-step sequence.
 
 ---
 
-## GRU
+## A worked example by hand
 
-The Gated Recurrent Unit merges the cell and hidden state into one vector and uses two gates instead of three:
+Shrink everything to one dimension so every number is visible: $F = H = 1$, weights $w_{xh} = 1.0$, $w_{hh} = 0.5$, bias $0$. Feed a single "event" followed by silence: $x = [1, 0, 0, 0, 0]$.
 
 $$
-\begin{aligned}
-\mathbf{r}_t &= \sigma(\mathbf{W}_{ir} \mathbf{x}_t + \mathbf{b}_{ir} + \mathbf{W}_{hr} \mathbf{h}_{t-1} + \mathbf{b}_{hr}) && \text{(reset gate)} \\
-\mathbf{z}_t &= \sigma(\mathbf{W}_{iz} \mathbf{x}_t + \mathbf{b}_{iz} + \mathbf{W}_{hz} \mathbf{h}_{t-1} + \mathbf{b}_{hz}) && \text{(update gate)} \\
-\mathbf{n}_t &= \tanh(\mathbf{W}_{in} \mathbf{x}_t + \mathbf{b}_{in} + \mathbf{r}_t \odot (\mathbf{W}_{hn} \mathbf{h}_{t-1} + \mathbf{b}_{hn})) && \text{(candidate)} \\
-\mathbf{h}_t &= (1 - \mathbf{z}_t) \odot \mathbf{n}_t + \mathbf{z}_t \odot \mathbf{h}_{t-1} && \text{(hidden state)}
-\end{aligned}
+h_t = \tanh(1.0 \cdot x_t + 0.5 \cdot h_{t-1}), \qquad h_0 = 0
 $$
 
-`z_t` interpolates between the previous state and the new candidate, so it plays the role of both forget and input gates with the constraint `i_t = 1 - f_t`. That constraint is what GRU gives up relative to LSTM: it cannot forget and not write at the same time.
+| Step $t$ | $x_t$ | Pre-activation $x_t + 0.5\,h_{t-1}$ | $h_t$ |
+| -------: | ----: | :---------------------------------- | ----: |
+|        1 |     1 | $1 + 0.5 \cdot 0 = 1.000$           | 0.762 |
+|        2 |     0 | $0 + 0.5 \cdot 0.762 = 0.381$       | 0.363 |
+|        3 |     0 | $0 + 0.5 \cdot 0.363 = 0.182$       | 0.180 |
+|        4 |     0 | $0.090$                             | 0.090 |
+|        5 |     0 | $0.045$                             | 0.045 |
 
-| Property          | RNN                           | GRU                         | LSTM                           |
-| :---------------- | :---------------------------- | :-------------------------- | :----------------------------- |
-| States            | 1                             | 1                           | 2 (`h` and `c`)                |
-| Gates             | 0                             | 2                           | 3                              |
-| Weight matrices   | `H_in*H + H*H`                | `3` times that              | `4` times that                 |
-| Additive path     | None                          | Via `z_t`                   | Via `c_t`                      |
-| Long dependencies | ~20 steps                     | Hundreds                    | Hundreds                       |
-| Typical use       | Short sequences, tiny budgets | Default when data is scarce | Default when data is plentiful |
+The event at step 1 is still detectable at step 5, so the network **has** memory: $h_5 \neq 0$ only because $x_1$ was nonzero. But the trace roughly halves every step, because each step multiplies the old state by $w_{hh} = 0.5$ and then `tanh` shrinks it a little more.
 
-At equal hidden size, an LSTM has roughly `4/3` the parameters of a GRU. Published comparisons are close enough to a tie that the choice is usually made on parameter budget and library support rather than accuracy.
+Raising the recurrent weight to $w_{hh} = 1.0$ slows the fade: $h = 0.762, 0.642, 0.566, 0.513, 0.472$. It still fades, because `tanh` compresses every value toward zero ($\tanh(z) < z$ for $z > 0$). Raising $w_{hh}$ further makes the state saturate near $\pm 1$ and stop responding to new input at all.
+
+That trade-off — memory that either fades or locks up, controlled by one shared weight — is the vanilla RNN's core weakness in miniature. The [next page](/ai/classical-deep-learning/vanishing-gradients) shows that the gradient used for training suffers from the same repeated multiplication, which is far more damaging.
 
 ---
 
-## Bidirectional, stacked, and variable length
+## Unrolling: an RNN is a deep network with tied weights
 
-A bidirectional layer runs two independent recurrences, one forward and one backward, and concatenates the outputs. It sees the whole sequence at every position, which is what you want for classification and tagging and what you cannot have for autoregressive generation.
+The recurrence is a loop. Writing out one copy of the cell per time step, called **unrolling** the network, turns it into an ordinary feed-forward graph:
 
-```python
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+<Mermaid
+  chart={`
+flowchart LR
+    H0["h0 = 0"] --> C1["cell"]
+    X1["x1"] --> C1
+    C1 -- "h1" --> C2["cell"]
+    X2["x2"] --> C2
+    C2 -- "h2" --> C3["cell"]
+    X3["x3"] --> C3
+    C3 -- "h3" --> C4["cell"]
+    X4["x4"] --> C4
+    C1 --> Y1["y1"]
+    C2 --> Y2["y2"]
+    C3 --> Y3["y3"]
+    C4 --> Y4["y4"]
+`}
+/>
 
-lengths = torch.tensor([40, 31, 27, 19, 12, 8, 5, 2])
-packed = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-out_packed, (h_n, c_n) = lstm(packed)
-out, out_lengths = pad_packed_sequence(out_packed, batch_first=True)
-```
+Every box labelled `cell` is the **same** weights. Two views follow from the picture:
 
-Packing removes the padded positions from the computation entirely, so short sequences in a batch cost nothing and the final hidden state `h_n` is the state at each sample's true last timestep rather than at the padding. Without packing, `h_n` is garbage for every sequence shorter than the longest.
+- **Depth equals sequence length.** The path from $x_1$ to $y_4$ passes through four applications of the cell, so a 100-step sequence is a 100-layer-deep network along the time axis, even with a single RNN layer.
+- **Backpropagation works unchanged.** The unrolled graph is a normal computation graph, so autograd can differentiate it. Running backprop over it is called **backpropagation through time (BPTT)**. Because each weight appears once per step, its gradient is the sum of its gradients at every step:
 
-`enforce_sorted=False` lets PyTorch sort internally. Older versions required the batch to be pre-sorted by length, and a lot of existing code still does that.
+$$
+\frac{\partial L}{\partial \mathbf{W}_{hh}} = \sum_{t=1}^{T} \frac{\partial L}{\partial \mathbf{W}_{hh}}\bigg|_{\text{step } t}
+$$
+
+The same rule governs any shared weight, including a convolution kernel's gradient summed over spatial positions. What is special about time is the depth: the contribution from an early step must travel back through many copies of the cell, which is the subject of the next page.
 
 ---
 
-## Time series prediction
+## What an RNN can be asked to do
 
-The setup is sliding-window autoregression: predict the next `H` values from the previous `W` values, and slide the window along the series.
+Whether the network reads an input at every step, and whether it emits an output at every step, depends on the task. Five patterns cover nearly every sequence problem:
 
-```python title="window.py"
+| Pattern                       | Input → output                        | Example                                        | Where the output is read                                         |
+| :---------------------------- | :------------------------------------ | :--------------------------------------------- | :--------------------------------------------------------------- |
+| **One-to-one**                | Vector → vector                       | Ordinary classification (no recurrence needed) | n/a                                                              |
+| **Many-to-one**               | Sequence → single label               | Sentiment of a review; spam detection          | Only the final hidden state $\mathbf{h}_T$ feeds a classifier    |
+| **One-to-many**               | Single vector → sequence              | Image captioning; music generation from a seed | The input sets $\mathbf{h}_0$; outputs are emitted at every step |
+| **Many-to-many, aligned**     | Sequence → one label per element      | Part-of-speech tagging; named-entity tagging   | $\mathbf{y}_t$ at every step                                     |
+| **Many-to-many, not aligned** | Sequence → sequence of another length | Translation; summarization                     | Two RNNs: an **encoder** reads, a **decoder** writes (Seq2Seq)   |
+
+The last pattern needs a separate architecture because a single RNN emits exactly one output per input step, and a French sentence is not the same length as its English translation. [Seq2Seq and Attention](/ai/classical-deep-learning/seq2seq-and-attention) builds it from two RNNs.
+
+<Callout type="info">
+  ### Many-to-one: why the last state works
+
+For sentiment classification, $\mathbf{h}_T$ is the only state that has seen the whole review, so a linear layer on $\mathbf{h}_T$ is the standard classifier. A common, often better, alternative is to pool all hidden states, $\frac{1}{T}\sum_t \mathbf{h}_t$ or $\max_t \mathbf{h}_t$, which gives early words a shorter path to the output.
+
+</Callout>
+
+---
+
+## Training an RNN: a character-level language model
+
+A **language model** assigns a probability to the next token given all previous ones. It is the cleanest RNN task because the training data labels itself: every text is its own target, shifted by one.
+
+Take the word `hello` with a vocabulary of four characters `{h, e, l, o}`:
+
+| Step $t$ | Input $x_t$ | Target (the next character) |
+| -------: | :---------- | :-------------------------- |
+|        1 | `h`         | `e`                         |
+|        2 | `e`         | `l`                         |
+|        3 | `l`         | `l`                         |
+|        4 | `l`         | `o`                         |
+
+Steps 3 and 4 show why memory is needed: the input is `l` both times, but the correct next character differs (`l` then `o`). A model that only sees the current character cannot get both right. The hidden state distinguishes "first `l` after `he`" from "second `l` after `hel`".
+
+At each step:
+
+1. Turn the input character into a vector (a one-hot or an [embedding](/ai/classical-deep-learning/word-embeddings)).
+2. Update the hidden state with the cell.
+3. Compute logits $\mathbf{y}_t$ of width $V = 4$ and a probability distribution $\operatorname{softmax}(\mathbf{y}_t)$ over the next character.
+4. Score it with cross-entropy against the true next character: $\ell_t = -\log p_t(\text{target}_t)$.
+
+The sequence loss is the average over steps, $L = \frac{1}{T}\sum_t \ell_t$, and BPTT sends its gradient back through every step. If the model assigns probability $0.6$ to the correct `o` at step 4, that step costs $-\ln 0.6 = 0.51$; a confident wrong answer with $p = 0.01$ costs $4.6$.
+
+**Generation.** After training, the model writes text by feeding its own output back in: give it `h`, sample a character from $\operatorname{softmax}(\mathbf{y}_1)$, feed that character as $x_2$, and repeat. This loop of predicting, sampling, and feeding back is called **autoregressive generation**. It is exactly how modern LLMs generate text; they replace the RNN with a transformer but keep the loop (see [Decoding](/ai/llm/decoding)).
+
+<Callout type="info">
+  ### Karpathy's char-RNN
+
+A three-layer character RNN trained on Shakespeare, Linux source code, or LaTeX produces text with correct local syntax: matched brackets, indentation, plausible variable names. Inspecting individual hidden units revealed cells that track whether the text is inside a quotation or how deep the current bracket nesting is — the network learned its own state variables, as the state-machine view predicts.
+
+</Callout>
+
+---
+
+## Deeper and wider: stacked and bidirectional RNNs
+
+**Stacked (multi-layer) RNNs.** The hidden states of one RNN layer form a sequence $\mathbf{h}^{(1)}_1, \dots, \mathbf{h}^{(1)}_T$, which can be the input to a second RNN layer, and so on. Lower layers tend to capture local patterns (character combinations, short phrases) and upper layers longer-range structure, mirroring the feature hierarchy of a CNN. Two to four layers is typical; beyond that, gains are small and training gets harder.
+
+**Bidirectional RNNs.** A normal RNN's state $\mathbf{h}_t$ knows only the past $x_1 \dots x_t$. For tagging, the future often matters too: in "Apple announced earnings", whether `Apple` is a company is clearer after reading `announced`. A **bidirectional** RNN runs two independent RNNs, one left-to-right and one right-to-left, and concatenates their states at each position:
+
+$$
+\mathbf{h}_t = [\overrightarrow{\mathbf{h}}_t \, ; \, \overleftarrow{\mathbf{h}}_t] \qquad \text{width } 2H
+$$
+
+The constraint: a bidirectional model needs the whole sequence before producing any output, so it cannot be used for generation or real-time streaming, where the future does not exist yet.
+
+---
+
+## RNNs in PyTorch
+
+The whole recurrence is a short loop, which is worth writing once to see that nothing is hidden:
+
+```python title="rnn_from_scratch.py"
 import torch
-from torch.utils.data import Dataset
 
-class WindowDataset(Dataset):
-    def __init__(self, series: torch.Tensor, window: int = 48, horizon: int = 1):
-        n = len(series) - window - horizon + 1
-        self.x = torch.stack([series[i : i + window] for i in range(n)])
-        self.y = torch.stack([series[i + window : i + window + horizon] for i in range(n)])
+F, H, T = 8, 16, 5
+W_xh, W_hh, b = torch.randn(H, F) * 0.1, torch.randn(H, H) * 0.1, torch.zeros(H)
 
-    def __len__(self):
-        return len(self.x)
-
-    def __getitem__(self, i):
-        return self.x[i], self.y[i]
-
-series = torch.randn(5000, 1)
-train = WindowDataset(series[:4000], window=48, horizon=1)
-test = WindowDataset(series[4000:], window=48, horizon=1)
-print(train[0][0].shape, train[0][1].shape)   # (48, 1) (1, 1)
+x = torch.randn(T, F)        # one sequence of 5 steps
+h = torch.zeros(H)           # h_0
+for t in range(T):
+    h = torch.tanh(W_xh @ x[t] + W_hh @ h + b)
+print(h.shape)               # (16,)  the final hidden state h_T
 ```
 
-### Multi-horizon strategies
+`nn.RNN` runs the same loop in an optimized kernel, over a batch:
 
-| Strategy  | How it works                                   | Failure mode                        |
-| :-------- | :--------------------------------------------- | :---------------------------------- |
-| One-step  | Predict `t+1` only                             | Cannot forecast                     |
-| Recursive | Feed predictions back as inputs                | Errors compound over the horizon    |
-| Direct    | One output head per future step                | No cross-step consistency           |
-| Seq2seq   | Encoder over history, decoder over the horizon | More parameters, best long horizons |
-
-Recursive multi-step is what "autoregression" usually means in practice, and it is where the error growth shows up: a small bias at step one gets fed back in and amplified. Direct multi-horizon avoids that at the cost of independent predictions per step.
-
-### Things that matter more than the architecture
-
-- **Normalize per feature, fitted on training data only.** A standardization computed over the whole series leaks the future into the training split.
-- **Difference non-stationary series.** An LSTM cannot extrapolate a trend it has never seen leave its training range.
-- **Split by time, never shuffle.** Random splits on a series produce optimistic numbers that do not survive deployment.
-- **Beat a naive baseline first.** Predicting `y_hat = x_t` (persistence) or a seasonal mean is a strong baseline on many real series, and a recurrent model that does not beat it is not learning.
-
-```python title="model.py"
-class Forecaster(nn.Module):
-    def __init__(self, n_features=1, hidden=128, layers=2, horizon=1):
-        super().__init__()
-        self.rnn = nn.LSTM(n_features, hidden, layers, batch_first=True)
-        self.head = nn.Linear(hidden, horizon)
-
-    def forward(self, x):
-        out, _ = self.rnn(x)          # x: (B, W, n_features)
-        return self.head(out[:, -1])  # use the final timestep only
+```python
+rnn = torch.nn.RNN(input_size=8, hidden_size=16, num_layers=1, batch_first=True)
+out, h_n = rnn(torch.randn(4, 5, 8))   # batch 4, length 5, features 8
+print(out.shape)   # (4, 5, 16)  hidden state at every step: use for tagging
+print(h_n.shape)   # (1, 4, 16)  final hidden state per layer: use for classification
 ```
 
-Using `out[:, -1]` gives the state after the whole window. For multi-step direct forecasting, widen the head to `horizon` outputs. For seq2seq, run a second decoder RNN whose input at each step is the previous prediction.
+Two details cause most bugs:
+
+- **Layout.** Without `batch_first=True`, PyTorch's recurrent layers expect `(T, B, F)`, time first.
+- **Padding.** A batch holds sequences of different lengths padded to the longest. Without care, the RNN keeps updating the state over the padding, and `h_n` for a short sequence is its state after a run of meaningless zeros. `torch.nn.utils.rnn.pack_padded_sequence` tells the layer each sequence's true length so padded steps are skipped and `h_n` is read at the real last step.
+
+PyTorch stores two biases, `b_ih` and `b_hh`, instead of one. Only their sum matters; the split exists for compatibility with cuDNN kernels.
 
 ---
 
-## When recurrent networks still make sense
+## Where the vanilla RNN breaks
 
-Transformers replaced RNNs for language, but the replacement is not universal.
+On paper, the hidden state can carry information from step 1 to step $T$. In practice, a vanilla RNN trained by gradient descent learns dependencies over roughly ten to twenty steps and almost nothing beyond. The worked example above hints at why: anything that passes repeatedly through the same multiplication either fades or explodes. The training gradient passes back through that multiplication once per step, so it fades or explodes exponentially with distance.
 
-| Situation                                      | Better choice                    |
-| :--------------------------------------------- | :------------------------------- |
-| Long sequences, plenty of data, parallelizable | Transformer                      |
-| Streaming inference, one sample at a time      | RNN or LSTM, constant memory     |
-| Very small dataset, short sequences            | GRU or LSTM                      |
-| Strictly causal online prediction              | Any recurrent model              |
-| Irregularly sampled time series                | RNN with a time-aware decay gate |
-| Edge deployment with a tiny memory budget      | GRU                              |
+[Vanishing and Exploding Gradients](/ai/classical-deep-learning/vanishing-gradients) derives that precisely and covers the partial fixes. [LSTM and GRU](/ai/classical-deep-learning/lstm-and-gru) covers the architectural fix that made recurrent networks practical.
 
-A recurrent model processes a stream in `O(1)` memory per step. A transformer needs the full KV cache, which grows linearly with sequence length. That is why [Phase 10](/ai/inference) spends so much time on KV-cache management: it is the cost of giving up recurrence.
+---
 
-Modern recurrent variants (Mamba, RWKV, RetNet, xLSTM) revisit these trade-offs with linear-time attention-like mechanisms, and as of 2026 they are competitive with transformers on long-context language modelling at lower inference cost.
+## Key terms
+
+| Term                  | Meaning                                                                                           |
+| :-------------------- | :------------------------------------------------------------------------------------------------ |
+| **RNN**               | A network that applies the same cell at every step of a sequence, carrying a hidden state forward |
+| **hidden state**      | The fixed-width vector $\mathbf{h}_t$ summarizing everything read up to step $t$                  |
+| **cell**              | The function $f_\theta$ that maps $(\mathbf{h}_{t-1}, \mathbf{x}_t)$ to $\mathbf{h}_t$            |
+| **weight sharing**    | Using the same parameters at every time step                                                      |
+| **unrolling**         | Drawing the loop as one cell copy per step, giving a deep feed-forward graph with tied weights    |
+| **BPTT**              | Backpropagation through time: ordinary backprop on the unrolled graph                             |
+| **language model**    | A model of $p(x_t \mid x_1, \dots, x_{t-1})$, trained to predict the next token                   |
+| **autoregressive**    | Generating by feeding each output back in as the next input                                       |
+| **bidirectional RNN** | A forward and a backward RNN whose states are concatenated at each position                       |
+| **stacked RNN**       | RNN layers where each layer reads the hidden-state sequence of the one below                      |
 
 ---
 
 ## Interview questions
 
 <Accordions>
-  <Accordion title="Write the LSTM update equations and label each gate.">
+  <Accordion title="What problem does a recurrent network solve that a dense network cannot?">
 
-    $\mathbf{i}_t = \sigma(\mathbf{W}_{ix} \mathbf{x}_t + \mathbf{b}_{ix} + \mathbf{W}_{ih} \mathbf{h}_{t-1} + \mathbf{b}_{ih})$ input gate, $\mathbf{f}_t$ forget gate, $\mathbf{o}_t$ output gate, same form with their own weights, and $\mathbf{g}_t = \tanh(\dots)$ the candidate. Then $\mathbf{c}_t = \mathbf{f}_t \odot \mathbf{c}_{t-1} + \mathbf{i}_t \odot \mathbf{g}_t$ is the additive cell update and $\mathbf{h}_t = \mathbf{o}_t \odot \tanh(\mathbf{c}_t)$ is the exposed hidden state. Every gate reads both $\mathbf{x}_t$ and $\mathbf{h}_{t-1}$.
-
-  </Accordion>
-  <Accordion title="Why does an LSTM avoid the vanishing gradient that a vanilla RNN suffers? Point at the specific term.">
-
-    The cell line. $\frac{\partial \mathbf{c}_t}{\partial \mathbf{c}_{t-1}} = \mathbf{f}_t$ plus terms through the gate pre-activations, whereas the RNN's equivalent factor is $\operatorname{diag}(\tanh') \mathbf{W}_{hh}$ applied once per step. The LSTM replaces that multiplicative $\mathbf{W}_{hh}$ chain with an elementwise gate the network can hold near $1$, and then the gradient passes through almost unchanged for hundreds of steps.
+    Variable-length, ordered input with weight sharing across positions. A dense network over a concatenated sequence fixes the length at design time and ties each weight to one position, so a pattern learned at positions 3 and 4 does not transfer to 17 and 18. An RNN applies one cell at every step and carries a hidden state, so the parameter count is independent of length and the same rule is applied everywhere.
 
   </Accordion>
-  <Accordion title="What is the constant error carousel?">
+  <Accordion title="Write the vanilla RNN update and give the shape of every matrix.">
 
-    The additive path $\mathbf{c}_t = \mathbf{f}_t \odot \mathbf{c}_{t-1} + \mathbf{i}_t \odot \mathbf{g}_t$, where the previous state is carried forward by multiplication with a gate value instead of through a saturating nonlinearity and a shared matrix. With the forget gate near 1 the cell is a running sum, so error signals circulate without decaying.
-
-  </Accordion>
-  <Accordion title={<>Derive the bound on <code>||dh_T / dh_k||</code> for a vanilla RNN and explain what <code>rho</code> does.</>}>
-
-    Unrolling gives `dh_T / dh_k` as a product of `T - k` Jacobians, each `diag(tanh') W_hh`, so its norm is bounded by `(gamma * rho)^(T-k)` with `gamma = max tanh' = 1` and `rho` the spectral norm of `W_hh`. `rho` decides everything: above 1 the gradient grows exponentially and you get `NaN` loss, below 1 it decays and long dependencies are unreachable, and at 1 stability holds only where the tanh derivatives are near 1. Because one matrix serves every step, no value works for both long and short dependencies; a vanilla RNN learns roughly ten to twenty steps and not much beyond.
+    $\mathbf{h}_t = \tanh(\mathbf{W}_{xh}\mathbf{x}_t + \mathbf{W}_{hh}\mathbf{h}_{t-1} + \mathbf{b}_h)$ and $\mathbf{y}_t = \mathbf{W}_{hy}\mathbf{h}_t + \mathbf{b}_y$. With input width $F$, hidden width $H$, and output width $O$: $\mathbf{W}_{xh}$ is $(H, F)$, $\mathbf{W}_{hh}$ is $(H, H)$, $\mathbf{W}_{hy}$ is $(O, H)$. The recurrent part has $HF + H^2 + H$ parameters, independent of the sequence length.
 
   </Accordion>
-  <Accordion title={<>Why does gradient clipping preserve direction with <code>clip_grad_norm_</code> but not with <code>clip_grad_value_</code>?</>}>
+  <Accordion title="Why tanh in the recurrence rather than no activation or ReLU?">
 
-    `clip_grad_norm_` rescales the whole vector by the single scalar `min(1, max_norm / ||g||)`, so direction is untouched and only magnitude is capped. `clip_grad_value_` clamps each element independently, which changes the relative sizes of coordinates and therefore the direction of the update.
-
-  </Accordion>
-  <Accordion title="Where does clipping go in an AMP training step, and why does the order matter?">
-
-    After `scaler.unscale_(opt)` and before `scaler.step(opt)`. GradScaler multiplies gradients by a large constant during backward to keep FP16 values above underflow, so clipping the scaled tensor applies your threshold in the wrong units and the bound means nothing.
+    Without a squashing function, repeated multiplication by $\mathbf{W}_{hh}$ lets the state grow or shrink geometrically with sequence length, and a purely linear recurrence cannot represent nonlinear state updates. `tanh` bounds every unit to $(-1, 1)$ and is zero-centred, so units can move in both directions. ReLU is unbounded, so the state can explode unless $\mathbf{W}_{hh}$ is carefully initialized (the IRNN uses an identity initialization to make it work).
 
   </Accordion>
-  <Accordion title="What is truncated BPTT, and what does it cost you?">
+  <Accordion title="What does unrolling an RNN mean, and what does it imply about depth?">
 
-    Processing the input in chunks of length `L`, carrying the hidden state across chunk boundaries but detaching it there, and backpropagating only within a chunk. It bounds activation memory and makes long sequences trainable. The cost is gradient flow: the model still sees earlier context through the hidden state, but it cannot learn dependencies that have to be established across the boundary.
-
-  </Accordion>
-  <Accordion title="Why initialize the LSTM forget gate bias to a positive value?">
-
-    So the forget gate starts near 1 and the cell remembers by default at the beginning of training. With a zero bias, `sigmoid(0) = 0.5` erases half the cell content at every step, which sends early gradients toward zero and can prevent the network from ever learning to retain anything.
+    Writing one copy of the cell per time step, all sharing weights, so the loop becomes an ordinary feed-forward computation graph. The depth of that graph along the time axis equals the sequence length, so a single-layer RNN on 100 steps is a 100-layer-deep network for the gradient travelling from the last output back to the first input. That depth is the root of the vanishing gradient problem.
 
   </Accordion>
-  <Accordion title="What does GRU give up relative to LSTM, and how many parameters does each have at equal hidden size?">
+  <Accordion title="How is the gradient of a shared weight computed in BPTT?">
 
-    A GRU merges forget and input into one update gate `z_t` that interpolates between the previous state and the new candidate, so `i_t = 1 - f_t`, and it has no separate cell state. The constraint is what it gives up: it cannot forget and not write in the same step. Three gates instead of four gives `3 * (d*h + h*h + h)` against `4 * (d*h + h*h + h)`, so an LSTM holds roughly 4/3 the parameters, and published results are close enough that the choice comes down to parameter budget and library support.
-
-  </Accordion>
-  <Accordion title={<>What goes wrong if you feed a padded batch to <code>nn.LSTM</code> without packing, and read <code>h_n</code>?</>}>
-
-    Every padded position is processed as if it were real, so the hidden state accumulates from zero embeddings, and `h_n` is the state at the last timestep of the longest sequence in the batch rather than each sample's own last real step. For every sequence shorter than the maximum, `h_n` is garbage. `pack_padded_sequence` removes padded positions from the computation so the state is read at the true final step.
+    By summing the gradient contributions from every time step at which the weight is used: $\partial L / \partial \mathbf{W}_{hh} = \sum_t \partial L / \partial \mathbf{W}_{hh}|_t$. Each contribution is computed by ordinary backprop through the unrolled graph. The same rule applies to a convolution kernel summed over spatial positions.
 
   </Accordion>
-  <Accordion title="Why must time series splits be chronological rather than random?">
+  <Accordion title="Give the five input-output patterns of sequence tasks with an example of each.">
 
-    A random split puts observations that come later in time inside the training set, and because neighbouring points are highly correlated the model interpolates rather than forecasts. Metrics look excellent and leak information the deployment will not have. A chronological split keeps the test window strictly after everything used for training.
-
-  </Accordion>
-  <Accordion title="Compare recursive and direct multi-step forecasting, and say when each fails.">
-
-    Recursive feeds its own one-step prediction back as input, so it needs only a one-step model and stays coherent, but errors compound and drift accumulates over the horizon. Direct trains a separate output per horizon step, which removes compounding and is better at long horizons, but each step needs enough data and the predictions can disagree with one another at the joins.
+    One-to-one: ordinary classification. Many-to-one: sentiment from a review, reading only $\mathbf{h}_T$. One-to-many: captioning, where an image sets the initial state and words are emitted every step. Many-to-many aligned: part-of-speech tagging, one output per input step. Many-to-many unaligned: translation, which needs an encoder RNN and a separate decoder RNN because input and output lengths differ.
 
   </Accordion>
-  <Accordion title="What does a recurrent model give you at inference time that a transformer does not?">
+  <Accordion title="In a character-level language model on 'hello', why must the model have memory?">
 
-    A constant-size state. The hidden vector summarizes arbitrarily long history at fixed width, so per-step compute and memory do not grow with sequence length. Attention reads the whole context, so both grow with it — the thing a recurrent model does not pay.
+    The input `l` appears at steps 3 and 4, but the correct next character is `l` the first time and `o` the second. A model that sees only the current character must give the same prediction both times. The hidden state encodes that the model has already seen `hel`, which is what lets it distinguish the two positions.
+
+  </Accordion>
+  <Accordion title="When can a bidirectional RNN not be used?">
+
+    Whenever the output at step $t$ must be produced before step $t+1$ is available: autoregressive generation, real-time speech recognition with no lookahead, online forecasting. The backward RNN needs the full sequence before it can produce any state. For tagging and classification of complete inputs it is usually the better choice.
+
+  </Accordion>
+  <Accordion title={<>What goes wrong if a padded batch is fed to <code>nn.RNN</code> without packing?</>}>
+
+    The layer processes padded positions as real input, so a short sequence's state keeps changing over a run of padding vectors, and `h_n` is the state at the length of the longest sequence rather than at each sequence's own last real step. `pack_padded_sequence` with the true lengths skips padded steps so `h_n` is correct.
 
   </Accordion>
 </Accordions>

@@ -1,0 +1,324 @@
+---
+title: Generative Models
+description: 'Models that create new data instead of labelling it: what learning a distribution means and why the normalizer forces workarounds, autoencoders and why they cannot generate, VAEs with the ELBO and the reparameterization trick, GANs with the minimax game, the optimal discriminator, the non-saturating loss and mode collapse, diffusion models from the closed-form noise schedule to the noise-prediction loss, sampling, latent diffusion and classifier-free guidance, and the three families compared.'
+---
+
+Most of this phase trains **discriminative** models, which map an input to an answer: this image is a cat, this review is positive. A **generative model** instead learns what the data itself looks like — the probability distribution the training examples were drawn from — well enough to produce new examples from it: a new face, a piece of audio, an image matching a text prompt.
+
+A generative model is a **training objective**, not a backbone. The networks inside are the familiar ones: a GAN's generator is usually a CNN, and a diffusion model's denoiser is a CNN (U-Net) or a transformer. This page covers the three classic families in the order they were developed — VAEs, then GANs, then diffusion — each fixing the main weakness of the one before.
+
+**Builds on:** [CNN Architectures](/ai/classical-deep-learning/vision-architectures) for the networks used inside, [Loss Functions](/ai/neural-networks/loss-functions) for binary cross-entropy and MSE, [Probability and Distributions](/ai/math-foundations/probability-and-distributions) for Gaussians, and [Information Theory and Loss](/ai/math-foundations/information-the-and-loss) for the KL divergence.
+
+---
+
+## What it means to learn a distribution
+
+A discriminative model learns $p(y \mid x)$. A generative model learns $p(x)$, the distribution the training data was drawn from, well enough to **sample** new $x$ from it. For a $64 \times 64$ RGB image, $x$ has 12,288 dimensions, and natural images occupy a vanishingly small, curved region (a **manifold**) of that space. Random points in the space look like static.
+
+The direct approach, maximum likelihood, needs $p_\theta(x)$ written down and normalized so it integrates to 1 over all 12,288 dimensions. That normalizer is intractable for any flexible network. The three families are three ways around it:
+
+| Family        | Strategy                                                                                      | Likelihood                  |
+| :------------ | :-------------------------------------------------------------------------------------------- | :-------------------------- |
+| **VAE**       | Introduce a latent $z$, and maximize a tractable **lower bound** on $\log p(x)$               | Approximate (a lower bound) |
+| **GAN**       | Skip the density. Train a sampler directly, using a second network as the judge               | None (implicit model)       |
+| **Diffusion** | Break generation into many small denoising steps, each simple enough to learn with regression | Lower bound, rarely used    |
+
+Autoregressive models are the fourth family: they factor $p(x) = \prod_i p(x_i \mid x_{<i})$ and sample one element at a time. That is how LLMs generate text, covered in [Decoding](/ai/llm/decoding). Perplexity, the standard measure of how well an autoregressive model fits text, is defined in [Evaluation Metrics](/ai/agents/eval-metrics#perplexity).
+
+---
+
+## Autoencoders and VAEs
+
+A plain **autoencoder** has an encoder $z = f(x)$, a decoder $\hat{x} = g(z)$, and a reconstruction loss $\lVert x - \hat{x} \rVert^2$. The code $z$ is smaller than $x$, so the network must keep what matters and drop the rest. The basics, the denoising variant, and the link to PCA are on [Encoding and Decoding](/ai/math-foundations/encoding-and-decoding#encoder-and-decoder-networks). Anomaly detection by reconstruction error is on [ML Anomaly Detection](/ai/math-foundations/ml-anomaly-detection#autoencoders).
+
+A plain autoencoder is **not a generator**. Its latent space has holes: the encoder places training codes wherever reconstruction is easiest, and a random $z$ between them decodes to garbage. There is no distribution over $z$ to sample from.
+
+The **VAE** (Kingma and Welling, arXiv:1312.6114) fixes this by making the encoder output a distribution, $q_\phi(z \mid x) = \mathcal{N}(\mu_\phi(x), \sigma_\phi^2(x))$, and pulling every such distribution toward a fixed prior $p(z) = \mathcal{N}(0, I)$. The training objective is the **evidence lower bound (ELBO)**:
+
+$$
+\log p_\theta(x) \;\ge\; \underbrace{\mathbb{E}_{q_\phi(z \mid x)}\big[\log p_\theta(x \mid z)\big]}_{\text{reconstruction}} \;-\; \underbrace{D_{\mathrm{KL}}\big(q_\phi(z \mid x) \,\Vert\, p(z)\big)}_{\text{stay close to the prior}}
+$$
+
+- The **reconstruction** term is the autoencoder loss. With a Gaussian decoder it is squared error.
+- The **KL** term penalizes codes that drift from $\mathcal{N}(0, I)$, which packs the codes into one smooth region with no holes. After training, sampling $z \sim \mathcal{N}(0, I)$ and decoding gives a plausible output.
+- **The reparameterization trick** makes the sampling step differentiable: draw $\epsilon \sim \mathcal{N}(0, I)$ and set $z = \mu + \sigma \odot \epsilon$. The randomness sits in $\epsilon$, which has no parameters, so gradients flow through $\mu$ and $\sigma$.
+
+For a diagonal Gaussian against $\mathcal{N}(0, I)$, the KL term has a closed form per latent dimension: $\tfrac{1}{2}(\mu^2 + \sigma^2 - \log \sigma^2 - 1)$, which is zero exactly when $\mu = 0$ and $\sigma = 1$.
+
+**Why VAE samples are blurry.** Squared-error reconstruction is the log-likelihood of a Gaussian, and the Gaussian that best fits several plausible sharp outputs is their average. When the decoder is unsure where an edge goes, it hedges by drawing a soft edge in between. This is the main reason VAEs lost image generation to GANs and then to diffusion, and the reason they survive as **compressors**: Stable Diffusion's VAE maps a $512 \times 512 \times 3$ image to a $64 \times 64 \times 4$ latent (48 times fewer numbers), and the diffusion model works in that latent space.
+
+---
+
+## GANs
+
+### The game
+
+A **GAN** (Goodfellow et al., arXiv:1406.2661) trains two networks against each other:
+
+- The **generator** $G$ maps noise $z \sim p(z)$ to a sample $G(z)$.
+- The **discriminator** $D$ outputs the probability that its input is real.
+
+They play a two-player minimax game over one value function:
+
+$$
+\min_G \max_D \; V(D, G) = \mathbb{E}_{x \sim p_{\text{data}}}\big[\log D(x)\big] + \mathbb{E}_{z \sim p(z)}\big[\log\big(1 - D(G(z))\big)\big]
+$$
+
+$D$ wants $D(x) \to 1$ on real data and $D(G(z)) \to 0$ on fakes. $G$ wants $D(G(z)) \to 1$. The generator never sees a training image. Its only learning signal is the gradient of the discriminator's judgment, back-propagated through $D$ into $G$'s weights.
+
+### What the game optimizes
+
+For a fixed generator with sample density $p_g$, the best discriminator has a closed form:
+
+$$
+D^*(x) = \frac{p_{\text{data}}(x)}{p_{\text{data}}(x) + p_g(x)}
+$$
+
+Where the generator puts the same density as the data, $D^* = 0.5$: the discriminator can only guess. Where real data has density 0.9 and the generator 0.1, $D^* = 0.9$. Substituting $D^*$ back into $V$ gives
+
+$$
+V(D^*, G) = -\log 4 + 2 \cdot \mathrm{JSD}(p_{\text{data}} \,\Vert\, p_g)
+$$
+
+so, with a perfect discriminator, training the generator minimizes the **Jensen-Shannon divergence** between the data and the generated distribution. The global optimum is $p_g = p_{\text{data}}$, where $D^* = 0.5$ everywhere.
+
+### The non-saturating loss
+
+The minimax objective is rarely used as written. Early in training the generator is poor, the discriminator rejects its samples easily, and $D(G(z)) \approx 0$. Write $D = \sigma(s)$ with logit $s$. The generator's minimax loss $\log(1 - D)$ has gradient $-D$ with respect to $s$, which is nearly zero exactly when the generator most needs a signal.
+
+The **non-saturating** loss has the generator maximize $\log D(G(z))$ instead (minimize $-\log D(G(z))$). Its gradient with respect to $s$ is $-(1 - D)$:
+
+| $D(G(z))$ | Minimax gradient magnitude | Non-saturating gradient magnitude |
+| :-------- | :------------------------- | :-------------------------------- |
+| 0.01      | 0.01                       | 0.99                              |
+| 0.1       | 0.1                        | 0.9                               |
+| 0.5       | 0.5                        | 0.5                               |
+
+Both losses have the same fixed point, but the non-saturating one gives the generator strong gradients exactly when its samples are bad. In code it is ordinary binary cross-entropy with the fake samples labeled "real":
+
+```python title="gan_step.py"
+import torch
+import torch.nn.functional as F
+
+def gan_step(G, D, real, opt_G, opt_D, z_dim=128):
+    b = real.size(0)
+    ones, zeros = torch.ones(b, 1), torch.zeros(b, 1)
+
+    # 1. Discriminator: real -> 1, fake -> 0. detach() so this step does not update G.
+    fake = G(torch.randn(b, z_dim))
+    loss_D = (F.binary_cross_entropy_with_logits(D(real), ones)
+              + F.binary_cross_entropy_with_logits(D(fake.detach()), zeros))
+    opt_D.zero_grad(); loss_D.backward(); opt_D.step()
+
+    # 2. Generator, non-saturating: label its fakes as real, so it maximizes log D(G(z)).
+    loss_G = F.binary_cross_entropy_with_logits(D(fake), ones)
+    opt_G.zero_grad(); loss_G.backward(); opt_G.step()
+    return loss_D.item(), loss_G.item()
+```
+
+`D` returns logits, and `binary_cross_entropy_with_logits` applies the sigmoid inside for numerical stability. Gradients from step 2 also land in `D`'s parameters, but they are cleared by `opt_D.zero_grad()` before `D`'s next update.
+
+### Why GANs are hard to train
+
+- **No convergence guarantee.** Gradient descent on a minimax game can circle around the equilibrium rather than reach it. Neither loss curve says whether samples are improving, so progress is measured with sample metrics such as **FID** (Fréchet Inception Distance: the distance between Gaussians fitted to Inception features of real and generated images; lower is better).
+- **Mode collapse.** The generator finds a few outputs that fool the current discriminator and produces only those, such as only a few faces. The discriminator adapts, the generator jumps to another few outputs, and the cycle repeats. The loss never penalizes the missing variety directly.
+- **Vanishing gradients from a strong discriminator.** When $p_{\text{data}}$ and $p_g$ lie on non-overlapping low-dimensional manifolds, which is the normal case early on, a near-perfect discriminator exists and the JS divergence is a constant $\log 2$. Its gradient is zero. This motivated the **Wasserstein GAN** (Arjovsky et al., arXiv:1701.07875), whose earth-mover distance still gives a useful gradient when the distributions do not overlap. It needs the critic to be 1-Lipschitz, enforced with a gradient penalty (WGAN-GP).
+
+Standard stabilizers: spectral normalization on the discriminator, a gradient penalty, separate learning rates for $G$ and $D$ (TTUR), and Adam with $\beta_1 = 0$ or $0.5$ instead of $0.9$, since momentum works against an opponent whose behavior keeps changing. The habit of using [LeakyReLU](/ai/neural-networks/neurons-and-activations) in GAN discriminators comes from the same concern: a dead ReLU unit in the discriminator cuts the gradient path back to the generator.
+
+**Where GANs still win.** A trained GAN generates in **one forward pass**, against tens of steps for diffusion. StyleGAN remains the reference for a single narrow domain such as faces, and adversarial losses survive inside other systems: the VAE that compresses images for Stable Diffusion is trained with a GAN loss to keep its reconstructions sharp, and diffusion distillation methods use a discriminator to cut sampling to one to four steps.
+
+---
+
+## Diffusion models
+
+### The idea
+
+Generating an image from nothing in one step is hard. Removing a small amount of noise from a slightly noisy image is easy: it is a regression problem with an obvious target. A diffusion model chains a thousand easy steps. The **forward process** destroys data by adding Gaussian noise little by little until only noise remains. The model learns the **reverse process**, one denoising step at a time. Sampling starts from pure noise and runs the reverse process.
+
+### The forward process in closed form
+
+DDPM (Ho et al., arXiv:2006.11239) adds noise over $T$ steps with a schedule $\beta_1, \dots, \beta_T$:
+
+$$
+q(x_t \mid x_{t-1}) = \mathcal{N}\big(\sqrt{1 - \beta_t}\, x_{t-1},\; \beta_t I\big)
+$$
+
+Scaling by $\sqrt{1 - \beta_t}$ keeps the total variance at 1 instead of letting it grow. Because a sum of Gaussians is Gaussian, any step can be reached from $x_0$ in one jump. With $\alpha_t = 1 - \beta_t$ and $\bar{\alpha}_t = \prod_{s=1}^{t} \alpha_s$:
+
+$$
+x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1 - \bar{\alpha}_t}\, \epsilon, \qquad \epsilon \sim \mathcal{N}(0, I)
+$$
+
+This closed form is what makes training cheap: a random $t$ can be picked and $x_t$ produced in one line, without simulating the $t - 1$ steps before it. With DDPM's linear schedule ($T = 1000$, $\beta$ from $10^{-4}$ to $0.02$):
+
+```python title="noise_schedule.py"
+import numpy as np
+T = 1000
+betas = np.linspace(1e-4, 0.02, T)
+alpha_bar = np.cumprod(1 - betas)
+for t in [1, 100, 250, 500, 1000]:
+    ab = alpha_bar[t - 1]
+    print(t, f"signal={np.sqrt(ab):.3f}", f"noise={np.sqrt(1 - ab):.3f}")
+# 1 signal=1.000 noise=0.010
+# 100 signal=0.947 noise=0.321
+# 250 signal=0.724 noise=0.690
+# 500 signal=0.280 noise=0.960
+# 1000 signal=0.006 noise=1.000
+```
+
+Signal and noise are about equal near $t = 250$. By $t = 1000$ the image's coefficient is $0.006$, so $x_T$ is indistinguishable from $\mathcal{N}(0, I)$, which is what lets sampling start from pure noise. The linear schedule destroys information quickly; the **cosine schedule** (Nichol and Dhariwal, arXiv:2102.09672) spends more steps at mid noise levels and improves quality, especially at low resolution.
+
+### The training loss
+
+The reverse step $p_\theta(x_{t-1} \mid x_t)$ is modeled as a Gaussian, and its mean can be written in terms of the noise $\epsilon$ that was added. So the network $\epsilon_\theta(x_t, t)$ is trained to **predict the noise**. Ho et al. found that dropping the ELBO's per-step weights gives better samples, leaving a plain regression:
+
+$$
+\mathcal{L}_{\text{simple}} = \mathbb{E}_{x_0,\, t,\, \epsilon}\Big[\big\lVert \epsilon - \epsilon_\theta\big(\sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1 - \bar{\alpha}_t}\, \epsilon,\; t\big)\big\rVert^2\Big]
+$$
+
+```python title="diffusion_step.py"
+import torch
+import torch.nn.functional as F
+
+T = 1000
+betas = torch.linspace(1e-4, 0.02, T)
+alpha_bar = torch.cumprod(1 - betas, dim=0)
+
+def diffusion_loss(model, x0):
+    b = x0.size(0)
+    t = torch.randint(0, T, (b,))                         # a random noise level per example
+    eps = torch.randn_like(x0)
+    ab = alpha_bar[t].view(b, 1, 1, 1)                    # broadcast over (C, H, W)
+    x_t = ab.sqrt() * x0 + (1 - ab).sqrt() * eps          # jump straight to step t
+    return F.mse_loss(model(x_t, t), eps)                 # predict the noise that was added
+```
+
+That is the whole training loop: no adversary, no minimax, one MSE loss. This stability is the main reason diffusion replaced GANs. The network is usually a U-Net, a CNN with skip connections between matching resolutions, with $t$ fed in as a sinusoidal embedding, the same construction as transformer [positional encodings](/ai/transformers/blocks-and-positions). Newer models (DiT, Stable Diffusion 3, Sora-style video models) replace the U-Net with a transformer over latent patches.
+
+A trained noise predictor is equivalent to a **score function**, the gradient of the log-density: $\nabla_{x_t} \log p(x_t) = -\epsilon_\theta(x_t, t) / \sqrt{1 - \bar{\alpha}_t}$. Each denoising step moves the sample uphill toward higher data density. This is the link to score-based models (Song et al., arXiv:2011.13456), which treat the forward process as a continuous-time stochastic differential equation.
+
+### Sampling
+
+DDPM sampling starts at $x_T \sim \mathcal{N}(0, I)$ and repeats, for $t = T, \dots, 1$:
+
+$$
+x_{t-1} = \frac{1}{\sqrt{\alpha_t}}\Big(x_t - \frac{\beta_t}{\sqrt{1 - \bar{\alpha}_t}}\, \epsilon_\theta(x_t, t)\Big) + \sigma_t z, \qquad z \sim \mathcal{N}(0, I)
+$$
+
+That is 1,000 network evaluations per image, which is the method's main cost. Faster samplers reuse the same trained network:
+
+| Sampler / method                                            | Steps | Idea                                                                          |
+| :---------------------------------------------------------- | :---- | :---------------------------------------------------------------------------- |
+| DDPM                                                        | 1,000 | Ancestral sampling, one learned step at a time                                |
+| DDIM (Song et al., arXiv:2010.02502)                        | 20–50 | A deterministic process with the same marginals, so most steps can be skipped |
+| DPM-Solver and similar ODE solvers                          | 10–25 | Treat sampling as solving an ODE and use a higher-order solver                |
+| Distillation (consistency models, adversarial distillation) | 1–4   | Train a student to jump many steps at once                                    |
+
+**Flow matching** (Lipman et al., arXiv:2210.02747), used by Stable Diffusion 3 and Flux, trains a network to predict a velocity along straight paths from noise to data. Straighter paths need fewer solver steps. It belongs to the same family and uses the same kind of regression loss.
+
+### Latent diffusion and guidance
+
+Running diffusion on $512 \times 512 \times 3$ pixels is expensive. **Latent diffusion** (Rombach et al., arXiv:2112.10752), the basis of Stable Diffusion, first trains a VAE to compress images to a $64 \times 64 \times 4$ latent, then runs the whole diffusion process in that latent space, and decodes once at the end. The VAE handles perceptual detail; the diffusion model handles composition. Text conditioning enters through **cross-attention** from the U-Net's features to the text encoder's token embeddings.
+
+**Classifier-free guidance** (Ho and Salimans, arXiv:2207.12598) makes samples follow the prompt more closely. During training, the text condition $c$ is dropped (replaced by an empty prompt) for about 10% of examples, so one network learns both $\epsilon_\theta(x_t, c)$ and $\epsilon_\theta(x_t, \varnothing)$. At sampling time the two predictions are extrapolated:
+
+$$
+\tilde{\epsilon} = \epsilon_\theta(x_t, \varnothing) + w \big(\epsilon_\theta(x_t, c) - \epsilon_\theta(x_t, \varnothing)\big)
+$$
+
+$w = 1$ is the plain conditional model. Values around 5 to 8 are common for Stable Diffusion: prompt adherence and sharpness go up, while diversity goes down and colors oversaturate at high $w$. Each step now costs two forward passes, usually run as one batch of two.
+
+---
+
+## Generative families compared
+
+| Property             | VAE                                                      | GAN                                                                 | Diffusion                                                        |
+| :------------------- | :------------------------------------------------------- | :------------------------------------------------------------------ | :--------------------------------------------------------------- |
+| Training objective   | ELBO (reconstruction + KL)                               | Adversarial minimax                                                 | MSE on predicted noise                                           |
+| Training stability   | Stable                                                   | Unstable; needs careful tuning                                      | Stable                                                           |
+| Sample quality       | Blurry                                                   | Sharp                                                               | Sharp, current state of the art                                  |
+| Mode coverage        | Good                                                     | Poor (mode collapse)                                                | Good                                                             |
+| Sampling cost        | One decoder pass                                         | One generator pass                                                  | 10–1,000 network passes (fewer with distillation)                |
+| Likelihood           | Lower bound                                              | None                                                                | Lower bound                                                      |
+| Useful latent space  | Yes, smooth and structured                               | Yes in StyleGAN; no encoder by default                              | Not by default; noise maps to image deterministically under DDIM |
+| Typical role in 2026 | Compressor for latent diffusion; representation learning | Fast single-domain generation; adversarial loss inside other models | Default for image, video, and audio generation                   |
+
+These three are often called the **generative trilemma**: quality, diversity, and speed, where each classic family gives up one. VAEs give up quality, GANs give up diversity, and diffusion gives up speed. Most of the recent progress in diffusion (better samplers, flow matching, distillation) is about removing the speed penalty.
+
+---
+
+## Key terms
+
+| Term                         | Meaning                                                                                          |
+| :--------------------------- | :----------------------------------------------------------------------------------------------- |
+| **generative model**         | A model of $p(x)$ that can sample new data                                                       |
+| **latent space**             | The space of compact codes $z$ a generator decodes from                                          |
+| **autoencoder**              | An encoder and decoder trained to reconstruct their input through a small code                   |
+| **VAE**                      | An autoencoder whose codes are distributions pulled toward $\mathcal{N}(0, I)$, so it can sample |
+| **ELBO**                     | The evidence lower bound: reconstruction minus KL divergence to the prior                        |
+| **reparameterization trick** | $z = \mu + \sigma \odot \epsilon$, which makes sampling differentiable                           |
+| **GAN**                      | A generator trained to fool a discriminator that separates real from generated samples           |
+| **mode collapse**            | A generator producing only a few kinds of output                                                 |
+| **diffusion model**          | A network trained to remove noise step by step, sampled by denoising pure noise                  |
+| **noise schedule**           | How much noise $\beta_t$ the forward process adds at each step                                   |
+| **classifier-free guidance** | Extrapolating from an unconditional toward a conditional prediction to follow a prompt closely   |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why can't a plain autoencoder generate new samples, and how does a VAE fix that?">
+
+    Its latent space has no defined distribution: codes sit wherever reconstruction was easiest, with gaps between them, and random codes decode to garbage. A VAE encodes to a Gaussian, adds a KL penalty pulling every code distribution toward $\mathcal{N}(0, I)$, and uses the reparameterization trick $z = \mu + \sigma \odot \epsilon$ to backpropagate through sampling. After training, decoding $z \sim \mathcal{N}(0, I)$ gives plausible data.
+
+  </Accordion>
+  <Accordion title="Why are VAE samples blurry?">
+
+    Squared-error reconstruction is a Gaussian likelihood, and the best Gaussian fit to several plausible sharp outputs is their average. Uncertainty about where an edge belongs becomes a soft edge. Adversarial or perceptual losses on the decoder fix this, which is how Stable Diffusion's VAE is trained.
+
+  </Accordion>
+  <Accordion title="What does a GAN minimize when the discriminator is optimal?">
+
+    The optimal discriminator is $D^*(x) = p_{\text{data}}(x) / (p_{\text{data}}(x) + p_g(x))$. Substituting it back gives $-\log 4 + 2\,\mathrm{JSD}(p_{\text{data}} \Vert p_g)$, so the generator minimizes the Jensen-Shannon divergence, with the optimum at $p_g = p_{\text{data}}$ and $D^* = 0.5$ everywhere.
+
+  </Accordion>
+  <Accordion title="What is the non-saturating GAN loss and why is it used?">
+
+    The generator maximizes $\log D(G(z))$ instead of minimizing $\log(1 - D(G(z)))$. With $D = \sigma(s)$, the original loss has gradient $-D$ with respect to the logit, which vanishes when the discriminator confidently rejects fakes, exactly early in training. The non-saturating loss has gradient $-(1 - D)$, which is large then. Both share the same fixed point.
+
+  </Accordion>
+  <Accordion title="What is mode collapse?">
+
+    The generator produces a narrow set of outputs that fool the current discriminator and ignores the rest of the data distribution. Nothing in the loss directly rewards variety, so the generator and discriminator can cycle between modes. Mitigations include Wasserstein losses with a gradient penalty, minibatch discrimination, and spectral normalization; diffusion models largely avoid the problem.
+
+  </Accordion>
+  <Accordion title="Why can a diffusion model train on a random timestep without simulating the steps before it?">
+
+    The forward process is a chain of Gaussians, so its marginal has a closed form: $x_t = \sqrt{\bar{\alpha}_t}\, x_0 + \sqrt{1 - \bar{\alpha}_t}\, \epsilon$. Any noise level can be reached from clean data in one operation, and the loss is the MSE between the true $\epsilon$ and the network's prediction.
+
+  </Accordion>
+  <Accordion title="Why did diffusion replace GANs for image generation?">
+
+    Training is a single, stable regression loss instead of an adversarial game, it covers the data distribution without mode collapse, and its quality scaled past GANs on diverse datasets such as ImageNet and text-to-image. The price is many network evaluations per sample, which DDIM, ODE solvers, flow matching, and distillation have reduced from 1,000 to as few as one to four.
+
+  </Accordion>
+  <Accordion title="What do latent diffusion and classifier-free guidance each add?">
+
+    Latent diffusion runs the diffusion process in a VAE's compressed latent space ($64 \times 64 \times 4$ instead of $512 \times 512 \times 3$), cutting compute by about 48 times, then decodes once. Classifier-free guidance trains one network with and without the prompt and extrapolates between the two noise predictions with a scale $w$, trading diversity for prompt adherence.
+
+  </Accordion>
+</Accordions>
+
+---
+
+## Canonical resources
+
+- _Auto-Encoding Variational Bayes_ (Kingma and Welling, arXiv:1312.6114) — the VAE, the ELBO, and the reparameterization trick
+- _Generative Adversarial Networks_ (Goodfellow et al., arXiv:1406.2661) — the minimax game and the optimal discriminator
+- _Wasserstein GAN_ (Arjovsky et al., arXiv:1701.07875) — why the JS divergence gives no gradient on disjoint supports
+- _Denoising Diffusion Probabilistic Models_ (Ho et al., arXiv:2006.11239) — the forward process, the noise-prediction loss, and ancestral sampling
+- _High-Resolution Image Synthesis with Latent Diffusion Models_ (Rombach et al., arXiv:2112.10752) — Stable Diffusion
+- _Classifier-Free Diffusion Guidance_ (Ho and Salimans, arXiv:2207.12598)
+- Lilian Weng, [_What are Diffusion Models?_](https://lilianweng.github.io/posts/2021-07-11-diffusion-models/) — the full derivation from the ELBO to $\mathcal{L}_{\text{simple}}$

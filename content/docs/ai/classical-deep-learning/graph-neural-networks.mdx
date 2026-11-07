@@ -1,0 +1,182 @@
+---
+title: Graph Neural Networks
+description: 'Neural networks for data made of entities and relationships: why a graph needs its own architecture, permutation equivariance, message passing, GCN, GraphSAGE, GAT and GIN, the GCN layer propagated by hand on a four-node graph, over-smoothing and over-squashing, the 1-WL expressiveness ceiling, and where GNNs are used.'
+---
+
+A **graph** is a set of **nodes** (entities) connected by **edges** (relationships): atoms joined by bonds, users connected by friendships, papers linked by citations, intersections joined by roads. A **graph neural network (GNN)** takes a graph as input and computes a vector for every node (and, when needed, for every edge or for the whole graph) by repeatedly letting each node gather information from its neighbours.
+
+CNNs assume the input is a regular grid and RNNs assume it is a sequence. A GNN assumes only that there are entities and a list of which ones are related, which makes it the most general backbone in this phase.
+
+**Builds on:** [Convolutions](/ai/classical-deep-learning/convolutions) for weight sharing and receptive fields, which carry over directly, and [Vectors and Matrices](/ai/math-foundations/vectors-and-matrices) for matrix products.
+
+---
+
+## Representing a graph
+
+A graph with $N$ nodes is stored as:
+
+- a **node feature matrix** $X$ of shape $(N, F)$: one row of $F$ features per node, such as an atom's element and charge;
+- an **adjacency matrix** $A$ of shape $(N, N)$, with $A_{ij} = 1$ if nodes $i$ and $j$ are connected and 0 otherwise;
+- optionally, **edge features** $\mathbf{e}_{ij}$, such as a bond type or a road's length.
+
+The **degree** of a node is its number of neighbours: the sum of its row of $A$.
+
+## Why a graph needs its own architecture
+
+A graph with $N$ nodes is stored as a node feature matrix $X \in \mathbb{R}^{N \times F}$ and an adjacency matrix $A \in \{0, 1\}^{N \times N}$. The node numbering is arbitrary: relabeling the nodes permutes the rows of $X$ and the rows and columns of $A$, and it is still the same graph.
+
+An MLP on the flattened $[X, A]$ fails for three reasons:
+
+1. **Order dependence.** Relabeling the nodes changes the input vector, so the MLP gives a different answer for the same graph. There are $N!$ labelings to learn to ignore.
+2. **Fixed size.** A molecule with 9 atoms and one with 40 need different input sizes.
+3. **Wasted parameters.** Real graphs are sparse. A social graph with $10^6$ users has $10^{12}$ entries in $A$, nearly all zero.
+
+A GNN layer is designed to be **permutation equivariant**: permuting the nodes permutes the output rows the same way, and nothing else changes. A graph-level readout built on top (a sum or mean over nodes) is then **permutation invariant**.
+
+## Message passing
+
+Every GNN layer in common use is an instance of one template. For node $v$ with neighbors $\mathcal{N}(v)$, layer $k$ computes:
+
+$$
+\begin{aligned}
+\mathbf{m}_v^{(k)} &= \bigoplus_{u \in \mathcal{N}(v)} \phi^{(k)}\big(\mathbf{h}_v^{(k-1)}, \mathbf{h}_u^{(k-1)}, \mathbf{e}_{uv}\big) \\
+\mathbf{h}_v^{(k)} &= \psi^{(k)}\big(\mathbf{h}_v^{(k-1)}, \mathbf{m}_v^{(k)}\big)
+\end{aligned}
+$$
+
+- $\phi$ builds a **message** from a neighbor (optionally using the edge feature $\mathbf{e}_{uv}$, such as a bond type).
+- $\bigoplus$ **aggregates** messages with an operation that ignores order: sum, mean, or max. This is where permutation invariance comes from.
+- $\psi$ **updates** the node's vector from its old value and the aggregate.
+
+After $k$ layers, $\mathbf{h}_v^{(k)}$ depends on every node within $k$ hops of $v$. This is the GNN's receptive field, and it grows exactly as a CNN's does with depth.
+
+The main variants differ only in $\phi$, $\bigoplus$, and $\psi$:
+
+| Variant                                           | Aggregation                                        | Distinguishing idea                                                                 |
+| :------------------------------------------------ | :------------------------------------------------- | :---------------------------------------------------------------------------------- |
+| **GCN** (Kipf and Welling, arXiv:1609.02907)      | Degree-normalized sum, self-loop included          | One shared weight matrix; a first-order approximation of spectral graph convolution |
+| **GraphSAGE** (Hamilton et al., arXiv:1706.02216) | Mean, max, or LSTM over a **sampled** neighborhood | Neighbor sampling makes training on graphs with millions of nodes feasible          |
+| **GAT** (Veličković et al., arXiv:1710.10903)     | Attention-weighted sum                             | Learns how much each neighbor matters, as attention does for tokens                 |
+| **GIN** (Xu et al., arXiv:1810.00826)             | Plain sum, then an MLP                             | As expressive as the 1-WL graph isomorphism test, the ceiling for message passing   |
+
+## The GCN layer
+
+The GCN layer in matrix form is:
+
+$$
+H^{(k)} = \sigma\big(\hat{D}^{-1/2} \hat{A} \hat{D}^{-1/2} H^{(k-1)} W^{(k)}\big), \qquad \hat{A} = A + I
+$$
+
+- $\hat{A} = A + I$ adds a self-loop, so a node's own vector is part of its update.
+- $\hat{D}$ is the diagonal degree matrix of $\hat{A}$. Dividing by $\sqrt{d_i d_j}$ keeps a node with 1,000 neighbors from producing vectors 1,000 times larger than a node with one.
+- $W^{(k)}$ is shared by every node, as a convolution filter is shared by every pixel. The parameter count is $F_{in} \times F_{out}$ whatever the graph size.
+
+A worked example on a graph of four people: Alice–Bob, Alice–Charlie, Bob–David, and Charlie–David, a 4-cycle. One feature, set to 1 only for Alice. The weight is fixed at identity and the nonlinearity is dropped, to show the propagation alone:
+
+```python title="gcn_propagation.py"
+import numpy as np
+
+# Alice-Bob, Alice-Charlie, Bob-David, Charlie-David: a 4-cycle
+A = np.array([[0, 1, 1, 0],
+              [1, 0, 0, 1],
+              [1, 0, 0, 1],
+              [0, 1, 1, 0]], dtype=float)
+X = np.array([[1.0], [0.0], [0.0], [0.0]])        # one feature: only Alice is "flagged"
+
+A_hat = A + np.eye(4)                              # self-loops: a node keeps its own signal
+d = A_hat.sum(1)
+D_inv_sqrt = np.diag(d ** -0.5)
+P = D_inv_sqrt @ A_hat @ D_inv_sqrt                # symmetric-normalized propagation matrix
+
+H = X
+for layer in range(1, 4):
+    H = P @ H                                      # weights = identity, no nonlinearity
+    print(layer, np.round(H.ravel(), 3))
+# 1 [0.333 0.333 0.333 0.   ]
+# 2 [0.333 0.222 0.222 0.222]
+# 3 [0.259 0.259 0.259 0.222]
+```
+
+After one layer, Alice's signal has reached her two direct neighbors and David is still 0. After two, it reaches David, two hops away. By layer three the four values are nearly equal, which is over-smoothing beginning on a tiny graph.
+
+## Over-smoothing and over-squashing
+
+The matrix $P = \hat{D}^{-1/2}\hat{A}\hat{D}^{-1/2}$ is a smoothing operator, a low-pass filter on the graph. Applying it $k$ times is like running a random walk for $k$ steps. On a connected graph, $P^k H$ converges to a vector that depends only on node degrees, not on the starting features. Every node ends up with the same representation (scaled by degree), and classification becomes impossible.
+
+This is why practical GNNs are **shallow**, typically 2 to 4 layers, which is the opposite of CNNs and transformers. The usual fixes:
+
+- **Residual connections**, $\mathbf{h}^{(k)} = \mathbf{h}^{(k-1)} + f(\mathbf{h}^{(k-1)})$, which keep each node's own signal alive.
+- **Jumping knowledge**: concatenating every layer's output, so the readout can use the shallow, unsmoothed representations.
+- **Normalization** designed for graphs (PairNorm), which keeps node vectors spread apart.
+
+A second failure is **over-squashing** (Alon and Yahav, arXiv:2006.05205). The number of nodes within $k$ hops can grow exponentially with $k$, but all of their information must pass through fixed-size vectors at bottleneck nodes. Long-range dependencies get compressed out, the graph version of the [Seq2Seq bottleneck](/ai/classical-deep-learning/seq2seq-and-attention#the-fixed-vector-bottleneck). Graph transformers, which let every node attend to every other node and add the graph structure as positional encodings, are the usual response.
+
+## Expressive power: the 1-WL ceiling
+
+Message passing cannot tell apart two graphs that the **1-dimensional Weisfeiler-Lehman (1-WL)** test cannot tell apart (Xu et al., 2019). 1-WL repeatedly relabels each node with a hash of its own label and the multiset of its neighbors' labels, which is message passing with a perfect injective aggregator.
+
+A standard failure case: two disjoint triangles versus one hexagon. Both have 6 nodes and every node has degree 2, so every node sees the same neighborhood at every round. A message-passing GNN gives them identical embeddings, although one graph is connected and the other is not. In chemistry this matters: some different molecules look identical to a plain GNN. The fix is to add features message passing cannot compute on its own: cycle counts, random-walk positional encodings, or Laplacian eigenvectors.
+
+**Sum aggregation is strictly more expressive than mean or max.** For a node with neighbors $\{a, a\}$ and another with $\{a\}$, the mean and the max are both $a$, so the two nodes look the same. The sum is $2a$ against $a$, so they differ. This is why GIN uses sum.
+
+## Tasks and where GNNs are used
+
+| Task level      | Output                                   | Example                                                                         |
+| :-------------- | :--------------------------------------- | :------------------------------------------------------------------------------ |
+| **Node**        | A label per node                         | Classifying papers in a citation graph; flagging fraudulent accounts            |
+| **Edge / link** | A score per pair of nodes                | Recommendation (user–item), drug–target interaction, knowledge-graph completion |
+| **Graph**       | A label per whole graph, after a readout | Molecular property prediction (solubility, toxicity)                            |
+
+Deployed examples include PinSage (Pinterest recommendations over a graph of billions of pins and boards, a GraphSAGE variant), GraphCast (DeepMind's weather model, message passing over a mesh of the globe), and the structure module side of protein-structure models. Fraud detection uses GNNs because fraud rings show up as relationships (shared devices, shared cards, payment cycles) that no single account's features reveal.
+
+---
+
+## Key terms
+
+| Term                            | Meaning                                                                              |
+| :------------------------------ | :----------------------------------------------------------------------------------- |
+| **graph / node / edge**         | Entities and the relationships between pairs of them                                 |
+| **adjacency matrix**            | $A_{ij} = 1$ when nodes $i$ and $j$ are connected                                    |
+| **degree**                      | The number of neighbours a node has                                                  |
+| **permutation equivariance**    | Relabelling the nodes relabels the outputs the same way and changes nothing else     |
+| **message passing**             | Each node aggregates messages from its neighbours and updates its own vector         |
+| **GCN / GraphSAGE / GAT / GIN** | Normalized sum / sampled neighbourhoods / attention weights / sum plus an MLP        |
+| **over-smoothing**              | Node vectors becoming indistinguishable after many layers                            |
+| **over-squashing**              | Information from exponentially many distant nodes compressed into fixed-size vectors |
+| **1-WL test**                   | A graph-isomorphism heuristic that bounds what message passing can distinguish       |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Why can't an MLP simply be applied to a graph's adjacency matrix?">
+
+    The node order is arbitrary. Relabeling the nodes changes the flattened input, so the MLP gives different outputs for the same graph and has to learn to ignore $N!$ orderings. It also needs a fixed node count, and it wastes parameters on the mostly zero entries of a sparse adjacency matrix. A GNN shares weights across nodes and aggregates neighbors with an order-independent sum, mean, or max, which makes it permutation equivariant.
+
+  </Accordion>
+  <Accordion title="What is message passing?">
+
+    Each node builds messages from its neighbors' vectors (and edge features), aggregates them with a permutation-invariant operation, and updates its own vector from its old value and the aggregate. After $k$ layers a node's vector depends on its $k$-hop neighborhood. GCN, GraphSAGE, GAT, and GIN differ only in how messages are built, aggregated, and applied.
+
+  </Accordion>
+  <Accordion title="Why are GNNs usually only 2 to 4 layers deep?">
+
+    Over-smoothing. Normalized neighbor averaging is a low-pass filter; applying it repeatedly is a random walk that converges to a state depending only on node degree, so all nodes end up with nearly the same vector. There is also over-squashing: the exponentially growing $k$-hop neighborhood must pass through fixed-size vectors. Residual connections, jumping knowledge, and graph transformers address these.
+
+  </Accordion>
+  <Accordion title="What can a message-passing GNN not distinguish?">
+
+    Any two graphs the 1-WL isomorphism test cannot distinguish, for example two disjoint triangles versus a single 6-cycle, where every node has degree 2 and sees identical neighborhoods. Sum aggregation reaches this ceiling (GIN); mean and max fall below it because they cannot count repeated neighbors. Structural features such as cycle counts or Laplacian eigenvectors push past it.
+
+  </Accordion>
+</Accordions>
+
+---
+
+## Canonical resources
+
+- _Semi-Supervised Classification with Graph Convolutional Networks_ (Kipf and Welling, arXiv:1609.02907) — the GCN layer
+- _How Powerful are Graph Neural Networks?_ (Xu et al., arXiv:1810.00826) — the 1-WL ceiling and GIN
+- _Neural Message Passing for Quantum Chemistry_ (Gilmer et al., arXiv:1704.01212) — the message-passing framework that unifies GNN variants
+- [`pyg-team/pytorch_geometric`](https://github.com/pyg-team/pytorch_geometric) — the standard PyTorch GNN library

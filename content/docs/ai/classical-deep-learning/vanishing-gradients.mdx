@@ -1,0 +1,236 @@
+---
+title: Vanishing and Exploding Gradients
+description: 'Why a vanilla RNN cannot learn long-range dependencies: backpropagation through time derived from the scalar case up, the product of Jacobians, the spectral-norm bound, why the failure is silent, gradient clipping, truncated BPTT, and why the real fix had to be architectural.'
+---
+
+A vanilla RNN can, in principle, carry information across a whole sequence. In practice, trained by gradient descent, it learns dependencies across about ten to twenty steps and almost nothing longer. The cause is not the forward pass but the backward pass: the gradient that teaches the network to use step $k$ when predicting step $T$ is multiplied by the same factor once per step in between, so it shrinks or grows **exponentially** with the distance $T - k$.
+
+This page derives that result, starting with a single number and building up to matrices, and covers the two standard patches: gradient clipping for explosion and truncated BPTT for cost. Neither fixes vanishing. That required a new cell, covered in [LSTM and GRU](/ai/classical-deep-learning/lstm-and-gru).
+
+**Builds on:** [Recurrent Neural Networks](/ai/classical-deep-learning/recurrent-networks) for the recurrence and unrolling, and the [chain rule](/ai/math-foundations/backprop-from-scratch) for backprop.
+
+---
+
+## What a long-range dependency is
+
+A **long-range dependency** exists when the correct output at step $T$ depends on an input many steps earlier. Language is full of them:
+
+- "The **keys** to the old wooden cabinet **are** missing." — `are` agrees with `keys`, six words back.
+- "I grew up in **France** and moved abroad at twenty, but I still speak fluent **French**." — the answer depends on a word about fifteen tokens earlier.
+- In code, a closing bracket depends on an opening bracket an arbitrary distance back.
+
+To learn the first example, training has to discover that the representation of `keys` at step 2 should influence the prediction at step 8. The signal that teaches this is the gradient of the loss at step 8 with respect to the hidden state at step 2. If that gradient is effectively zero, the network never learns the connection, no matter how much data it sees.
+
+---
+
+## The scalar case: one number multiplied many times
+
+Take the one-unit RNN from the previous page, without input or bias terms that do not affect the argument:
+
+$$
+h_t = \tanh(z_t), \qquad z_t = w\,h_{t-1} + u\,x_t
+$$
+
+By the chain rule, one step back costs one derivative:
+
+$$
+\frac{\partial h_t}{\partial h_{t-1}} = \tanh'(z_t) \cdot w
+$$
+
+where $\tanh'(z) = 1 - \tanh^2(z)$ lies in $(0, 1]$, equal to 1 only at $z = 0$. Going back from step $T$ to step $k$ chains $T - k$ of these:
+
+$$
+\frac{\partial h_T}{\partial h_k} = \prod_{t=k+1}^{T} \tanh'(z_t)\, w
+$$
+
+Suppose each factor $\tanh'(z_t)\,w$ is about the same value $a$. Then the product is $a^{T-k}$, and the whole story is whether $a$ is below or above 1:
+
+| Per-step factor $a$                     | After 10 steps |     After 50 steps |     After 100 steps |
+| :-------------------------------------- | -------------: | -----------------: | ------------------: |
+| $0.72$ (e.g. $w = 0.9$, $\tanh' = 0.8$) |          0.037 | $7 \times 10^{-8}$ | $5 \times 10^{-15}$ |
+| $0.90$                                  |           0.35 |              0.005 |  $3 \times 10^{-5}$ |
+| $1.00$                                  |              1 |                  1 |                   1 |
+| $1.50$                                  |             58 |  $6 \times 10^{8}$ |            overflow |
+
+A factor of $0.72$ is perfectly ordinary, and it reduces the gradient from 50 steps back to one ten-millionth of its size. That is **vanishing**. A factor of $1.5$ multiplies it by six hundred million, and the next weight update is enormous. That is **exploding**. Holding $a$ at exactly 1 at every step is impossible, because $\tanh'(z_t)$ changes with every input.
+
+---
+
+## The vector case: a product of Jacobians
+
+With a hidden vector of width $H$, the one-step derivative is an $H \times H$ **Jacobian** matrix. Differentiating $\mathbf{h}_t = \tanh(\mathbf{W}_{hh}\mathbf{h}_{t-1} + \mathbf{W}_{xh}\mathbf{x}_t + \mathbf{b})$:
+
+$$
+\frac{\partial \mathbf{h}_t}{\partial \mathbf{h}_{t-1}} = \operatorname{diag}\big(\tanh'(\mathbf{z}_t)\big)\, \mathbf{W}_{hh}
+$$
+
+The diagonal matrix applies each unit's `tanh` slope; $\mathbf{W}_{hh}$ is the same at every step. Across $T - k$ steps:
+
+$$
+\frac{\partial \mathbf{h}_T}{\partial \mathbf{h}_k} = \prod_{t=k+1}^{T} \operatorname{diag}\big(\tanh'(\mathbf{z}_t)\big)\, \mathbf{W}_{hh}
+$$
+
+The size of a matrix's effect on a vector is measured by its **spectral norm** $\lVert \mathbf{W} \rVert_2$, the largest factor by which it can stretch any vector (its largest singular value). Norms of products are at most products of norms, so with $\gamma = \max \tanh' \le 1$ and $\rho = \lVert \mathbf{W}_{hh} \rVert_2$:
+
+$$
+\left\lVert \frac{\partial \mathbf{h}_T}{\partial \mathbf{h}_k} \right\rVert_2 \le (\gamma \rho)^{T-k}
+$$
+
+This is the scalar result with $\rho$ in place of $w$. Pascanu, Mikolov and Bengio (arXiv:1211.5063) gave the matching conditions:
+
+- If the largest singular value of $\mathbf{W}_{hh}$ is below $1/\gamma$, long-range gradients **must** vanish. This is a sufficient condition.
+- If it is above $1/\gamma$, explosion **can** occur. This is a necessary condition, not a guarantee.
+
+Using the eigen-decomposition gives the same intuition from another angle: repeatedly multiplying by $\mathbf{W}_{hh}$ amplifies the directions whose eigenvalue magnitude exceeds 1 and kills the directions whose magnitude is below 1. After many steps, only the dominant directions survive. Information stored in any other direction is gone.
+
+### Why `tanh` makes it worse
+
+$\gamma$ is a best case. When a unit's pre-activation $z$ is large, the unit **saturates**: $\tanh(z) \approx \pm 1$ and $\tanh'(z) \approx 0$. At $z = 2$, $\tanh' = 0.07$; at $z = 3$, it is $0.01$. A network with large weights therefore has a large $\rho$ (pushing toward explosion) and saturated units with tiny slopes (pushing toward vanishing), with the balance changing from input to input. Training such a network is unstable in both directions at once.
+
+---
+
+## Why the failure is silent
+
+Exploding gradients announce themselves: the loss jumps to `NaN`. Vanishing gradients do not. The full gradient for $\mathbf{W}_{hh}$ is a **sum** of contributions from every pair of steps:
+
+$$
+\frac{\partial L_T}{\partial \mathbf{W}_{hh}} = \sum_{k=1}^{T} \underbrace{\frac{\partial L_T}{\partial \mathbf{h}_T}\,\frac{\partial \mathbf{h}_T}{\partial \mathbf{h}_k}}_{\text{shrinks like } a^{T-k}}\, \frac{\partial \mathbf{h}_k}{\partial \mathbf{W}_{hh}}
+$$
+
+The terms with $k$ close to $T$ (short-range) are large; the terms with $k$ far from $T$ (long-range) are exponentially small. The sum is dominated by short-range terms, so training proceeds normally and the loss goes down — the network just learns to use the last few steps and ignores everything earlier. Bengio, Simard and Frasconi (1994) proved this tension in general: a recurrent network that stores information robustly against noise necessarily has vanishing long-term gradients.
+
+The practical symptom is a model that does well on local patterns and fails whenever the answer depends on distant context, such as subject-verb agreement across a long clause.
+
+---
+
+## Gradient clipping: the fix for exploding
+
+**Gradient clipping** caps the size of the gradient before the optimizer step. The standard form, **clipping by norm**, treats every parameter's gradient as one long vector $\mathbf{g}$ and rescales it if its length exceeds a threshold $\tau$:
+
+$$
+\mathbf{g} \leftarrow \mathbf{g} \cdot \min\!\left(1, \frac{\tau}{\lVert \mathbf{g} \rVert}\right)
+$$
+
+Worked example with $\tau = 5$: a gradient of norm $3$ passes unchanged. A gradient of norm $400$ is multiplied by $5/400 = 0.0125$, so it keeps its **direction** but its length becomes 5.
+
+Why this is the right fix: an exploding gradient is usually the result of the loss surface having a **cliff**, a region where the loss changes extremely sharply. The gradient direction at a cliff is still informative; only the step size is catastrophic. Clipping keeps the direction and bounds the step.
+
+```python
+loss.backward()
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+optimizer.step()
+```
+
+**Clipping by value** (`clip_grad_value_`) clamps each coordinate to $[-\tau, \tau]$ independently. That changes the relative sizes of coordinates and therefore the direction of the update, which is why norm clipping is the default.
+
+Practical settings: `max_norm` of `1.0` is common, `5.0` for LSTM language models. Logging the pre-clip norm is worth doing: if it routinely exceeds the threshold by an order of magnitude, the learning rate is too high and clipping is doing the optimizer's job.
+
+<Callout type="warn">
+  ### Clipping with mixed precision
+
+`torch.amp.GradScaler` multiplies the loss by a large factor so FP16 gradients do not underflow. Clipping those scaled gradients applies the threshold in the wrong units. Call `scaler.unscale_(optimizer)` first, then clip, then `scaler.step(optimizer)`.
+
+</Callout>
+
+**Clipping does nothing for vanishing gradients.** It only ever shrinks. A gradient that is already $10^{-8}$ passes through untouched.
+
+---
+
+## Truncated BPTT: bounding the cost
+
+Full BPTT on a sequence of length $T$ keeps every hidden state in memory for the backward pass, so memory is $O(T)$. For a long text or a continuous sensor stream, $T$ can be millions.
+
+**Truncated BPTT** splits the sequence into chunks of length $L$. The forward pass carries the hidden state across chunk boundaries, so the model still **sees** earlier context, but the backward pass is cut at each boundary, so gradients flow back at most $L$ steps:
+
+```python
+h = None
+for chunk, target in zip(sequence.split(L, dim=1), targets.split(L, dim=1)):
+    out, h = rnn(chunk, h)
+    loss = criterion(out, target)
+    loss.backward()
+    optimizer.step(); optimizer.zero_grad()
+    h = h.detach()          # keep the value, cut the gradient path
+```
+
+`detach()` keeps the state's numbers but removes its history from the graph. Memory becomes $O(L)$. The cost is that no dependency longer than $L$ can be **learned**, because no gradient ever connects positions further apart than that. Given that a vanilla RNN's gradient has already vanished after a few dozen steps, truncation at $L = 35$ to $L = 200$ loses little in practice.
+
+---
+
+## Partial remedies, and why they were not enough
+
+| Remedy                                             | Idea                                                                                                    | Limitation                                                                |
+| :------------------------------------------------- | :------------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------ |
+| **Orthogonal initialization** of $\mathbf{W}_{hh}$ | Start with all singular values exactly 1, so the product neither grows nor shrinks initially            | Training moves the weights away from orthogonality; `tanh'` still shrinks |
+| **IRNN** (Le et al., 2015)                         | ReLU activation with $\mathbf{W}_{hh}$ initialized to the identity                                      | Works on some tasks; fragile and prone to explosion                       |
+| **Unitary / orthogonal RNNs**                      | Constrain $\mathbf{W}_{hh}$ to stay orthogonal throughout training                                      | Expensive parameterizations; restricts what the network can represent     |
+| **Skip connections in time**                       | Let $\mathbf{h}_t$ also read $\mathbf{h}_{t-d}$ directly                                                | Shortens some paths, does not remove the multiplicative chain             |
+| **Gated cells (LSTM, GRU)**                        | Carry memory by **addition**, controlled by learned gates, instead of by repeated matrix multiplication | The fix that worked; the next page                                        |
+
+Every non-gated remedy tries to keep the per-step multiplicative factor near 1. The gated cells change the structure instead: the memory at step $t$ is the memory at step $t - 1$ **plus** an update, so the derivative of one with respect to the other is close to 1 by construction — the same idea that [residual connections](/ai/classical-deep-learning/vision-architectures#resnet-the-residual-connection) later brought to very deep CNNs.
+
+---
+
+## Key terms
+
+| Term                      | Meaning                                                                                                                           |
+| :------------------------ | :-------------------------------------------------------------------------------------------------------------------------------- |
+| **long-range dependency** | An output that depends on an input many steps earlier                                                                             |
+| **Jacobian**              | The matrix of partial derivatives of one vector with respect to another; here $\partial \mathbf{h}_t / \partial \mathbf{h}_{t-1}$ |
+| **spectral norm**         | The largest factor by which a matrix can stretch a vector (its largest singular value)                                            |
+| **vanishing gradient**    | Gradients from distant steps shrinking exponentially, so long-range relations are never learned                                   |
+| **exploding gradient**    | Gradients growing exponentially, producing huge updates and `NaN` losses                                                          |
+| **saturation**            | A `tanh` or sigmoid unit pushed to its flat region, where its derivative is near 0                                                |
+| **gradient clipping**     | Rescaling the gradient when its norm exceeds a threshold; fixes explosion only                                                    |
+| **truncated BPTT**        | Backpropagating only within chunks of length $L$ while carrying the forward state across chunks                                   |
+
+---
+
+## Interview questions
+
+<Accordions>
+  <Accordion title="Derive why gradients vanish in a vanilla RNN, starting from one hidden unit.">
+
+    With $h_t = \tanh(w h_{t-1} + u x_t)$, one step back costs $\partial h_t / \partial h_{t-1} = \tanh'(z_t)\,w$, so $\partial h_T / \partial h_k = \prod_{t=k+1}^{T} \tanh'(z_t)\,w$. If each factor is roughly $a$, the product is $a^{T-k}$: exponentially small for $a < 1$ and exponentially large for $a > 1$. With $a = 0.72$, the gradient from 50 steps back is about $7 \times 10^{-8}$ of its original size.
+
+  </Accordion>
+  <Accordion title={<>State the bound on <code>||dh_T / dh_k||</code> for a vector RNN and explain each term.</>}>
+
+    $\lVert \partial \mathbf{h}_T / \partial \mathbf{h}_k \rVert \le (\gamma\rho)^{T-k}$, where each one-step Jacobian is $\operatorname{diag}(\tanh'(\mathbf{z}_t))\mathbf{W}_{hh}$, $\gamma = \max \tanh' \le 1$ bounds the diagonal, and $\rho = \lVert \mathbf{W}_{hh} \rVert_2$ is the spectral norm. If $\gamma\rho < 1$, long-range gradients must vanish; if the largest singular value exceeds $1/\gamma$, explosion becomes possible.
+
+  </Accordion>
+  <Accordion title="Why is the vanishing gradient problem harder to detect than the exploding one?">
+
+    The weight gradient is a sum over all step pairs. Short-range terms stay large and long-range terms vanish, so the total gradient looks healthy and the loss decreases normally; the network simply learns to use only recent context. Exploding gradients, by contrast, produce visible loss spikes and `NaN` values.
+
+  </Accordion>
+  <Accordion title="Why does saturation of tanh make the problem worse?">
+
+    $\tanh'(z) = 1 - \tanh^2(z)$ falls rapidly away from zero: $0.07$ at $z = 2$ and $0.01$ at $z = 3$. Large weights push pre-activations into that region, so the diagonal factors in each Jacobian become tiny even while $\lVert \mathbf{W}_{hh} \rVert$ is large. The network is pushed toward explosion and vanishing at once, varying with the input.
+
+  </Accordion>
+  <Accordion title="Why does clip_grad_norm_ preserve direction while clip_grad_value_ does not?">
+
+    `clip_grad_norm_` multiplies the entire gradient by one scalar, $\min(1, \tau / \lVert \mathbf{g} \rVert)$, which changes only its length. `clip_grad_value_` clamps each coordinate separately, which changes the ratios between coordinates and so the direction. Norm clipping fits the cliff picture of explosion: the direction is informative, only the step is too large.
+
+  </Accordion>
+  <Accordion title="Does gradient clipping help with vanishing gradients?">
+
+    No. Clipping only scales gradients down when their norm exceeds a threshold. A gradient that has already vanished is far below any threshold and passes through unchanged. Vanishing requires a change in architecture (gated cells, residual paths) or in initialization and parameterization.
+
+  </Accordion>
+  <Accordion title="Where does gradient clipping go in an AMP training step?">
+
+    After `scaler.unscale_(optimizer)` and before `scaler.step(optimizer)`. The GradScaler multiplies gradients by a large factor during backward, so clipping before unscaling applies the threshold to inflated values and the bound is meaningless.
+
+  </Accordion>
+  <Accordion title="What is truncated BPTT, and what does it give up?">
+
+    Splitting a long sequence into chunks of length $L$, carrying the hidden state forward across chunks but detaching it at each boundary so backprop stays within a chunk. Memory drops from $O(T)$ to $O(L)$. The model still sees earlier context through the carried state, but it can never learn a dependency longer than $L$ because no gradient crosses a boundary.
+
+  </Accordion>
+  <Accordion title="Why did orthogonal initialization not solve the problem on its own?">
+
+    An orthogonal $\mathbf{W}_{hh}$ has all singular values equal to 1, so the matrix part of each Jacobian neither grows nor shrinks gradients at initialization. But the `tanh'` factors are still at most 1 and often much smaller, and training moves $\mathbf{W}_{hh}$ away from orthogonality. The multiplicative chain remains; the gated architectures removed it.
+
+  </Accordion>
+</Accordions>

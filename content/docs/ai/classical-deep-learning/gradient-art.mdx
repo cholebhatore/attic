@@ -1,11 +1,19 @@
 ---
-title: Gradient Manipulation
-description: 'Optimizing the input instead of the weights: FGSM and PGD adversarial attacks on MNIST, Deep Dream activation ascent, and neural style transfer with L-BFGS.'
+title: Adversarial Examples and Style Transfer
+description: 'Optimizing the input instead of the weights: why tiny perturbations fool classifiers, FGSM and PGD attacks with the epsilon budget, the attack taxonomy, adversarial training and gradient masking, Deep Dream by gradient ascent on activations, and neural style transfer with content features, Gram matrices, and L-BFGS.'
 ---
 
-Every page so far has computed `d loss / d weights` and used it to change the model. Nothing in the autograd engine requires that. Set `requires_grad = True` on the input tensor and the same backward pass gives you `d loss / d pixels`, which you can use to change the image instead.
+Training computes the gradient of the loss with respect to the **weights** and changes the model while the images stay fixed. Nothing in backpropagation requires that. With the model frozen and `requires_grad = True` set on the **input**, the same backward pass gives the gradient with respect to every pixel, and the image itself can be optimized instead.
 
-That one change produces three useful and one dangerous thing: adversarial examples, Deep Dream, and style transfer. All three freeze the model completely.
+That one change produces three very different results:
+
+- **Adversarial examples:** change an image so slightly that a person sees no difference, yet the model's answer flips — a panda classified as a gibbon. A security problem, and a revealing fact about how classifiers work.
+- **Deep Dream:** change the image to make some internal layer fire harder, which paints the patterns that layer detects (eyes, dogs, swirls) into the picture.
+- **Style transfer:** change an image until its content matches one photograph and its textures match a painting.
+
+**Builds on:** [Interpretability](/ai/classical-deep-learning/interpretability), which reads input gradients without acting on them, and [Gradient Descent](/ai/neural-networks/gradient-descent).
+
+All three share the same setup:
 
 ```python
 import torch
@@ -25,37 +33,6 @@ loss = objective(model(x))
 | Deep Dream          | Layer activation norm               | Ascend    | Hundreds     |
 | Style transfer      | Content plus Gram-matrix style loss | Descend   | 300 to 1000  |
 | Feature attribution | Class score                         | Read only | One backward |
-
----
-
-## The plain-language version
-
-Normally training changes the **weights** to make the loss smaller, while the images stay fixed. This page flips that around: **freeze the model and change the image**. The same backward pass that gives `d loss / d weights` can just as easily give `d loss / d pixels`, so you can nudge pixels in whatever direction you want.
-
-Three very different results come from that one trick:
-
-- **Adversarial examples**: change the image so slightly a human sees no difference, yet the model's answer flips (a panda classified as a gibbon). A security problem.
-- **Deep Dream**: push the image to make some internal layer fire harder, which paints the patterns that layer detects (eyes, dogs, swirls) into the picture.
-- **Style transfer**: change an image until its content matches one photo and its textures match a painting.
-
-| Word                             | Plain meaning                                                                                                                                 |
-| :------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------- |
-| **input gradient**               | The gradient of the loss with respect to the input pixels instead of the weights.                                                             |
-| **perturbation**                 | A small change added to an input.                                                                                                             |
-| **adversarial example**          | An input with a deliberately crafted, usually invisible perturbation that makes the model answer wrongly.                                     |
-| **`eps` (epsilon) budget**       | The maximum amount any single pixel may change. Keeps the perturbation small.                                                                 |
-| **`L_inf` norm**                 | The largest absolute value in a vector. An `L_inf` budget of 0.25 means no pixel moves by more than 0.25.                                     |
-| **FGSM**                         | Fast Gradient Sign Method: one step that moves every pixel by `eps` in the direction of the sign of its gradient.                             |
-| **PGD**                          | Projected Gradient Descent: many small FGSM-like steps, pulling the image back inside the `eps` budget after each one. Stronger than FGSM.    |
-| **untargeted / targeted attack** | Untargeted: make the model wrong in any way. Targeted: make it predict a specific class the attacker chose.                                   |
-| **white-box / black-box**        | White-box: the attacker can read the model's gradients. Black-box: the attacker only sees its outputs.                                        |
-| **transferability**              | An adversarial example built against one model often fools other models too.                                                                  |
-| **adversarial training**         | Training on adversarial examples so the model learns to resist them.                                                                          |
-| **gradient ascent**              | Moving uphill to make a quantity larger, the opposite of gradient descent. Deep Dream does this to activations.                               |
-| **content / style**              | Content is what objects are where, read from deep layers. Style is texture and color statistics, read from correlations between feature maps. |
-| **Gram matrix**                  | A table of how strongly every pair of feature maps fires together. It captures texture while ignoring where things are.                       |
-| **VGG**                          | An older, simple CNN whose features work especially well for style transfer.                                                                  |
-| **L-BFGS**                       | An optimizer that uses curvature information. Works well when optimizing a single image with a fixed model.                                   |
 
 ---
 
@@ -109,7 +86,7 @@ The untargeted version ascends the loss for the true label. The targeted version
 | ImageNet   | `[0, 1]`    | `4 / 255 = 0.016`                 | Tighter, images are busier              |
 | Normalized | zero-mean   | State the pre-normalization value | Eps after `Normalize` is not comparable |
 
-Always clip to the valid input range after adding the perturbation. Skipping that step gives you an attack on a distribution the model never saw, and the accuracy drop means nothing.
+Always clip to the valid input range after adding the perturbation. Skipping that step produces an attack on a distribution the model never saw, and the accuracy drop means nothing.
 
 ---
 
@@ -183,7 +160,7 @@ The cost is roughly the number of PGD steps, so a 40-step run trains about thirt
 <Callout type="warn">
   ### Gradient masking is not robustness
 
-Many published defenses worked by breaking the gradient rather than the perturbation, so FGSM and weak PGD found nothing while a stronger attack found everything. The symptoms are specific: PGD much weaker than expected relative to FGSM, near-zero gradient norms on adversarial examples, accuracy that goes up as you increase the number of steps, and attacks that fail on a reparameterized copy of the same model. Athalye et al. broke thirteen of the eighteen defenses published at ICML 2018 this way. Always evaluate with AutoAttack, and check the model under a different random seed and input transform before believing a robustness number.
+Many published defenses worked by breaking the gradient rather than the perturbation, so FGSM and weak PGD found nothing while a stronger attack found everything. The symptoms are specific: PGD much weaker than expected relative to FGSM, near-zero gradient norms on adversarial examples, accuracy that goes up as the number of attack steps increases, and attacks that fail on a reparameterized copy of the same model. Athalye et al. broke thirteen of the eighteen defenses published at ICML 2018 this way. Always evaluate with AutoAttack, and check the model under a different random seed and input transform before believing a robustness number.
 
 </Callout>
 
@@ -360,6 +337,29 @@ Starting from the content image converges faster and keeps the layout. Starting 
 
 ---
 
+## Key terms
+
+| Term                             | Meaning                                                                                                                                       |
+| :------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------- |
+| **input gradient**               | The gradient of the loss with respect to the input pixels instead of the weights.                                                             |
+| **perturbation**                 | A small change added to an input.                                                                                                             |
+| **adversarial example**          | An input with a deliberately crafted, usually invisible perturbation that makes the model answer wrongly.                                     |
+| **`eps` (epsilon) budget**       | The maximum amount any single pixel may change. Keeps the perturbation small.                                                                 |
+| **`L_inf` norm**                 | The largest absolute value in a vector. An `L_inf` budget of 0.25 means no pixel moves by more than 0.25.                                     |
+| **FGSM**                         | Fast Gradient Sign Method: one step that moves every pixel by `eps` in the direction of the sign of its gradient.                             |
+| **PGD**                          | Projected Gradient Descent: many small FGSM-like steps, pulling the image back inside the `eps` budget after each one. Stronger than FGSM.    |
+| **untargeted / targeted attack** | Untargeted: make the model wrong in any way. Targeted: make it predict a specific class the attacker chose.                                   |
+| **white-box / black-box**        | White-box: the attacker can read the model's gradients. Black-box: the attacker only sees its outputs.                                        |
+| **transferability**              | An adversarial example built against one model often fools other models too.                                                                  |
+| **adversarial training**         | Training on adversarial examples so the model learns to resist them.                                                                          |
+| **gradient ascent**              | Moving uphill to make a quantity larger, the opposite of gradient descent. Deep Dream does this to activations.                               |
+| **content / style**              | Content is what objects are where, read from deep layers. Style is texture and color statistics, read from correlations between feature maps. |
+| **Gram matrix**                  | A table of how strongly every pair of feature maps fires together. It captures texture while ignoring where things are.                       |
+| **VGG**                          | An older, simple CNN whose features work especially well for style transfer.                                                                  |
+| **L-BFGS**                       | An optimizer that uses curvature information. Works well when optimizing a single image with a fixed model.                                   |
+
+---
+
 ## Interview questions
 
 <Accordions>
@@ -388,7 +388,7 @@ Starting from the content image converges faster and keeps the layout. Starting 
     `eps` is measured in the input's own units and the datasets differ in both what is visible and how far the boundary is. MNIST's published benchmark is `0.3` on nearly flat 28x28 digits. CIFAR-10 images are busy and full of high-frequency texture, so `8 / 255 = 0.031` already crosses boundaries and `0.3` would be an obvious, out-of-distribution corruption. ImageNet is tighter still at `4 / 255`.
 
   </Accordion>
-  <Accordion title="What is gradient masking, and how do you detect it in a defense you are evaluating?">
+  <Accordion title="What is gradient masking, and how is it detected when evaluating a defense?">
 
     A defense that scores high because gradients are useless rather than because it is correct: gradient masking makes the loss surface flat, saturated, noisy, or non-differentiable near the input, so a white-box attack finds nothing and reports safety. Detect it with gradient-free and ensemble attacks such as AutoAttack, check whether many steps and random restarts beat the reported single-step result, and compare the model's own gradient norm against a baseline model's.
 
@@ -418,7 +418,7 @@ Starting from the content image converges faster and keeps the layout. Starting 
     The optimization is over the pixels of a single image with the model frozen: one smooth objective, no minibatches, no stochastic noise. A quasi-Newton method can build a curvature approximation and converge in hundreds of iterations, whereas Adam's per-coordinate adaptive steps gain nothing there and need many more.
 
   </Accordion>
-  <Accordion title="What happens to a style transfer result if you raise the content weight relative to the style weight?">
+  <Accordion title="What happens to a style transfer result when the content weight is raised relative to the style weight?">
 
     Content wins: the layout, object boundaries and colours stay close to the photograph and the painting's texture appears only faintly. Lower it instead and the style overwhelms recognizability, producing something that looks like the painter but no longer like the subject.
 

@@ -1,44 +1,24 @@
 ---
 title: Interpretability
-description: 'Forward and backward hooks, capturing and visualizing feature maps, saliency maps from input gradients, and Grad-CAM heatmaps built by hand.'
+description: 'Looking inside a trained vision model to see why it answered as it did: forward and backward hooks, inspecting feature maps and finding what a unit responds to, saliency maps from input gradients, Grad-CAM built by hand, guided backpropagation, integrated gradients and other attribution methods in captum, and hooks for other model surgery.'
 ---
 
-A trained CNN is a differentiable function from pixels to class scores, and you can query it in two directions. Push an image forward and read what each layer computes. Push a class score backward and read which pixels and which units were responsible for it. Both directions use the same mechanism: hooks.
+**Interpretability** is the set of techniques for explaining why a trained model produced a particular output: which parts of the input mattered, and what each internal unit has learned to detect. A trained network gives an answer but not a reason, and the reason matters. A model that labels a photo "wolf" because of the snow in the background will fail on a wolf standing on grass; a heatmap of where the model looked exposes that before deployment does.
 
----
+A trained CNN is a differentiable function from pixels to class scores, so it can be queried in two directions:
 
-## The plain-language version
+- **Forward:** run an image through and read what each layer computes. Early **feature maps** respond to edges; later ones to eyes, wheels, or fur.
+- **Backward:** take the score for a class and compute its gradient with respect to the input pixels or an internal layer. Large gradients mark the inputs that most affect the answer, and painting them gives a **heatmap** of where the model was "looking".
 
-A trained network gives an answer but not a reason. **Interpretability** is the set of techniques for looking inside to see **why** it answered the way it did: which parts of the image mattered, and what each internal unit has learned to detect.
+Both directions use the same PyTorch mechanism, **hooks**.
 
-There are two directions to look:
-
-- **Forward**: run an image through and inspect what each layer produced. The **feature maps** of early layers show edges; later ones respond to eyes, wheels, or fur.
-- **Backward**: start from the model's score for a class and compute its gradient with respect to the input pixels. Pixels with large gradients are the ones that, if changed, would change the answer most. Painting those gradients as an image gives a **heatmap** of where the model was "looking".
-
-Both use **hooks**: small functions you attach to a layer so PyTorch calls them automatically whenever data (forward) or gradients (backward) pass through that layer.
-
-Why it matters: a model that correctly labels "wolf" because of the snow in the background will fail on a wolf on grass. A heatmap exposes that before users do.
-
-| Word                                  | Plain meaning                                                                                                                                                           |
-| :------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **interpretability / explainability** | Understanding why a model produced its output.                                                                                                                          |
-| **hook**                              | A function registered on a layer that runs automatically during the forward pass (`register_forward_hook`) or backward pass.                                            |
-| **feature map / activation map**      | The output grid of one convolution filter. Shows where in the image that filter's pattern appears.                                                                      |
-| **unit / channel**                    | One filter in a layer and its feature map. "What a unit responds to" means which image patterns make it fire strongly.                                                  |
-| **saliency map**                      | A heatmap of the gradient of a class score with respect to each input pixel.                                                                                            |
-| **Grad-CAM**                          | Gradient-weighted Class Activation Mapping: weight a late conv layer's feature maps by how much each one affects the class score, giving a coarse but reliable heatmap. |
-| **Guided Grad-CAM**                   | Grad-CAM multiplied by a sharper pixel-level gradient map, for heatmaps that are both class-specific and detailed.                                                      |
-| **attribution**                       | Assigning credit for the output to each input feature (pixel, word).                                                                                                    |
-| **integrated gradients**              | An attribution method that averages gradients along a path from a blank image to the real one, to fix the noise of plain gradients.                                     |
-| **`captum`**                          | PyTorch's library of ready-made attribution methods.                                                                                                                    |
-| **spurious correlation**              | A pattern that predicts the label in training data but is not the real cause, like snow for "wolf". Interpretability tools help catch them.                             |
+**Builds on:** [Convolutions](/ai/classical-deep-learning/convolutions#the-feature-hierarchy) for feature maps, [Backpropagation](/ai/neural-networks/mlp-from-scratch) for input gradients, and [Autograd Engine](/ai/pytorch/autograd-engine).
 
 ---
 
 ## Hooks
 
-A hook is a callback PyTorch invokes during a module's forward or backward pass. You register it on a module and it fires every time that module runs, with no change to the model's source.
+A hook is a callback PyTorch invokes during a module's forward or backward pass. It is registered on a module and fires every time that module runs, with no change to the model's source.
 
 | Registration                   | Signature                                    | Fires                 |
 | :----------------------------- | :------------------------------------------- | :-------------------- |
@@ -64,12 +44,12 @@ for h in handles:
 
 Four things worth knowing:
 
-- Returning a value from a forward hook replaces the module's output. This is how you patch a layer without editing the model.
+- Returning a value from a forward hook replaces the module's output. This is how a layer is patched without editing the model.
 - Returning a tuple from a backward hook replaces `grad_input`. This is how guided backprop works.
 - `register_full_backward_hook` is the current API. `register_backward_hook` is deprecated and mishandles modules with multiple outputs.
-- Hooks hold references to what they capture. Remove the handles, or your activations stay on the GPU for the lifetime of the process.
+- Hooks hold references to what they capture. Unless the handles are removed, the captured activations stay on the GPU for the lifetime of the process.
 
-If you need the gradient of a tensor that is not a module output, `retain_grad()` is simpler than a hook:
+For the gradient of a tensor that is not a module output, `retain_grad()` is simpler than a hook:
 
 ```python
 mid = model.features[:6](x)
@@ -248,7 +228,7 @@ result = guided * cam
 <Callout type="warn">
   ### In-place operations break backward hooks
 
-`nn.ReLU(inplace=True)` overwrites its input tensor, and a backward hook registered on the preceding convolution then sees a tensor that has already been freed. PyTorch raises a version-counter error, or the hook silently receives the wrong gradient. When you need Grad-CAM, rebuild the model with `inplace=False`, or register the hook on the ReLU module itself rather than the convolution before it.
+`nn.ReLU(inplace=True)` overwrites its input tensor, and a backward hook registered on the preceding convolution then sees a tensor that has already been freed. PyTorch raises a version-counter error, or the hook silently receives the wrong gradient. For Grad-CAM, rebuild the model with `inplace=False`, or register the hook on the ReLU module itself rather than the convolution before it.
 
 </Callout>
 
@@ -278,15 +258,15 @@ ig = IntegratedGradients(model)
 attr = ig.attribute(x, target=idx, baselines=torch.zeros_like(x), n_steps=50)
 ```
 
-Integrated gradients is the one to reach for when you need a defensible answer rather than a pretty picture. It satisfies two axioms that plain gradients violate: a feature that never changes between the baseline and the input gets zero attribution, and attributions sum to the difference between the input's score and the baseline's score. It costs `m` backward passes, usually `m = 50`.
+Integrated gradients is the one to reach for when a defensible answer is needed rather than a pretty picture. It satisfies two axioms that plain gradients violate: a feature that never changes between the baseline and the input gets zero attribution, and attributions sum to the difference between the input's score and the baseline's score. It costs `m` backward passes, usually `m = 50`.
 
-Occlusion methods are model-agnostic and slow, but they measure the quantity you asked about directly: how much does the score change when this patch is gone.
+Occlusion methods are model-agnostic and slow, but they measure the quantity in question directly: how much does the score change when this patch is gone.
 
 ---
 
 ## Hooks for everything else
 
-The same two registration calls cover most model surgery you will ever need without touching a `forward` method.
+The same two registration calls cover most model surgery without touching a `forward` method.
 
 | Use                                | Hook type       | Notes                                      |
 | :--------------------------------- | :-------------- | :----------------------------------------- |
@@ -316,12 +296,30 @@ handle.remove()
 
 ---
 
+## Key terms
+
+| Term                                  | Meaning                                                                                                                                                                 |
+| :------------------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **interpretability / explainability** | Understanding why a model produced its output.                                                                                                                          |
+| **hook**                              | A function registered on a layer that runs automatically during the forward pass (`register_forward_hook`) or backward pass.                                            |
+| **feature map / activation map**      | The output grid of one convolution filter. Shows where in the image that filter's pattern appears.                                                                      |
+| **unit / channel**                    | One filter in a layer and its feature map. "What a unit responds to" means which image patterns make it fire strongly.                                                  |
+| **saliency map**                      | A heatmap of the gradient of a class score with respect to each input pixel.                                                                                            |
+| **Grad-CAM**                          | Gradient-weighted Class Activation Mapping: weight a late conv layer's feature maps by how much each one affects the class score, giving a coarse but reliable heatmap. |
+| **Guided Grad-CAM**                   | Grad-CAM multiplied by a sharper pixel-level gradient map, for heatmaps that are both class-specific and detailed.                                                      |
+| **attribution**                       | Assigning credit for the output to each input feature (pixel, word).                                                                                                    |
+| **integrated gradients**              | An attribution method that averages gradients along a path from a blank image to the real one, to fix the noise of plain gradients.                                     |
+| **`captum`**                          | PyTorch's library of ready-made attribution methods.                                                                                                                    |
+| **spurious correlation**              | A pattern that predicts the label in training data but is not the real cause, like snow for "wolf". Interpretability tools help catch them.                             |
+
+---
+
 ## Interview questions
 
 <Accordions>
   <Accordion title="What is the signature of a forward hook, and what happens if it returns a value?">
 
-    `hook(module, args, output)`. Returning a value from a forward hook replaces the module's output, which is how you patch a layer without editing the model; returning `None` leaves it as it is.
+    `hook(module, args, output)`. Returning a value from a forward hook replaces the module's output, which is how a layer is patched without editing the model; returning `None` leaves it as it is.
 
   </Accordion>
   <Accordion title={<>Why is <code>register_full_backward_hook</code> preferred over <code>register_backward_hook</code>?</>}>
@@ -329,7 +327,7 @@ handle.remove()
     `register_backward_hook` is deprecated and mishandles modules with multiple inputs or outputs. `register_full_backward_hook` is given the module's full input and output and does the autograd bookkeeping correctly, so it is the current API for anything with more than one tensor crossing the boundary.
 
   </Accordion>
-  <Accordion title="How do you get the gradient of an intermediate tensor that is not a module's output?">
+  <Accordion title="How is the gradient of an intermediate tensor obtained that is not a module's output?">
 
     Call `tensor.retain_grad()` before the backward pass and read `tensor.grad` afterwards. Hooks are the right tool at module boundaries; for an intermediate tensor produced inside a chain of calls, `retain_grad` avoids registering and removing anything.
 
@@ -359,22 +357,22 @@ handle.remove()
     Sensitivity of the input, meaning a feature identical to the baseline receives exactly zero attribution, and completeness, meaning the attributions sum to the difference between the score at the input and the score at the baseline. Plain gradients violate both: a saturated unit can have a gradient of zero while being entirely responsible for the prediction.
 
   </Accordion>
-  <Accordion title="When would you use occlusion over a gradient method?">
+  <Accordion title="When is occlusion preferable to a gradient method?">
 
-    When the model is not differentiable, when you distrust its gradients because gradient masking is suspected, or when you want the literal counterfactual rather than a linearization: how much does the score fall with this patch removed. It costs many forward passes, and being model-agnostic is also what makes the answer defensible to a skeptic.
+    When the model is not differentiable, when its gradients are distrusted because gradient masking is suspected, or when the literal counterfactual is wanted rather than a linearization: how much does the score fall with this patch removed. It costs many forward passes, and being model-agnostic is also what makes the answer defensible to a skeptic.
 
   </Accordion>
-  <Accordion title={<>How do you extract embeddings from a pretrained backbone without editing its <code>forward</code>?</>}>
+  <Accordion title={<>How are embeddings extracted from a pretrained backbone without editing its <code>forward</code>?</>}>
 
     Create the model with `num_classes=0`, which drops the classifier head and returns the pooled feature vector, or call `forward_features` and pool the map yourself. Either way the checkpoint's code is untouched and no `forward` is edited.
 
   </Accordion>
-  <Accordion title="What does a high dead-unit fraction in a layer's activations tell you?">
+  <Accordion title="What does a high dead-unit fraction in a layer's activations indicate?">
 
     It is the dead-unit rate: `frac_zero` after a ReLU. Above roughly 0.8 the layer has collapsed and contributes nothing for most inputs, usually from a learning rate too high, a missing normalization layer, or a bias pushed negative enough that the unit never activates.
 
   </Accordion>
-  <Accordion title="Why do hooks cause memory leaks, and how do you avoid it?">
+  <Accordion title="Why do hooks cause memory leaks, and how is that avoided?">
 
     The hook's closure keeps a reference to everything it captures, so those activations stay alive, and if they were stored without `.detach()` they keep the graph alive too — on the GPU, for the lifetime of the process. Call `remove()` on the returned handles when the inspection is finished, and `.detach()` before storing.
 
