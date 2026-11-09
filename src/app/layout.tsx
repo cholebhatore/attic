@@ -24,6 +24,13 @@ export default function Layout({ children }: LayoutProps<'/'>) {
       className={`${geist.variable} ${jetBrainsMono.variable}`}
       suppressHydrationWarning
     >
+      <head>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `(function(){try{var s=localStorage.getItem('attic-font-size')||'md';document.documentElement.dataset.fontSize=s;var l=localStorage.getItem('attic-line-height')||'normal';document.documentElement.dataset.lineHeight=l;}catch(e){}})()`,
+          }}
+        />
+      </head>
       <body className="flex flex-col min-h-screen" suppressHydrationWarning>
         <RootProvider>{children}</RootProvider>
       </body>
