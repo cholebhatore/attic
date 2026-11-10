@@ -1,11 +1,12 @@
 import { RootProvider } from 'fumadocs-ui/provider/next';
 import 'katex/dist/katex.min.css';
 import './global.css';
-import { Inter, JetBrains_Mono, Geist } from 'next/font/google';
+import { Geist, JetBrains_Mono } from 'next/font/google';
+import type { Metadata } from 'next';
 
-const inter = Inter({
-  subsets: ['latin'],
-});
+export const metadata: Metadata = {
+  metadataBase: new URL(process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000'),
+};
 
 const geist = Geist({
   subsets: ['latin'],

@@ -41,10 +41,14 @@ function emitChange() {
 
 function subscribe(callback: () => void) {
   listeners.add(callback);
-  window.addEventListener('storage', callback);
+  if (typeof window !== 'undefined') {
+    window.addEventListener('storage', callback);
+  }
   return () => {
     listeners.delete(callback);
-    window.removeEventListener('storage', callback);
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('storage', callback);
+    }
   };
 }
 
@@ -101,15 +105,13 @@ export function FontAdjustPopover() {
   return (
     <Popover>
       <PopoverTrigger
-        className={(state) =>
-          cn(
-            buttonVariants({
-              variant: 'secondary',
-              size: 'sm',
-            }),
-            'gap-1.5 text-xs text-fd-muted-foreground hover:text-fd-foreground data-[popup-open]:bg-fd-accent data-[popup-open]:text-fd-accent-foreground',
-          )
-        }
+        className={cn(
+          buttonVariants({
+            variant: 'secondary',
+            size: 'sm',
+          }),
+          'gap-1.5 text-xs text-fd-muted-foreground hover:text-fd-foreground data-[popup-open]:bg-fd-accent data-[popup-open]:text-fd-accent-foreground',
+        )}
         aria-label="Reading appearance"
       >
         <Type className="size-3.5 text-fd-muted-foreground" />
