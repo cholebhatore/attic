@@ -65,7 +65,8 @@ function MdxImageZoom({ children, ...props }: React.ComponentProps<typeof ImageZ
 
   return (
     <ImageZoom {...props}>
-      <img {...(props as React.ImgHTMLAttributes<HTMLImageElement>)} />
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img alt="" {...(props as React.ImgHTMLAttributes<HTMLImageElement>)} />
     </ImageZoom>
   );
 }
