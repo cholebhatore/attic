@@ -1,6 +1,6 @@
 ---
 title: Architectures and the Forward Pass
-description: 'BERT against GPT against T5, masked and causal language modeling, why decoder-only won, and a token-by-token trace of a decoder forward pass with shapes.'
+description: 'Self-attention against cross-attention, BERT against GPT against T5, masked and causal language modeling, how a decoder-only model runs without an encoder, why decoder-only won, and a token-by-token trace of a decoder forward pass with shapes.'
 ---
 
 The transformer block is the same everywhere. What differs between BERT, GPT, and T5 is the mask on the attention, the training objective, and whether there is one stack or two. This page compares the three families and then traces a single forward pass through a decoder, with the shape at every step.
@@ -13,20 +13,25 @@ The transformer block is the same everywhere. What differs between BERT, GPT, an
 
 The same block builds three kinds of model. An **encoder-only** model (BERT) lets every word see every other word and is trained by hiding words and guessing them; it understands text but does not generate it. A **decoder-only** model (GPT, Llama) uses a causal mask and is trained to predict the next word; it generates text, and every modern chat LLM is one. An **encoder-decoder** model (T5, the original transformer) uses an encoder to read the input and a decoder to write the output, which suits translation.
 
-Think of three jobs. A proofreader reads the whole page at once and fills in a smudged word (encoder). A storyteller writes one word at a time, never seeing the future (decoder). An interpreter listens to a whole sentence, then speaks the translation word by word (encoder-decoder).
+Think of three jobs. A **reader** takes in the whole page at once, in both directions, and builds a picture of it. A **writer** produces one word at a time and never sees the word after the current one. A **translator** reads the whole source sentence first, then writes the translation word by word while looking back at what it read.
 
 This page covers, in order:
 
-1. **The three families**: encoder-only, decoder-only, encoder-decoder
-2. **Masked language modeling**: how BERT is trained
-3. **Causal language modeling**: how GPT is trained
-4. **Encoder-decoder**: T5 and cross-attention
-5. **Why decoder-only dominates**: one objective, one stack, and scale
-6. **Step-by-step decoder forward pass**: token IDs to logits with shapes, weight tying, and where the memory goes
-7. **Parameter accounting**: every parameter in GPT-2 small
+1. **Attention versus self-attention**: one sequence or two
+2. **The three families**: encoder-only, decoder-only, encoder-decoder
+3. **Masked language modeling**: how BERT is trained
+4. **Causal language modeling**: how GPT is trained
+5. **Encoder-decoder**: T5 and cross-attention
+6. **How a decoder-only model runs without an encoder**
+7. **Why decoder-only dominates**: one objective, one stack, and scale
+8. **Step-by-step decoder forward pass**: token IDs to logits with shapes, weight tying, and where the memory goes
+9. **Parameter accounting**: every parameter in GPT-2 small
 
 | Word                               | Plain meaning                                                                                                                |
 | :--------------------------------- | :--------------------------------------------------------------------------------------------------------------------------- |
+| **self-attention**                 | Attention where queries, keys, and values all come from one sequence. Every token looks at the tokens around it.             |
+| **cross-attention**                | Attention where queries come from one sequence and keys and values from another. Connects a decoder to an encoder.           |
+| **causal mask**                    | Blocks each position from seeing later positions, so a token can only look backward.                                         |
 | **encoder-only**                   | A stack with bidirectional attention. Produces contextual embeddings for every input token.                                  |
 | **decoder-only**                   | A stack with causal attention, trained to predict the next token.                                                            |
 | **encoder-decoder**                | Two stacks: an encoder for the input, and a decoder that generates the output and reads the encoder through cross-attention. |
@@ -39,37 +44,103 @@ This page covers, in order:
 
 ---
 
+## Attention versus self-attention
+
+Every attention layer does the same lookup: each position emits a query, compares it with every key, and averages the values. The layer's name comes from where the three vectors are read from.
+
+**Self-attention** reads queries, keys, and values from the same sequence. It is how a token builds its own context. In "I poured water from the bottle into the cup until **it** was full", the query for `it` matches the key for `cup` more strongly than the key for `bottle`, so `it` takes most of its new vector from `cup`. Every encoder layer and every decoder layer contains one.
+
+**Cross-attention**, also called general or encoder-decoder attention, reads queries from one sequence and keys and values from another. Translating "I ate an apple" into Hindi, the decoder's query at the position that produces `सेब` matches the key for `apple` more strongly than the keys for the other English words, so the Hindi token takes most of its vector from `apple`. The two lengths need not match: the attention matrix is `(T_dec, T_enc)`. Only the middle sublayer of a decoder block does this, and only in an encoder-decoder model.
+
+| Feature                 | Self-attention                    | Cross-attention                               |
+| :---------------------- | :-------------------------------- | :-------------------------------------------- |
+| Inputs                  | One sequence                      | Two sequences                                 |
+| Origin of `Q`, `K`, `V` | All from sequence A               | `Q` from sequence A; `K`, `V` from sequence B |
+| Purpose                 | Build context inside one sequence | Carry information between two sequences       |
+| Where it appears        | Every encoder and decoder layer   | Decoder blocks of an encoder-decoder model    |
+
+[Attention Internals](/ai/transformers/attention-internals) covers the computation, the shape argument, and the text-to-image case where image patches query a text encoder.
+
+---
+
 ## The three families
+
+The block is identical in all three. What changes is the attention mask, the training objective, and whether the model has one stack or two.
+
+Read each block diagram from top to bottom. Token IDs become an embedding plus a position vector, so word order survives. The vectors then pass through `N` identical blocks; each diagram shows the path through a single block. Inside a block, attention is the only step that mixes information across positions, and it runs several heads in parallel before concatenating them. The feed-forward network transforms each position on its own. Every sublayer is wrapped in an **add and norm**: the sublayer's input is added back (the residual) and the result is normalized. The attention box, the head, and the number of stacks change between the three families.
+
+### Encoder-only: the reader
 
 <Mermaid
   chart={`
+%%{init: {"flowchart": {"wrappingWidth": 500}}}%%
 flowchart TB
-    subgraph EncOnly["Encoder-only: BERT"]
-      direction TB
-      E1["Bidirectional self-attention"] --> E2["Pooled hidden states"] --> E3["Task head"]
-    end
-    subgraph DecOnly["Decoder-only: GPT"]
-      direction TB
-      D1["Causal self-attention"] --> D2["Last hidden state"] --> D3["LM head over vocab"]
-    end
-    subgraph EncDec["Encoder-decoder: T5"]
-      direction TB
-      C1["Bidirectional encoder"] --> C3["Cross-attention"]
-      C2["Causal decoder"] --> C3
-      C3 --> C4["LM head over vocab"]
-    end
+    IN["Input: The bank was closed"] --> EMB["Embedding + positions"]
+    EMB --> ATT["Bidirectional self-attention + add and norm"]
+    ATT --> FF["Feed-forward + add and norm"]
+    FF --> HEAD["Pool + task head"]
+    HEAD --> OUT["Label or embedding"]
 `}
 />
 
-| Property          | Encoder-only (BERT)                   | Decoder-only (GPT)          | Encoder-decoder (T5)                            |
-| :---------------- | :------------------------------------ | :-------------------------- | :---------------------------------------------- |
-| Attention mask    | None, full bidirectional              | Upper-triangular causal     | Encoder none, decoder causal, plus cross        |
-| Objective         | Masked language modeling              | Causal language modeling    | Span corruption, seq2seq                        |
-| Supervised tokens | The 15% masked                        | Every position              | Every decoder position                          |
-| Generates text    | No                                    | Yes                         | Yes                                             |
-| Params per layer  | `4d^2` attention + `8d^2` FFN         | Same                        | Adds `4d^2` cross-attention                     |
-| Examples          | BERT, RoBERTa, BGE, E5                | GPT-3, LLaMA, Mistral, Qwen | T5, BART, FLAN-T5, mT5                          |
-| Best for          | Classification, retrieval, embeddings | General-purpose LLMs        | Translation, summarization, small-model seq2seq |
+The encoder reads the whole input at once. With no mask, every token sees every other token on both sides, so the vector for `bank` in "river bank" already contains `river`. Training hides 15% of the tokens and asks the model to recover them, which forces each vector to carry what its neighbours say. The output is one vector per token, not text, so a task head turns it into a label or a similarity score. The stack runs the block `N` times, 12 in BERT-base. The pool step applies only to sentence-level tasks; token-level tasks such as named-entity recognition put the head on every position and skip it.
+
+BERT and RoBERTa are the reference models. You meet this family in a Gmail spam filter reading a whole email before deciding `Spam` or `Not Spam`, and in the embedding model behind semantic search or RAG, which scores a query against stored documents.
+
+### Decoder-only: the writer
+
+<Mermaid
+  chart={`
+%%{init: {"flowchart": {"wrappingWidth": 500}}}%%
+flowchart TB
+    IN["Prompt + generated tokens"] --> EMB["Embedding + positions"]
+    EMB --> ATT["Masked self-attention + add and norm"]
+    ATT --> FF["Feed-forward + add and norm"]
+    FF --> HEAD["Final norm + LM head"]
+    HEAD --> OUT["Next token"]
+    OUT -.->|"append and rerun"| IN
+`}
+/>
+
+The decoder generates one token at a time, left to right. A causal mask hides everything after the current position, so each token can only look backward at its prefix. Every position is a training label, so one pass over `T` tokens gives `T - 1` predictions.
+
+GPT, Claude, Llama, and Gemini are all this shape. ChatGPT and Copilot run the same loop under different prompts: given a question or a function header, the model predicts the next token, appends it, and repeats until it emits a stop token. The dashed edge in the diagram is that loop, and a later section walks through it.
+
+### Encoder-decoder: the translator
+
+<Mermaid
+  chart={`
+%%{init: {"flowchart": {"wrappingWidth": 500}}}%%
+flowchart TB
+    SRC["Input: That is good"] --> SEMB["Embedding + positions"]
+    SEMB --> SATT["Bidirectional self-attention + add and norm"]
+    SATT --> SFF["Feed-forward + add and norm"]
+    TGT["Output so far: Das ist"] --> TEMB["Embedding + positions"]
+    TEMB --> TATT["Masked self-attention + add and norm"]
+    TATT --> TCA["Cross-attention + add and norm"]
+    TCA --> TFF["Feed-forward + add and norm"]
+    TFF --> THEAD["Final norm + LM head"]
+    THEAD --> TOUT["Next token: gut"]
+    SFF -->|"K, V"| TCA
+`}
+/>
+
+Two stacks. The encoder reads the source bidirectionally; the decoder writes the output causally and cross-attends to the encoder's final states in every block. The stacks have separate weights, and the only connection between them is the arrow into cross-attention, which supplies one key and one value per source position. Because cross-attention scores `T_dec` queries against `T_enc` keys, the output can be a different length from the input, which translation and transcription need.
+
+The original 2017 transformer, T5, BART, and Whisper are encoder-decoder models. Whisper encodes a whole audio clip, then the decoder writes the transcript word by word, using cross-attention to check the audio representation at each step.
+
+| Property          | Encoder-only (BERT)                      | Decoder-only (GPT)                            | Encoder-decoder (T5)                                                 |
+| :---------------- | :--------------------------------------- | :-------------------------------------------- | :------------------------------------------------------------------- |
+| Analogy           | Reader                                   | Writer                                        | Translator                                                           |
+| How it works      | Reads the whole input in both directions | Generates one token at a time from the prefix | Reads the input, then writes the output while cross-attending        |
+| Attention         | Bidirectional self-attention             | Masked self-attention                         | Bidirectional self-attention, masked self-attention, cross-attention |
+| Attention mask    | None, full bidirectional                 | Upper-triangular causal                       | Encoder none, decoder causal, plus cross                             |
+| Objective         | Masked language modeling                 | Causal language modeling                      | Span corruption, seq2seq                                             |
+| Supervised tokens | The 15% masked                           | Every position                                | Every decoder position                                               |
+| Generates text    | No                                       | Yes                                           | Yes                                                                  |
+| Params per layer  | `4d^2` attention + `8d^2` FFN            | Same                                          | Adds `4d^2` cross-attention                                          |
+| Examples          | BERT, RoBERTa, BGE, E5                   | GPT-3, LLaMA, Mistral, Qwen, Claude           | T5, BART, FLAN-T5, mT5, Whisper                                      |
+| Where you meet it | Spam filters, retrieval, embeddings      | Chatbots, coding assistants                   | Translation, summarization, speech-to-text                           |
 
 Encoder-only models cannot generate, because a bidirectional model that sees the answer cannot be asked to produce it one token at a time. Decoder-only models can do everything an encoder can, at some cost in efficiency on pure classification. That asymmetry is most of the story.
 
@@ -144,6 +215,16 @@ The decoder layer costs `20d^2` against `12d^2` for a decoder-only layer of the 
 At fixed parameter counts in the 100M to 3B range, T5 and FLAN-T5 beat comparably sized decoder-only models on translation and summarization, because the encoder gives every generated token a full bidirectional read of the source. Above roughly 10B parameters, decoder-only models trained on enough data close the gap and then pass it, and the KV-cache and batching advantages of a single stack take over. If you are fine-tuning a small model for a translation or extraction task today, an encoder-decoder is still a reasonable first choice.
 
 </Callout>
+
+---
+
+## How a decoder-only model runs without an encoder
+
+A decoder-only model does not keep the prompt and the response in separate blocks. It joins them into one sequence and continues it.
+
+Take `The capital of France is`. During prefill, all five tokens go through the stack at once, and the causal mask lets each one look only at itself and the tokens before it. `France` builds its vector from `capital` and `of`; `is` builds one from the whole prefix. At the last position the LM head produces a distribution over the vocabulary and the sampler picks `Paris`. The sequence becomes `The capital of France is Paris`, the model runs again to predict the next token, and the loop stops at an end-of-sequence token or a length limit. Each decode step computes the query for the new token only; the keys and values of earlier tokens come from the KV cache.
+
+The encoder in the translator family builds a bidirectional representation of the source before decoding starts. A chat prompt has no separate source: it is the beginning of the text being generated. Training the same layers to predict every next token from its prefix gives them the context-building job, because the correct next token depends on everything before it. Dropping the second stack also drops a set of parameters, a second KV cache, and the handoff between two models.
 
 ---
 
@@ -262,6 +343,16 @@ Two thirds of the non-embedding weight is in the FFN, and the embedding itself i
 ## Interview questions
 
 <Accordions>
+  <Accordion title="What is the difference between attention and self-attention?">
+
+    Attention is the general operation: each position emits a query, compares it with a set of keys, and takes a weighted average of the values. Self-attention is the case where queries, keys, and values all come from the same sequence, so each token builds its context from the other tokens around it. When the queries come from the decoder and the keys and values from the encoder, the same operation is called cross-attention, and it connects two sequences.
+
+  </Accordion>
+  <Accordion title="How does a decoder-only model answer a prompt without an encoder?">
+
+    It appends the prompt and the response into one sequence and predicts the next token. The prompt is processed in parallel under the causal mask during prefill, the last position's logits select the first output token, and each generated token is appended and fed back while cached keys and values avoid recomputing the prefix. The prompt is already the prefix of the output, so there is no separate source for an encoder to read.
+
+  </Accordion>
   <Accordion title="What are the three differences between BERT, GPT, and T5, given the same block?">
 
     Three, given an identical block. Attention visibility: BERT bidirectional, GPT causal, T5 both (bidirectional encoder, causal decoder with cross-attention). Objective: BERT classifies masked positions, GPT predicts the next token, T5 generates corrupted spans as a sequence. Interface: BERT needs a task head, GPT emits continuations, T5 turns every task into text-to-text with a prefix.
